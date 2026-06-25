@@ -42,6 +42,22 @@ int tigris_dispatch_kernel_cmsis_nn(
     tigris_mem_t        *mem,
     void                *user_ctx);
 
+/**
+ * Reserve the CMSIS-NN kernel scratch buffer from the top of the fast arena.
+ *
+ * Sizes a single 16-aligned scratch to the largest kernel buffer across the
+ * plan and carves it from mem (reducing mem->fast_size), so the per-op CMSIS-NN
+ * scratch is never allocated on the stack. Call once after tigris_mem_init()
+ * and before inference; the reduced fast_size must be used by subsequent
+ * tigris_mem_init() re-inits. Optional - if not called, a small bounded static
+ * fallback covers tiny models and oversized ops fail rather than overflow.
+ *
+ * @param plan  Loaded plan.
+ * @param mem   Memory manager (fast_size is reduced in place).
+ * @return 0 on success, -1 if mem/plan is NULL or the arena is too small.
+ */
+int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem);
+
 #ifdef __cplusplus
 }
 #endif

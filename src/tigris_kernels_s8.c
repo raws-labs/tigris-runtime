@@ -33,29 +33,52 @@ static inline int8_t clamp_act(int32_t x, int8_t act_min, int8_t act_max)
     return (int8_t)x;
 }
 
+/* gemmlowp SaturatingRoundingDoublingHighMul - the high 32 bits of 2*a*b with
+ * rounding (TFLite/CMSIS-NN/ESP-NN convention). */
+static inline int32_t sat_round_dbl_high_mul(int32_t a, int32_t b)
+{
+    if (a == INT32_MIN && b == INT32_MIN) return INT32_MAX;
+    int64_t ab = (int64_t)a * (int64_t)b;
+    int64_t nudge = ab >= 0 ? (1 << 30) : (1 - (1 << 30));
+    return (int32_t)((ab + nudge) / ((int64_t)1 << 31));
+}
+
+/* gemmlowp RoundingDivideByPOT - round-to-nearest divide by 2^exponent, with the
+ * sign-correct tie threshold. */
+static inline int32_t round_div_by_pot(int32_t x, int exponent)
+{
+    if (exponent <= 0) return x;
+    int32_t mask = ((int32_t)1 << exponent) - 1;
+    int32_t remainder = x & mask;
+    int32_t threshold = (mask >> 1) + (x < 0 ? 1 : 0);
+    return (x >> exponent) + (remainder > threshold ? 1 : 0);
+}
+
 /**
- * Multiply-by-quantized-multiplier (TFLite convention).
- *
- * Two-step: SaturatingRoundingDoublingHighMul (x*m >> 31 with rounding),
- * then apply remaining shift with rounding. Matches TFLite/CMSIS-NN/ESP-NN.
+ * Multiply-by-quantized-multiplier - bit-exact with TFLite/CMSIS-NN gemmlowp.
+ * shift > 0 left-shifts the input; shift <= 0 right-shifts the result.
  */
 static inline int32_t multiply_by_quantized_multiplier(
     int32_t x, int32_t multiplier, int32_t shift)
 {
-    /* Step 1: SaturatingRoundingDoublingHighMul - high 32 bits of x*m*2 */
-    int64_t ab = (int64_t)x * (int64_t)multiplier;
-    int32_t nudge = ab >= 0 ? (1 << 30) : -(1 << 30);
-    int32_t high = (int32_t)((ab + nudge) >> 31);
+    int left  = shift > 0 ? shift : 0;
+    int right = shift > 0 ? 0 : -shift;
+    return round_div_by_pot(
+        sat_round_dbl_high_mul(x * ((int32_t)1 << left), multiplier), right);
+}
 
-    /* Step 2: Apply remaining shift with rounding */
-    if (shift >= 0) {
-        return high << shift;
-    }
-    int right = -shift;
-    int32_t mask = (1 << right) - 1;
-    int32_t threshold = mask >> 1;
-    int32_t remainder = high & mask;
-    return (high >> right) + (remainder > threshold ? 1 : 0);
+/* TFLite QuantizeMultiplier: frexp(scale) -> (Q0.31 multiplier, shift=exp).
+ * Used at runtime where the effective multiplier is not precomputed in the plan
+ * (the quantized Mean folds 1/HW into it). */
+static inline void compute_quant_mult(double scale, int32_t *mult, int *shift)
+{
+    if (scale <= 0.0) { *mult = 0; *shift = 0; return; }
+    int e;
+    double q = frexp(scale, &e);
+    int64_t qf = (int64_t)(q * 2147483648.0 + 0.5);  /* round(q * 2^31), q>0 */
+    if (qf == ((int64_t)1 << 31)) { qf /= 2; e += 1; }
+    *mult = (int32_t)qf;
+    *shift = e;
 }
 
 /** Get multiplier from quant data (works for both per-tensor and per-channel). */
@@ -175,6 +198,64 @@ static int kern_conv2d_s8(
                     int32_t scaled = multiply_by_quantized_multiplier(acc, m, s);
                     Y[((n*OH+oh)*OW+ow)*OC+oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
                 }
+            }
+        }
+    }
+    return 0;
+}
+
+/* INT8 1D convolution. NLC activation layout, weights [OC, K, IC], per-channel
+ * requant - the int8 analogue of kern_conv1d (float) / kern_conv2d_s8. Conv1D
+ * tensors are 3D so they are never tiled (the tile path requires 4D I/O), hence
+ * no mem->tile handling, matching the float kernel. */
+static int kern_conv1d_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+
+    const int8_t  *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t        *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
+    const int32_t *B = (const int32_t *)tigris_op_bias(plan, op);
+
+    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+
+    const tigris_quant_param_t *in_qp  = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    int32_t input_zp = in_qp ? in_qp->zero_point : 0;
+    const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+
+    /* NLC layout (transposed from NCL) */
+    int N  = x_shape[0];
+    int IT = x_shape[1];   /* input length (time) */
+    int IC = x_shape[2];
+    int OT = y_shape[1];   /* output length (time) */
+    int OC = y_shape[2];
+    int K  = op->spatial.kernel_h;                              /* kernel size in kernel_h */
+    int S  = op->spatial.stride_h   ? op->spatial.stride_h   : 1;
+    int D  = op->spatial.dilation_h ? op->spatial.dilation_h : 1;
+    int PB = op->spatial.pad_top;                              /* pad_begin in pad_top */
+
+    for (int n = 0; n < N; n++) {
+        for (int ot = 0; ot < OT; ot++) {
+            for (int oc = 0; oc < OC; oc++) {
+                int32_t acc = B ? B[oc] : 0;
+                for (int k = 0; k < K; k++) {
+                    int it = ot * S - PB + k * D;
+                    if (it < 0 || it >= IT) continue;
+                    for (int ic = 0; ic < IC; ic++) {
+                        int32_t x_val = (int32_t)X[(n*IT+it)*IC+ic] - input_zp;
+                        int32_t w_val = (int32_t)W[(oc*K+k)*IC+ic];
+                        acc += x_val * w_val;
+                    }
+                }
+                int ch = (out_qp && out_qp->num_channels > 1) ? oc : 0;
+                int32_t m = out_qp ? get_multiplier(plan, out_qp, ch) : 1;
+                int32_t s = out_qp ? get_shift(plan, out_qp, ch) : 0;
+                int32_t scaled = multiply_by_quantized_multiplier(acc, m, s);
+                Y[(n*OT+ot)*OC+oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
             }
         }
     }
@@ -336,7 +417,10 @@ static int kern_relu6_s8(
     float scale = qp ? qp->scale : 1.0f;
     int32_t zp = qp ? qp->zero_point : 0;
     int8_t lo = clamp_s8(zp);  /* quantized 0 */
-    int8_t hi = clamp_s8((int32_t)(6.0f / scale) + zp);  /* quantized 6 */
+    /* Round (not truncate) the quantized 6.0 ceiling to match TFLite's activation
+     * max and the compiler's fused-Relu6 bound; truncation is 1 LSB too low when
+     * 6/scale has a fractional part >= 0.5. */
+    int8_t hi = clamp_s8((int32_t)lroundf(6.0f / scale) + zp);  /* quantized 6 */
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
     for (uint32_t i = 0; i < n; i++) {
@@ -369,18 +453,28 @@ static int kern_add_s8(
     float sy = qp_y ? qp_y->scale : 1.0f;
     int32_t zy = qp_y ? qp_y->zero_point : 0;
 
-    /* real_a = sa * (a - za), real_b = sb * (b - zb)
-     * real_y = real_a + real_b
-     * y = real_y / sy + zy = (sa/sy)*(a-za) + (sb/sy)*(b-zb) + zy
-     */
-    float ma = sa / sy;
-    float mb = sb / sy;
+    /* TFLite-exact quantized Add (reference/integer_ops/add.h): shift both inputs
+     * left by 20, scale each by an integer multiplier derived from its scale
+     * relative to twice-the-max-input-scale, sum, then requantize to the output
+     * scale. All integer gemmlowp - bit-exact with tflite/CMSIS-NN. The old float
+     * (sa/sy)*(a-za)+... drifted ~1 LSB/op, accumulating to tens of LSB across a
+     * residual network like MobileNetV2. */
+    const int LEFT_SHIFT = 20;
+    double twice_max = 2.0 * ((sa > sb) ? (double)sa : (double)sb);
+    int32_t a_mult, b_mult, y_mult;
+    int a_shift, b_shift, y_shift;
+    compute_quant_mult((double)sa / twice_max, &a_mult, &a_shift);
+    compute_quant_mult((double)sb / twice_max, &b_mult, &b_shift);
+    compute_quant_mult(twice_max / (((double)(1 << LEFT_SHIFT)) * (double)sy),
+                       &y_mult, &y_shift);
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
     for (uint32_t i = 0; i < n; i++) {
-        float real_sum = ma * (float)((int32_t)A[i] - za)
-                       + mb * (float)((int32_t)B_ptr[i] - zb);
-        int32_t q = (int32_t)roundf(real_sum) + zy;
+        int32_t av = ((int32_t)A[i] - za) * (1 << LEFT_SHIFT);
+        int32_t bv = ((int32_t)B_ptr[i] - zb) * (1 << LEFT_SHIFT);
+        int32_t scaled = multiply_by_quantized_multiplier(av, a_mult, a_shift)
+                       + multiply_by_quantized_multiplier(bv, b_mult, b_shift);
+        int32_t q = multiply_by_quantized_multiplier(scaled, y_mult, y_shift) + zy;
         Y[i] = clamp_s8(q);
     }
     return 0;
@@ -411,18 +505,40 @@ static int kern_global_avg_pool_s8(
     int C = x_shape[3];
     int HW = H * W;
 
-    float rescale = in_scale / out_scale;
+    /* Guard a missing/zero output scale (unquantized output tensor): degrade to
+     * preserving the input quant instead of dividing by zero. */
+    if (!(out_scale > 0.0f)) {
+        out_scale = in_scale;
+        output_zp = input_zp;
+    }
+
+    /* TFLite QuantizedMeanOrSum (reference/reduce.h), bit-exact:
+     *   - requant multiplier/shift from (in_scale / out_scale)
+     *   - fold the 1/HW mean into the multiplier
+     *   - per channel: MBQM(Σx - in_zp*HW, mult, shift) + out_zp */
+    int32_t mult;
+    int shift0;
+    compute_quant_mult((double)in_scale / (double)out_scale, &mult, &shift0);
+    if (HW > 1) {
+        int s = 63 - __builtin_clzll((unsigned long long)HW);
+        if (s > 32) s = 32;
+        if (s > 31 + shift0) s = 31 + shift0;
+        mult = (int32_t)(((int64_t)mult << s) / HW);
+        shift0 -= s;
+    }
 
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
+            /* Walk the channel with a stride-C pointer - no per-element index
+             * arithmetic. temp_sum = Σ raw x (TFLite subtracts the zp after). */
+            const int8_t *xp = X + (size_t)(n * HW) * C + c;
             int32_t sum = 0;
-            for (int h = 0; h < H; h++) {
-                for (int w = 0; w < W; w++) {
-                    sum += (int32_t)X[((n*H+h)*W+w)*C+c] - input_zp;
-                }
+            for (int p = 0; p < HW; p++) {
+                sum += *xp;
+                xp += C;
             }
-            float avg = (float)sum / (float)HW;
-            int32_t q = (int32_t)(avg * rescale + 0.5f) + output_zp;
+            int32_t shifted = sum - input_zp * HW;
+            int32_t q = multiply_by_quantized_multiplier(shifted, mult, shift0) + output_zp;
             Y[n * C + c] = clamp_s8(q);
         }
     }
@@ -494,7 +610,10 @@ static int kern_max_pool_s8(
                             if (v > max_val) max_val = v;
                         }
                     }
-                    Y[((n * OH + oh) * OW + ow) * C + c] = max_val;
+                    /* Apply the fused activation clamp, as TFLM/CMSIS MaxPool do
+                     * (no-op when act range is the full [-128, 127]). */
+                    Y[((n * OH + oh) * OW + ow) * C + c] =
+                        clamp_act(max_val, op->act_min, op->act_max);
                 }
             }
         }
@@ -646,6 +765,41 @@ static int kern_sigmoid_s8(
     return 0;
 }
 
+/* Tanh via a 256-entry LUT, mirroring kern_sigmoid_s8 (tanh in place of the
+ * logistic). int8 input -> int8 output with its own output quant. */
+static int kern_tanh_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+
+    const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+
+    float in_scale = in_qp ? in_qp->scale : 1.0f;
+    int32_t in_zp = in_qp ? in_qp->zero_point : 0;
+    float out_scale = out_qp ? out_qp->scale : 1.0f;
+    int32_t out_zp = out_qp ? out_qp->zero_point : 0;
+
+    int8_t lut[256];
+    for (int i = 0; i < 256; i++) {
+        int8_t x_val = (int8_t)i;
+        float real = in_scale * (float)((int32_t)x_val - in_zp);
+        float th = tanhf(real);
+        int32_t q = (int32_t)roundf(th / out_scale) + out_zp;
+        lut[i] = clamp_s8(q);
+    }
+
+    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    for (uint32_t i = 0; i < n; i++) {
+        Y[i] = lut[(uint8_t)X[i]];
+    }
+    return 0;
+}
+
 static int kern_mul_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -705,7 +859,9 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_CONCAT:      return kern_concat_s8(plan, op, mem);
     case TIGRIS_OP_RESIZE:      return kern_resize_nearest_s8(plan, op, mem);
     case TIGRIS_OP_SIGMOID:     return kern_sigmoid_s8(plan, op, mem);
+    case TIGRIS_OP_TANH:        return kern_tanh_s8(plan, op, mem);
     case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, mem);
+    case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
     default:
         return -1;  /* unsupported op type */
     }

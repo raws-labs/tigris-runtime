@@ -59,8 +59,10 @@ typedef struct {
     #define TIGRIS_TENSOR_ALIGN 8    /* ESP32-S3 TIE (ee.vld.l.64.ip) */
   #elif defined(__ARM_NEON)
     #define TIGRIS_TENSOR_ALIGN 16   /* 32-bit ARM with NEON */
+  #elif defined(__ARM_FEATURE_DSP)
+    #define TIGRIS_TENSOR_ALIGN 16   /* Cortex-M4/M7/M33: CMSIS-NN opt kernels need aligned buffers */
   #else
-    #define TIGRIS_TENSOR_ALIGN 4    /* Cortex-M, 8-bit MCUs, etc. */
+    #define TIGRIS_TENSOR_ALIGN 4    /* Cortex-M0, 8-bit MCUs, etc. */
   #endif
 #endif
 
@@ -74,11 +76,24 @@ typedef struct {
     uint32_t     fast_size;         /* capacity in bytes */
     uint32_t     fast_used;         /* bump offset */
     uint32_t     fast_reserved;    /* bytes reserved at start (survives reset) */
+    uint32_t     fast_peak;         /* high-water mark for fast_used (true SRAM working set) */
     uint8_t     *slow_base;         /* slow buffer */
     uint32_t     slow_size;         /* capacity in bytes */
     uint32_t     slow_used;         /* bump offset */
     tigris_tile_ctx_t tile;         /* per-tile context (active during tiled execution) */
 } tigris_mem_t;
+
+/**
+ * Record a new fast-arena high-water mark if fast_used grew.
+ * Called at every site that increases fast_used (the bump allocator and the
+ * executor's direct scratch/weight bumps) so fast_peak is the true measured
+ * peak SRAM working set, not a compile-time estimate.
+ */
+static inline void tigris_mem_note_fast_peak(tigris_mem_t *mem)
+{
+    if (mem && mem->fast_used > mem->fast_peak)
+        mem->fast_peak = mem->fast_used;
+}
 
 /* API */
 

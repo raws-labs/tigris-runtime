@@ -36,6 +36,7 @@ tigris_mem_error_t tigris_mem_init(
     uint32_t slow_adj = (TIGRIS_TENSOR_ALIGN - ((uintptr_t)slow_buf & mask)) & mask;
     mem->fast_used     = fast_adj;
     mem->fast_reserved = fast_adj;
+    mem->fast_peak     = fast_adj;
     mem->slow_used     = slow_adj;
 
     memset(tensor_ptrs, 0, (size_t)num_tensors * sizeof(void *));
@@ -56,6 +57,8 @@ static tigris_mem_error_t alloc_bump(
 
     mem->tensor_ptrs[tensor_idx] = base + *used;
     *used += aligned;
+    if (used == &mem->fast_used)
+        tigris_mem_note_fast_peak(mem);
     return TIGRIS_MEM_OK;
 }
 

@@ -311,6 +311,22 @@ static tigris_exec_error_t exec_stage_tiled(
     void *out_slow_bases[MAX_STAGE_OUTPUTS];
     int in_place = 0;  /* set if output reuses input's slow memory */
 
+    /* Spatial op + image dims, computed up front: the in-place halo guard below
+     * and the tile geometry both need them. */
+    int sp_op_idx = find_spatial_op(plan, stage);
+    const tigris_spatial_attrs_t *sp_attrs =
+        (sp_op_idx >= 0) ? &plan->ops[sp_op_idx].spatial : NULL;
+    const int32_t *in_shape = tigris_tensor_shape(plan, &plan->tensors[sin[0]]);
+    int32_t full_in_h = in_shape[1];
+    int32_t full_in_w = in_shape[2];
+    const int32_t *out_shape = tigris_tensor_shape(plan, &plan->tensors[sout[0]]);
+    int32_t full_out_h = out_shape[1];
+    int32_t full_out_w = out_shape[2];
+    int32_t orig_pad_top = sp_attrs ? sp_attrs->pad_top : 0;
+    int32_t stride = sp_attrs ? sp_attrs->stride_h : 1;
+    int32_t dh = (sp_attrs && sp_attrs->dilation_h) ? sp_attrs->dilation_h : 1;
+    int32_t eff_kh = sp_attrs ? ((sp_attrs->kernel_h - 1) * dh + 1) : 1;
+
     for (uint16_t i = 0; i < stage->outputs_count && i < MAX_STAGE_OUTPUTS; i++) {
         uint16_t tidx = sout[i];
         tigris_mem_error_t merr = tigris_mem_alloc_slow(
@@ -320,10 +336,14 @@ static tigris_exec_error_t exec_stage_tiled(
              *   - Single input/output
              *   - Input dies after this stage (last_consumer == current_stage)
              *   - Input and output have same size
+             *   - No cross-tile halo: with eff_kh > stride a kernel reads input
+             *     rows beyond this tile, so writing the output into the shared
+             *     buffer would clobber rows the next tile still needs.
              */
             if (stage->inputs_count == 1 && stage->outputs_count == 1 &&
                 last_consumer && last_consumer[sin[0]] == current_stage &&
-                plan->tensors[sin[0]].size_bytes == plan->tensors[tidx].size_bytes)
+                plan->tensors[sin[0]].size_bytes == plan->tensors[tidx].size_bytes &&
+                eff_kh <= stride)
             {
                 /* Reuse input's slow memory for output */
                 out_slow_bases[i] = mem->tensor_ptrs[sin[0]];
@@ -342,25 +362,7 @@ static tigris_exec_error_t exec_stage_tiled(
     for (uint16_t i = 0; i < stage->inputs_count && i < MAX_STAGE_INPUTS; i++)
         in_slow_bases[i] = mem->tensor_ptrs[sin[i]];
 
-    /* Find the spatial op (if any) for computing output H per tile */
-    int sp_op_idx = find_spatial_op(plan, stage);
-    const tigris_spatial_attrs_t *sp_attrs = NULL;
-    if (sp_op_idx >= 0)
-        sp_attrs = &plan->ops[sp_op_idx].spatial;
-
-    /* Get input/output image dimensions for the first input/output (NHWC) */
-    const int32_t *in_shape = tigris_tensor_shape(plan, &plan->tensors[sin[0]]);
-    int32_t full_in_h = in_shape[1];
-    int32_t full_in_w = in_shape[2];
-
-    const int32_t *out_shape = tigris_tensor_shape(plan, &plan->tensors[sout[0]]);
-    int32_t full_out_h = out_shape[1];
-    int32_t full_out_w = out_shape[2];
-
-    int32_t orig_pad_top = sp_attrs ? sp_attrs->pad_top : 0;
-    int32_t stride = sp_attrs ? sp_attrs->stride_h : 1;
-    int32_t dh = (sp_attrs && sp_attrs->dilation_h) ? sp_attrs->dilation_h : 1;
-    int32_t eff_kh = sp_attrs ? ((sp_attrs->kernel_h - 1) * dh + 1) : 1;
+    /* (Spatial op + image dims computed up front, above.) */
 
     /* Compute the per-output-row memory cost including intermediates.
      *
@@ -461,14 +463,11 @@ static tigris_exec_error_t exec_stage_tiled(
 
         int32_t tile_in_h = in_end - in_start;
 
-        /* c. Set tile context */
-        mem->tile.active     = 1;
-        mem->tile.pad_top    = (uint8_t)eff_pad_top;
-        mem->tile.pad_bottom = (uint8_t)eff_pad_bottom;
-        mem->tile.in_h       = tile_in_h;
-        mem->tile.out_h      = tile_out_h;
-        mem->tile.in_w       = full_in_w;
-        mem->tile.out_w      = full_out_w;
+        /* c. Activate tiling. The per-op tile context (in/out h+w, pad) is set
+         * inside the execute loop below: ops before the spatial op run at the
+         * input tile dims, the spatial op reduces them, ops after run at the
+         * output dims. */
+        mem->tile.active = 1;
 
         /* d. LOAD: load tile for each stage input */
         for (uint16_t i = 0; i < stage->inputs_count && i < MAX_STAGE_INPUTS; i++) {
@@ -480,12 +479,40 @@ static tigris_exec_error_t exec_stage_tiled(
                 return TIGRIS_EXEC_ERR_MEM;
         }
 
-        /* e. EXECUTE: alloc tile-sized outputs in fast, run kernels */
+        /* e. EXECUTE: track the data height/width flowing through the stage. It
+         * starts at the input tile size; the (single) spatial op reduces it to
+         * the output tile size; pointwise ops preserve it. Mirrors
+         * exec_chain_tiled so a pointwise op placed BEFORE the spatial op (e.g. a
+         * residual Add feeding a strided conv) is sized at the input height, not
+         * under-allocated/under-computed at the output height (which made the
+         * following spatial op read past the buffer). */
+        int32_t cur_h = tile_in_h;
+        int32_t cur_w = full_in_w;
         for (uint16_t j = 0; j < stage->ops_count; j++) {
             uint16_t op_idx = sops[j];
             const tigris_op_t *op = &plan->ops[op_idx];
+            int is_spatial = ((int)op_idx == sp_op_idx);
 
-            /* Alloc tile-sized outputs in fast (NHWC) */
+            if (is_spatial) {
+                mem->tile.in_h       = cur_h;          /* = tile_in_h */
+                mem->tile.out_h      = tile_out_h;
+                mem->tile.in_w       = full_in_w;
+                mem->tile.out_w      = full_out_w;
+                mem->tile.pad_top    = (uint8_t)eff_pad_top;
+                mem->tile.pad_bottom = (uint8_t)eff_pad_bottom;
+            } else {
+                /* Pointwise op: height/width preserved, no padding. */
+                mem->tile.in_h       = cur_h;
+                mem->tile.out_h      = cur_h;
+                mem->tile.in_w       = cur_w;
+                mem->tile.out_w      = cur_w;
+                mem->tile.pad_top    = 0;
+                mem->tile.pad_bottom = 0;
+            }
+
+            int32_t alloc_h = is_spatial ? tile_out_h : cur_h;
+
+            /* Alloc tile-sized outputs in fast (NHWC, alloc_h rows) */
             const uint16_t *outs = tigris_op_outputs(plan, op);
             for (uint8_t k = 0; k < op->num_outputs; k++) {
                 uint16_t tidx = outs[k];
@@ -493,8 +520,7 @@ static tigris_exec_error_t exec_stage_tiled(
                 const int32_t *shape = tigris_tensor_shape(plan, t);
                 uint32_t elem_size = t->size_bytes /
                     (uint32_t)(shape[0] * shape[1] * shape[2] * shape[3]);
-                /* NHWC: N * tile_out_h * W * C */
-                uint32_t tile_bytes = (uint32_t)shape[0] * (uint32_t)tile_out_h *
+                uint32_t tile_bytes = (uint32_t)shape[0] * (uint32_t)alloc_h *
                     (uint32_t)shape[2] * (uint32_t)shape[3] * elem_size;
                 tigris_mem_error_t merr = tigris_mem_alloc_fast(
                     mem, tidx, tile_bytes);
@@ -506,10 +532,9 @@ static tigris_exec_error_t exec_stage_tiled(
             if (kret != 0)
                 return TIGRIS_EXEC_ERR_KERNEL;
 
-            /* After spatial op, update context for pointwise followers */
-            if ((int)op_idx == sp_op_idx) {
-                mem->tile.in_h = tile_out_h;
-                mem->tile.in_w = full_out_w;
+            if (is_spatial) {
+                cur_h = tile_out_h;
+                cur_w = full_out_w;
             }
         }
 
@@ -733,6 +758,7 @@ static tigris_exec_error_t exec_chain_tiled(
 
             weight_bases[c] = scratch;
             mem->fast_used += needed;
+            tigris_mem_note_fast_peak(mem);
         }
         mem->fast_reserved = mem->fast_used;
     }
@@ -1198,6 +1224,7 @@ tigris_exec_error_t tigris_run(
 
                 mem->fast_used += needed;
                 mem->fast_reserved = mem->fast_used;  /* lock weights in arena */
+                tigris_mem_note_fast_peak(mem);
 
                 stage_plan = *plan;  /* shallow copy */
                 stage_plan.weight_blob = scratch;

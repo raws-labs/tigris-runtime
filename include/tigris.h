@@ -27,7 +27,7 @@ extern "C" {
 
 #define TIGRIS_MAGIC           0x53524754  /* "TGRS" in little-endian */
 #define TIGRIS_MAGIC_BYTES     "TGRS"
-#define TIGRIS_SCHEMA_VERSION  1
+#define TIGRIS_SCHEMA_VERSION  2
 
 /* Section type IDs */
 #define TIGRIS_SEC_TENSORS        1
@@ -177,22 +177,23 @@ typedef struct {
 } tigris_tensor_t;                  /* 16 bytes total */
 
 /**
- * Spatial attributes - 12 bytes, embedded in tigris_op_t.
- * Zero for non-spatial ops (pointwise, reshape, etc.).
+ * Spatial attributes - 18 bytes (schema v2), embedded in tigris_op_t.
+ * Zero for non-spatial ops (pointwise, reshape, etc.). pad/dilation are u16
+ * (were u8) so deep dilated convs (dilation/pad up to 65535) don't overflow.
  */
 typedef struct {
     uint8_t     kernel_h;
     uint8_t     kernel_w;
     uint8_t     stride_h;
     uint8_t     stride_w;
-    uint8_t     pad_top;
-    uint8_t     pad_bottom;
-    uint8_t     pad_left;
-    uint8_t     pad_right;
-    uint8_t     dilation_h;
-    uint8_t     dilation_w;
+    uint16_t    pad_top;
+    uint16_t    pad_bottom;
+    uint16_t    pad_left;
+    uint16_t    pad_right;
+    uint16_t    dilation_h;
+    uint16_t    dilation_w;
     uint16_t    group;              /* LE; 1 for normal conv */
-} tigris_spatial_attrs_t;           /* 12 bytes */
+} tigris_spatial_attrs_t;           /* 18 bytes */
 
 /**
  * Operator descriptor - 32 bytes.
@@ -205,14 +206,14 @@ typedef struct {
     uint8_t     stage;               /*  7: stage assignment */
     uint16_t    inputs_off;          /*  8: offset into index pool */
     uint16_t    outputs_off;         /* 10: offset into index pool */
-    tigris_spatial_attrs_t spatial;  /* 12-23: spatial attributes */
-    uint16_t    weight_idx;          /* 24: index into weight_entries, 0xFFFF=none */
-    uint16_t    bias_idx;            /* 26: index into weight_entries, 0xFFFF=none */
-    uint8_t     fused_act;           /* 28: TIGRIS_ACT_* */
-    int8_t      act_min;             /* 29: int8 lower bound */
-    int8_t      act_max;             /* 30: int8 upper bound */
-    uint8_t     _pad1;               /* 31 */
-} tigris_op_t;                       /* 32 bytes total */
+    tigris_spatial_attrs_t spatial;  /* 12-29: spatial attributes (18 bytes, v2) */
+    uint16_t    weight_idx;          /* 30: index into weight_entries, 0xFFFF=none */
+    uint16_t    bias_idx;            /* 32: index into weight_entries, 0xFFFF=none */
+    uint8_t     fused_act;           /* 34: TIGRIS_ACT_* */
+    int8_t      act_min;             /* 35: int8 lower bound */
+    int8_t      act_max;             /* 36: int8 upper bound */
+    uint8_t     _pad1;               /* 37 */
+} tigris_op_t;                       /* 38 bytes total */
 
 /**
  * Stage descriptor - 28 bytes.

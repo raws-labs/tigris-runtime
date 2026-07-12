@@ -29,6 +29,7 @@
 #include "sdkconfig.h"   /* CONFIG_NN_OPTIMIZED, CONFIG_IDF_TARGET_ESP32S3 */
 #include <esp_nn.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #ifdef __XTENSA__
@@ -75,6 +76,37 @@ static inline int32_t get_shft(
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+static void esp_nn_workspace_free(void *ptr)
+{
+#ifdef __XTENSA__
+    heap_caps_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+void tigris_esp_nn_deinit(void)
+{
+    /* ESP-NN stores these pointers globally too; clear them before freeing
+     * adapter-owned memory so a later dispatch cannot observe stale storage. */
+    esp_nn_set_conv_scratch_buf(NULL);
+    esp_nn_set_depthwise_conv_scratch_buf(NULL);
+    esp_nn_workspace_free(s_scratch_buf);
+    esp_nn_workspace_free(s_sram_scratch);
+    esp_nn_workspace_free(s_dw_out_buf);
+    esp_nn_workspace_free(s_pad_buf);
+    s_scratch_buf = NULL;
+    s_scratch_size = 0;
+    s_sram_scratch = NULL;
+    s_sram_scratch_size = 0;
+    s_dw_out_buf = NULL;
+    s_pad_buf = NULL;
+    s_pad_size = 0;
+#ifdef __XTENSA__
+    s_conv_sram = s_conv_psram = s_conv_fallback = 0;
+#endif
+}
+
 /* tigris_esp_nn_prepare */
 
 int tigris_esp_nn_prepare(
@@ -82,6 +114,10 @@ int tigris_esp_nn_prepare(
     tigris_mem_t        *mem)
 {
     if (!plan || !mem) return -1;
+
+    /* The adapter owns its platform workspace. Replacing it here makes a
+     * repeat prepare deterministic and avoids leaking PSRAM/SRAM reservations. */
+    tigris_esp_nn_deinit();
 
     int max_scratch = 0;
     int max_dw_out  = 0;
@@ -217,7 +253,7 @@ int tigris_esp_nn_prepare(
 
     if (dw_aligned > 0) {
         s_dw_out_buf = ESP_NN_ALLOC(dw_aligned);
-        if (!s_dw_out_buf) return -1;
+        if (!s_dw_out_buf) goto fail;
     }
     if (pad_aligned > 0) {
         s_pad_buf  = ESP_NN_ALLOC(pad_aligned);
@@ -270,6 +306,11 @@ int tigris_esp_nn_prepare(
 
 #undef ESP_NN_ALLOC
     return 0;
+
+fail:
+#undef ESP_NN_ALLOC
+    tigris_esp_nn_deinit();
+    return -1;
 }
 
 /* Asymmetric padding helper */

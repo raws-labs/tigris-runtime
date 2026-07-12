@@ -82,6 +82,9 @@ static const char *TAG = "tigris";
 
 void app_main(void)
 {
+#ifdef TIGRIS_HAS_ESP_NN
+    int esp_nn_prepared = 0;
+#endif
     /* Disable all watchdogs for long-running inference */
     disable_all_wdts();
 
@@ -244,12 +247,15 @@ void app_main(void)
     int is_quantized = (input_dtype == 3);
     printf("\nModel type: %s\n", is_quantized ? "int8 quantized" : "float32");
 
-    /* 7. Prepare the selected accelerated backend exactly once. */
+    /* 7. Prepare the selected accelerated backend. Repeat preparation safely
+       replaces its adapter workspace; release it at cleanup. */
 #ifdef TIGRIS_HAS_ESP_NN
     if (is_quantized && tigris_esp_nn_prepare(&plan, &mem) != 0) {
         ESP_LOGE(TAG, "ESP-NN preparation failed");
         goto cleanup;
     }
+    if (is_quantized)
+        esp_nn_prepared = 1;
 #endif
 
     /* 8. Allocate model inputs in slow, fill with test data */
@@ -424,6 +430,10 @@ void app_main(void)
     printf("\n");
 
 cleanup:
+#ifdef TIGRIS_HAS_ESP_NN
+    if (esp_nn_prepared)
+        tigris_esp_nn_deinit();
+#endif
     heap_caps_free(tensor_ptrs);
     heap_caps_free(slow_buf);
     heap_caps_free(fast_buf);

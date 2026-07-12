@@ -115,4 +115,9 @@ total=$((passed + failed))
 printf "\nResults: %d passed, %d failed, %d total\n" \
     "$passed" "$failed" "$total"
 
+if [ "$total" -eq 0 ]; then
+    printf "FATAL: no benchmark variants were executed\n" >&2
+    exit 1
+fi
+
 [ "$failed" -eq 0 ]

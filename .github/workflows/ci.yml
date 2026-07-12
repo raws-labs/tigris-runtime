@@ -1,0 +1,81 @@
+name: Runtime CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native ${{ matrix.compiler }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - run: >-
+          cmake -S . -B build-${{ matrix.compiler }}
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+      - run: cmake --build build-${{ matrix.compiler }} --parallel
+      - run: ctest --test-dir build-${{ matrix.compiler }} --output-on-failure
+
+  sanitizers:
+    name: ASan and UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: >-
+          cmake -S . -B build-sanitize
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - run: cmake --build build-sanitize --parallel
+      - run: ctest --test-dir build-sanitize --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+  loader-fuzz-smoke:
+    name: Loader fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p fuzz-artifacts
+      - run: python3 test/make_fuzz_seed.py fuzz-corpus/minimal.tgrs
+      - run: >-
+          clang -std=c11 -Wall -Wextra -Wpedantic -Werror
+          -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
+          -Iinclude test/fuzz_loader.c src/tigris_loader.c
+          -o fuzz-loader
+      - run: >-
+          ./fuzz-loader fuzz-corpus -max_total_time=20 -timeout=2
+          -artifact_prefix=fuzz-artifacts/
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: loader-fuzz-artifacts
+          path: fuzz-artifacts/
+          if-no-files-found: ignore
+
+  cortex-m:
+    name: Cortex-M cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update
+      - run: sudo apt-get install --yes --no-install-recommends gcc-arm-none-eabi
+      - run: >-
+          cmake -S . -B build-arm
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi.cmake
+          -DCMAKE_C_FLAGS="-mcpu=cortex-m4 -mthumb"
+      - run: cmake --build build-arm --target tigris_runtime --parallel

@@ -3,92 +3,112 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/docs)
 
-Portable C99 runtime for [TiGrIS](https://github.com/raws-labs/tigris). Executes `.tgrs` inference plans on embedded devices with no dynamic allocation and no dependencies beyond libc.
+Portable C runtime for [TiGrIS](https://github.com/raws-labs/tigris). It
+loads compatible `.tgrs` plans and executes them against caller-owned memory
+arenas. The reference runtime has no dependency beyond the C library and does
+not call a general-purpose allocator during inference.
 
 ## What it does
 
-A `.tgrs` plan is an ordered list of operator calls with pre-computed tile parameters, arena offsets, and weight pointers. The runtime is small because it does not need to make any decisions: the compiler already made them.
+A plan records the operator order, tensor metadata, stage boundaries, and tile
+strategy selected by the compiler. At runtime, TiGrIS:
 
-- Loads a `.tgrs` plan from flash (memory-mapped, no copy)
-- Walks the plan stage by stage, using a bump allocator over an arena you provide
-- Handles tiled execution (spatial strips, chain streaming, temporal partitioning) transparently
-- Pluggable kernel backends: pick one at link time
-- About 5 KB of code on a typical Cortex-M build, zero heap allocation at runtime
+- validates the plan version and structural limits before exposing its tables;
+- assigns activation addresses from caller-provided fast and slow arenas;
+- executes normal, spatially tiled, and streamed-chain stages;
+- reads uncompressed weights in place or decompresses stage blocks into the
+  fast arena; and
+- reports allocation, tiling, and kernel failures to the caller.
 
-The plan format is stable and versioned; the runtime refuses to load plans it does not understand.
+The schedule and activation bound are compiled, but addresses are assigned by
+bounded bump allocation, reset, and compaction during execution. A finite
+arena can still be exhausted. The loader validates plan-version compatibility
+before exposing plan tables.
 
 ## Kernel backends
 
-Backends are swapped at link time. The compiler does not care which one you pick: plans are the same across all of them.
+| Backend | Model dtype | Target | Dispatch |
+|---|---|---|---|
+| `reference` | float32 | Any C target | `tigris_dispatch_kernel` |
+| `s8_ref` | int8 | Any C target | `tigris_dispatch_kernel_s8` |
+| `esp-nn` | int8 | ESP32 family | `tigris_dispatch_kernel_esp_nn` |
+| `cmsis-nn` | int8 | Cortex-M family | `tigris_dispatch_kernel_cmsis_nn` |
 
-| Backend | Target | Source |
-|---------|--------|--------|
-| `reference` | Any C99 | `tigris_kernels.c` |
-| `s8_ref` | Any C99, int8 | `tigris_kernels_s8.c` |
-| `esp-nn` | ESP32 family (SIMD on S3/P4, C fallbacks elsewhere) | `tigris_kernels_esp_nn.c` |
-| `cmsis-nn` | Cortex-M family (DSP on M4/M7, Helium on M55, plain C elsewhere) | `tigris_kernels_cmsis_nn.c` |
+Accelerated adapters fall back to `s8_ref` for explicitly supported
+non-native variants. They are not interchangeable with arbitrary plans:
+generate a harness with `tigris codegen --backend ...` so the compiler can
+validate the selected dtype/operator route.
 
-You can also register your own kernel function and pass it to `tigris_run`; the runtime does not assume any particular kernel library.
+ESP-NN and CMSIS-NN also require a successful preparation call after
+`tigris_mem_init()` and before inference. ESP-NN preparation obtains
+platform-managed workspace; CMSIS-NN reserves scratch from the top of the fast
+buffer and reduces `mem.fast_size`.
 
-## Memory model
+## Memory contract
 
-The runtime works against a memory region you own. You pass in an SRAM buffer (always required) and optionally a PSRAM buffer; the plan decides which stages live where. Weights are either copied into the arena or read in place from flash (XIP), depending on how the plan was compiled.
+The caller owns:
 
-```
-+--------- SRAM arena ---------+  +------- PSRAM (optional) -------+
-| activations (bump-allocated) |  | spill buffers, large weights   |
-+------------------------------+  +--------------------------------+
-                |
-                +--- weights: copied here, or read in place from flash
-```
+- a fast arena, normally SRAM;
+- a slow arena, normally PSRAM or another writable RAM region; and
+- one `void *` entry per tensor.
 
-No malloc, no free, no hidden allocations. The arena sizes are fixed at compile time and validated when the plan is loaded.
+The plan's `budget` is the modeled activation requirement. Add
+`tigris_weight_decompression_overhead()` for compressed plans, account for
+base-alignment padding, and provision any backend workspace separately.
+Optimized Cortex-M builds require the plan base and tensors to satisfy
+`TIGRIS_TENSOR_ALIGN` (16 bytes with DSP enabled).
+
+The core executor performs no unbounded heap fallback. Normal stages may spill
+to the supplied slow arena; if neither bounded arena can satisfy an operation,
+`tigris_run()` returns an error. `mem.fast_peak` records the measured core
+fast-arena high-water mark.
 
 ## Build and test
 
 ```bash
-cmake -B build && cmake --build build
-./build/test_kernels
-./build/test_e2e test/fixtures/model 262144
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
-Generate test fixtures from an ONNX model using the compiler:
+CTest registers only self-contained tests. Fixture-driven executables are
+built but require plans generated by the compiler. Generate them with:
 
 ```bash
 pip install tigris-ml
 tigris gen-fixtures model.onnx -o test/fixtures/ -m 256K
+./test/run_all.sh test/fixtures
 ```
+
+The top-level build also compiles the canonical POSIX int8 integration example:
+
+```bash
+./build/tigris_posix_example model.tgrs
+```
+
+See [examples/posix/main.c](examples/posix/main.c) for checked loader, arena,
+input, execution, and output handling. Production integrations normally use
+the harness emitted by `tigris codegen`.
 
 ## ESP32 (ESP-IDF)
 
-The runtime ships as a standard ESP-IDF component. An example project lives under `examples/esp32`:
+The ESP-IDF example lives in `examples/esp32`:
 
 ```bash
 cd examples/esp32
 idf.py set-target esp32s3
-idf.py build && idf.py flash
+idf.py build
+idf.py flash
 ```
 
-## Integration
-
-The runtime is a single static library. Link it, pick a kernel backend, and call:
-
-```c
-#include "tigris.h"
-
-tigris_plan_t plan;
-tigris_load(&plan, plan_data, plan_size);
-
-tigris_mem_t mem;
-tigris_mem_init(&mem, sram_buf, sram_size, psram_buf, psram_size);
-
-tigris_run(&plan, &mem, input_data, output_ptrs, kernel_func, NULL);
-```
-
-For most users this is wrapped by the C harness that `tigris codegen` produces. You only touch these APIs directly when you embed the runtime in a larger system with its own memory layout.
+The plan should live in a memory-mapped flash partition. Allocate the fast
+arena from internal SRAM and the slow arena from PSRAM when available. When
+using ESP-NN, call `tigris_esp_nn_prepare()` exactly once and check its return
+value before `tigris_run()`.
 
 ## Further reading
 
-- [Getting started](https://tigris-ml.dev/docs): installation, first compile, deploying to ESP32
-- [Introducing TiGrIS](https://tigris-ml.dev/blog/introducing-tigris): design, benchmarks, how tiling works
-- [Runtime API](https://tigris-ml.dev/docs/runtime/api-reference): header reference and memory model
+- [Getting started](https://tigris-ml.dev/docs)
+- [Runtime integration](https://tigris-ml.dev/docs/runtime/integration)
+- [Runtime API](https://tigris-ml.dev/docs/runtime/api-reference)
+- [Memory model](https://tigris-ml.dev/docs/architecture/memory-model)

@@ -234,12 +234,25 @@ void app_main(void)
 
     /* 6. Detect quantized model */
 
+    if (plan.header->num_model_inputs == 0) {
+        ESP_LOGE(TAG, "plan has no model inputs");
+        goto cleanup;
+    }
+
     /* dtype 3 = INT8, dtype 1 = FLOAT32 */
     uint8_t input_dtype = plan.tensors[plan.model_inputs[0]].dtype;
     int is_quantized = (input_dtype == 3);
     printf("\nModel type: %s\n", is_quantized ? "int8 quantized" : "float32");
 
-    /* 7. Allocate model inputs in slow, fill with test data */
+    /* 7. Prepare the selected accelerated backend exactly once. */
+#ifdef TIGRIS_HAS_ESP_NN
+    if (is_quantized && tigris_esp_nn_prepare(&plan, &mem) != 0) {
+        ESP_LOGE(TAG, "ESP-NN preparation failed");
+        goto cleanup;
+    }
+#endif
+
+    /* 8. Allocate model inputs in slow, fill with test data */
 
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {
         uint16_t tidx = plan.model_inputs[i];
@@ -272,7 +285,7 @@ void app_main(void)
         printf(" (%lu bytes)\n", (unsigned long)sz);
     }
 
-    /* 8. Run inference */
+    /* 9. Run inference */
 
     /* Select dispatch function based on model type */
     tigris_kernel_fn dispatch;
@@ -304,7 +317,7 @@ void app_main(void)
         goto cleanup;
     }
 
-    /* 9. Inference report */
+    /* 10. Inference report */
 
     printf("\n");
     printf("\n");

@@ -116,7 +116,7 @@ static void test_error_strings(void)
 
 /* Minimal self-contained plans for malformed-input tests. */
 
-#define MINIMAL_PLAN_SIZE 96u
+#define MINIMAL_PLAN_SIZE 100u
 
 static void build_minimal_plan(uint8_t *buf)
 {
@@ -139,8 +139,9 @@ static void build_minimal_plan(uint8_t *buf)
     };
     for (uint32_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
         dir[i].type = required[i];
-        dir[i].offset = MINIMAL_PLAN_SIZE;
+        dir[i].offset = MINIMAL_PLAN_SIZE - 1u;
     }
+    buf[MINIMAL_PLAN_SIZE - 1u] = '\0';
     /* dir[5] remains the zero-valued sentinel. */
 }
 
@@ -167,6 +168,19 @@ static void test_section_directory_guards(void)
     dir[1].type = TIGRIS_SEC_TENSORS;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION, "duplicate section type");
+
+    build_minimal_plan(buf);
+    dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+    dir[0].type = TIGRIS_SEC_OPS;
+    dir[1].type = TIGRIS_SEC_TENSORS;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "unordered section directory");
+
+    build_minimal_plan(buf);
+    dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+    dir[0].offset = sizeof(tigris_file_header_t);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "section overlaps directory");
 }
 
 static void test_counted_sections_required(void)
@@ -233,6 +247,8 @@ static void build_staged_plan(uint8_t *buf)
     uint16_t *indices = (uint16_t *)(buf + STAGED_INDEX_OFF);
     for (uint16_t i = 0; i < hdr->num_ops; i++) {
         ops[i].op_type = TIGRIS_OP_CONV;
+        ops[i].weight_idx = TIGRIS_NO_WEIGHT;
+        ops[i].bias_idx = TIGRIS_NO_WEIGHT;
         indices[i] = i;
     }
 
@@ -298,6 +314,70 @@ static void test_chain_limit_guards(void)
     stages[0].ops_count = 9;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_PLAN_LIMITS, "ninth chain spatial op rejected");
+}
+
+/* A tiny valid plan with one tensor and a model-input reference. */
+
+#define REFERENCED_PLAN_SIZE 133u
+#define REF_TENSORS_OFF 96u
+#define REF_INDEX_OFF   112u
+#define REF_SHAPES_OFF  116u
+#define REF_STRINGS_OFF 132u
+
+static void build_referenced_plan(uint8_t *buf)
+{
+    memset(buf, 0, REFERENCED_PLAN_SIZE);
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = REFERENCED_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 1;
+    hdr->num_model_inputs = 1;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, REF_TENSORS_OFF};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, REF_INDEX_OFF};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, REF_INDEX_OFF};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, REF_SHAPES_OFF};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, REF_STRINGS_OFF};
+
+    tigris_tensor_t *tensor = (tigris_tensor_t *)(buf + REF_TENSORS_OFF);
+    tensor->size_bytes = sizeof(float);
+    tensor->ndim = 1;
+    tensor->dtype = 1;
+    tensor->flags = TIGRIS_TENSOR_MODEL_INPUT;
+    tensor->quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    *(uint16_t *)(buf + REF_INDEX_OFF) = 0;
+    *(int32_t *)(buf + REF_SHAPES_OFF) = 1;
+    buf[REF_STRINGS_OFF] = '\0';
+}
+
+static void test_cross_reference_guards(void)
+{
+    printf("  test_cross_reference_guards...\n");
+    _Alignas(4) uint8_t buf[REFERENCED_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_referenced_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "referenced plan loads");
+
+    build_referenced_plan(buf);
+    *(uint16_t *)(buf + REF_INDEX_OFF) = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "model IO tensor index");
+
+    build_referenced_plan(buf);
+    ((tigris_tensor_t *)(buf + REF_TENSORS_OFF))->shape_off = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "tensor shape range");
+
+    build_referenced_plan(buf);
+    ((tigris_tensor_t *)(buf + REF_TENSORS_OFF))->name_str = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "tensor string range");
 }
 
 /* Struct size validation */
@@ -482,6 +562,7 @@ int main(int argc, char *argv[])
     test_section_directory_guards();
     test_counted_sections_required();
     test_chain_limit_guards();
+    test_cross_reference_guards();
 
     printf("\nStruct size tests:\n");
     test_struct_sizes();

@@ -25,6 +25,20 @@ static inline int bounds_ok(uint32_t offset, uint32_t size, uint32_t buf_len)
     return (offset <= buf_len) && (size <= buf_len - offset);
 }
 
+/** Check an element range without overflowing offset + count. */
+static inline int elements_ok(uint32_t offset, uint32_t count, uint32_t total)
+{
+    return offset <= total && count <= total - offset;
+}
+
+/** Check that an offset names a terminated string inside the string section. */
+static int string_ok(const char *strings, uint32_t strings_len, uint32_t offset)
+{
+    if (!strings || offset >= strings_len)
+        return 0;
+    return memchr(strings + offset, '\0', strings_len - offset) != NULL;
+}
+
 /* Public API */
 
 tigris_error_t tigris_plan_load(
@@ -68,12 +82,16 @@ tigris_error_t tigris_plan_load(
 
     /* Track which sections we found via offsets into buf (0 = not found) */
     uint32_t section_offsets[TIGRIS_SEC_MAX];
+    uint32_t section_ends[TIGRIS_SEC_MAX];
     uint8_t section_seen[TIGRIS_SEC_MAX];
     memset(section_offsets, 0, sizeof(section_offsets));
+    memset(section_ends, 0, sizeof(section_ends));
     memset(section_seen, 0, sizeof(section_seen));
 
     int found_sentinel = 0;
     uint32_t sec_cursor = sec_off;
+    uint32_t previous_type = 0;
+    uint32_t previous_offset = 0;
     while (bounds_ok(sec_cursor, sizeof(tigris_section_entry_t), buf_len)) {
         const tigris_section_entry_t *sec =
             (const tigris_section_entry_t *)(buf + sec_cursor);
@@ -89,16 +107,38 @@ tigris_error_t tigris_plan_load(
         if (section_seen[sec->type])
             return TIGRIS_ERR_BAD_SECTION;
 
-        if (sec->offset > buf_len)
+        /* The writer emits an ordered directory and non-overlapping section
+         * starts. Empty sections may share an offset with the next section. */
+        if (sec->type <= previous_type || sec->offset < previous_offset ||
+            sec->offset > buf_len)
             return TIGRIS_ERR_BAD_SECTION;
 
         section_seen[sec->type] = 1;
         section_offsets[sec->type] = sec->offset;
+        previous_type = sec->type;
+        previous_offset = sec->offset;
         sec_cursor += sizeof(tigris_section_entry_t);
     }
 
     if (!found_sentinel)
         return TIGRIS_ERR_BAD_SECTION;
+
+    /* No section may overlap the parsed directory. Derive each section's
+     * exclusive end from the next distinct section start. */
+    uint32_t dir_end = sec_cursor + sizeof(tigris_section_entry_t);
+    for (uint32_t i = 1; i < TIGRIS_SEC_MAX; i++) {
+        if (!section_seen[i])
+            continue;
+        if (section_offsets[i] < dir_end)
+            return TIGRIS_ERR_BAD_SECTION;
+        uint32_t end = buf_len;
+        for (uint32_t j = 1; j < TIGRIS_SEC_MAX; j++) {
+            if (section_seen[j] && section_offsets[j] > section_offsets[i] &&
+                section_offsets[j] < end)
+                end = section_offsets[j];
+        }
+        section_ends[i] = end;
+    }
 
     /* Required sections */
 
@@ -122,7 +162,7 @@ tigris_error_t tigris_plan_load(
     {
         uint32_t off = section_offsets[TIGRIS_SEC_TENSORS];
         uint32_t need = (uint32_t)hdr->num_tensors * sizeof(tigris_tensor_t);
-        if (!bounds_ok(off, need, buf_len))
+        if (!bounds_ok(off, need, section_ends[TIGRIS_SEC_TENSORS]))
             return TIGRIS_ERR_BAD_SECTION;
         out_plan->tensors = (const tigris_tensor_t *)(buf + off);
     }
@@ -131,7 +171,7 @@ tigris_error_t tigris_plan_load(
     {
         uint32_t off = section_offsets[TIGRIS_SEC_OPS];
         uint32_t need = (uint32_t)hdr->num_ops * sizeof(tigris_op_t);
-        if (!bounds_ok(off, need, buf_len))
+        if (!bounds_ok(off, need, section_ends[TIGRIS_SEC_OPS]))
             return TIGRIS_ERR_BAD_SECTION;
         out_plan->ops = (const tigris_op_t *)(buf + off);
     }
@@ -140,7 +180,7 @@ tigris_error_t tigris_plan_load(
     if (section_offsets[TIGRIS_SEC_STAGES] && hdr->num_stages > 0) {
         uint32_t off = section_offsets[TIGRIS_SEC_STAGES];
         uint32_t need = (uint32_t)hdr->num_stages * sizeof(tigris_stage_t);
-        if (!bounds_ok(off, need, buf_len))
+        if (!bounds_ok(off, need, section_ends[TIGRIS_SEC_STAGES]))
             return TIGRIS_ERR_BAD_SECTION;
         out_plan->stages = (const tigris_stage_t *)(buf + off);
     }
@@ -149,7 +189,7 @@ tigris_error_t tigris_plan_load(
     if (section_offsets[TIGRIS_SEC_TILE_PLANS] && hdr->num_tile_plans > 0) {
         uint32_t off = section_offsets[TIGRIS_SEC_TILE_PLANS];
         uint32_t need = (uint32_t)hdr->num_tile_plans * sizeof(tigris_tile_plan_t);
-        if (!bounds_ok(off, need, buf_len))
+        if (!bounds_ok(off, need, section_ends[TIGRIS_SEC_TILE_PLANS]))
             return TIGRIS_ERR_BAD_SECTION;
         out_plan->tile_plans = (const tigris_tile_plan_t *)(buf + off);
     }
@@ -158,7 +198,7 @@ tigris_error_t tigris_plan_load(
     if (section_offsets[TIGRIS_SEC_WEIGHTS] && hdr->num_weights > 0) {
         uint32_t off = section_offsets[TIGRIS_SEC_WEIGHTS];
         uint32_t entries_size = (uint32_t)hdr->num_weights * sizeof(tigris_weight_entry_t);
-        if (!bounds_ok(off, entries_size, buf_len))
+        if (!bounds_ok(off, entries_size, section_ends[TIGRIS_SEC_WEIGHTS]))
             return TIGRIS_ERR_BAD_SECTION;
         out_plan->weight_entries = (const tigris_weight_entry_t *)(buf + off);
         /* weight_blob set below only if no compressed blocks */
@@ -167,7 +207,7 @@ tigris_error_t tigris_plan_load(
     /* Weight blocks - compressed per-stage weight data (optional) */
     if (section_offsets[TIGRIS_SEC_WEIGHT_BLOCKS]) {
         uint32_t off = section_offsets[TIGRIS_SEC_WEIGHT_BLOCKS];
-        if (!bounds_ok(off, 4, buf_len))
+        if (!bounds_ok(off, 4, section_ends[TIGRIS_SEC_WEIGHT_BLOCKS]))
             return TIGRIS_ERR_BAD_SECTION;
         uint16_t num_blocks, compression;
         memcpy(&num_blocks, buf + off, 2);
@@ -175,7 +215,7 @@ tigris_error_t tigris_plan_load(
         out_plan->num_weight_blocks = num_blocks;
         out_plan->weight_compression = compression;
         uint32_t entries_size = (uint32_t)num_blocks * sizeof(tigris_weight_block_t);
-        if (!bounds_ok(off + 4, entries_size, buf_len))
+        if (!bounds_ok(off + 4, entries_size, section_ends[TIGRIS_SEC_WEIGHT_BLOCKS]))
             return TIGRIS_ERR_BAD_SECTION;
         out_plan->weight_blocks = (const tigris_weight_block_t *)(buf + off + 4);
         out_plan->weight_blocks_data = buf + off + 4 + entries_size;
@@ -192,7 +232,7 @@ tigris_error_t tigris_plan_load(
     if (section_offsets[TIGRIS_SEC_QUANT_PARAMS]) {
         uint32_t off = section_offsets[TIGRIS_SEC_QUANT_PARAMS];
         /* First 4 bytes: uint16_t num_quant_params + uint16_t quant_data_len */
-        if (!bounds_ok(off, 4, buf_len))
+        if (!bounds_ok(off, 4, section_ends[TIGRIS_SEC_QUANT_PARAMS]))
             return TIGRIS_ERR_BAD_SECTION;
         uint16_t nqp, qd_len;
         memcpy(&nqp, buf + off, 2);
@@ -200,7 +240,8 @@ tigris_error_t tigris_plan_load(
         out_plan->num_quant_params = nqp;
         uint32_t entries_size = (uint32_t)nqp * sizeof(tigris_quant_param_t);
         uint32_t data_size = (uint32_t)qd_len * sizeof(int32_t);
-        if (!bounds_ok(off + 4, entries_size + data_size, buf_len))
+        if (!bounds_ok(off + 4, entries_size + data_size,
+                       section_ends[TIGRIS_SEC_QUANT_PARAMS]))
             return TIGRIS_ERR_BAD_SECTION;
         out_plan->quant_params = (const tigris_quant_param_t *)(buf + off + 4);
         if (qd_len > 0)
@@ -225,46 +266,159 @@ tigris_error_t tigris_plan_load(
         out_plan->strings = (const char *)(buf + off);
     }
 
-    /* Model I/O convenience pointers */
+    /* Validate every table span and cross-reference before exposing the plan
+     * to the executor. Section boundaries above ensure these counts cannot
+     * borrow bytes from the next table. */
+    uint32_t index_bytes = section_ends[TIGRIS_SEC_INDEX_POOL] -
+                           section_offsets[TIGRIS_SEC_INDEX_POOL];
+    uint32_t shape_bytes = section_ends[TIGRIS_SEC_SHAPE_POOL] -
+                           section_offsets[TIGRIS_SEC_SHAPE_POOL];
+    uint32_t strings_len = section_ends[TIGRIS_SEC_STRINGS] -
+                           section_offsets[TIGRIS_SEC_STRINGS];
+    if (((index_bytes % sizeof(uint16_t)) != 0 &&
+         (hdr->num_ops || hdr->num_stages || hdr->num_model_inputs ||
+          hdr->num_model_outputs)) ||
+        ((shape_bytes % sizeof(int32_t)) != 0 && hdr->num_tensors) ||
+        strings_len == 0)
+        return TIGRIS_ERR_BAD_SECTION;
+    uint32_t index_count = index_bytes / sizeof(uint16_t);
+    uint32_t shape_count = shape_bytes / sizeof(int32_t);
 
+    if (!string_ok(out_plan->strings, strings_len, hdr->model_name_str))
+        return TIGRIS_ERR_BAD_SECTION;
+
+    uint32_t model_io_count = (uint32_t)hdr->num_model_inputs +
+                              (uint32_t)hdr->num_model_outputs;
+    if (!elements_ok(hdr->model_io_off, model_io_count, index_count))
+        return TIGRIS_ERR_BAD_SECTION;
     out_plan->model_inputs  = out_plan->index_pool + hdr->model_io_off;
     out_plan->model_outputs = out_plan->model_inputs + hdr->num_model_inputs;
+    for (uint32_t i = 0; i < model_io_count; i++) {
+        if (out_plan->model_inputs[i] >= hdr->num_tensors)
+            return TIGRIS_ERR_BAD_SECTION;
+    }
 
-    /* Shape pool bounds validation */
+    if (hdr->num_tensors > LOADER_MAX_TENSORS)
+        return TIGRIS_ERR_PLAN_LIMITS;
 
-    {
-        /* Compute shape pool section size: gap to the next section after it */
-        uint32_t sp_off = section_offsets[TIGRIS_SEC_SHAPE_POOL];
-        uint32_t sp_end = buf_len;  /* default: extends to end of file */
-        for (uint32_t i = 1; i < TIGRIS_SEC_MAX; i++) {
-            if (section_offsets[i] > sp_off && section_offsets[i] < sp_end)
-                sp_end = section_offsets[i];
+    for (uint16_t i = 0; i < hdr->num_tensors; i++) {
+        const tigris_tensor_t *tensor = &out_plan->tensors[i];
+        if (!string_ok(out_plan->strings, strings_len, tensor->name_str) ||
+            !elements_ok(tensor->shape_off, tensor->ndim, shape_count))
+            return TIGRIS_ERR_BAD_SECTION;
+        if (tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM &&
+            tensor->quant_param_idx >= hdr->num_quant_params)
+            return TIGRIS_ERR_BAD_SECTION;
+        for (uint8_t dim = 0; dim < tensor->ndim; dim++) {
+            if (out_plan->shape_pool[tensor->shape_off + dim] <= 0)
+                return TIGRIS_ERR_BAD_SECTION;
         }
-        /* Also consider the section directory itself as a boundary */
-        if (hdr->section_dir_off > sp_off && hdr->section_dir_off < sp_end)
-            sp_end = hdr->section_dir_off;
+    }
 
-        uint32_t shape_pool_count = (sp_end - sp_off) / sizeof(int32_t);
-        for (uint16_t i = 0; i < hdr->num_tensors; i++) {
-            const tigris_tensor_t *t = &out_plan->tensors[i];
-            if ((uint32_t)t->shape_off + t->ndim > shape_pool_count)
+    for (uint16_t i = 0; i < hdr->num_ops; i++) {
+        const tigris_op_t *op = &out_plan->ops[i];
+        if (!string_ok(out_plan->strings, strings_len, op->name_str) ||
+            !elements_ok(op->inputs_off, op->num_inputs, index_count) ||
+            !elements_ok(op->outputs_off, op->num_outputs, index_count))
+            return TIGRIS_ERR_BAD_SECTION;
+        if (hdr->num_stages && op->stage >= hdr->num_stages)
+            return TIGRIS_ERR_BAD_SECTION;
+        if ((op->weight_idx != TIGRIS_NO_WEIGHT &&
+             op->weight_idx >= hdr->num_weights) ||
+            (op->bias_idx != TIGRIS_NO_WEIGHT &&
+             op->bias_idx >= hdr->num_weights))
+            return TIGRIS_ERR_BAD_SECTION;
+        for (uint8_t j = 0; j < op->num_inputs; j++) {
+            if (out_plan->index_pool[op->inputs_off + j] >= hdr->num_tensors)
+                return TIGRIS_ERR_BAD_SECTION;
+        }
+        for (uint8_t j = 0; j < op->num_outputs; j++) {
+            if (out_plan->index_pool[op->outputs_off + j] >= hdr->num_tensors)
+                return TIGRIS_ERR_BAD_SECTION;
+        }
+    }
+
+    if (out_plan->weight_entries && !out_plan->weight_blocks) {
+        uint32_t weights_off = section_offsets[TIGRIS_SEC_WEIGHTS];
+        uint32_t entries_size = (uint32_t)hdr->num_weights *
+                                sizeof(tigris_weight_entry_t);
+        uint32_t blob_len = section_ends[TIGRIS_SEC_WEIGHTS] -
+                            weights_off - entries_size;
+        for (uint16_t i = 0; i < hdr->num_weights; i++) {
+            const tigris_weight_entry_t *weight = &out_plan->weight_entries[i];
+            if (!string_ok(out_plan->strings, strings_len, weight->name_str) ||
+                !bounds_ok(weight->offset, weight->size_bytes, blob_len))
+                return TIGRIS_ERR_BAD_SECTION;
+        }
+    }
+
+    if (section_offsets[TIGRIS_SEC_QUANT_PARAMS]) {
+        uint32_t qp_off = section_offsets[TIGRIS_SEC_QUANT_PARAMS];
+        uint16_t nqp, qd_len;
+        memcpy(&nqp, buf + qp_off, sizeof(nqp));
+        memcpy(&qd_len, buf + qp_off + sizeof(nqp), sizeof(qd_len));
+        if (nqp != hdr->num_quant_params)
+            return TIGRIS_ERR_BAD_SECTION;
+        for (uint16_t i = 0; i < nqp; i++) {
+            const tigris_quant_param_t *qp = &out_plan->quant_params[i];
+            if (qp->num_channels == 0 ||
+                (qp->num_channels > 1 &&
+                 (!elements_ok(qp->multiplier_off, qp->num_channels, qd_len) ||
+                  !elements_ok(qp->shift_off, qp->num_channels, qd_len))))
+                return TIGRIS_ERR_BAD_SECTION;
+        }
+    }
+
+    if (out_plan->weight_blocks) {
+        uint32_t wb_off = section_offsets[TIGRIS_SEC_WEIGHT_BLOCKS];
+        uint32_t block_entries = (uint32_t)out_plan->num_weight_blocks *
+                                 sizeof(tigris_weight_block_t);
+        uint32_t blobs_off = wb_off + 4u + block_entries;
+        uint32_t blobs_len = section_ends[TIGRIS_SEC_WEIGHT_BLOCKS] - blobs_off;
+        if (out_plan->weight_compression != TIGRIS_COMPRESS_NONE &&
+            out_plan->weight_compression != TIGRIS_COMPRESS_LZ4)
+            return TIGRIS_ERR_BAD_SECTION;
+        for (uint16_t i = 0; i < out_plan->num_weight_blocks; i++) {
+            const tigris_weight_block_t *block = &out_plan->weight_blocks[i];
+            if (block->stage_idx >= hdr->num_stages ||
+                !elements_ok(block->first_weight_idx, block->num_weights,
+                             hdr->num_weights) ||
+                !bounds_ok(block->blob_offset, block->compressed_size, blobs_len))
                 return TIGRIS_ERR_BAD_SECTION;
         }
     }
 
     /* Plan limits validation */
 
-    if (hdr->num_tensors > LOADER_MAX_TENSORS)
-        return TIGRIS_ERR_PLAN_LIMITS;
-
     for (uint16_t i = 0; i < hdr->num_stages; i++) {
         const tigris_stage_t *stage = &out_plan->stages[i];
+        if (!elements_ok(stage->ops_off, stage->ops_count, index_count) ||
+            !elements_ok(stage->inputs_off, stage->inputs_count, index_count) ||
+            !elements_ok(stage->outputs_off, stage->outputs_count, index_count) ||
+            (stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
+             stage->tile_plan_idx >= hdr->num_tile_plans) ||
+            (stage->chain_len == 0 && stage->chain_id != TIGRIS_NO_CHAIN) ||
+            (stage->chain_len > 0 && stage->chain_id == TIGRIS_NO_CHAIN))
+            return TIGRIS_ERR_BAD_SECTION;
         if (stage->inputs_count > LOADER_MAX_STAGE_INPUTS)
             return TIGRIS_ERR_PLAN_LIMITS;
         if (stage->outputs_count > LOADER_MAX_STAGE_OUTPUTS)
             return TIGRIS_ERR_PLAN_LIMITS;
         if (stage->chain_len > LOADER_MAX_CHAIN_STAGES)
             return TIGRIS_ERR_PLAN_LIMITS;
+
+        for (uint16_t j = 0; j < stage->ops_count; j++) {
+            if (out_plan->index_pool[stage->ops_off + j] >= hdr->num_ops)
+                return TIGRIS_ERR_BAD_SECTION;
+        }
+        for (uint16_t j = 0; j < stage->inputs_count; j++) {
+            if (out_plan->index_pool[stage->inputs_off + j] >= hdr->num_tensors)
+                return TIGRIS_ERR_BAD_SECTION;
+        }
+        for (uint16_t j = 0; j < stage->outputs_count; j++) {
+            if (out_plan->index_pool[stage->outputs_off + j] >= hdr->num_tensors)
+                return TIGRIS_ERR_BAD_SECTION;
+        }
 
         if (stage->chain_len >= 2) {
             if (stage->chain_id == TIGRIS_NO_CHAIN ||

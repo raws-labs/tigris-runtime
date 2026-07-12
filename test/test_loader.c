@@ -114,6 +114,192 @@ static void test_error_strings(void)
     TEST_ASSERT(strlen(tigris_error_str((tigris_error_t)999)) > 0, "unknown string");
 }
 
+/* Minimal self-contained plans for malformed-input tests. */
+
+#define MINIMAL_PLAN_SIZE 96u
+
+static void build_minimal_plan(uint8_t *buf)
+{
+    memset(buf, 0, MINIMAL_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = MINIMAL_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    const uint32_t required[] = {
+        TIGRIS_SEC_TENSORS,
+        TIGRIS_SEC_OPS,
+        TIGRIS_SEC_INDEX_POOL,
+        TIGRIS_SEC_SHAPE_POOL,
+        TIGRIS_SEC_STRINGS,
+    };
+    for (uint32_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        dir[i].type = required[i];
+        dir[i].offset = MINIMAL_PLAN_SIZE;
+    }
+    /* dir[5] remains the zero-valued sentinel. */
+}
+
+static void test_section_directory_guards(void)
+{
+    printf("  test_section_directory_guards...\n");
+    _Alignas(4) uint8_t buf[MINIMAL_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_minimal_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "minimal plan loads");
+
+    build_minimal_plan(buf);
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+    dir[5].type = TIGRIS_SEC_WEIGHTS;
+    dir[5].offset = MINIMAL_PLAN_SIZE;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "missing directory sentinel");
+
+    build_minimal_plan(buf);
+    dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+    dir[1].type = TIGRIS_SEC_TENSORS;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "duplicate section type");
+}
+
+static void test_counted_sections_required(void)
+{
+    printf("  test_counted_sections_required...\n");
+    _Alignas(4) uint8_t buf[MINIMAL_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_file_header_t *hdr;
+
+    build_minimal_plan(buf);
+    hdr = (tigris_file_header_t *)buf;
+    hdr->num_stages = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_MISSING_SEC, "counted stages require section");
+
+    build_minimal_plan(buf);
+    hdr = (tigris_file_header_t *)buf;
+    hdr->num_tile_plans = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_MISSING_SEC, "counted tile plans require section");
+
+    build_minimal_plan(buf);
+    hdr = (tigris_file_header_t *)buf;
+    hdr->num_weights = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_MISSING_SEC, "counted weights require section");
+
+    build_minimal_plan(buf);
+    hdr = (tigris_file_header_t *)buf;
+    hdr->num_quant_params = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_MISSING_SEC, "counted quant params require section");
+}
+
+#define STAGED_PLAN_SIZE 704u
+#define STAGED_OPS_OFF   128u
+#define STAGED_STAGES_OFF 480u
+#define STAGED_INDEX_OFF 544u
+#define STAGED_SHAPES_OFF 640u
+#define STAGED_STRINGS_OFF 644u
+
+static void build_staged_plan(uint8_t *buf)
+{
+    memset(buf, 0, STAGED_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = STAGED_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_ops = 9;
+    hdr->num_stages = 2;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, STAGED_OPS_OFF};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, STAGED_OPS_OFF};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, STAGED_STAGES_OFF};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, STAGED_INDEX_OFF};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, STAGED_SHAPES_OFF};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, STAGED_STRINGS_OFF};
+
+    tigris_op_t *ops = (tigris_op_t *)(buf + STAGED_OPS_OFF);
+    uint16_t *indices = (uint16_t *)(buf + STAGED_INDEX_OFF);
+    for (uint16_t i = 0; i < hdr->num_ops; i++) {
+        ops[i].op_type = TIGRIS_OP_CONV;
+        indices[i] = i;
+    }
+
+    tigris_stage_t *stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
+    stages[0].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stages[0].chain_id = TIGRIS_NO_CHAIN;
+    stages[1].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stages[1].chain_id = TIGRIS_NO_CHAIN;
+}
+
+static void test_chain_limit_guards(void)
+{
+    printf("  test_chain_limit_guards...\n");
+    _Alignas(4) uint8_t buf[STAGED_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_stage_t *stages;
+
+    build_staged_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "base staged plan loads");
+
+    build_staged_plan(buf);
+    stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
+    stages[0].inputs_count = 17;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_PLAN_LIMITS, "stage input limit");
+
+    build_staged_plan(buf);
+    stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
+    stages[0].outputs_count = 17;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_PLAN_LIMITS, "stage output limit");
+
+    build_staged_plan(buf);
+    stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
+    stages[0].chain_id = 0;
+    stages[0].chain_len = 17;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_PLAN_LIMITS, "chain length limit");
+
+    build_staged_plan(buf);
+    stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
+    stages[0].chain_id = 1;
+    stages[0].chain_len = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "chain end within stage table");
+
+    build_staged_plan(buf);
+    stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
+    stages[0].chain_id = TIGRIS_NO_CHAIN;
+    stages[0].chain_len = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "chain requires valid head");
+
+    build_staged_plan(buf);
+    stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
+    stages[0].chain_id = 0;
+    stages[0].chain_len = 2;
+    stages[0].ops_count = 8;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "eight chain spatial ops fit fixed metadata");
+
+    stages[0].ops_count = 9;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_PLAN_LIMITS, "ninth chain spatial op rejected");
+}
+
 /* Struct size validation */
 
 static void test_struct_sizes(void)
@@ -122,10 +308,10 @@ static void test_struct_sizes(void)
     TEST_ASSERT_EQ(sizeof(tigris_file_header_t), 48, "header size");
     TEST_ASSERT_EQ(sizeof(tigris_section_entry_t), 8, "section entry size");
     TEST_ASSERT_EQ(sizeof(tigris_tensor_t), 16, "tensor size");
-    TEST_ASSERT_EQ(sizeof(tigris_op_t), 32, "op size");
+    TEST_ASSERT_EQ(sizeof(tigris_op_t), 38, "op size");
     TEST_ASSERT_EQ(sizeof(tigris_stage_t), 28, "stage size");
     TEST_ASSERT_EQ(sizeof(tigris_tile_plan_t), 24, "tile plan size");
-    TEST_ASSERT_EQ(sizeof(tigris_spatial_attrs_t), 12, "spatial attrs size");
+    TEST_ASSERT_EQ(sizeof(tigris_spatial_attrs_t), 18, "spatial attrs size");
     TEST_ASSERT_EQ(sizeof(tigris_weight_entry_t), 12, "weight entry size");
     TEST_ASSERT_EQ(sizeof(tigris_quant_param_t), 16, "quant param size");
 }
@@ -293,6 +479,9 @@ int main(int argc, char *argv[])
     test_bad_version();
     test_size_mismatch();
     test_error_strings();
+    test_section_directory_guards();
+    test_counted_sections_required();
+    test_chain_limit_guards();
 
     printf("\nStruct size tests:\n");
     test_struct_sizes();

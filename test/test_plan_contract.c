@@ -94,7 +94,7 @@ static void test_linear_3op(const char *fixtures_dir)
     if (err != TIGRIS_OK) { free(buf); return; }
 
     TEST_ASSERT(memcmp(plan.header->magic, TIGRIS_MAGIC_BYTES, 4) == 0, "magic");
-    TEST_ASSERT_EQ(plan.header->version, 1, "version");
+    TEST_ASSERT_EQ(plan.header->version, 2, "schema v2 version");
     TEST_ASSERT_EQ(plan.header->file_size, buf_len, "file_size matches");
     TEST_ASSERT_EQ(plan.header->num_tensors, 4, "num_tensors");
     TEST_ASSERT_EQ(plan.header->num_ops, 3, "num_ops");
@@ -136,13 +136,13 @@ static void test_conv_relu_chain(const char *fixtures_dir)
     if (err != TIGRIS_OK) { free(buf); return; }
 
     TEST_ASSERT(memcmp(plan.header->magic, TIGRIS_MAGIC_BYTES, 4) == 0, "magic");
-    TEST_ASSERT_EQ(plan.header->version, 1, "version");
+    TEST_ASSERT_EQ(plan.header->version, 2, "schema v2 version");
     TEST_ASSERT_EQ(plan.header->file_size, buf_len, "file_size matches");
     TEST_ASSERT_EQ(plan.header->num_tensors, 3, "num_tensors");
     TEST_ASSERT_EQ(plan.header->num_ops, 2, "num_ops (relu fused)");
     TEST_ASSERT_EQ(plan.header->num_stages, 1, "num_stages");
     TEST_ASSERT_EQ(plan.header->num_tile_plans, 0, "num_tile_plans");
-    TEST_ASSERT_EQ(plan.header->budget, 32768, "budget");
+    TEST_ASSERT_EQ(plan.header->budget, 65536, "budget");
     TEST_ASSERT(plan.header->peak > 0, "peak > 0");
     TEST_ASSERT_EQ(plan.header->num_model_inputs, 1, "num_model_inputs");
     TEST_ASSERT_EQ(plan.header->num_model_outputs, 1, "num_model_outputs");
@@ -187,7 +187,7 @@ static void test_ds_cnn(const char *fixtures_dir)
     if (err != TIGRIS_OK) { free(buf); return; }
 
     TEST_ASSERT(memcmp(plan.header->magic, TIGRIS_MAGIC_BYTES, 4) == 0, "magic");
-    TEST_ASSERT_EQ(plan.header->version, 1, "version");
+    TEST_ASSERT_EQ(plan.header->version, 2, "schema v2 version");
     TEST_ASSERT_EQ(plan.header->file_size, buf_len, "file_size matches");
     TEST_ASSERT_EQ(plan.header->num_tensors, 13, "num_tensors");
     TEST_ASSERT_EQ(plan.header->num_ops, 12, "num_ops");
@@ -229,10 +229,10 @@ static void test_struct_sizes(void)
     TEST_ASSERT_EQ(sizeof(tigris_file_header_t), 48, "header = 48 bytes");
     TEST_ASSERT_EQ(sizeof(tigris_section_entry_t), 8, "section entry = 8 bytes");
     TEST_ASSERT_EQ(sizeof(tigris_tensor_t), 16, "tensor = 16 bytes");
-    TEST_ASSERT_EQ(sizeof(tigris_op_t), 32, "op = 32 bytes");
+    TEST_ASSERT_EQ(sizeof(tigris_op_t), 38, "op = 38 bytes");
     TEST_ASSERT_EQ(sizeof(tigris_stage_t), 28, "stage = 28 bytes");
     TEST_ASSERT_EQ(sizeof(tigris_tile_plan_t), 24, "tile plan = 24 bytes");
-    TEST_ASSERT_EQ(sizeof(tigris_spatial_attrs_t), 12, "spatial attrs = 12 bytes");
+    TEST_ASSERT_EQ(sizeof(tigris_spatial_attrs_t), 18, "spatial attrs = 18 bytes");
     TEST_ASSERT_EQ(sizeof(tigris_weight_entry_t), 12, "weight entry = 12 bytes");
     TEST_ASSERT_EQ(sizeof(tigris_quant_param_t), 16, "quant param = 16 bytes");
     TEST_ASSERT_EQ(sizeof(tigris_weight_block_t), 20, "weight block = 20 bytes");

@@ -28,12 +28,13 @@ typedef enum {
 
 /* Tile context */
 
-/** Per-tile spatial context, active during tiled stage execution. */
+/** Runtime-only per-tile spatial context, active during tiled execution. */
 typedef struct {
     uint8_t  active;       /* 0=full tensor, 1=tile active */
-    uint8_t  pad_top;      /* effective top padding for this tile */
-    uint8_t  pad_bottom;   /* effective bottom padding */
     uint8_t  _pad0;
+    uint16_t pad_top;      /* effective top padding for this tile */
+    uint16_t pad_bottom;   /* effective bottom padding */
+    uint16_t _pad1;
     int32_t  in_h;         /* tile input H (with halo) */
     int32_t  out_h;        /* tile output H (core) */
     int32_t  in_w;         /* input W (same as full, for convenience) */
@@ -108,7 +109,9 @@ static inline void tigris_mem_note_fast_peak(tigris_mem_t *mem)
  * @param fast_size    Size of fast_buf in bytes.
  * @param slow_buf     Slow buffer (PSRAM or heap on embedded targets).
  * @param slow_size    Size of slow_buf in bytes.
- * @return TIGRIS_MEM_OK on success, or TIGRIS_MEM_ERR_NULL.
+ * @return TIGRIS_MEM_OK on success, TIGRIS_MEM_ERR_NULL for a null argument,
+ *         or TIGRIS_MEM_ERR_OOM if an unaligned buffer is too small to reach
+ *         its first aligned allocation address.
  */
 tigris_mem_error_t tigris_mem_init(
     tigris_mem_t *mem,
@@ -122,7 +125,8 @@ tigris_mem_error_t tigris_mem_init(
  * @param mem         Memory manager.
  * @param tensor_idx  Tensor index to allocate for.
  * @param size_bytes  Number of bytes to allocate.
- * @return TIGRIS_MEM_OK, TIGRIS_MEM_ERR_OOM, or TIGRIS_MEM_ERR_BAD_INDEX.
+ * @return TIGRIS_MEM_OK, TIGRIS_MEM_ERR_NULL, TIGRIS_MEM_ERR_OOM, or
+ *         TIGRIS_MEM_ERR_BAD_INDEX.
  */
 tigris_mem_error_t tigris_mem_alloc_fast(
     tigris_mem_t *mem, uint16_t tensor_idx, uint32_t size_bytes);
@@ -133,7 +137,8 @@ tigris_mem_error_t tigris_mem_alloc_fast(
  * @param mem         Memory manager.
  * @param tensor_idx  Tensor index to allocate for.
  * @param size_bytes  Number of bytes to allocate.
- * @return TIGRIS_MEM_OK, TIGRIS_MEM_ERR_OOM, or TIGRIS_MEM_ERR_BAD_INDEX.
+ * @return TIGRIS_MEM_OK, TIGRIS_MEM_ERR_NULL, TIGRIS_MEM_ERR_OOM, or
+ *         TIGRIS_MEM_ERR_BAD_INDEX.
  */
 tigris_mem_error_t tigris_mem_alloc_slow(
     tigris_mem_t *mem, uint16_t tensor_idx, uint32_t size_bytes);

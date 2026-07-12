@@ -196,7 +196,7 @@ typedef struct {
 } tigris_spatial_attrs_t;           /* 18 bytes */
 
 /**
- * Operator descriptor - 32 bytes.
+ * Operator descriptor - 38 bytes (schema v2).
  */
 typedef struct {
     uint32_t    name_str;            /*  0: offset into string table */
@@ -289,6 +289,57 @@ typedef struct {
 } tigris_weight_block_t;            /* 20 bytes total */
 
 #pragma pack(pop)
+
+/*
+ * Compile-time wire-format contract.
+ *
+ * Use named negative-size typedefs rather than C11-only _Static_assert so the
+ * public header remains usable from C99 and C++ translation units. A layout
+ * drift therefore fails at compile time, before a mismatched runtime can load
+ * a plan produced by the compiler.
+ */
+#define TIGRIS_LAYOUT_ASSERT(name, expr) \
+    typedef char name[(expr) ? 1 : -1]
+
+TIGRIS_LAYOUT_ASSERT(tigris_layout_file_header_size,
+                     sizeof(tigris_file_header_t) == 48);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_section_entry_size,
+                     sizeof(tigris_section_entry_t) == 8);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_tensor_size,
+                     sizeof(tigris_tensor_t) == 16);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_spatial_attrs_size,
+                     sizeof(tigris_spatial_attrs_t) == 18);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_op_size,
+                     sizeof(tigris_op_t) == 38);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_stage_size,
+                     sizeof(tigris_stage_t) == 28);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_tile_plan_size,
+                     sizeof(tigris_tile_plan_t) == 24);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_weight_entry_size,
+                     sizeof(tigris_weight_entry_t) == 12);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_quant_param_size,
+                     sizeof(tigris_quant_param_t) == 16);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_weight_block_size,
+                     sizeof(tigris_weight_block_t) == 20);
+
+TIGRIS_LAYOUT_ASSERT(tigris_layout_spatial_pad_top_offset,
+                     offsetof(tigris_spatial_attrs_t, pad_top) == 4);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_spatial_dilation_h_offset,
+                     offsetof(tigris_spatial_attrs_t, dilation_h) == 12);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_spatial_group_offset,
+                     offsetof(tigris_spatial_attrs_t, group) == 16);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_op_spatial_offset,
+                     offsetof(tigris_op_t, spatial) == 12);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_op_weight_idx_offset,
+                     offsetof(tigris_op_t, weight_idx) == 30);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_op_bias_idx_offset,
+                     offsetof(tigris_op_t, bias_idx) == 32);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_op_fused_act_offset,
+                     offsetof(tigris_op_t, fused_act) == 34);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_op_pad_offset,
+                     offsetof(tigris_op_t, _pad1) == 37);
+
+#undef TIGRIS_LAYOUT_ASSERT
 
 /* Parsed plan handle */
 
@@ -530,25 +581,16 @@ static inline const tigris_quant_param_t *tigris_tensor_quant(
 /**
  * Compute extra fast-arena bytes needed for weight decompression.
  *
- * For compressed plans, the executor decompresses one stage's weights at a
- * time into the fast arena prefix. The host must add this overhead to the
- * fast buffer size.
+ * Standalone stages decompress one block at a time. A tiled chain keeps every
+ * stage's block resident simultaneously, so its requirement is the aligned
+ * sum across the chain. The returned value is the maximum of those execution
+ * groups, aligned to TIGRIS_TENSOR_ALIGN by the runtime implementation.
  *
  * @param plan  Loaded plan.
- * @return Required overhead in bytes (4-byte aligned), or 0 for uncompressed plans.
+ * @return Required overhead in bytes, 0 for an uncompressed plan, or
+ *         UINT32_MAX if the required aligned sum cannot be represented.
  */
-static inline uint32_t tigris_weight_decompression_overhead(
-    const tigris_plan_t *plan)
-{
-    if (!plan->weight_blocks || plan->num_weight_blocks == 0)
-        return 0;
-    uint32_t max_uncomp = 0;
-    for (uint16_t i = 0; i < plan->num_weight_blocks; i++) {
-        if (plan->weight_blocks[i].uncompressed_size > max_uncomp)
-            max_uncomp = plan->weight_blocks[i].uncompressed_size;
-    }
-    return (max_uncomp + 3u) & ~3u;  /* align to 4 */
-}
+uint32_t tigris_weight_decompression_overhead(const tigris_plan_t *plan);
 
 #ifdef __cplusplus
 }

@@ -597,13 +597,8 @@ static void test_e2e_compressed(const char *path, const char *ref_path)
     uint32_t fast_size = plan.header->peak;
     if (fast_size < total_tensor_bytes(&plan))
         fast_size = total_tensor_bytes(&plan);
-    /* Extra space for decompressed weights in fast arena */
-    uint32_t max_uncomp = 0;
-    for (uint16_t i = 0; i < plan.num_weight_blocks; i++) {
-        if (plan.weight_blocks[i].uncompressed_size > max_uncomp)
-            max_uncomp = plan.weight_blocks[i].uncompressed_size;
-    }
-    fast_size += max_uncomp + 16;  /* +16 for alignment */
+    /* Extra space for every compressed block held by an execution group. */
+    fast_size += tigris_weight_decompression_overhead(&plan);
 
     uint8_t *fast_buf = (uint8_t *)malloc(fast_size);
     uint32_t slow_size = total_tensor_bytes(&plan) * 2;

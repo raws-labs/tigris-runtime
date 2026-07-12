@@ -9,7 +9,26 @@
 
 /* Helpers */
 
-#define ALIGN_UP(x) (((x) + (TIGRIS_TENSOR_ALIGN - 1u)) & ~(TIGRIS_TENSOR_ALIGN - 1u))
+#if (TIGRIS_TENSOR_ALIGN == 0) || \
+    ((TIGRIS_TENSOR_ALIGN & (TIGRIS_TENSOR_ALIGN - 1u)) != 0)
+#error "TIGRIS_TENSOR_ALIGN must be a non-zero power of two"
+#endif
+
+/** Align a uint32_t size without allowing the addition to wrap. */
+static int align_up_u32(uint32_t value, uint32_t *aligned)
+{
+    const uint32_t mask = (uint32_t)TIGRIS_TENSOR_ALIGN - 1u;
+    if (!aligned || value > UINT32_MAX - mask)
+        return 0;
+
+    *aligned = (value + mask) & ~mask;
+    return 1;
+}
+
+static uint32_t saturating_add_u32(uint32_t a, uint32_t b)
+{
+    return (b > UINT32_MAX - a) ? UINT32_MAX : a + b;
+}
 
 /* Public API */
 
@@ -22,18 +41,22 @@ tigris_mem_error_t tigris_mem_init(
     if (!mem || !tensor_ptrs || !fast_buf || !slow_buf)
         return TIGRIS_MEM_ERR_NULL;
 
+    /* Align initial bump offset so first allocation respects TIGRIS_TENSOR_ALIGN,
+     * even if the caller-provided buffer base isn't aligned. */
+    uint32_t mask = TIGRIS_TENSOR_ALIGN - 1u;
+    uint32_t fast_adj = (TIGRIS_TENSOR_ALIGN - ((uintptr_t)fast_buf & mask)) & mask;
+    uint32_t slow_adj = (TIGRIS_TENSOR_ALIGN - ((uintptr_t)slow_buf & mask)) & mask;
+
+    /* An unaligned buffer may be too small to reach its first aligned address. */
+    if (fast_adj > fast_size || slow_adj > slow_size)
+        return TIGRIS_MEM_ERR_OOM;
+
     mem->tensor_ptrs = tensor_ptrs;
     mem->num_tensors = num_tensors;
     mem->fast_base   = (uint8_t *)fast_buf;
     mem->fast_size   = fast_size;
     mem->slow_base   = (uint8_t *)slow_buf;
     mem->slow_size   = slow_size;
-
-    /* Align initial bump offset so first allocation respects TIGRIS_TENSOR_ALIGN,
-     * even if the caller-provided buffer base isn't aligned. */
-    uint32_t mask = TIGRIS_TENSOR_ALIGN - 1u;
-    uint32_t fast_adj = (TIGRIS_TENSOR_ALIGN - ((uintptr_t)fast_buf & mask)) & mask;
-    uint32_t slow_adj = (TIGRIS_TENSOR_ALIGN - ((uintptr_t)slow_buf & mask)) & mask;
     mem->fast_used     = fast_adj;
     mem->fast_reserved = fast_adj;
     mem->fast_peak     = fast_adj;
@@ -48,10 +71,13 @@ static tigris_mem_error_t alloc_bump(
     tigris_mem_t *mem, uint16_t tensor_idx, uint32_t size_bytes,
     uint8_t *base, uint32_t *used, uint32_t capacity)
 {
-    if (!mem) return TIGRIS_MEM_ERR_NULL;
+    if (!mem || !mem->tensor_ptrs || !base || !used)
+        return TIGRIS_MEM_ERR_NULL;
     if (tensor_idx >= mem->num_tensors) return TIGRIS_MEM_ERR_BAD_INDEX;
 
-    uint32_t aligned = ALIGN_UP(size_bytes);
+    uint32_t aligned;
+    if (!align_up_u32(size_bytes, &aligned))
+        return TIGRIS_MEM_ERR_OOM;
     if (*used > capacity || aligned > capacity - *used)
         return TIGRIS_MEM_ERR_OOM;
 
@@ -65,6 +91,7 @@ static tigris_mem_error_t alloc_bump(
 tigris_mem_error_t tigris_mem_alloc_fast(
     tigris_mem_t *mem, uint16_t tensor_idx, uint32_t size_bytes)
 {
+    if (!mem) return TIGRIS_MEM_ERR_NULL;
     return alloc_bump(mem, tensor_idx, size_bytes,
                       mem->fast_base, &mem->fast_used, mem->fast_size);
 }
@@ -72,6 +99,7 @@ tigris_mem_error_t tigris_mem_alloc_fast(
 tigris_mem_error_t tigris_mem_alloc_slow(
     tigris_mem_t *mem, uint16_t tensor_idx, uint32_t size_bytes)
 {
+    if (!mem) return TIGRIS_MEM_ERR_NULL;
     return alloc_bump(mem, tensor_idx, size_bytes,
                       mem->slow_base, &mem->slow_used, mem->slow_size);
 }
@@ -207,4 +235,61 @@ const char *tigris_mem_error_str(tigris_mem_error_t err)
         case TIGRIS_MEM_ERR_NOT_SET:   return "tensor pointer not set";
         default:                       return "unknown error";
     }
+}
+
+uint32_t tigris_weight_decompression_overhead(const tigris_plan_t *plan)
+{
+    if (!plan || !plan->weight_blocks || plan->num_weight_blocks == 0)
+        return 0;
+
+    uint32_t max_required = 0;
+
+    /* A standalone execution group holds one block. This pass is also a
+     * conservative fallback for blocks whose stage metadata is unavailable. */
+    for (uint16_t i = 0; i < plan->num_weight_blocks; i++) {
+        const tigris_weight_block_t *wb = &plan->weight_blocks[i];
+        if (wb->compressed_size == 0)
+            continue;
+
+        uint32_t aligned;
+        if (!align_up_u32(wb->uncompressed_size, &aligned))
+            return UINT32_MAX;
+        if (aligned > max_required)
+            max_required = aligned;
+    }
+
+    if (!plan->header || !plan->stages)
+        return max_required;
+
+    /* Chain heads decompress the first block for every stage in the chain
+     * before executing any tile, so those aligned sizes are simultaneous. */
+    for (uint16_t s = 0; s < plan->header->num_stages; s++) {
+        const tigris_stage_t *stage = &plan->stages[s];
+        if (stage->chain_len < 2 || stage->chain_id != s ||
+            stage->chain_len > plan->header->num_stages - s)
+            continue;
+
+        uint32_t chain_required = 0;
+        for (uint16_t c = 0; c < stage->chain_len; c++) {
+            uint16_t stage_idx = (uint16_t)(s + c);
+            for (uint16_t i = 0; i < plan->num_weight_blocks; i++) {
+                const tigris_weight_block_t *wb = &plan->weight_blocks[i];
+                if (wb->stage_idx != stage_idx || wb->compressed_size == 0)
+                    continue;
+
+                uint32_t aligned;
+                if (!align_up_u32(wb->uncompressed_size, &aligned))
+                    return UINT32_MAX;
+                chain_required = saturating_add_u32(chain_required, aligned);
+                if (chain_required == UINT32_MAX)
+                    return UINT32_MAX;
+                break;  /* executor uses the first block for a stage */
+            }
+        }
+
+        if (chain_required > max_required)
+            max_required = chain_required;
+    }
+
+    return max_required;
 }

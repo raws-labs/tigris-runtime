@@ -12,6 +12,13 @@
 
 /* Helpers */
 
+/* Keep these in sync with the executor's fixed-size working arrays. */
+#define LOADER_MAX_STAGE_INPUTS       16u
+#define LOADER_MAX_STAGE_OUTPUTS      16u
+#define LOADER_MAX_CHAIN_STAGES       16u
+#define LOADER_MAX_CHAIN_SPATIAL_OPS   8u
+#define LOADER_MAX_TENSORS           512u
+
 /** Check that [offset, offset+size) fits within buf_len. */
 static inline int bounds_ok(uint32_t offset, uint32_t size, uint32_t buf_len)
 {
@@ -59,27 +66,39 @@ tigris_error_t tigris_plan_load(
     if (!bounds_ok(sec_off, sizeof(tigris_section_entry_t), buf_len))
         return TIGRIS_ERR_BAD_SECTION;
 
-    /* Walk section entries until sentinel (type == 0) */
-    const tigris_section_entry_t *sec =
-        (const tigris_section_entry_t *)(buf + sec_off);
-
     /* Track which sections we found via offsets into buf (0 = not found) */
     uint32_t section_offsets[TIGRIS_SEC_MAX];
+    uint8_t section_seen[TIGRIS_SEC_MAX];
     memset(section_offsets, 0, sizeof(section_offsets));
+    memset(section_seen, 0, sizeof(section_seen));
 
-    while ((const uint8_t *)(sec + 1) <= buf + buf_len) {
+    int found_sentinel = 0;
+    uint32_t sec_cursor = sec_off;
+    while (bounds_ok(sec_cursor, sizeof(tigris_section_entry_t), buf_len)) {
+        const tigris_section_entry_t *sec =
+            (const tigris_section_entry_t *)(buf + sec_cursor);
         if (sec->type == 0)
-            break;  /* sentinel */
+        {
+            found_sentinel = 1;
+            break;
+        }
 
         if (sec->type >= TIGRIS_SEC_MAX)
+            return TIGRIS_ERR_BAD_SECTION;
+
+        if (section_seen[sec->type])
             return TIGRIS_ERR_BAD_SECTION;
 
         if (sec->offset > buf_len)
             return TIGRIS_ERR_BAD_SECTION;
 
+        section_seen[sec->type] = 1;
         section_offsets[sec->type] = sec->offset;
-        sec++;
+        sec_cursor += sizeof(tigris_section_entry_t);
     }
+
+    if (!found_sentinel)
+        return TIGRIS_ERR_BAD_SECTION;
 
     /* Required sections */
 
@@ -88,6 +107,14 @@ tigris_error_t tigris_plan_load(
     if (!section_offsets[TIGRIS_SEC_INDEX_POOL])  return TIGRIS_ERR_MISSING_SEC;
     if (!section_offsets[TIGRIS_SEC_SHAPE_POOL])  return TIGRIS_ERR_MISSING_SEC;
     if (!section_offsets[TIGRIS_SEC_STRINGS])     return TIGRIS_ERR_MISSING_SEC;
+    if (hdr->num_stages && !section_offsets[TIGRIS_SEC_STAGES])
+        return TIGRIS_ERR_MISSING_SEC;
+    if (hdr->num_tile_plans && !section_offsets[TIGRIS_SEC_TILE_PLANS])
+        return TIGRIS_ERR_MISSING_SEC;
+    if (hdr->num_weights && !section_offsets[TIGRIS_SEC_WEIGHTS])
+        return TIGRIS_ERR_MISSING_SEC;
+    if (hdr->num_quant_params && !section_offsets[TIGRIS_SEC_QUANT_PARAMS])
+        return TIGRIS_ERR_MISSING_SEC;
 
     /* Set pointers */
 
@@ -227,17 +254,51 @@ tigris_error_t tigris_plan_load(
 
     /* Plan limits validation */
 
-    if (hdr->num_tensors > 512)
+    if (hdr->num_tensors > LOADER_MAX_TENSORS)
         return TIGRIS_ERR_PLAN_LIMITS;
 
     for (uint16_t i = 0; i < hdr->num_stages; i++) {
         const tigris_stage_t *stage = &out_plan->stages[i];
-        if (stage->inputs_count > 16)
+        if (stage->inputs_count > LOADER_MAX_STAGE_INPUTS)
             return TIGRIS_ERR_PLAN_LIMITS;
-        if (stage->outputs_count > 16)
+        if (stage->outputs_count > LOADER_MAX_STAGE_OUTPUTS)
             return TIGRIS_ERR_PLAN_LIMITS;
-        if (stage->chain_len > 16)
+        if (stage->chain_len > LOADER_MAX_CHAIN_STAGES)
             return TIGRIS_ERR_PLAN_LIMITS;
+
+        if (stage->chain_len >= 2) {
+            if (stage->chain_id == TIGRIS_NO_CHAIN ||
+                stage->chain_id >= hdr->num_stages ||
+                stage->chain_len > hdr->num_stages - stage->chain_id)
+                return TIGRIS_ERR_BAD_SECTION;
+
+            /* Chain execution stores spatial-op metadata in a fixed [8] array.
+             * Validate only the stage-op slice needed for that limit here; full
+             * plan cross-reference validation belongs to the hardening pass. */
+            uint32_t pool_off = section_offsets[TIGRIS_SEC_INDEX_POOL];
+            uint32_t prefix = (uint32_t)stage->ops_off * sizeof(uint16_t);
+            uint32_t bytes = (uint32_t)stage->ops_count * sizeof(uint16_t);
+            if (!bounds_ok(pool_off, prefix, buf_len) ||
+                !bounds_ok(pool_off + prefix, bytes, buf_len))
+                return TIGRIS_ERR_BAD_SECTION;
+
+            const uint8_t *op_indices = buf + pool_off + prefix;
+            uint32_t spatial_count = 0;
+            for (uint16_t j = 0; j < stage->ops_count; j++) {
+                uint16_t op_idx;
+                memcpy(&op_idx, op_indices + (uint32_t)j * sizeof(op_idx),
+                       sizeof(op_idx));
+                if (op_idx >= hdr->num_ops)
+                    return TIGRIS_ERR_BAD_SECTION;
+
+                uint8_t op_type = out_plan->ops[op_idx].op_type;
+                if (op_type == TIGRIS_OP_CONV || op_type == TIGRIS_OP_DEPTHWISE) {
+                    spatial_count++;
+                    if (spatial_count > LOADER_MAX_CHAIN_SPATIAL_OPS)
+                        return TIGRIS_ERR_PLAN_LIMITS;
+                }
+            }
+        }
     }
 
     return TIGRIS_OK;

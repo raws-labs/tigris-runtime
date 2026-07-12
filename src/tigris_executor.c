@@ -141,7 +141,7 @@ static void compact_slow(tigris_mem_t *mem, const tigris_plan_t *plan)
 /* Helpers */
 
 /**
- * Find the first spatial op (Conv/DWConv/MaxPool) in a stage.
+ * Find the first spatial op (Conv/DWConv/Pool) in a stage.
  * Returns its index in plan->ops, or -1 if none.
  */
 static int find_spatial_op(const tigris_plan_t *plan, const tigris_stage_t *stage)
@@ -150,14 +150,14 @@ static int find_spatial_op(const tigris_plan_t *plan, const tigris_stage_t *stag
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         uint8_t t = plan->ops[sops[j]].op_type;
         if (t == TIGRIS_OP_CONV || t == TIGRIS_OP_DEPTHWISE ||
-            t == TIGRIS_OP_MAX_POOL)
+            t == TIGRIS_OP_MAX_POOL || t == TIGRIS_OP_AVG_POOL)
             return (int)sops[j];
     }
     return -1;
 }
 
 /**
- * Count total spatial ops (Conv/DWConv/MaxPool) in a stage.
+ * Count total spatial ops (Conv/DWConv/Pool) in a stage.
  * exec_stage_tiled only handles stages with at most 1 spatial op.
  */
 static int count_spatial_ops(const tigris_plan_t *plan, const tigris_stage_t *stage)
@@ -167,7 +167,7 @@ static int count_spatial_ops(const tigris_plan_t *plan, const tigris_stage_t *st
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         uint8_t t = plan->ops[sops[j]].op_type;
         if (t == TIGRIS_OP_CONV || t == TIGRIS_OP_DEPTHWISE ||
-            t == TIGRIS_OP_MAX_POOL)
+            t == TIGRIS_OP_MAX_POOL || t == TIGRIS_OP_AVG_POOL)
             count++;
     }
     return count;
@@ -498,8 +498,8 @@ static tigris_exec_error_t exec_stage_tiled(
                 mem->tile.out_h      = tile_out_h;
                 mem->tile.in_w       = full_in_w;
                 mem->tile.out_w      = full_out_w;
-                mem->tile.pad_top    = (uint8_t)eff_pad_top;
-                mem->tile.pad_bottom = (uint8_t)eff_pad_bottom;
+                mem->tile.pad_top    = eff_pad_top;
+                mem->tile.pad_bottom = eff_pad_bottom;
             } else {
                 /* Pointwise op: height/width preserved, no padding. */
                 mem->tile.in_h       = cur_h;
@@ -596,7 +596,14 @@ static tigris_exec_error_t exec_stage_tiled(
 
 /* Weight block helpers */
 
-#define ALIGN_TENSOR(x) (((x) + (TIGRIS_TENSOR_ALIGN - 1u)) & ~(TIGRIS_TENSOR_ALIGN - 1u))
+static int align_tensor_size(uint32_t value, uint32_t *aligned)
+{
+    const uint32_t mask = TIGRIS_TENSOR_ALIGN - 1u;
+    if (!aligned || value > UINT32_MAX - mask)
+        return 0;
+    *aligned = (value + mask) & ~mask;
+    return 1;
+}
 
 /** Find the weight block for a given stage, or NULL if none. */
 static const tigris_weight_block_t *find_weight_block(
@@ -737,9 +744,11 @@ static tigris_exec_error_t exec_chain_tiled(
             uint8_t *scratch = mem->fast_base + mem->fast_used;
             const uint8_t *csrc =
                 plan->weight_blocks_data + wb->blob_offset;
-            uint32_t needed = ALIGN_TENSOR(wb->uncompressed_size);
+            uint32_t needed;
 
-            if (mem->fast_used + needed > mem->fast_size) {
+            if (!align_tensor_size(wb->uncompressed_size, &needed) ||
+                mem->fast_used > mem->fast_size ||
+                needed > mem->fast_size - mem->fast_used) {
                 TIGRIS_PLATFORM_DBG("MEM@%d f=%lu/%lu s=%lu/%lu\n", __LINE__,
                     (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
                     (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
@@ -1000,8 +1009,8 @@ static tigris_exec_error_t exec_chain_tiled(
             mem->tile.in_w       = info[c].full_in_w;
             mem->tile.out_w      = info[c].full_out_w;
             if (info[c].sp_count > 0) {
-                mem->tile.pad_top    = (uint8_t)sp_tile_pt[c][0];
-                mem->tile.pad_bottom = (uint8_t)sp_tile_pb[c][0];
+                mem->tile.pad_top    = sp_tile_pt[c][0];
+                mem->tile.pad_bottom = sp_tile_pb[c][0];
             } else {
                 mem->tile.pad_top    = 0;
                 mem->tile.pad_bottom = 0;
@@ -1024,8 +1033,8 @@ static tigris_exec_error_t exec_chain_tiled(
                 if (is_spatial) {
                     mem->tile.in_h       = sp_tile_in_h[c][sp_j];
                     mem->tile.out_h      = sp_tile_out_h[c][sp_j];
-                    mem->tile.pad_top    = (uint8_t)sp_tile_pt[c][sp_j];
-                    mem->tile.pad_bottom = (uint8_t)sp_tile_pb[c][sp_j];
+                    mem->tile.pad_top    = sp_tile_pt[c][sp_j];
+                    mem->tile.pad_bottom = sp_tile_pb[c][sp_j];
                     mem->tile.in_w       = info[c].sp_full_in_ws[sp_j];
                     mem->tile.out_w      = info[c].sp_full_out_ws[sp_j];
                 }
@@ -1084,8 +1093,8 @@ static tigris_exec_error_t exec_chain_tiled(
                     sp_j++;
                     /* Pre-set pad for next spatial op (if any) */
                     if (sp_j < info[c].sp_count) {
-                        mem->tile.pad_top = (uint8_t)sp_tile_pt[c][sp_j];
-                        mem->tile.pad_bottom = (uint8_t)sp_tile_pb[c][sp_j];
+                        mem->tile.pad_top = sp_tile_pt[c][sp_j];
+                        mem->tile.pad_bottom = sp_tile_pb[c][sp_j];
                     }
                 }
             }
@@ -1168,6 +1177,18 @@ tigris_exec_error_t tigris_run(
     if (plan->header->num_stages == 0 || !plan->stages)
         return TIGRIS_EXEC_ERR_NO_STAGES;
 
+    /* Preserve the caller's fast-arena state across all temporary stage and
+     * chain weight reservations.  During the run, fast_used is also the reset
+     * floor so caller-owned bytes above fast_reserved cannot be overwritten. */
+    const uint32_t caller_fast_used = mem->fast_used;
+    const uint32_t caller_fast_reserved = mem->fast_reserved;
+    if (caller_fast_used > mem->fast_size ||
+        caller_fast_reserved > caller_fast_used)
+        return TIGRIS_EXEC_ERR_MEM;
+    mem->fast_reserved = caller_fast_used;
+
+    tigris_exec_error_t result = TIGRIS_EXEC_OK;
+
     /* Zero stats if provided */
     if (stats) memset(stats, 0, sizeof(*stats));
 
@@ -1207,17 +1228,23 @@ tigris_exec_error_t tigris_run(
                 /* Decompress into fast arena prefix */
                 uint8_t *scratch = mem->fast_base + mem->fast_used;
                 const uint8_t *csrc = plan->weight_blocks_data + wb->blob_offset;
-                uint32_t needed = ALIGN_TENSOR(wb->uncompressed_size);
+                uint32_t needed;
 
-                if (mem->fast_used + needed > mem->fast_size)
-                    return TIGRIS_EXEC_ERR_MEM;
+                if (!align_tensor_size(wb->uncompressed_size, &needed) ||
+                    mem->fast_used > mem->fast_size ||
+                    needed > mem->fast_size - mem->fast_used) {
+                    result = TIGRIS_EXEC_ERR_MEM;
+                    goto restore_fast_arena;
+                }
 
                 if (plan->weight_compression == TIGRIS_COMPRESS_LZ4) {
                     int32_t dec = tigris_lz4_decompress(
                         csrc, wb->compressed_size,
                         scratch, wb->uncompressed_size);
-                    if (dec < 0 || (uint32_t)dec != wb->uncompressed_size)
-                        return TIGRIS_EXEC_ERR_KERNEL;
+                    if (dec < 0 || (uint32_t)dec != wb->uncompressed_size) {
+                        result = TIGRIS_EXEC_ERR_KERNEL;
+                        goto restore_fast_arena;
+                    }
                 } else {
                     memcpy(scratch, csrc, wb->uncompressed_size);
                 }
@@ -1243,7 +1270,8 @@ tigris_exec_error_t tigris_run(
                     s, stage->chain_len, (int)err,
                     (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
                     (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
-                return err;
+                result = err;
+                goto restore_fast_arena;
             }
             if (stats) stats->stages_chain += stage->chain_len;
             /* Skip remaining chain stages (they were executed above) */
@@ -1264,7 +1292,7 @@ tigris_exec_error_t tigris_run(
                 if (run_plan->tensors[sout[i]].ndim != 4) all_4d = 0;
             }
 
-            /* Only tile stages with at most 1 spatial op (Conv/DWConv/MaxPool).
+            /* Only tile stages with at most 1 spatial op (Conv/DWConv/Pool).
              * Multi-spatial stages (e.g. full backbone with stride changes,
              * MaxPool, Resize) can't be tiled by exec_stage_tiled which
              * assumes a single spatial transition.  Run those as normal -
@@ -1281,7 +1309,8 @@ tigris_exec_error_t tigris_run(
                         s, (int)err, (unsigned long)total_io,
                         (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
                         (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
-                    return err;
+                    result = err;
+                    goto restore_fast_arena;
                 }
                 if (stats) stats->stages_tiled++;
             } else {
@@ -1292,7 +1321,8 @@ tigris_exec_error_t tigris_run(
                         s, (int)err, (unsigned long)total_io,
                         (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
                         (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
-                    return err;
+                    result = err;
+                    goto restore_fast_arena;
                 }
                 if (stats) stats->stages_normal++;
             }
@@ -1317,13 +1347,18 @@ tigris_exec_error_t tigris_run(
         if (need_compact)
             compact_slow(mem, plan);
 
-        /* Unlock decompressed weights after stage */
-        mem->fast_reserved = 0;
+        /* Release stage/chain-local fast allocations before the next group,
+         * retaining the caller's in-run reset floor. */
+        mem->fast_used = caller_fast_used;
+        mem->fast_reserved = caller_fast_used;
 
         TIGRIS_PLATFORM_FEED_WDT();
     }
 
-    return TIGRIS_EXEC_OK;
+restore_fast_arena:
+    mem->fast_used = caller_fast_used;
+    mem->fast_reserved = caller_fast_reserved;
+    return result;
 }
 
 const char *tigris_exec_error_str(tigris_exec_error_t err)

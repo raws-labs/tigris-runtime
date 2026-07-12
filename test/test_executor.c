@@ -114,6 +114,48 @@ static void test_mem_init_null(void)
                    TIGRIS_MEM_ERR_NULL, "null slow");
 }
 
+static void test_mem_init_unalignable_buffer(void)
+{
+    printf("  test_mem_init_unalignable_buffer...\n");
+    tigris_mem_t mem;
+    void *ptrs[1];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[TIGRIS_TENSOR_ALIGN + 1];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[TIGRIS_TENSOR_ALIGN + 1];
+
+#if TIGRIS_TENSOR_ALIGN > 1
+    TEST_ASSERT_EQ(
+        tigris_mem_init(&mem, ptrs, 1, fast + 1, 1, slow, sizeof(slow)),
+        TIGRIS_MEM_ERR_OOM, "fast buffer cannot reach alignment");
+    TEST_ASSERT_EQ(
+        tigris_mem_init(&mem, ptrs, 1, fast, sizeof(fast), slow + 1, 1),
+        TIGRIS_MEM_ERR_OOM, "slow buffer cannot reach alignment");
+#else
+    TEST_ASSERT_EQ(
+        tigris_mem_init(&mem, ptrs, 1, fast + 1, 1, slow, sizeof(slow)),
+        TIGRIS_MEM_OK, "alignment-one fast buffer remains usable");
+    TEST_ASSERT_EQ(
+        tigris_mem_init(&mem, ptrs, 1, fast, sizeof(fast), slow + 1, 1),
+        TIGRIS_MEM_OK, "alignment-one slow buffer remains usable");
+#endif
+}
+
+static void test_mem_alloc_null(void)
+{
+    printf("  test_mem_alloc_null...\n");
+    tigris_mem_t invalid;
+    memset(&invalid, 0, sizeof(invalid));
+    invalid.num_tensors = 1;
+
+    TEST_ASSERT_EQ(tigris_mem_alloc_fast(NULL, 0, 1), TIGRIS_MEM_ERR_NULL,
+                   "fast null mem");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(NULL, 0, 1), TIGRIS_MEM_ERR_NULL,
+                   "slow null mem");
+    TEST_ASSERT_EQ(tigris_mem_alloc_fast(&invalid, 0, 1), TIGRIS_MEM_ERR_NULL,
+                   "fast uninitialised arenas");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&invalid, 0, 1), TIGRIS_MEM_ERR_NULL,
+                   "slow uninitialised arenas");
+}
+
 static void test_mem_alloc_fast(void)
 {
     printf("  test_mem_alloc_fast...\n");
@@ -171,6 +213,26 @@ static void test_mem_alloc_slow_oom(void)
     tigris_mem_init(&mem, ptrs, 2, fast, 64, slow, 64);
 
     TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, 65), TIGRIS_MEM_ERR_OOM, "oom");
+}
+
+static void test_mem_alloc_alignment_overflow(void)
+{
+    printf("  test_mem_alloc_alignment_overflow...\n");
+    tigris_mem_t mem;
+    void *ptrs[2];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[64];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[64];
+    tigris_mem_init(&mem, ptrs, 2, fast, sizeof(fast), slow, sizeof(slow));
+
+    TEST_ASSERT_EQ(tigris_mem_alloc_fast(&mem, 0, UINT32_MAX),
+                   TIGRIS_MEM_ERR_OOM, "fast alignment overflow");
+    TEST_ASSERT_EQ(mem.fast_used, 0, "fast offset unchanged after overflow");
+    TEST_ASSERT(ptrs[0] == NULL, "fast pointer unchanged after overflow");
+
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 1, UINT32_MAX),
+                   TIGRIS_MEM_ERR_OOM, "slow alignment overflow");
+    TEST_ASSERT_EQ(mem.slow_used, 0, "slow offset unchanged after overflow");
+    TEST_ASSERT(ptrs[1] == NULL, "slow pointer unchanged after overflow");
 }
 
 static void test_mem_bad_index(void)
@@ -514,10 +576,13 @@ int main(int argc, char *argv[])
     printf("Memory manager tests:\n");
     test_mem_init();
     test_mem_init_null();
+    test_mem_init_unalignable_buffer();
+    test_mem_alloc_null();
     test_mem_alloc_fast();
     test_mem_alloc_fast_oom();
     test_mem_alloc_slow();
     test_mem_alloc_slow_oom();
+    test_mem_alloc_alignment_overflow();
     test_mem_bad_index();
     test_mem_reset();
     test_mem_load();

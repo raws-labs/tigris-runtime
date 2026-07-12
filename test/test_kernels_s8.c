@@ -68,7 +68,7 @@ static int32_t test_shapes[MAX_SHAPES];
 static uint16_t test_indices[MAX_INDICES];
 static char test_strings[MAX_STRINGS];
 static tigris_weight_entry_t test_weight_entries[MAX_WEIGHTS];
-static uint8_t test_weight_blob[MAX_WEIGHT_BLOB];
+static _Alignas(int32_t) uint8_t test_weight_blob[MAX_WEIGHT_BLOB];
 static tigris_quant_param_t test_qp[MAX_QP];
 static int32_t test_qd[MAX_QD];
 
@@ -282,6 +282,98 @@ static void test_relu6_s8(void)
     TEST_ASSERT_EQ(out[1], 0, "relu6(0) = 0");
     TEST_ASSERT_EQ(out[2], 30, "relu6(30) = 30 (in range)");
     TEST_ASSERT_EQ(out[3], 60, "relu6(80) = 60 (clamped)");
+}
+
+static void test_binary_s8_contract(void)
+{
+    printf("  test_binary_s8_contract...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    int32_t shape[] = {1, 4};
+    uint16_t t_a = add_tensor(&plan, "a", shape, 2, 3, 4, qp);
+    uint16_t t_b = add_tensor(&plan, "b", shape, 2, 3, 4, qp);
+    uint16_t t_y = add_tensor(&plan, "y", shape, 2, 3, 4, qp);
+
+    uint16_t inputs[] = {t_a, t_b};
+    uint16_t outputs[] = {t_y};
+    test_ops[0].op_type = TIGRIS_OP_ADD;
+    test_ops[0].num_inputs = 2;
+    test_ops[0].num_outputs = 1;
+    test_ops[0].inputs_off = add_indices(inputs, 2);
+    test_ops[0].outputs_off = add_indices(outputs, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[1024], slow[1024];
+    tigris_mem_t mem;
+    tigris_mem_init(
+        &mem, ptrs, test_header.num_tensors,
+        fast, sizeof(fast), slow, sizeof(slow));
+    const int8_t a[] = {1, 2, 3, 4};
+    const int8_t b[] = {2, -1, 3, 0};
+    tigris_mem_alloc_fast(&mem, t_a, sizeof(a));
+    memcpy(ptrs[t_a], a, sizeof(a));
+    tigris_mem_alloc_fast(&mem, t_b, sizeof(b));
+    memcpy(ptrs[t_b], b, sizeof(b));
+    tigris_mem_alloc_fast(&mem, t_y, sizeof(a));
+
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(
+                       &plan, &test_ops[0], 0, &mem, NULL),
+                   0, "two-dynamic-input Add remains supported");
+    const int8_t add_expected[] = {3, 1, 6, 4};
+    TEST_ASSERT(memcmp(ptrs[t_y], add_expected, sizeof(add_expected)) == 0,
+                "two-dynamic-input Add output");
+
+    test_ops[0].op_type = TIGRIS_OP_MUL;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(
+                       &plan, &test_ops[0], 0, &mem, NULL),
+                   0, "two-dynamic-input Mul remains supported");
+    const int8_t mul_expected[] = {2, -2, 9, 0};
+    TEST_ASSERT(memcmp(ptrs[t_y], mul_expected, sizeof(mul_expected)) == 0,
+                "two-dynamic-input Mul output");
+
+    /* Equal byte counts are insufficient: general dynamic broadcasting is
+     * not implemented, so logical shapes must match exactly. */
+    uint16_t y_shape_off = test_tensors[t_y].shape_off;
+    test_shapes[y_shape_off] = 2;
+    test_shapes[y_shape_off + 1] = 2;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(
+                       &plan, &test_ops[0], 0, &mem, NULL),
+                   -1, "same-size differently-shaped dynamic output rejected");
+    test_shapes[y_shape_off] = 1;
+    test_shapes[y_shape_off + 1] = 4;
+
+    test_ops[0].weight_idx = 0;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(
+                       &plan, &test_ops[0], 0, &mem, NULL),
+                   -1, "ambiguous dynamic inputs plus weight rejected");
+
+    /* Compiler one-input + weight encoding must fail before ins[1] is read:
+     * the weight entry carries bytes but no constant quant scale/zero point. */
+    const int8_t constant[] = {1, 1, 1, 1};
+    test_ops[0].weight_idx = add_weight(
+        constant, (uint32_t)sizeof(constant), "constant");
+    test_ops[0].num_inputs = 1;
+    test_indices[1] = t_y;
+    test_ops[0].outputs_off = 1;
+    test_ops[0].op_type = TIGRIS_OP_ADD;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(
+                       &plan, &test_ops[0], 0, &mem, NULL),
+                   -1, "quantized constant Add fails closed");
+    test_ops[0].op_type = TIGRIS_OP_MUL;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(
+                       &plan, &test_ops[0], 0, &mem, NULL),
+                   -1, "quantized constant Mul fails closed");
+
+    test_ops[0].num_inputs = 3;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(
+                       &plan, &test_ops[0], 0, &mem, NULL),
+                   -1, "unsupported quantized binary arity rejected");
 }
 
 static void test_reshape_s8(void)
@@ -548,6 +640,10 @@ static void test_fc_s8(void)
 
     build_plan(&plan);
 
+    TEST_ASSERT(((uintptr_t)tigris_op_bias(&plan, &test_ops[0]) %
+                 _Alignof(int32_t)) != 0,
+                "FC bias fixture is deliberately unaligned");
+
     void *ptrs[MAX_TENSORS];
     uint8_t fast[4096], slow_buf[4096];
     tigris_mem_t mem;
@@ -791,6 +887,7 @@ int main(void)
     test_relu_s8();
     test_relu6_s8();
     test_relu6_s8_rounds_ceiling();
+    test_binary_s8_contract();
     test_reshape_s8();
     test_conv2d_s8_per_tensor();
     test_conv2d_s8_v2();

@@ -996,6 +996,198 @@ static void test_mul(void)
         TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "mul output");
 }
 
+typedef struct {
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[2];
+    tigris_op_t op;
+    int32_t shapes[8];
+    uint16_t indices[2];
+    tigris_weight_entry_t weight;
+    uint8_t weight_blob[1 + 4 * sizeof(float)];
+    tigris_plan_t plan;
+    tigris_mem_t mem;
+    void *ptrs[2];
+    float input[4];
+    float output[4];
+} const_binary_fixture_t;
+
+static void init_const_binary_fixture(
+    const_binary_fixture_t *fx, tigris_op_type_t op_type,
+    const float *constant, uint32_t constant_bytes)
+{
+    memset(fx, 0, sizeof(*fx));
+
+    const int32_t shape[4] = {1, 2, 2, 1};
+    const float input[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    fx->header.num_tensors = 2;
+    fx->header.num_ops = 1;
+    fx->header.num_weights = 1;
+    memcpy(fx->shapes, shape, sizeof(shape));
+    memcpy(fx->shapes + 4, shape, sizeof(shape));
+    memcpy(fx->input, input, sizeof(input));
+    for (int i = 0; i < 4; i++)
+        fx->output[i] = -123.0f;
+
+    for (int i = 0; i < 2; i++) {
+        fx->tensors[i].shape_off = (uint16_t)(i * 4);
+        fx->tensors[i].ndim = 4;
+        fx->tensors[i].dtype = 1; /* ONNX FLOAT */
+        fx->tensors[i].size_bytes = sizeof(fx->input);
+        fx->tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+
+    /* Compiler encoding: the dynamic input is the only tensor input; the
+     * constant is raw float32 bytes selected through weight_idx. Offset it by
+     * one byte to verify that packed, unaligned weight blobs are safe. */
+    fx->indices[0] = 0;
+    fx->indices[1] = 1;
+    fx->op.op_type = (uint8_t)op_type;
+    fx->op.num_inputs = 1;
+    fx->op.num_outputs = 1;
+    fx->op.inputs_off = 0;
+    fx->op.outputs_off = 1;
+    fx->op.weight_idx = 0;
+    fx->op.bias_idx = TIGRIS_NO_WEIGHT;
+    fx->weight.offset = 1;
+    fx->weight.size_bytes = constant_bytes;
+    memcpy(fx->weight_blob + 1, constant, constant_bytes);
+
+    fx->plan.header = &fx->header;
+    fx->plan.tensors = fx->tensors;
+    fx->plan.ops = &fx->op;
+    fx->plan.index_pool = fx->indices;
+    fx->plan.shape_pool = fx->shapes;
+    fx->plan.weight_entries = &fx->weight;
+    fx->plan.weight_blob = fx->weight_blob;
+
+    fx->ptrs[0] = fx->input;
+    fx->ptrs[1] = fx->output;
+    fx->mem.tensor_ptrs = fx->ptrs;
+    fx->mem.num_tensors = 2;
+}
+
+static void assert_f32_array(
+    const float *actual, const float *expected, const char *message)
+{
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(actual[i], expected[i], EPS, message);
+}
+
+static void test_constant_binary_f32(void)
+{
+    printf("  test_constant_binary_f32...\n");
+
+    const_binary_fixture_t fx;
+    float scalar = 2.0f;
+    const float exact[4] = {10.0f, 0.5f, -1.0f, 2.0f};
+    const float add_scalar_expected[4] = {3.0f, 4.0f, 5.0f, 6.0f};
+    const float mul_scalar_expected[4] = {2.0f, 4.0f, 6.0f, 8.0f};
+    const float add_exact_expected[4] = {11.0f, 2.5f, 2.0f, 6.0f};
+    const float mul_exact_expected[4] = {10.0f, 1.0f, -3.0f, 8.0f};
+
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_ADD, &scalar, (uint32_t)sizeof(scalar));
+    TEST_ASSERT(((uintptr_t)tigris_op_weight(&fx.plan, &fx.op) %
+                 _Alignof(float)) != 0,
+                "constant fixture is deliberately unaligned");
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == 0,
+                "scalar constant Add succeeds");
+    assert_f32_array(fx.output, add_scalar_expected,
+                     "scalar constant Add output");
+
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_MUL, &scalar, (uint32_t)sizeof(scalar));
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == 0,
+                "scalar constant Mul succeeds");
+    assert_f32_array(fx.output, mul_scalar_expected,
+                     "scalar constant Mul output");
+
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_ADD, exact, (uint32_t)sizeof(exact));
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == 0,
+                "exact constant Add succeeds");
+    assert_f32_array(fx.output, add_exact_expected,
+                     "exact constant Add output");
+
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_MUL, exact, (uint32_t)sizeof(exact));
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == 0,
+                "exact constant Mul succeeds");
+    assert_f32_array(fx.output, mul_exact_expected,
+                     "exact constant Mul output");
+
+    /* Scalar broadcast remains well-defined during tiling. */
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_ADD, &scalar, (uint32_t)sizeof(scalar));
+    fx.mem.tile.active = 1;
+    fx.mem.tile.out_h = 2;
+    fx.mem.tile.out_w = 2;
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == 0,
+                "scalar constant Add supports a tile");
+    assert_f32_array(fx.output, add_scalar_expected,
+                     "tiled scalar constant Add output");
+}
+
+static void test_malformed_constant_binary_f32(void)
+{
+    printf("  test_malformed_constant_binary_f32...\n");
+
+    const_binary_fixture_t fx;
+    const float partial[2] = {2.0f, 3.0f};
+    const float exact[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_ADD, partial, (uint32_t)sizeof(partial));
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == -1,
+                "non-scalar non-exact constant is rejected");
+
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_ADD, exact, (uint32_t)sizeof(exact));
+    fx.mem.tile.active = 1;
+    fx.mem.tile.out_h = 1;
+    fx.mem.tile.out_w = 2;
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == -1,
+                "exact constant without a tile offset is rejected");
+
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_MUL, exact, (uint32_t)sizeof(exact));
+    fx.op.weight_idx = TIGRIS_NO_WEIGHT;
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == -1,
+                "one-input Mul without a constant is rejected");
+
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_ADD, exact, (uint32_t)sizeof(exact));
+    fx.op.weight_idx = 1;
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == -1,
+                "out-of-range constant index is rejected");
+
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_ADD, exact, (uint32_t)sizeof(exact));
+    fx.shapes[4] = 2;
+    fx.shapes[5] = 2;
+    fx.shapes[6] = 1;
+    fx.shapes[7] = 1;
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == -1,
+                "same-byte-count output with a different shape is rejected");
+
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_MUL, exact, (uint32_t)sizeof(exact));
+    fx.op.num_inputs = 3;
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == -1,
+                "unsupported binary arity is rejected before index access");
+}
+
 /* Unsupported op type test */
 
 static void test_unsupported_op(void)
@@ -1039,6 +1231,8 @@ int main(void)
     test_resize_nearest();
     test_sigmoid();
     test_mul();
+    test_constant_binary_f32();
+    test_malformed_constant_binary_f32();
     test_unsupported_op();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

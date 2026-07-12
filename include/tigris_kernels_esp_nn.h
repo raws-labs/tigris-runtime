@@ -23,20 +23,23 @@ extern "C" {
 #endif
 
 /**
- * Pre-allocate ESP-NN scratch buffers from the arena.
+ * Prepare platform-managed ESP-NN workspace.
  *
  * Scans all ops in the plan to compute maximum scratch, depthwise output,
- * and asymmetric-padding buffer sizes.  Carves them from the top of
- * mem->fast_size (shrinking the available arena) so that no heap allocation
- * occurs during inference.
+ * and asymmetric-padding buffer sizes. On ESP-IDF it obtains aligned PSRAM
+ * workspace and may use otherwise-free internal SRAM for faster Conv scratch.
+ * The supplied TiGrIS fast arena is not reduced. Missing optional workspace
+ * causes the affected op to fall back to s8_ref rather than changing its
+ * semantics, and no workspace allocation occurs inside tigris_run().
  *
  * Must be called ONCE after tigris_mem_init() and before tigris_run().
- * The reduced fast_size persists across tigris_mem_init() re-inits as long
- * as they use the already-reduced mem->fast_size value.
+ * Workspace is held in process-lifetime adapter state; the current API has no
+ * deinitialization or repeat-prepare ownership contract.
  *
  * @param plan  Loaded plan (read-only, used to scan op shapes).
- * @param mem   Memory manager (fast_size is reduced in place).
- * @return 0 on success, -1 if the arena is too small.
+ * @param mem   Initialized memory manager (read-only sizing input).
+ * @return 0 after a valid scan/setup, or -1 for invalid/overflowing metadata
+ *         or an unavailable mandatory depthwise output buffer.
  */
 int tigris_esp_nn_prepare(
     const tigris_plan_t *plan,
@@ -50,14 +53,16 @@ void tigris_esp_nn_print_conv_stats(void);
 /**
  * ESP-NN accelerated int8 kernel dispatch - concrete tigris_kernel_fn.
  *
- * Supported ops: Conv, DepthwiseConv, FullyConnected, AvgPool/GlobalAvg, Add.
- * All others fall back to tigris_dispatch_kernel_s8().
+ * Supported ops: unit-dilation Conv/DepthwiseConv, FullyConnected, compatible-
+ * quantization AveragePool, and Add. Conv/DepthwiseConv with non-unit dilation,
+ * tiled or requantizing AveragePool, GlobalAveragePool, and other unsupported
+ * ops fall back to tigris_dispatch_kernel_s8().
  *
  * @param plan      Loaded plan (read-only).
  * @param op        Current operator descriptor.
  * @param op_index  Global index of the op in plan->ops[].
  * @param mem       Memory manager with tensor pointers set.
- * @param user_ctx  Unused (may be NULL).
+ * @param user_ctx  Forwarded to s8_ref when a fallback route is selected.
  * @return 0 on success, -1 on unsupported op type.
  */
 int tigris_dispatch_kernel_esp_nn(

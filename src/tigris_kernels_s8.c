@@ -11,6 +11,7 @@
  */
 
 #include "tigris_kernels_s8.h"
+#include "tigris_accel_policy.h"
 
 #include <math.h>
 #include <string.h>
@@ -31,6 +32,14 @@ static inline int8_t clamp_act(int32_t x, int8_t act_min, int8_t act_max)
     if (x < act_min) return act_min;
     if (x > act_max) return act_max;
     return (int8_t)x;
+}
+
+/** Load a possibly unaligned int32 bias value from the packed weight blob. */
+static inline int32_t load_bias_s32(const uint8_t *bias, uint32_t index)
+{
+    int32_t value;
+    memcpy(&value, bias + (size_t)index * sizeof(value), sizeof(value));
+    return value;
 }
 
 /* gemmlowp SaturatingRoundingDoublingHighMul - the high 32 bits of 2*a*b with
@@ -81,6 +90,30 @@ static inline void compute_quant_mult(double scale, int32_t *mult, int *shift)
     *shift = e;
 }
 
+/** Fold a positive sample count into a quantized scale for a mean. */
+static inline void compute_mean_quant_mult(
+    double scale, int32_t count, int32_t *mult, int *shift)
+{
+    compute_quant_mult(scale, mult, shift);
+    if (count > 1) {
+        int s = 63 - __builtin_clzll((unsigned long long)count);
+        if (s > 32) s = 32;
+        int max_s = 31 + *shift;
+        if (max_s < 0) max_s = 0;
+        if (s > max_s) s = max_s;
+        *mult = (int32_t)(((int64_t)*mult << s) / count);
+        *shift -= s;
+    }
+}
+
+/** Vendor/TFLite AveragePool rounding: nearest, with exact ties away from 0. */
+static inline int32_t round_divide_away_from_zero(int32_t value, int32_t divisor)
+{
+    int32_t half = divisor / 2;
+    return value > 0 ? (value + half) / divisor
+                     : (value - half) / divisor;
+}
+
 /** Get multiplier from quant data (works for both per-tensor and per-channel). */
 static inline int32_t get_multiplier(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
@@ -119,6 +152,51 @@ static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
            (uint32_t)mem->tile.out_w * (uint32_t)shape[3];
 }
 
+/** Validate exact-shape, two-dynamic-input int8 elementwise operands. */
+static int binary_s8_io_is_valid(
+    const tigris_plan_t *plan, const tigris_op_t *op, const tigris_mem_t *mem)
+{
+    if (!plan || !op || !mem || !plan->header || !plan->tensors ||
+        !plan->index_pool || !plan->shape_pool || !mem->tensor_ptrs ||
+        op->num_inputs != 2 || op->num_outputs != 1 ||
+        op->weight_idx != TIGRIS_NO_WEIGHT ||
+        op->bias_idx != TIGRIS_NO_WEIGHT)
+        return 0;
+
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    uint16_t indices[3] = {ins[0], ins[1], outs[0]};
+    for (uint8_t i = 0; i < 3; i++) {
+        if (indices[i] >= plan->header->num_tensors ||
+            indices[i] >= mem->num_tensors ||
+            !tigris_mem_tensor_ptr(mem, indices[i]))
+            return 0;
+    }
+
+    const tigris_tensor_t *a = &plan->tensors[indices[0]];
+    const tigris_tensor_t *b = &plan->tensors[indices[1]];
+    const tigris_tensor_t *y = &plan->tensors[indices[2]];
+    if (a->dtype != 3 || b->dtype != 3 || y->dtype != 3 ||
+        a->ndim != b->ndim || a->ndim != y->ndim ||
+        a->size_bytes != b->size_bytes || a->size_bytes != y->size_bytes ||
+        (mem->tile.active && a->ndim != 4))
+        return 0;
+
+    uint64_t numel = 1;
+    const int32_t *a_shape = tigris_tensor_shape(plan, a);
+    const int32_t *b_shape = tigris_tensor_shape(plan, b);
+    const int32_t *y_shape = tigris_tensor_shape(plan, y);
+    for (uint8_t i = 0; i < a->ndim; i++) {
+        if (a_shape[i] <= 0 || a_shape[i] != b_shape[i] ||
+            a_shape[i] != y_shape[i])
+            return 0;
+        numel *= (uint32_t)a_shape[i];
+        if (numel > UINT32_MAX)
+            return 0;
+    }
+    return (uint32_t)numel == a->size_bytes;
+}
+
 /* Int8 Kernels */
 
 static int kern_conv2d_s8(
@@ -130,7 +208,7 @@ static int kern_conv2d_s8(
     const int8_t  *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t        *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
     const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
-    const int32_t *B = (const int32_t *)tigris_op_bias(plan, op);
+    const uint8_t *B = (const uint8_t *)tigris_op_bias(plan, op);
 
     const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
@@ -177,7 +255,7 @@ static int kern_conv2d_s8(
         for (int oh = 0; oh < OH; oh++) {
             for (int ow = 0; ow < OW; ow++) {
                 for (int oc = 0; oc < OC; oc++) {
-                    int32_t acc = B ? B[oc] : 0;
+                    int32_t acc = B ? load_bias_s32(B, (uint32_t)oc) : 0;
                     for (int kh = 0; kh < KH; kh++) {
                         int ih = oh * SH - PT + kh * DH;
                         if (ih < 0 || ih >= IH) continue;
@@ -217,7 +295,7 @@ static int kern_conv1d_s8(
     const int8_t  *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t        *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
     const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
-    const int32_t *B = (const int32_t *)tigris_op_bias(plan, op);
+    const uint8_t *B = (const uint8_t *)tigris_op_bias(plan, op);
 
     const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
@@ -241,7 +319,7 @@ static int kern_conv1d_s8(
     for (int n = 0; n < N; n++) {
         for (int ot = 0; ot < OT; ot++) {
             for (int oc = 0; oc < OC; oc++) {
-                int32_t acc = B ? B[oc] : 0;
+                int32_t acc = B ? load_bias_s32(B, (uint32_t)oc) : 0;
                 for (int k = 0; k < K; k++) {
                     int it = ot * S - PB + k * D;
                     if (it < 0 || it >= IT) continue;
@@ -271,7 +349,7 @@ static int kern_depthwise_conv2d_s8(
     const int8_t  *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t        *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
     const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
-    const int32_t *B = (const int32_t *)tigris_op_bias(plan, op);
+    const uint8_t *B = (const uint8_t *)tigris_op_bias(plan, op);
 
     const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
@@ -309,7 +387,7 @@ static int kern_depthwise_conv2d_s8(
         for (int oh = 0; oh < OH; oh++) {
             for (int ow = 0; ow < OW; ow++) {
                 for (int c = 0; c < C; c++) {
-                    int32_t acc = B ? B[c] : 0;
+                    int32_t acc = B ? load_bias_s32(B, (uint32_t)c) : 0;
                     for (int kh = 0; kh < KH; kh++) {
                         int ih = oh * SH - PT + kh * DH;
                         if (ih < 0 || ih >= IH) continue;
@@ -342,7 +420,7 @@ static int kern_fully_connected_s8(
     const int8_t  *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t        *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
     const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
-    const int32_t *B = (const int32_t *)tigris_op_bias(plan, op);
+    const uint8_t *B = (const uint8_t *)tigris_op_bias(plan, op);
 
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
 
@@ -367,7 +445,7 @@ static int kern_fully_connected_s8(
     /* Compute: [N, OC] */
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
-            int32_t acc = B ? B[oc] : 0;
+            int32_t acc = B ? load_bias_s32(B, (uint32_t)oc) : 0;
             for (int ic = 0; ic < IC; ic++) {
                 int32_t x_val = (int32_t)X[n * IC + ic] - input_zp;
                 int32_t w_val = (int32_t)W[oc * IC + ic];
@@ -435,6 +513,12 @@ static int kern_relu6_s8(
 static int kern_add_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
+    /* Constants are absent from the tensor/quant tables in the current wire
+     * format. Without their scale and zero point, one-input + weight_idx Add
+     * cannot be interpreted safely, so fail closed before reading ins[1]. */
+    if (!binary_s8_io_is_valid(plan, op, mem))
+        return -1;
+
     const uint16_t *ins  = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
 
@@ -518,14 +602,8 @@ static int kern_global_avg_pool_s8(
      *   - per channel: MBQM(Σx - in_zp*HW, mult, shift) + out_zp */
     int32_t mult;
     int shift0;
-    compute_quant_mult((double)in_scale / (double)out_scale, &mult, &shift0);
-    if (HW > 1) {
-        int s = 63 - __builtin_clzll((unsigned long long)HW);
-        if (s > 32) s = 32;
-        if (s > 31 + shift0) s = 31 + shift0;
-        mult = (int32_t)(((int64_t)mult << s) / HW);
-        shift0 -= s;
-    }
+    compute_mean_quant_mult(
+        (double)in_scale / (double)out_scale, HW, &mult, &shift0);
 
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
@@ -540,6 +618,122 @@ static int kern_global_avg_pool_s8(
             int32_t shifted = sum - input_zp * HW;
             int32_t q = multiply_by_quantized_multiplier(shifted, mult, shift0) + output_zp;
             Y[n * C + c] = clamp_s8(q);
+        }
+    }
+    return 0;
+}
+
+static int kern_avg_pool_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+
+    const int32_t *x_shape =
+        tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    const int32_t *y_shape =
+        tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+
+    const tigris_quant_param_t *in_qp =
+        tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    const tigris_quant_param_t *out_qp =
+        tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    int32_t input_zp = in_qp ? in_qp->zero_point : 0;
+    int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+    float in_scale = in_qp ? in_qp->scale : 1.0f;
+    float out_scale = out_qp ? out_qp->scale : 1.0f;
+    if (!(in_scale > 0.0f))
+        in_scale = 1.0f;
+    if (!(out_scale > 0.0f)) {
+        out_scale = in_scale;
+        output_zp = input_zp;
+    }
+    int same_quant = in_scale == out_scale && input_zp == output_zp;
+
+    int N  = x_shape[0];
+    int IH = x_shape[1];
+    int IW = x_shape[2];
+    int C  = x_shape[3];
+    int OH = y_shape[1];
+    int OW = y_shape[2];
+    int KH = op->spatial.kernel_h;
+    int KW = op->spatial.kernel_w;
+    int SH = op->spatial.stride_h ? op->spatial.stride_h : 1;
+    int SW = op->spatial.stride_w ? op->spatial.stride_w : 1;
+    int PT = op->spatial.pad_top;
+    int PL = op->spatial.pad_left;
+
+    if (mem->tile.active) {
+        IH = mem->tile.in_h;
+        OH = mem->tile.out_h;
+        IW = mem->tile.in_w;
+        OW = mem->tile.out_w;
+        PT = mem->tile.pad_top;
+    }
+    if (KH <= 0 || KW <= 0)
+        return -1;
+
+    /* ONNX AveragePool defaults count_include_pad=0, the only mode representable
+     * by the current schema. Both ESP-NN and CMSIS-NN use the same valid-sample
+     * divisor. */
+    for (int n = 0; n < N; n++) {
+        for (int oh = 0; oh < OH; oh++) {
+            int ih_base = oh * SH - PT;
+            int kh_start = ih_base < 0 ? -ih_base : 0;
+            int kh_end = KH;
+            if (ih_base + kh_end > IH)
+                kh_end = IH - ih_base;
+
+            for (int ow = 0; ow < OW; ow++) {
+                int iw_base = ow * SW - PL;
+                int kw_start = iw_base < 0 ? -iw_base : 0;
+                int kw_end = KW;
+                if (iw_base + kw_end > IW)
+                    kw_end = IW - iw_base;
+
+                int32_t count = (kh_end - kh_start) * (kw_end - kw_start);
+                if (count <= 0)
+                    return -1;
+
+                for (int c = 0; c < C; c++) {
+                    int32_t sum = 0;
+                    for (int kh = kh_start; kh < kh_end; kh++) {
+                        int ih = ih_base + kh;
+                        for (int kw = kw_start; kw < kw_end; kw++) {
+                            int iw = iw_base + kw;
+                            sum += X[((n * IH + ih) * IW + iw) * C + c];
+                        }
+                    }
+
+                    int32_t q;
+                    if (same_quant) {
+                        q = round_divide_away_from_zero(sum, count);
+                    } else {
+                        /* TFLite rejects mismatched input/output quantization
+                         * for int8 AveragePool, so there is no canonical
+                         * integer-kernel result for this extension. Define it
+                         * as dequantize -> valid-sample mean -> requantize,
+                         * using round() so half ties follow the away-from-zero
+                         * convention of the native ESP/CMSIS pool kernels. */
+                        int32_t centered = sum - input_zp * count;
+                        double scaled =
+                            ((double)centered * (double)in_scale) /
+                            ((double)count * (double)out_scale);
+                        double quantized = round(scaled) + (double)output_zp;
+                        if (quantized < (double)op->act_min)
+                            q = op->act_min;
+                        else if (quantized > (double)op->act_max)
+                            q = op->act_max;
+                        else
+                            q = (int32_t)quantized;
+                    }
+                    Y[((n * OH + oh) * OW + ow) * C + c] =
+                        clamp_act(q, op->act_min, op->act_max);
+                }
+            }
         }
     }
     return 0;
@@ -803,6 +997,10 @@ static int kern_tanh_s8(
 static int kern_mul_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
+    /* See kern_add_s8: constant quantization is not recoverable from weight_idx. */
+    if (!binary_s8_io_is_valid(plan, op, mem))
+        return -1;
+
     const uint16_t *ins  = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
 
@@ -853,6 +1051,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_RELU6:       return kern_relu6_s8(plan, op, mem);
     case TIGRIS_OP_ADD:         return kern_add_s8(plan, op, mem);
     case TIGRIS_OP_GLOBAL_AVG:  return kern_global_avg_pool_s8(plan, op, mem);
+    case TIGRIS_OP_AVG_POOL:     return kern_avg_pool_s8(plan, op, mem);
     case TIGRIS_OP_RESHAPE:     return kern_reshape_s8(plan, op, mem);
     case TIGRIS_OP_FLATTEN:     return kern_reshape_s8(plan, op, mem);
     case TIGRIS_OP_MAX_POOL:    return kern_max_pool_s8(plan, op, mem);
@@ -865,4 +1064,146 @@ int tigris_dispatch_kernel_s8(
     default:
         return -1;  /* unsupported op type */
     }
+}
+
+/* Optional accelerator pre-routing. This lives with s8_ref so integrations
+ * that enumerate the historical runtime sources explicitly do not need a new
+ * translation unit merely to use the fallback policy. */
+
+static uint16_t effective_dilation(uint16_t dilation)
+{
+    return dilation ? dilation : 1u;
+}
+
+static int is_conv_or_depthwise(const tigris_op_t *op)
+{
+    return op && (op->op_type == TIGRIS_OP_CONV ||
+                  op->op_type == TIGRIS_OP_DEPTHWISE);
+}
+
+static int cmsis_tiled_spatial_uses_reference(const tigris_op_t *op)
+{
+    if (!op)
+        return 0;
+
+    switch ((tigris_op_type_t)op->op_type) {
+    case TIGRIS_OP_CONV:
+    case TIGRIS_OP_DEPTHWISE:
+    case TIGRIS_OP_AVG_POOL:
+    case TIGRIS_OP_GLOBAL_AVG:
+    case TIGRIS_OP_MAX_POOL:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int pool_quantization_is_compatible(
+    const tigris_plan_t *plan, const tigris_op_t *op)
+{
+    if (!op || (op->op_type != TIGRIS_OP_AVG_POOL &&
+                op->op_type != TIGRIS_OP_GLOBAL_AVG))
+        return 1;
+    if (!plan)
+        return 0;
+
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const tigris_quant_param_t *in_qp =
+        tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    const tigris_quant_param_t *out_qp =
+        tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    float in_scale = in_qp ? in_qp->scale : 1.0f;
+    float out_scale = out_qp ? out_qp->scale : 1.0f;
+    int32_t in_zp = in_qp ? in_qp->zero_point : 0;
+    int32_t out_zp = out_qp ? out_qp->zero_point : 0;
+
+    return in_scale > 0.0f && out_scale > 0.0f &&
+           in_scale == out_scale && in_zp == out_zp;
+}
+
+int tigris_accel_esp_pad_workspace_fits(
+    int32_t input_h,
+    int32_t input_w,
+    int32_t input_c,
+    uint16_t pad_top,
+    uint16_t pad_bottom,
+    uint16_t pad_left,
+    uint16_t pad_right,
+    uint32_t workspace_bytes,
+    uint32_t *required_bytes)
+{
+    if (required_bytes)
+        *required_bytes = 0;
+    if (input_h <= 0 || input_w <= 0 || input_c <= 0)
+        return 0;
+
+    uint64_t padded_h = (uint64_t)(uint32_t)input_h +
+                        pad_top + pad_bottom;
+    uint64_t padded_w = (uint64_t)(uint32_t)input_w +
+                        pad_left + pad_right;
+    if (padded_h > INT32_MAX || padded_w > INT32_MAX ||
+        padded_h > UINT32_MAX / padded_w)
+        return 0;
+    uint64_t area = padded_h * padded_w;
+    if (area > UINT32_MAX / (uint32_t)input_c)
+        return 0;
+    uint64_t needed = area * (uint32_t)input_c;
+
+    if (required_bytes)
+        *required_bytes = (uint32_t)needed;
+    return needed <= workspace_bytes;
+}
+
+tigris_accel_route_t tigris_accel_pre_route(
+    tigris_accel_backend_t backend,
+    const tigris_plan_t   *plan,
+    const tigris_op_t     *op,
+    int                    tile_active)
+{
+    if (backend == TIGRIS_ACCEL_CMSIS_NN && tile_active &&
+        cmsis_tiled_spatial_uses_reference(op))
+        return TIGRIS_ACCEL_ROUTE_S8_REF;
+
+    if (backend == TIGRIS_ACCEL_ESP_NN && tile_active && op &&
+        op->op_type == TIGRIS_OP_AVG_POOL)
+        return TIGRIS_ACCEL_ROUTE_S8_REF;
+
+    if ((backend == TIGRIS_ACCEL_ESP_NN ||
+         backend == TIGRIS_ACCEL_CMSIS_NN) &&
+        !pool_quantization_is_compatible(plan, op))
+        return TIGRIS_ACCEL_ROUTE_S8_REF;
+
+    if (backend == TIGRIS_ACCEL_ESP_NN && op &&
+        op->op_type == TIGRIS_OP_GLOBAL_AVG)
+        return TIGRIS_ACCEL_ROUTE_S8_REF;
+
+    if (backend == TIGRIS_ACCEL_ESP_NN && is_conv_or_depthwise(op) &&
+        (effective_dilation(op->spatial.dilation_h) != 1u ||
+         effective_dilation(op->spatial.dilation_w) != 1u))
+        return TIGRIS_ACCEL_ROUTE_S8_REF;
+
+    return TIGRIS_ACCEL_ROUTE_ADAPTER;
+}
+
+int tigris_accel_try_s8_ref(
+    tigris_accel_backend_t backend,
+    const tigris_plan_t   *plan,
+    const tigris_op_t     *op,
+    uint16_t               op_index,
+    tigris_mem_t          *mem,
+    void                  *user_ctx,
+    int                   *handled)
+{
+    if (!plan || !op || !mem || !handled)
+        return -1;
+
+    *handled = tigris_accel_pre_route(
+                   backend, plan, op, mem->tile.active) ==
+               TIGRIS_ACCEL_ROUTE_S8_REF;
+    if (!*handled)
+        return 0;
+
+    return tigris_dispatch_kernel_s8(
+        plan, op, op_index, mem, user_ctx);
 }

@@ -23,6 +23,10 @@ extern "C" {
 
 /**
  * Reference int8 quantized kernel dispatch - concrete tigris_kernel_fn.
+ * AveragePool excludes padded cells. With identical input/output quantization
+ * it follows ESP-NN/CMSIS-NN half-away-from-zero rounding; mismatched
+ * quantization is explicitly dequantized and requantized with the same tie
+ * direction.
  *
  * @param plan      Loaded plan (read-only).
  * @param op        Current operator descriptor.

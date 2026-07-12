@@ -38,6 +38,57 @@ static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
            (uint32_t)mem->tile.out_w * (uint32_t)shape[3];
 }
 
+/** True when two tensor descriptors have the same logical shape. */
+static int tensor_shapes_equal(
+    const tigris_plan_t *plan,
+    const tigris_tensor_t *a,
+    const tigris_tensor_t *b)
+{
+    if (a->ndim != b->ndim)
+        return 0;
+    if (a->ndim == 0)
+        return 1;
+
+    const int32_t *a_shape = tigris_tensor_shape(plan, a);
+    const int32_t *b_shape = tigris_tensor_shape(plan, b);
+    for (uint8_t i = 0; i < a->ndim; i++) {
+        if (a_shape[i] != b_shape[i])
+            return 0;
+    }
+    return 1;
+}
+
+/** Validate that a tensor's shape describes exactly its float32 byte size. */
+static int tensor_is_f32(const tigris_plan_t *plan, const tigris_tensor_t *t)
+{
+    /* ONNX TensorProto.DataType.FLOAT == 1. */
+    if (!plan || !t || t->dtype != 1)
+        return 0;
+
+    uint64_t numel = 1;
+    if (t->ndim > 0) {
+        const int32_t *shape = tigris_tensor_shape(plan, t);
+        if (!shape)
+            return 0;
+        for (uint8_t i = 0; i < t->ndim; i++) {
+            if (shape[i] <= 0)
+                return 0;
+            numel *= (uint32_t)shape[i];
+            if (numel > UINT32_MAX / sizeof(float))
+                return 0;
+        }
+    }
+    return (uint32_t)(numel * sizeof(float)) == t->size_bytes;
+}
+
+/** Load float32 weight data without assuming the packed blob is aligned. */
+static float load_weight_f32(const uint8_t *data, uint32_t index)
+{
+    float value;
+    memcpy(&value, data + (size_t)index * sizeof(value), sizeof(value));
+    return value;
+}
+
 /** Apply fused activation (float). */
 static inline float apply_fused_act_f32(float v, uint8_t fused_act)
 {
@@ -280,32 +331,106 @@ static int kern_conv1d(
     return 0;
 }
 
+static int kern_binary_f32(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem,
+    int multiply)
+{
+    if (!plan || !op || !mem || !plan->header || !plan->tensors ||
+        !plan->index_pool || !plan->shape_pool || !mem->tensor_ptrs ||
+        op->num_outputs != 1 ||
+        (op->num_inputs != 1 && op->num_inputs != 2))
+        return -1;
+
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    uint16_t a_idx = ins[0];
+    uint16_t y_idx = outs[0];
+    if (a_idx >= plan->header->num_tensors ||
+        y_idx >= plan->header->num_tensors ||
+        a_idx >= mem->num_tensors || y_idx >= mem->num_tensors)
+        return -1;
+
+    const tigris_tensor_t *a_tensor = &plan->tensors[a_idx];
+    const tigris_tensor_t *y_tensor = &plan->tensors[y_idx];
+    if (!tensor_is_f32(plan, a_tensor) ||
+        !tensor_is_f32(plan, y_tensor) ||
+        !tensor_shapes_equal(plan, a_tensor, y_tensor))
+        return -1;
+    if (mem->tile.active && a_tensor->ndim != 4)
+        return -1;
+
+    const float *A = (const float *)tigris_mem_tensor_ptr(mem, a_idx);
+    float *Y = (float *)tigris_mem_tensor_ptr(mem, y_idx);
+    if (!A || !Y)
+        return -1;
+
+    const float *dynamic_b = NULL;
+    const uint8_t *constant_b = NULL;
+    uint32_t constant_count = 0;
+
+    if (op->num_inputs == 2) {
+        /* Dynamic elementwise Add/Mul supports exact-shape operands only. */
+        if (op->weight_idx != TIGRIS_NO_WEIGHT ||
+            op->bias_idx != TIGRIS_NO_WEIGHT)
+            return -1;
+        uint16_t b_idx = ins[1];
+        if (b_idx >= plan->header->num_tensors || b_idx >= mem->num_tensors)
+            return -1;
+        const tigris_tensor_t *b_tensor = &plan->tensors[b_idx];
+        if (!tensor_is_f32(plan, b_tensor) ||
+            !tensor_shapes_equal(plan, a_tensor, b_tensor))
+            return -1;
+        dynamic_b = (const float *)tigris_mem_tensor_ptr(mem, b_idx);
+        if (!dynamic_b)
+            return -1;
+    } else {
+        /* The compiler omits constants from the tensor input list and stores
+         * the sole constant operand in weight_idx. The wire format has only a
+         * byte size, so scalar broadcast and exact-size elementwise constants
+         * are the only unambiguous cases. */
+        if (op->weight_idx == TIGRIS_NO_WEIGHT ||
+            op->weight_idx >= plan->header->num_weights ||
+            op->bias_idx != TIGRIS_NO_WEIGHT || !plan->weight_entries ||
+            !plan->weight_blob)
+            return -1;
+
+        const tigris_weight_entry_t *weight =
+            &plan->weight_entries[op->weight_idx];
+        if (weight->size_bytes == sizeof(float)) {
+            constant_count = 1;
+        } else if (weight->size_bytes == a_tensor->size_bytes &&
+                   !mem->tile.active) {
+            /* A full constant has no shape/tile-offset metadata. It is safe
+             * only for non-tiled exact-shape execution. */
+            constant_count = a_tensor->size_bytes / sizeof(float);
+        } else {
+            return -1;
+        }
+        constant_b = (const uint8_t *)tigris_op_weight(plan, op);
+        if (!constant_b)
+            return -1;
+    }
+
+    uint32_t n = tile_aware_numel(plan, a_idx, mem);
+    for (uint32_t i = 0; i < n; i++) {
+        float b = dynamic_b
+            ? dynamic_b[i]
+            : load_weight_f32(constant_b, constant_count == 1 ? 0 : i);
+        Y[i] = multiply ? A[i] * b : A[i] + b;
+    }
+    return 0;
+}
+
 static int kern_mul(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
-    const uint16_t *ins  = tigris_op_inputs(plan, op);
-    const uint16_t *outs = tigris_op_outputs(plan, op);
-    const float *A = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
-    const float *B = (const float *)tigris_mem_tensor_ptr(mem, ins[1]);
-    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
-    for (uint32_t i = 0; i < n; i++)
-        Y[i] = A[i] * B[i];
-    return 0;
+    return kern_binary_f32(plan, op, mem, 1);
 }
 
 static int kern_add(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
-    const uint16_t *ins  = tigris_op_inputs(plan, op);
-    const uint16_t *outs = tigris_op_outputs(plan, op);
-    const float *A = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
-    const float *B = (const float *)tigris_mem_tensor_ptr(mem, ins[1]);
-    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
-    for (uint32_t i = 0; i < n; i++)
-        Y[i] = A[i] + B[i];
-    return 0;
+    return kern_binary_f32(plan, op, mem, 0);
 }
 
 static int kern_global_avg_pool(

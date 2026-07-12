@@ -25,8 +25,11 @@ extern "C" {
 /**
  * CMSIS-NN accelerated int8 kernel dispatch - concrete tigris_kernel_fn.
  *
- * Supported ops: Conv, DepthwiseConv, FullyConnected, AvgPool/GlobalAvg.
- * All others fall back to tigris_dispatch_kernel_s8().
+ * Supported ops: Conv, DepthwiseConv, FullyConnected, and compatible-
+ * quantization AvgPool/GlobalAvg. The vendored generic Conv/Depthwise
+ * implementations honor non-unit dilation, so non-tiled dilated ops remain
+ * accelerated. Tiled spatial ops, requantizing pooling, and unsupported ops
+ * fall back to tigris_dispatch_kernel_s8().
  *
  * @param plan      Loaded plan (read-only).
  * @param op        Current operator descriptor.

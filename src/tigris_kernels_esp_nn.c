@@ -16,28 +16,30 @@
  * CRITICAL: must #include "sdkconfig.h" before <esp_nn.h> so that
  * CONFIG_NN_OPTIMIZED routes to the S3 SIMD path (not ANSI C fallback).
  *
- * Memory: all scratch buffers are carved from the arena by
- * tigris_esp_nn_prepare() - zero heap allocation at inference time.
+ * Memory: tigris_esp_nn_prepare() obtains platform-managed aligned workspace.
+ * No workspace allocation occurs inside tigris_run().
  */
 
 #ifdef TIGRIS_HAS_ESP_NN
 
 #include "tigris_kernels_esp_nn.h"
+#include "tigris_accel_policy.h"
 #include "tigris_kernels_s8.h"
 
 #include "sdkconfig.h"   /* CONFIG_NN_OPTIMIZED, CONFIG_IDF_TARGET_ESP32S3 */
 #include <esp_nn.h>
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 #ifdef __XTENSA__
 #include "esp_heap_caps.h"
 #endif
 
-/* Arena-backed scratch buffers */
+/* Preparation-time platform-managed workspace */
 /*
- * All buffers are carved from the top of the fast arena by
- * tigris_esp_nn_prepare().  They live above mem->fast_size and are
- * invisible to the executor and arena allocator.
+ * ESP-IDF allocations prefer PSRAM, with an optional internal-SRAM Conv
+ * scratch for bandwidth. The buffers are independent of mem->fast_size and
+ * live in process-lifetime adapter state.
  *
  * Each region is 16-byte aligned (ESP-NN SIMD requires this).
  * The scratch region gets +16 bytes slack because ESP-NN internally
@@ -88,6 +90,12 @@ int tigris_esp_nn_prepare(
     for (uint16_t i = 0; i < plan->header->num_ops; i++) {
         const tigris_op_t *op = &plan->ops[i];
 
+        /* ESP-NN encodes only unit dilation. Dilated Conv/Depthwise execute in
+         * s8_ref, so do not size or allocate vendor scratch for them. */
+        if (tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, plan, op, 0) ==
+            TIGRIS_ACCEL_ROUTE_S8_REF)
+            continue;
+
         if (op->op_type == TIGRIS_OP_CONV) {
             const uint16_t *ins  = tigris_op_inputs(plan, op);
             const uint16_t *outs = tigris_op_outputs(plan, op);
@@ -106,9 +114,16 @@ int tigris_esp_nn_prepare(
             int pad_h = pt, pad_w = pl;
 
             if (asymmetric) {
+                uint32_t required;
+                if (!tigris_accel_esp_pad_workspace_fits(
+                        IH, IW, IC, (uint16_t)pt, (uint16_t)pb,
+                        (uint16_t)pl, (uint16_t)pr,
+                        UINT32_MAX, &required) ||
+                    required > (uint32_t)(INT_MAX - 15))
+                    return -1;
                 int PH = IH + pt + pb;
                 int PW = IW + pl + pr;
-                max_pad = MAX(max_pad, PH * PW * IC);
+                max_pad = MAX(max_pad, (int)required);
                 conv_IH = PH;
                 conv_IW = PW;
                 pad_h = 0;
@@ -190,7 +205,6 @@ int tigris_esp_nn_prepare(
      * consecutive regions maintain 16-byte alignment. */
     uint32_t dw_aligned  = (uint32_t)((max_dw_out  + 15) & ~15);
     uint32_t pad_aligned = (uint32_t)((max_pad     + 15) & ~15);
-    uint32_t arena_cost  = dw_aligned + pad_aligned;
 
     /* Allocate all ESP-NN buffers from heap (PSRAM) to avoid stealing
      * from the tensor arena, which the plan compiler sized for tensors. */
@@ -207,6 +221,8 @@ int tigris_esp_nn_prepare(
     }
     if (pad_aligned > 0) {
         s_pad_buf  = ESP_NN_ALLOC(pad_aligned);
+        /* Allocation failure is non-fatal: adapt_conv2d verifies this exact
+         * workspace before changing vendor padding and falls back to s8_ref. */
         s_pad_size = s_pad_buf ? (int)pad_aligned : 0;
     }
     if (max_scratch > 0) {
@@ -270,12 +286,18 @@ static const int8_t *asymmetric_pad_input(
     int pt, int pb, int pl, int pr, int8_t fill_val,
     int *out_h, int *out_w)
 {
+    uint32_t needed;
+    if (!s_pad_buf || s_pad_size <= 0 ||
+        !tigris_accel_esp_pad_workspace_fits(
+            IH, IW, IC, (uint16_t)pt, (uint16_t)pb,
+            (uint16_t)pl, (uint16_t)pr,
+            (uint32_t)s_pad_size, &needed))
+        return NULL;
+
     int PH = IH + pt + pb;
     int PW = IW + pl + pr;
-    int needed = PH * PW * IC;
-    if (!s_pad_buf || needed > s_pad_size) return input; /* shouldn't happen */
 
-    memset(s_pad_buf, fill_val, (size_t)needed);
+    memset(s_pad_buf, fill_val, needed);
     int8_t *dst = (int8_t *)s_pad_buf;
     for (int h = 0; h < IH; h++) {
         memcpy(dst + ((h + pt) * PW + pl) * IC,
@@ -330,9 +352,16 @@ static int adapt_conv2d(
     int pad_h = pt, pad_w = pl;
 
     if (asymmetric) {
-        conv_input = asymmetric_pad_input(
+        const int8_t *padded = asymmetric_pad_input(
             X, IH, IW, IC, pt, pb, pl, pr,
             (int8_t)(-in_offset), &conv_IH, &conv_IW);
+        if (!padded) {
+#ifdef __XTENSA__
+            s_conv_fallback++;
+#endif
+            return -99;
+        }
+        conv_input = padded;
         pad_h = 0;
         pad_w = 0;
     }
@@ -574,7 +603,19 @@ int tigris_dispatch_kernel_esp_nn(
     tigris_mem_t        *mem,
     void                *user_ctx)
 {
-    (void)user_ctx;
+    /* Pre-route dilated Conv/Depthwise and pooling variants whose tiling or
+     * quantization cannot be represented by the ESP-NN adapters. This runs
+     * before entering an adapter, where those semantics would be lost. */
+    int handled = 0;
+    int route_rc = tigris_accel_try_s8_ref(
+        TIGRIS_ACCEL_ESP_NN, plan, op, op_index, mem, user_ctx, &handled);
+    if (handled) {
+#ifdef __XTENSA__
+        if (op->op_type == TIGRIS_OP_CONV)
+            s_conv_fallback++;
+#endif
+        return route_rc;
+    }
 
     int rc;
     switch ((tigris_op_type_t)op->op_type) {

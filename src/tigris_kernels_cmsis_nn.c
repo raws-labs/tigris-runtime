@@ -15,6 +15,7 @@
 #ifdef TIGRIS_HAS_CMSIS_NN
 
 #include "tigris_kernels_cmsis_nn.h"
+#include "tigris_accel_policy.h"
 #include "tigris_kernels_s8.h"
 
 #include "arm_nnfunctions.h"
@@ -372,6 +373,9 @@ int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem)
     uint32_t max_scratch = 0;
     for (uint16_t i = 0; i < plan->header->num_ops; i++) {
         const tigris_op_t *op = &plan->ops[i];
+        if (tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, plan, op, 0) ==
+            TIGRIS_ACCEL_ROUTE_S8_REF)
+            continue;
         const uint16_t *ins  = tigris_op_inputs(plan, op);
         const uint16_t *outs = tigris_op_outputs(plan, op);
         const int32_t *xs = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
@@ -458,25 +462,15 @@ int tigris_dispatch_kernel_cmsis_nn(
     tigris_mem_t        *mem,
     void                *user_ctx)
 {
-    /* When a spatial stage is executed with tiling, the executor sets
-     * mem->tile.active and the kernel must compute on the TILE's dimensions
-     * (in_h/out_h/pad_*). The CMSIS-NN adapters below read full tensor shapes via
-     * tigris_tensor_shape() and have no tile awareness, so they would silently
-     * compute on the wrong (untiled) shape and corrupt the output. The reference
-     * s8 kernels DO honor mem->tile, so route tiled spatial ops there until the
-     * adapters gain native tile support. (FC/non-spatial ops are never tiled.) */
-    if (mem->tile.active) {
-        switch ((tigris_op_type_t)op->op_type) {
-        case TIGRIS_OP_CONV:
-        case TIGRIS_OP_DEPTHWISE:
-        case TIGRIS_OP_AVG_POOL:
-        case TIGRIS_OP_GLOBAL_AVG:
-        case TIGRIS_OP_MAX_POOL:
-            return tigris_dispatch_kernel_s8(plan, op, op_index, mem, user_ctx);
-        default:
-            break;
-        }
-    }
+    /* CMSIS-NN's vendored generic Conv/Depthwise kernels explicitly consume
+     * dilation.h/.w, so non-tiled dilation remains native. The shared policy
+     * routes tiled spatial ops and pooling that requires requantization to
+     * s8_ref before any vendor call. */
+    int handled = 0;
+    int route_rc = tigris_accel_try_s8_ref(
+        TIGRIS_ACCEL_CMSIS_NN, plan, op, op_index, mem, user_ctx, &handled);
+    if (handled)
+        return route_rc;
 
     switch ((tigris_op_type_t)op->op_type) {
     case TIGRIS_OP_CONV:        return adapt_conv2d(plan, op, mem);

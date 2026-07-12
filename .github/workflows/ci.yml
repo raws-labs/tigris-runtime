@@ -72,7 +72,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update
-      - run: sudo apt-get install --yes --no-install-recommends gcc-arm-none-eabi
+      - run: >-
+          sudo apt-get install --yes --no-install-recommends
+          gcc-arm-none-eabi libnewlib-arm-none-eabi
       - run: >-
           cmake -S . -B build-arm
           -DCMAKE_BUILD_TYPE=Release

@@ -525,6 +525,68 @@ static void test_global_avg_pool(void)
         TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "global_avg_pool output");
 }
 
+/* AveragePool test */
+
+static void test_avg_pool(void)
+{
+    printf("  test_avg_pool...\n");
+
+    /* NHWC: 1x4x4x1, 2x2 stride 2 -> 1x2x2x1. */
+    int32_t x_shape[] = {1, 4, 4, 1};
+    int32_t y_shape[] = {1, 2, 2, 1};
+    float input[16];
+    for (int i = 0; i < 16; i++) input[i] = (float)(i + 1);
+    float expected[] = {3.5f, 5.5f, 11.5f, 13.5f};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(input); tensors[0].dtype = 1;
+    tensors[1].shape_off = 4; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(expected); tensors[1].dtype = 1;
+
+    int32_t shape_pool[8];
+    memcpy(shape_pool, x_shape, sizeof(x_shape));
+    memcpy(shape_pool + 4, y_shape, sizeof(y_shape));
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_AVG_POOL;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.spatial.kernel_h = 2; op.spatial.kernel_w = 2;
+    op.spatial.stride_h = 2; op.spatial.stride_w = 2;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+
+    void *ptrs[2];
+    float output[4];
+    ptrs[0] = input; ptrs[1] = output;
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "dispatch returns 0");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(output[i], expected[i], EPS, "avg_pool output");
+}
+
 /* FullyConnected (Gemm) test */
 
 static void test_fully_connected(void)
@@ -1224,6 +1286,7 @@ int main(void)
     test_relu6();
     test_add();
     test_global_avg_pool();
+    test_avg_pool();
     test_fully_connected();
     test_reshape();
     test_max_pool();

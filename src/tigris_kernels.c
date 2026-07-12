@@ -560,6 +560,69 @@ static int kern_max_pool(
     return 0;
 }
 
+/* ONNX AveragePool with the representable default: exclude padded samples
+ * from the divisor. The tiled executor supplies tile-local height and padding
+ * so the same bounds checks are valid for full and tiled tensors. */
+static int kern_avg_pool(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+
+    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+    int N  = x_shape[0];
+    int IH = x_shape[1];
+    int IW = x_shape[2];
+    int C  = x_shape[3];
+    int OH = y_shape[1];
+    int OW = y_shape[2];
+    int KH = op->spatial.kernel_h;
+    int KW = op->spatial.kernel_w;
+    int SH = op->spatial.stride_h ? op->spatial.stride_h : 1;
+    int SW = op->spatial.stride_w ? op->spatial.stride_w : 1;
+    int PT = op->spatial.pad_top;
+    int PL = op->spatial.pad_left;
+
+    if (!X || !Y || KH <= 0 || KW <= 0)
+        return -1;
+
+    if (mem->tile.active) {
+        IH = mem->tile.in_h;
+        OH = mem->tile.out_h;
+        IW = mem->tile.in_w;
+        OW = mem->tile.out_w;
+        PT = mem->tile.pad_top;
+    }
+
+    for (int n = 0; n < N; n++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+                for (int c = 0; c < C; c++) {
+                    float sum = 0.0f;
+                    int count = 0;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PT + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PL + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            sum += X[((n * IH + ih) * IW + iw) * C + c];
+                            count++;
+                        }
+                    }
+                    if (count == 0)
+                        return -1;
+                    Y[((n * OH + oh) * OW + ow) * C + c] = sum / (float)count;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static int kern_concat(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -676,6 +739,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_RESHAPE:     return kern_reshape(plan, op, mem);
     case TIGRIS_OP_FLATTEN:     return kern_reshape(plan, op, mem);
     case TIGRIS_OP_MAX_POOL:    return kern_max_pool(plan, op, mem);
+    case TIGRIS_OP_AVG_POOL:    return kern_avg_pool(plan, op, mem);
     case TIGRIS_OP_CONCAT:      return kern_concat(plan, op, mem);
     case TIGRIS_OP_RESIZE:      return kern_resize_nearest(plan, op, mem);
     default:

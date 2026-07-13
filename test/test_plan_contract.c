@@ -94,7 +94,7 @@ static void test_linear_3op(const char *fixtures_dir)
     if (err != TIGRIS_OK) { free(buf); return; }
 
     TEST_ASSERT(memcmp(plan.header->magic, TIGRIS_MAGIC_BYTES, 4) == 0, "magic");
-    TEST_ASSERT_EQ(plan.header->version, 2, "schema v2 version");
+    TEST_ASSERT_EQ(plan.header->version, TIGRIS_SCHEMA_VERSION, "current schema version");
     TEST_ASSERT_EQ(plan.header->file_size, buf_len, "file_size matches");
     TEST_ASSERT_EQ(plan.header->num_tensors, 4, "num_tensors");
     TEST_ASSERT_EQ(plan.header->num_ops, 3, "num_ops");
@@ -136,7 +136,7 @@ static void test_conv_relu_chain(const char *fixtures_dir)
     if (err != TIGRIS_OK) { free(buf); return; }
 
     TEST_ASSERT(memcmp(plan.header->magic, TIGRIS_MAGIC_BYTES, 4) == 0, "magic");
-    TEST_ASSERT_EQ(plan.header->version, 2, "schema v2 version");
+    TEST_ASSERT_EQ(plan.header->version, TIGRIS_SCHEMA_VERSION, "current schema version");
     TEST_ASSERT_EQ(plan.header->file_size, buf_len, "file_size matches");
     TEST_ASSERT_EQ(plan.header->num_tensors, 3, "num_tensors");
     TEST_ASSERT_EQ(plan.header->num_ops, 2, "num_ops (relu fused)");
@@ -187,7 +187,7 @@ static void test_ds_cnn(const char *fixtures_dir)
     if (err != TIGRIS_OK) { free(buf); return; }
 
     TEST_ASSERT(memcmp(plan.header->magic, TIGRIS_MAGIC_BYTES, 4) == 0, "magic");
-    TEST_ASSERT_EQ(plan.header->version, 2, "schema v2 version");
+    TEST_ASSERT_EQ(plan.header->version, TIGRIS_SCHEMA_VERSION, "current schema version");
     TEST_ASSERT_EQ(plan.header->file_size, buf_len, "file_size matches");
     TEST_ASSERT_EQ(plan.header->num_tensors, 13, "num_tensors");
     TEST_ASSERT_EQ(plan.header->num_ops, 12, "num_ops");

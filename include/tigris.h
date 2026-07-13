@@ -27,7 +27,9 @@ extern "C" {
 
 #define TIGRIS_MAGIC           0x53524754  /* "TGRS" in little-endian */
 #define TIGRIS_MAGIC_BYTES     "TGRS"
-#define TIGRIS_SCHEMA_VERSION  2
+#define TIGRIS_SCHEMA_VERSION  3
+#define TIGRIS_SCHEMA_VERSION_V2 2
+#define TIGRIS_QUANT_PAGE_ELEMS 65536u
 
 /* Section type IDs */
 #define TIGRIS_SEC_TENSORS        1
@@ -177,7 +179,7 @@ typedef struct {
 } tigris_tensor_t;                  /* 16 bytes total */
 
 /**
- * Spatial attributes - 18 bytes (schema v2), embedded in tigris_op_t.
+ * Spatial attributes - 18 bytes, embedded in tigris_op_t.
  * Zero for non-spatial ops (pointwise, reshape, etc.). pad/dilation are u16
  * (were u8) so deep dilated convs (dilation/pad up to 65535) don't overflow.
  */
@@ -196,7 +198,7 @@ typedef struct {
 } tigris_spatial_attrs_t;           /* 18 bytes */
 
 /**
- * Operator descriptor - 38 bytes (schema v2).
+ * Operator descriptor - 38 bytes (layout retained by schema v3).
  */
 typedef struct {
     uint32_t    name_str;            /*  0: offset into string table */
@@ -271,7 +273,7 @@ typedef struct {
     uint16_t    num_channels;       /*  8: 1=per-tensor, >1=per-channel */
     uint16_t    multiplier_off;     /* 10: offset into quant data (int32 elements) */
     uint16_t    shift_off;          /* 12: offset into quant data (int32 elements) */
-    uint16_t    _pad;               /* 14 */
+    uint16_t    _pad;               /* 14: v3 quant-data page (v2 reserved) */
 } tigris_quant_param_t;             /* 16 bytes total */
 
 /**

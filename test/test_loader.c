@@ -183,6 +183,74 @@ static void test_section_directory_guards(void)
                    TIGRIS_ERR_BAD_SECTION, "section overlaps directory");
 }
 
+static void test_v2_plan_header_is_still_accepted(void)
+{
+    printf("  test_v2_plan_header_is_still_accepted...\n");
+    _Alignas(4) uint8_t buf[MINIMAL_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_minimal_plan(buf);
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "v2 minimal plan loads");
+}
+
+#define V2_QUANT_PLAN_SIZE 136u
+
+static void build_v2_quant_plan(uint8_t *buf)
+{
+    memset(buf, 0, V2_QUANT_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION_V2;
+    hdr->file_size = V2_QUANT_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_quant_params = 1;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    const uint32_t required[] = {
+        TIGRIS_SEC_TENSORS,
+        TIGRIS_SEC_OPS,
+        TIGRIS_SEC_INDEX_POOL,
+        TIGRIS_SEC_SHAPE_POOL,
+        TIGRIS_SEC_STRINGS,
+    };
+    for (uint32_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        dir[i].type = required[i];
+        dir[i].offset = 104u;
+    }
+    dir[5].type = TIGRIS_SEC_QUANT_PARAMS;
+    dir[5].offset = 108u;
+
+    uint16_t *quant_header = (uint16_t *)(buf + 108u);
+    quant_header[0] = 1;  /* num params */
+    quant_header[1] = 2;  /* v2 quant-data length */
+    tigris_quant_param_t *qp = (tigris_quant_param_t *)(buf + 112u);
+    qp->scale = 0.25f;
+    qp->num_channels = 1;
+    qp->multiplier_off = 0;
+    qp->shift_off = 1;
+    int32_t *quant_data = (int32_t *)(buf + 128u);
+    quant_data[0] = 123;
+    quant_data[1] = -7;
+}
+
+static void test_v2_quant_plan_is_still_accepted(void)
+{
+    printf("  test_v2_quant_plan_is_still_accepted...\n");
+    _Alignas(4) uint8_t buf[V2_QUANT_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_v2_quant_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "v2 quantized plan loads");
+    TEST_ASSERT_EQ(plan.num_quant_params, 1, "v2 quant param count");
+    TEST_ASSERT_EQ(plan.quant_data[0], 123, "v2 multiplier data");
+    TEST_ASSERT_EQ(plan.quant_data[1], -7, "v2 shift data");
+}
+
 static void test_counted_sections_required(void)
 {
     printf("  test_counted_sections_required...\n");
@@ -449,7 +517,9 @@ static void test_fixture(const char *path)
 
     /* Header checks */
     TEST_ASSERT(memcmp(plan.header->magic, "TGRS", 4) == 0, "magic");
-    TEST_ASSERT_EQ(plan.header->version, TIGRIS_SCHEMA_VERSION, "version");
+    TEST_ASSERT(plan.header->version == TIGRIS_SCHEMA_VERSION ||
+                plan.header->version == TIGRIS_SCHEMA_VERSION_V2,
+                "supported version");
     TEST_ASSERT_EQ(plan.header->file_size, buf_len, "file_size");
     TEST_ASSERT(plan.header->num_ops > 0, "has ops");
     TEST_ASSERT(plan.header->num_tensors > 0, "has tensors");
@@ -560,6 +630,8 @@ int main(int argc, char *argv[])
     test_size_mismatch();
     test_error_strings();
     test_section_directory_guards();
+    test_v2_plan_header_is_still_accepted();
+    test_v2_quant_plan_is_still_accepted();
     test_counted_sections_required();
     test_chain_limit_guards();
     test_cross_reference_guards();

@@ -65,13 +65,15 @@ static int   s_pad_size     = 0;
 static inline int32_t get_mult(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    return plan->quant_data[qp->multiplier_off + ch];
+    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off + ch];
 }
 
 static inline int32_t get_shft(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    return plan->quant_data[qp->shift_off + ch];
+    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
 }
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))

@@ -118,14 +118,16 @@ static inline int32_t round_divide_away_from_zero(int32_t value, int32_t divisor
 static inline int32_t get_multiplier(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    return plan->quant_data[qp->multiplier_off + ch];
+    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off + ch];
 }
 
 /** Get shift from quant data (works for both per-tensor and per-channel). */
 static inline int32_t get_shift(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    return plan->quant_data[qp->shift_off + ch];
+    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
 }
 
 /** Total number of elements in a tensor. */

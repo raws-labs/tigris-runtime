@@ -66,7 +66,8 @@ tigris_error_t tigris_plan_load(
     if (memcmp(hdr->magic, TIGRIS_MAGIC_BYTES, 4) != 0)
         return TIGRIS_ERR_BAD_MAGIC;
 
-    if (hdr->version != TIGRIS_SCHEMA_VERSION)
+    if (hdr->version != TIGRIS_SCHEMA_VERSION &&
+        hdr->version != TIGRIS_SCHEMA_VERSION_V2)
         return TIGRIS_ERR_BAD_VERSION;
 
     if (hdr->file_size != buf_len)
@@ -231,20 +232,40 @@ tigris_error_t tigris_plan_load(
     /* Quant params (optional) */
     if (section_offsets[TIGRIS_SEC_QUANT_PARAMS]) {
         uint32_t off = section_offsets[TIGRIS_SEC_QUANT_PARAMS];
-        /* First 4 bytes: uint16_t num_quant_params + uint16_t quant_data_len */
+        /* First 4 bytes: uint16_t num_quant_params + quant-data length (v2)
+         * or page count (v3). */
         if (!bounds_ok(off, 4, section_ends[TIGRIS_SEC_QUANT_PARAMS]))
             return TIGRIS_ERR_BAD_SECTION;
-        uint16_t nqp, qd_len;
+        uint16_t nqp, qd_field;
         memcpy(&nqp, buf + off, 2);
-        memcpy(&qd_len, buf + off + 2, 2);
+        memcpy(&qd_field, buf + off + 2, 2);
         out_plan->num_quant_params = nqp;
         uint32_t entries_size = (uint32_t)nqp * sizeof(tigris_quant_param_t);
-        uint32_t data_size = (uint32_t)qd_len * sizeof(int32_t);
+        uint32_t data_size;
+        if (hdr->version == TIGRIS_SCHEMA_VERSION_V2)
+            data_size = (uint32_t)qd_field * sizeof(int32_t);
+        else {
+            if (section_ends[TIGRIS_SEC_QUANT_PARAMS] < off + 4u + entries_size)
+                return TIGRIS_ERR_BAD_SECTION;
+            data_size = section_ends[TIGRIS_SEC_QUANT_PARAMS] - off - 4u - entries_size;
+            if ((data_size % sizeof(int32_t)) != 0)
+                return TIGRIS_ERR_BAD_SECTION;
+            uint32_t physical_pages = (data_size / sizeof(int32_t) +
+                                       TIGRIS_QUANT_PAGE_ELEMS - 1u) /
+                                      TIGRIS_QUANT_PAGE_ELEMS;
+            /* The next aligned section can contribute up to 15 padding bytes
+             * to this section span. It may therefore extend an otherwise
+             * page-aligned pool into one physical page without changing the
+             * semantic v3 page count recorded by the compiler. */
+            if (qd_field == 0 || physical_pages < qd_field ||
+                physical_pages > (uint32_t)qd_field + 1u)
+                return TIGRIS_ERR_BAD_SECTION;
+        }
         if (!bounds_ok(off + 4, entries_size + data_size,
                        section_ends[TIGRIS_SEC_QUANT_PARAMS]))
             return TIGRIS_ERR_BAD_SECTION;
         out_plan->quant_params = (const tigris_quant_param_t *)(buf + off + 4);
-        if (qd_len > 0)
+        if (data_size > 0)
             out_plan->quant_data = (const int32_t *)(buf + off + 4 + entries_size);
     }
 
@@ -354,17 +375,26 @@ tigris_error_t tigris_plan_load(
 
     if (section_offsets[TIGRIS_SEC_QUANT_PARAMS]) {
         uint32_t qp_off = section_offsets[TIGRIS_SEC_QUANT_PARAMS];
-        uint16_t nqp, qd_len;
+        uint16_t nqp, qd_field;
         memcpy(&nqp, buf + qp_off, sizeof(nqp));
-        memcpy(&qd_len, buf + qp_off + sizeof(nqp), sizeof(qd_len));
+        memcpy(&qd_field, buf + qp_off + sizeof(nqp), sizeof(qd_field));
+        uint32_t qd_len = hdr->version == TIGRIS_SCHEMA_VERSION_V2 ? qd_field :
+            (section_ends[TIGRIS_SEC_QUANT_PARAMS] - qp_off - 4u -
+             (uint32_t)nqp * sizeof(tigris_quant_param_t)) / sizeof(int32_t);
         if (nqp != hdr->num_quant_params)
             return TIGRIS_ERR_BAD_SECTION;
         for (uint16_t i = 0; i < nqp; i++) {
             const tigris_quant_param_t *qp = &out_plan->quant_params[i];
+            uint32_t page = hdr->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+            uint32_t moff = page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off;
+            uint32_t soff = page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off;
             if (qp->num_channels == 0 ||
-                (qp->num_channels > 1 &&
-                 (!elements_ok(qp->multiplier_off, qp->num_channels, qd_len) ||
-                  !elements_ok(qp->shift_off, qp->num_channels, qd_len))))
+                (hdr->version != TIGRIS_SCHEMA_VERSION_V2 &&
+                 (page >= qd_field ||
+                  (uint32_t)qp->multiplier_off + qp->num_channels > TIGRIS_QUANT_PAGE_ELEMS ||
+                  (uint32_t)qp->shift_off + qp->num_channels > TIGRIS_QUANT_PAGE_ELEMS)) ||
+                !elements_ok(moff, qp->num_channels, qd_len) ||
+                !elements_ok(soff, qp->num_channels, qd_len))
                 return TIGRIS_ERR_BAD_SECTION;
         }
     }

@@ -247,15 +247,28 @@ void app_main(void)
     int is_quantized = (input_dtype == 3);
     printf("\nModel type: %s\n", is_quantized ? "int8 quantized" : "float32");
 
-    /* 7. Prepare the selected accelerated backend. Repeat preparation safely
-       replaces its adapter workspace; release it at cleanup. */
+    /* 7. Prepare the selected accelerated backend.  Exercise its lifecycle on
+       the target: repeat preparation replaces workspace safely, an explicit
+       release clears it, and preparation can then be re-established. */
 #ifdef TIGRIS_HAS_ESP_NN
     if (is_quantized && tigris_esp_nn_prepare(&plan, &mem) != 0) {
         ESP_LOGE(TAG, "ESP-NN preparation failed");
         goto cleanup;
     }
-    if (is_quantized)
+    if (is_quantized &&
+        (tigris_esp_nn_prepare(&plan, &mem) != 0)) {
+        ESP_LOGE(TAG, "ESP-NN repeat preparation failed");
+        goto cleanup;
+    }
+    if (is_quantized) {
+        tigris_esp_nn_deinit();
+        if (tigris_esp_nn_prepare(&plan, &mem) != 0) {
+            ESP_LOGE(TAG, "ESP-NN preparation after release failed");
+            goto cleanup;
+        }
         esp_nn_prepared = 1;
+        printf("ESP_NN_LIFECYCLE: PASS\n");
+    }
 #endif
 
     /* 8. Allocate model inputs in slow, fill with test data */
@@ -407,7 +420,7 @@ void app_main(void)
         if (is_quantized) {
             int8_t *out = (int8_t *)out_ptr;
             uint32_t n = t->size_bytes;
-            uint32_t print_n = n < 10 ? n : 10;
+            uint32_t print_n = n <= 64 ? n : 10;
             printf("      First %" PRIu32 ":", print_n);
             for (uint32_t j = 0; j < print_n; j++)
                 printf(" %d", (int)out[j]);
@@ -417,7 +430,7 @@ void app_main(void)
         } else {
             float *out = (float *)out_ptr;
             uint32_t n = t->size_bytes / sizeof(float);
-            uint32_t print_n = n < 10 ? n : 10;
+            uint32_t print_n = n <= 64 ? n : 10;
             printf("      First %" PRIu32 ":", print_n);
             for (uint32_t j = 0; j < print_n; j++)
                 printf(" %.4f", out[j]);
@@ -438,4 +451,5 @@ cleanup:
     heap_caps_free(slow_buf);
     heap_caps_free(fast_buf);
     esp_partition_munmap(mmap_handle);
+    printf("TIGRIS_DONE\n");
 }

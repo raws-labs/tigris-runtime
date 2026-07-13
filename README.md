@@ -104,6 +104,10 @@ idf.py build
 idf.py flash
 ```
 
+The example's portable int8 path is the default. With the `espressif/esp-nn`
+managed component available, pass `-DTIGRIS_ENABLE_ESP_NN=ON` to build the
+ESP-NN adapter.
+
 The plan should live in a memory-mapped flash partition. Allocate the fast
 arena from internal SRAM and the slow arena from PSRAM when available. When
 using ESP-NN, call `tigris_esp_nn_prepare()` and check its return value before

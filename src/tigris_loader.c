@@ -430,6 +430,7 @@ tigris_error_t tigris_plan_load(
 
     /* Plan limits validation */
 
+    uint16_t next_scheduled_op = 0;
     for (uint16_t i = 0; i < hdr->num_stages; i++) {
         const tigris_stage_t *stage = &out_plan->stages[i];
         if (!elements_ok(stage->ops_off, stage->ops_count, index_count) ||
@@ -477,8 +478,15 @@ tigris_error_t tigris_plan_load(
         }
 
         for (uint16_t j = 0; j < stage->ops_count; j++) {
-            if (out_plan->index_pool[stage->ops_off + j] >= hdr->num_ops)
+            uint16_t op_idx = out_plan->index_pool[stage->ops_off + j];
+            if (op_idx >= hdr->num_ops)
                 return TIGRIS_ERR_BAD_SECTION;
+            /* The binary plan contract is a forward, partitioned schedule.
+             * Enforcing it here prevents a malformed stage list from silently
+             * omitting work or running the same operation more than once. */
+            if (op_idx != next_scheduled_op)
+                return TIGRIS_ERR_BAD_SECTION;
+            next_scheduled_op++;
         }
         for (uint16_t j = 0; j < stage->inputs_count; j++) {
             if (out_plan->index_pool[stage->inputs_off + j] >= hdr->num_tensors)
@@ -523,6 +531,9 @@ tigris_error_t tigris_plan_load(
             }
         }
     }
+
+    if (next_scheduled_op != hdr->num_ops)
+        return TIGRIS_ERR_BAD_SECTION;
 
     /* A compressed stage redirects weight_entry offsets into its own decoded
      * block.  Check that every referenced weight/bias is present in that

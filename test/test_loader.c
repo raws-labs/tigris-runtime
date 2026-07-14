@@ -323,8 +323,11 @@ static void build_staged_plan(uint8_t *buf)
     tigris_stage_t *stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
     stages[0].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
     stages[0].chain_id = TIGRIS_NO_CHAIN;
+    stages[0].ops_count = 4;
     stages[1].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
     stages[1].chain_id = TIGRIS_NO_CHAIN;
+    stages[1].ops_off = 4;
+    stages[1].ops_count = 5;
 }
 
 static void test_chain_limit_guards(void)
@@ -387,12 +390,35 @@ static void test_chain_limit_guards(void)
     stages[1].chain_id = 0;
     stages[1].chain_len = 2;
     stages[0].ops_count = 8;
+    stages[1].ops_off = 8;
+    stages[1].ops_count = 1;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "eight chain spatial ops fit fixed metadata");
 
     stages[0].ops_count = 9;
+    stages[1].ops_off = 9;
+    stages[1].ops_count = 0;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_PLAN_LIMITS, "ninth chain spatial op rejected");
+}
+
+static void test_stage_schedule_guards(void)
+{
+    printf("  test_stage_schedule_guards...\n");
+    _Alignas(4) uint8_t buf[STAGED_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_staged_plan(buf);
+    uint16_t *indices = (uint16_t *)(buf + STAGED_INDEX_OFF);
+    indices[4] = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "duplicated stage operation");
+
+    build_staged_plan(buf);
+    tigris_stage_t *stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
+    stages[1].ops_count = 4;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "missing scheduled operation");
 }
 
 /* A compact valid compressed-weight plan.  It lets the loader tests exercise
@@ -724,6 +750,7 @@ int main(int argc, char *argv[])
     test_v2_quant_plan_is_still_accepted();
     test_counted_sections_required();
     test_chain_limit_guards();
+    test_stage_schedule_guards();
     test_compressed_block_guards();
     test_cross_reference_guards();
 

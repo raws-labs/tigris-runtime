@@ -574,6 +574,127 @@ static void test_cross_reference_guards(void)
                    TIGRIS_ERR_BAD_SECTION, "unsupported activation dtype");
 }
 
+/* A compact schema-v4 plan that carries the required Transpose permutation
+ * attribute.  This exercises both the optional metadata section and the
+ * loader's semantic validation before an executor can consume it. */
+#define TRANSPOSE_PLAN_SIZE      251u
+#define TRANSPOSE_TENSORS_OFF    112u
+#define TRANSPOSE_OPS_OFF        144u
+#define TRANSPOSE_STAGES_OFF     182u
+#define TRANSPOSE_INDEX_OFF      210u
+#define TRANSPOSE_SHAPES_OFF     220u
+#define TRANSPOSE_STRINGS_OFF    236u
+#define TRANSPOSE_ATTRS_OFF      237u
+#define TRANSPOSE_ATTR_DATA_OFF  249u
+
+static void build_transpose_plan(uint8_t *buf)
+{
+    memset(buf, 0, TRANSPOSE_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = TRANSPOSE_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 2;
+    hdr->num_ops = 1;
+    hdr->num_stages = 1;
+    hdr->model_io_off = 2;
+    hdr->num_model_inputs = 1;
+    hdr->num_model_outputs = 1;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, TRANSPOSE_TENSORS_OFF};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, TRANSPOSE_OPS_OFF};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, TRANSPOSE_STAGES_OFF};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, TRANSPOSE_INDEX_OFF};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, TRANSPOSE_SHAPES_OFF};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, TRANSPOSE_STRINGS_OFF};
+    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, TRANSPOSE_ATTRS_OFF};
+
+    tigris_tensor_t *tensors =
+        (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
+    tensors[0].size_bytes = 6u * sizeof(float);
+    tensors[0].shape_off = 0;
+    tensors[0].ndim = 2;
+    tensors[0].dtype = 1;
+    tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    tensors[0].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    tensors[1].size_bytes = 6u * sizeof(float);
+    tensors[1].shape_off = 2;
+    tensors[1].ndim = 2;
+    tensors[1].dtype = 1;
+    tensors[1].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+    tensors[1].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+
+    tigris_op_t *op = (tigris_op_t *)(buf + TRANSPOSE_OPS_OFF);
+    op->op_type = TIGRIS_OP_TRANSPOSE;
+    op->num_inputs = 1;
+    op->num_outputs = 1;
+    op->inputs_off = 0;
+    op->outputs_off = 1;
+    op->weight_idx = TIGRIS_NO_WEIGHT;
+    op->bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + TRANSPOSE_STAGES_OFF);
+    stage->ops_off = 4;
+    stage->ops_count = 1;
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    uint16_t *indices = (uint16_t *)(buf + TRANSPOSE_INDEX_OFF);
+    indices[0] = 0;
+    indices[1] = 1;
+    indices[2] = 0;
+    indices[3] = 1;
+    indices[4] = 0;
+    int32_t *shapes = (int32_t *)(buf + TRANSPOSE_SHAPES_OFF);
+    shapes[0] = 2;
+    shapes[1] = 3;
+    shapes[2] = 3;
+    shapes[3] = 2;
+    buf[TRANSPOSE_STRINGS_OFF] = '\0';
+
+    uint16_t count = 1;
+    memcpy(buf + TRANSPOSE_ATTRS_OFF, &count, sizeof(count));
+    tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(
+        buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->op_index = 0;
+    attr->type = TIGRIS_OP_ATTR_TRANSPOSE_PERM;
+    attr->data_len = 2;
+    attr->data_offset = 0;
+    buf[TRANSPOSE_ATTR_DATA_OFF] = 1;
+    buf[TRANSPOSE_ATTR_DATA_OFF + 1u] = 0;
+}
+
+static void test_transpose_attribute_guards(void)
+{
+    printf("  test_transpose_attribute_guards...\n");
+    _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_transpose_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid transpose attribute loads");
+    TEST_ASSERT_EQ(plan.num_op_attributes, 1, "one transpose attribute");
+
+    build_transpose_plan(buf);
+    buf[TRANSPOSE_ATTR_DATA_OFF + 1u] = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "duplicate permutation axis rejected");
+
+    build_transpose_plan(buf);
+    ((tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u))->data_len = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "wrong permutation rank rejected");
+
+    build_transpose_plan(buf);
+    ((tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u))->type = 99;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "unknown attribute type rejected");
+}
+
 /* Struct size validation */
 
 static void test_struct_sizes(void)
@@ -588,6 +709,7 @@ static void test_struct_sizes(void)
     TEST_ASSERT_EQ(sizeof(tigris_spatial_attrs_t), 18, "spatial attrs size");
     TEST_ASSERT_EQ(sizeof(tigris_weight_entry_t), 12, "weight entry size");
     TEST_ASSERT_EQ(sizeof(tigris_quant_param_t), 16, "quant param size");
+    TEST_ASSERT_EQ(sizeof(tigris_op_attribute_t), 8, "op attribute size");
 }
 
 /* Fixture loading tests */
@@ -644,6 +766,7 @@ static void test_fixture(const char *path)
     /* Header checks */
     TEST_ASSERT(memcmp(plan.header->magic, "TGRS", 4) == 0, "magic");
     TEST_ASSERT(plan.header->version == TIGRIS_SCHEMA_VERSION ||
+                plan.header->version == TIGRIS_SCHEMA_VERSION_V3 ||
                 plan.header->version == TIGRIS_SCHEMA_VERSION_V2,
                 "supported version");
     TEST_ASSERT_EQ(plan.header->file_size, buf_len, "file_size");
@@ -763,6 +886,7 @@ int main(int argc, char *argv[])
     test_stage_schedule_guards();
     test_compressed_block_guards();
     test_cross_reference_guards();
+    test_transpose_attribute_guards();
 
     printf("\nStruct size tests:\n");
     test_struct_sizes();

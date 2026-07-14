@@ -27,7 +27,8 @@ extern "C" {
 
 #define TIGRIS_MAGIC           0x53524754  /* "TGRS" in little-endian */
 #define TIGRIS_MAGIC_BYTES     "TGRS"
-#define TIGRIS_SCHEMA_VERSION  3
+#define TIGRIS_SCHEMA_VERSION  4
+#define TIGRIS_SCHEMA_VERSION_V3 3
 #define TIGRIS_SCHEMA_VERSION_V2 2
 #define TIGRIS_QUANT_PAGE_ELEMS 65536u
 
@@ -42,7 +43,11 @@ extern "C" {
 #define TIGRIS_SEC_WEIGHTS        8
 #define TIGRIS_SEC_QUANT_PARAMS   9
 #define TIGRIS_SEC_WEIGHT_BLOCKS  10
-#define TIGRIS_SEC_MAX            11  /* one past the last valid section */
+#define TIGRIS_SEC_OP_ATTRIBUTES  11
+#define TIGRIS_SEC_MAX            12  /* one past the last valid section */
+
+/* Typed payloads stored in TIGRIS_SEC_OP_ATTRIBUTES. */
+#define TIGRIS_OP_ATTR_TRANSPOSE_PERM 1
 
 /* Compression types */
 #define TIGRIS_COMPRESS_NONE  0
@@ -290,6 +295,14 @@ typedef struct {
     uint32_t    uncompressed_size;  /* 16 */
 } tigris_weight_block_t;            /* 20 bytes total */
 
+/** Typed variable-length operator attribute descriptor - 8 bytes. */
+typedef struct {
+    uint16_t    op_index;            /* 0: global operator index */
+    uint8_t     type;                /* 2: TIGRIS_OP_ATTR_* */
+    uint8_t     data_len;            /* 3: payload bytes */
+    uint32_t    data_offset;         /* 4: offset into attribute data pool */
+} tigris_op_attribute_t;
+
 #pragma pack(pop)
 
 /*
@@ -323,6 +336,8 @@ TIGRIS_LAYOUT_ASSERT(tigris_layout_quant_param_size,
                      sizeof(tigris_quant_param_t) == 16);
 TIGRIS_LAYOUT_ASSERT(tigris_layout_weight_block_size,
                      sizeof(tigris_weight_block_t) == 20);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_op_attribute_size,
+                     sizeof(tigris_op_attribute_t) == 8);
 
 TIGRIS_LAYOUT_ASSERT(tigris_layout_spatial_pad_top_offset,
                      offsetof(tigris_spatial_attrs_t, pad_top) == 4);
@@ -367,6 +382,11 @@ typedef struct {
     uint16_t                     num_weight_blocks;
     uint16_t                     weight_compression;  /* TIGRIS_COMPRESS_* */
 
+    /* Optional variable-length per-operator attributes. */
+    const tigris_op_attribute_t *op_attributes;
+    const uint8_t               *op_attribute_data;
+    uint16_t                     num_op_attributes;
+
     /* Quantization (optional) */
     const tigris_quant_param_t  *quant_params;  /* [num_quant_params] or NULL */
     const int32_t               *quant_data;    /* multiplier/shift arrays or NULL */
@@ -390,6 +410,26 @@ static inline const char *tigris_tensor_name(
     const tigris_plan_t *plan, const tigris_tensor_t *t)
 {
     return plan->strings + t->name_str;
+}
+
+/** Return the payload for a typed attribute on one operator, or NULL. */
+static inline const uint8_t *tigris_op_attribute_data(
+    const tigris_plan_t *plan, uint16_t op_index, uint8_t type,
+    uint8_t *out_len)
+{
+    if (out_len)
+        *out_len = 0;
+    if (!plan || !plan->op_attributes || !plan->op_attribute_data)
+        return NULL;
+    for (uint16_t i = 0; i < plan->num_op_attributes; i++) {
+        const tigris_op_attribute_t *attr = &plan->op_attributes[i];
+        if (attr->op_index == op_index && attr->type == type) {
+            if (out_len)
+                *out_len = attr->data_len;
+            return plan->op_attribute_data + attr->data_offset;
+        }
+    }
+    return NULL;
 }
 
 /**

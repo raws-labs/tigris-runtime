@@ -11,6 +11,7 @@
  */
 
 #include "tigris_kernels_s8.h"
+#include "tigris_kernels.h"
 #include "tigris_accel_policy.h"
 
 #include <math.h>
@@ -1116,7 +1117,6 @@ int tigris_dispatch_kernel_s8(
     tigris_mem_t        *mem,
     void                *user_ctx)
 {
-    (void)op_index;
     (void)user_ctx;
 
     switch ((tigris_op_type_t)op->op_type) {
@@ -1138,6 +1138,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_SOFTMAX:     return kern_softmax_s8(plan, op, mem);
     case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
+    case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */
     }

@@ -330,10 +330,23 @@ tigris_error_t tigris_plan_load(
         if (tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM &&
             tensor->quant_param_idx >= hdr->num_quant_params)
             return TIGRIS_ERR_BAD_SECTION;
+        uint32_t elements = 1;
         for (uint8_t dim = 0; dim < tensor->ndim; dim++) {
-            if (out_plan->shape_pool[tensor->shape_off + dim] <= 0)
+            int32_t value = out_plan->shape_pool[tensor->shape_off + dim];
+            if (value <= 0 || (uint32_t)value > UINT32_MAX / elements)
                 return TIGRIS_ERR_BAD_SECTION;
+            elements *= (uint32_t)value;
         }
+        uint32_t element_size;
+        if (tensor->dtype == 1)
+            element_size = sizeof(float);
+        else if (tensor->dtype == 3)
+            element_size = sizeof(int8_t);
+        else
+            return TIGRIS_ERR_BAD_SECTION;
+        if (elements > UINT32_MAX / element_size ||
+            tensor->size_bytes != elements * element_size)
+            return TIGRIS_ERR_BAD_SECTION;
     }
 
     for (uint16_t i = 0; i < hdr->num_ops; i++) {

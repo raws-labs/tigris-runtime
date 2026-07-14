@@ -562,6 +562,16 @@ static void test_cross_reference_guards(void)
     ((tigris_tensor_t *)(buf + REF_TENSORS_OFF))->name_str = 1;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION, "tensor string range");
+
+    build_referenced_plan(buf);
+    ((tigris_tensor_t *)(buf + REF_TENSORS_OFF))->size_bytes = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "tensor size matches shape and dtype");
+
+    build_referenced_plan(buf);
+    ((tigris_tensor_t *)(buf + REF_TENSORS_OFF))->dtype = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "unsupported activation dtype");
 }
 
 /* Struct size validation */

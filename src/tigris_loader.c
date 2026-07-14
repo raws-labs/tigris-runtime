@@ -408,13 +408,23 @@ tigris_error_t tigris_plan_load(
         if (out_plan->weight_compression != TIGRIS_COMPRESS_NONE &&
             out_plan->weight_compression != TIGRIS_COMPRESS_LZ4)
             return TIGRIS_ERR_BAD_SECTION;
+        if (out_plan->num_weight_blocks == 0 || hdr->num_weights == 0 ||
+            out_plan->num_weight_blocks > hdr->num_stages)
+            return TIGRIS_ERR_BAD_SECTION;
+        uint16_t previous_stage = TIGRIS_NO_CHAIN;
         for (uint16_t i = 0; i < out_plan->num_weight_blocks; i++) {
             const tigris_weight_block_t *block = &out_plan->weight_blocks[i];
             if (block->stage_idx >= hdr->num_stages ||
+                (i > 0 && block->stage_idx <= previous_stage) ||
                 !elements_ok(block->first_weight_idx, block->num_weights,
                              hdr->num_weights) ||
-                !bounds_ok(block->blob_offset, block->compressed_size, blobs_len))
+                block->num_weights == 0 || block->compressed_size == 0 ||
+                block->uncompressed_size == 0 ||
+                !bounds_ok(block->blob_offset, block->compressed_size, blobs_len) ||
+                (out_plan->weight_compression == TIGRIS_COMPRESS_NONE &&
+                 block->compressed_size != block->uncompressed_size))
                 return TIGRIS_ERR_BAD_SECTION;
+            previous_stage = block->stage_idx;
         }
     }
 
@@ -436,6 +446,35 @@ tigris_error_t tigris_plan_load(
             return TIGRIS_ERR_PLAN_LIMITS;
         if (stage->chain_len > LOADER_MAX_CHAIN_STAGES)
             return TIGRIS_ERR_PLAN_LIMITS;
+
+        /* A chain is represented redundantly on every member.  The executor
+         * only starts it at its declared head and skips the other members, so
+         * accepting an incomplete or displaced chain silently drops work. */
+        if (stage->chain_len > 0) {
+            if (stage->chain_len < 2 || stage->chain_id > i ||
+                stage->chain_len > hdr->num_stages - stage->chain_id)
+                return TIGRIS_ERR_BAD_SECTION;
+            const tigris_stage_t *head = &out_plan->stages[stage->chain_id];
+            if (head->chain_id != stage->chain_id ||
+                head->chain_len != stage->chain_len ||
+                head->chain_tile_h == 0 ||
+                stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN ||
+                (i != stage->chain_id && stage->chain_tile_h != 0))
+                return TIGRIS_ERR_BAD_SECTION;
+            if (i == stage->chain_id) {
+                for (uint16_t member = i + 1u;
+                     member < i + stage->chain_len; member++) {
+                    const tigris_stage_t *next = &out_plan->stages[member];
+                    if (next->chain_id != i ||
+                        next->chain_len != stage->chain_len ||
+                        next->chain_tile_h != 0 ||
+                        next->tile_plan_idx != TIGRIS_NO_TILE_PLAN)
+                        return TIGRIS_ERR_BAD_SECTION;
+                }
+            }
+        } else if (stage->chain_tile_h != 0) {
+            return TIGRIS_ERR_BAD_SECTION;
+        }
 
         for (uint16_t j = 0; j < stage->ops_count; j++) {
             if (out_plan->index_pool[stage->ops_off + j] >= hdr->num_ops)
@@ -480,6 +519,36 @@ tigris_error_t tigris_plan_load(
                     spatial_count++;
                     if (spatial_count > LOADER_MAX_CHAIN_SPATIAL_OPS)
                         return TIGRIS_ERR_PLAN_LIMITS;
+                }
+            }
+        }
+    }
+
+    /* A compressed stage redirects weight_entry offsets into its own decoded
+     * block.  Check that every referenced weight/bias is present in that
+     * block before any executor or kernel can dereference the offset. */
+    if (out_plan->weight_blocks) {
+        uint16_t block_cursor = 0;
+        for (uint16_t s = 0; s < hdr->num_stages; s++) {
+            const tigris_weight_block_t *block = NULL;
+            if (block_cursor < out_plan->num_weight_blocks &&
+                out_plan->weight_blocks[block_cursor].stage_idx == s) {
+                block = &out_plan->weight_blocks[block_cursor++];
+            }
+
+            const tigris_stage_t *stage = &out_plan->stages[s];
+            for (uint16_t j = 0; j < stage->ops_count; j++) {
+                const tigris_op_t *op =
+                    &out_plan->ops[out_plan->index_pool[stage->ops_off + j]];
+                uint16_t refs[2] = {op->weight_idx, op->bias_idx};
+                for (uint8_t r = 0; r < 2; r++) {
+                    if (refs[r] == TIGRIS_NO_WEIGHT)
+                        continue;
+                    if (!block ||
+                        !bounds_ok(out_plan->weight_entries[refs[r]].offset,
+                                   out_plan->weight_entries[refs[r]].size_bytes,
+                                   block->uncompressed_size))
+                        return TIGRIS_ERR_BAD_SECTION;
                 }
             }
         }

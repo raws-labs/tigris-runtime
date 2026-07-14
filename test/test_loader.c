@@ -375,6 +375,17 @@ static void test_chain_limit_guards(void)
     stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
     stages[0].chain_id = 0;
     stages[0].chain_len = 2;
+    stages[0].chain_tile_h = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "chain requires every member");
+
+    build_staged_plan(buf);
+    stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
+    stages[0].chain_id = 0;
+    stages[0].chain_len = 2;
+    stages[0].chain_tile_h = 1;
+    stages[1].chain_id = 0;
+    stages[1].chain_len = 2;
     stages[0].ops_count = 8;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "eight chain spatial ops fit fixed metadata");
@@ -382,6 +393,85 @@ static void test_chain_limit_guards(void)
     stages[0].ops_count = 9;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_PLAN_LIMITS, "ninth chain spatial op rejected");
+}
+
+/* A compact valid compressed-weight plan.  It lets the loader tests exercise
+ * block metadata without depending on generated model fixtures. */
+#define WEIGHT_BLOCK_PLAN_SIZE 191u
+#define WB_STAGES_OFF          120u
+#define WB_INDEX_OFF           148u
+#define WB_STRINGS_OFF         150u
+#define WB_WEIGHTS_OFF         151u
+#define WB_BLOCKS_OFF          163u
+
+static void build_compressed_weight_plan(uint8_t *buf)
+{
+    memset(buf, 0, WEIGHT_BLOCK_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = WEIGHT_BLOCK_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_stages = 1;
+    hdr->num_weights = 1;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, WB_STAGES_OFF};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, WB_STAGES_OFF};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, WB_STAGES_OFF};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, WB_INDEX_OFF};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, WB_STRINGS_OFF};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, WB_STRINGS_OFF};
+    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHTS, WB_WEIGHTS_OFF};
+    dir[7] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHT_BLOCKS, WB_BLOCKS_OFF};
+
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + WB_STAGES_OFF);
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    tigris_weight_entry_t *weight =
+        (tigris_weight_entry_t *)(buf + WB_WEIGHTS_OFF);
+    weight->size_bytes = 4;
+
+    uint16_t num_blocks = 1;
+    uint16_t compression = TIGRIS_COMPRESS_NONE;
+    memcpy(buf + WB_BLOCKS_OFF, &num_blocks, sizeof(num_blocks));
+    memcpy(buf + WB_BLOCKS_OFF + sizeof(num_blocks), &compression,
+           sizeof(compression));
+    tigris_weight_block_t *block =
+        (tigris_weight_block_t *)(buf + WB_BLOCKS_OFF + 4u);
+    block->stage_idx = 0;
+    block->first_weight_idx = 0;
+    block->num_weights = 1;
+    block->compressed_size = 4;
+    block->uncompressed_size = 4;
+}
+
+static void test_compressed_block_guards(void)
+{
+    printf("  test_compressed_block_guards...\n");
+    _Alignas(4) uint8_t buf[WEIGHT_BLOCK_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_compressed_weight_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "minimal compressed block loads");
+
+    build_compressed_weight_plan(buf);
+    tigris_weight_block_t *block =
+        (tigris_weight_block_t *)(buf + WB_BLOCKS_OFF + 4u);
+    block->compressed_size = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "uncompressed blocks require all copied source bytes");
+
+    build_compressed_weight_plan(buf);
+    block = (tigris_weight_block_t *)(buf + WB_BLOCKS_OFF + 4u);
+    block->uncompressed_size = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "empty weight block rejected");
 }
 
 /* A tiny valid plan with one tensor and a model-input reference. */
@@ -634,6 +724,7 @@ int main(int argc, char *argv[])
     test_v2_quant_plan_is_still_accepted();
     test_counted_sections_required();
     test_chain_limit_guards();
+    test_compressed_block_guards();
     test_cross_reference_guards();
 
     printf("\nStruct size tests:\n");

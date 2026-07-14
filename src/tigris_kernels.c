@@ -285,6 +285,52 @@ static int kern_tanh(
     return 0;
 }
 
+/* Softmax over the final dimension.  Supported plans use ONNX's default
+ * final-axis form; Softmax is deliberately not tileable. */
+static int kern_softmax(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    if (!plan || !op || !mem || op->num_inputs != 1 || op->num_outputs != 1 ||
+        mem->tile.active)
+        return -1;
+
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const tigris_tensor_t *x_tensor = &plan->tensors[ins[0]];
+    const tigris_tensor_t *y_tensor = &plan->tensors[outs[0]];
+    if (!tensor_is_f32(plan, x_tensor) || !tensor_is_f32(plan, y_tensor) ||
+        !tensor_shapes_equal(plan, x_tensor, y_tensor) || x_tensor->ndim == 0)
+        return -1;
+
+    const int32_t *shape = tigris_tensor_shape(plan, x_tensor);
+    const uint32_t classes = (uint32_t)shape[x_tensor->ndim - 1];
+    const uint32_t count = tensor_numel(plan, ins[0]);
+    if (classes == 0 || count % classes != 0)
+        return -1;
+
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (!X || !Y)
+        return -1;
+
+    for (uint32_t row = 0; row < count / classes; row++) {
+        const float *x = X + (size_t)row * classes;
+        float *y = Y + (size_t)row * classes;
+        float maximum = x[0];
+        for (uint32_t c = 1; c < classes; c++)
+            if (x[c] > maximum) maximum = x[c];
+
+        float sum = 0.0f;
+        for (uint32_t c = 0; c < classes; c++)
+            sum += expf(x[c] - maximum);
+        if (sum == 0.0f)
+            return -1;
+        for (uint32_t c = 0; c < classes; c++)
+            y[c] = expf(x[c] - maximum) / sum;
+    }
+    return 0;
+}
+
 static int kern_conv1d(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -731,6 +777,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_RELU6:       return kern_relu6(plan, op, mem);
     case TIGRIS_OP_SIGMOID:     return kern_sigmoid(plan, op, mem);
     case TIGRIS_OP_TANH:        return kern_tanh(plan, op, mem);
+    case TIGRIS_OP_SOFTMAX:     return kern_softmax(plan, op, mem);
     case TIGRIS_OP_ADD:         return kern_add(plan, op, mem);
     case TIGRIS_OP_MUL:         return kern_mul(plan, op, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d(plan, op, mem);

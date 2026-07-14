@@ -996,6 +996,80 @@ static int kern_tanh_s8(
     return 0;
 }
 
+/* Softmax over the final tensor dimension.  The binary plan format does not
+ * carry a Softmax axis attribute; the compiler's supported quantized graphs
+ * use ONNX's default/final-axis form.  Keep this scalar reference path for
+ * terminal classifiers (and as the accelerator fallback), where correctness
+ * matters more than throughput. */
+static int kern_softmax_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    if (!plan || !op || !mem || op->num_inputs != 1 || op->num_outputs != 1 ||
+        mem->tile.active)
+        return -1;
+
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    if (ins[0] >= plan->header->num_tensors || outs[0] >= plan->header->num_tensors ||
+        ins[0] >= mem->num_tensors || outs[0] >= mem->num_tensors)
+        return -1;
+
+    const tigris_tensor_t *x_tensor = &plan->tensors[ins[0]];
+    const tigris_tensor_t *y_tensor = &plan->tensors[outs[0]];
+    if (x_tensor->dtype != 3 || y_tensor->dtype != 3 || x_tensor->ndim == 0 ||
+        x_tensor->ndim != y_tensor->ndim || x_tensor->size_bytes != y_tensor->size_bytes)
+        return -1;
+
+    const int32_t *x_shape = tigris_tensor_shape(plan, x_tensor);
+    const int32_t *y_shape = tigris_tensor_shape(plan, y_tensor);
+    uint64_t count = 1;
+    for (uint8_t i = 0; i < x_tensor->ndim; i++) {
+        if (x_shape[i] <= 0 || x_shape[i] != y_shape[i])
+            return -1;
+        count *= (uint32_t)x_shape[i];
+        if (count > UINT32_MAX)
+            return -1;
+    }
+    const uint32_t classes = (uint32_t)x_shape[x_tensor->ndim - 1];
+    if (classes == 0 || count != x_tensor->size_bytes || count % classes != 0)
+        return -1;
+
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (!X || !Y)
+        return -1;
+
+    const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, x_tensor);
+    const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, y_tensor);
+    const float in_scale = in_qp ? in_qp->scale : 1.0f;
+    const int32_t in_zp = in_qp ? in_qp->zero_point : 0;
+    const float out_scale = out_qp ? out_qp->scale : 1.0f;
+    const int32_t out_zp = out_qp ? out_qp->zero_point : 0;
+    if (in_scale <= 0.0f || out_scale <= 0.0f)
+        return -1;
+
+    for (uint32_t row = 0; row < (uint32_t)count / classes; row++) {
+        const int8_t *x = X + (size_t)row * classes;
+        int8_t *y = Y + (size_t)row * classes;
+        int32_t max_q = x[0];
+        for (uint32_t c = 1; c < classes; c++)
+            if (x[c] > max_q) max_q = x[c];
+
+        float sum = 0.0f;
+        for (uint32_t c = 0; c < classes; c++)
+            sum += expf(in_scale * (float)((int32_t)x[c] - max_q));
+        if (sum == 0.0f)
+            return -1;
+
+        for (uint32_t c = 0; c < classes; c++) {
+            float probability = expf(in_scale * (float)((int32_t)x[c] - max_q)) / sum;
+            y[c] = clamp_s8((int32_t)roundf(probability / out_scale) + out_zp);
+        }
+    }
+    (void)in_zp; /* Translation invariance cancels the input zero point. */
+    return 0;
+}
+
 static int kern_mul_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1061,6 +1135,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_RESIZE:      return kern_resize_nearest_s8(plan, op, mem);
     case TIGRIS_OP_SIGMOID:     return kern_sigmoid_s8(plan, op, mem);
     case TIGRIS_OP_TANH:        return kern_tanh_s8(plan, op, mem);
+    case TIGRIS_OP_SOFTMAX:     return kern_softmax_s8(plan, op, mem);
     case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
     default:

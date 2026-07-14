@@ -1002,6 +1002,58 @@ static void test_sigmoid(void)
         TEST_ASSERT_NEAR(out_buf[i], expected[i], 1e-4f, "sigmoid output");
 }
 
+static void test_softmax(void)
+{
+    printf("  test_softmax...\n");
+
+    /* Two independent class vectors: [0,1,-1] and [0,0,0]. */
+    float X[6] = {0.0f, 1.0f, -1.0f, 0.0f, 0.0f, 0.0f};
+    float expected[6] = {0.244728f, 0.665241f, 0.090031f,
+                         0.333333f, 0.333333f, 0.333333f};
+    int32_t shape[] = {2, 3};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 2;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 1;
+    tensors[1].shape_off = 0; tensors[1].ndim = 2;
+    tensors[1].size_bytes = sizeof(X); tensors[1].dtype = 1;
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_SOFTMAX;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape;
+    plan.strings = g_strings;
+
+    void *ptrs[2];
+    float out_buf[6];
+    ptrs[0] = X; ptrs[1] = out_buf;
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "softmax dispatch returns 0");
+    for (int i = 0; i < 6; i++)
+        TEST_ASSERT_NEAR(out_buf[i], expected[i], 1e-5f, "softmax output");
+}
+
 /* Mul test */
 
 static void test_mul(void)
@@ -1293,6 +1345,7 @@ int main(void)
     test_concat();
     test_resize_nearest();
     test_sigmoid();
+    test_softmax();
     test_mul();
     test_constant_binary_f32();
     test_malformed_constant_binary_f32();

@@ -125,6 +125,8 @@ typedef enum {
     TIGRIS_ERR_MISSING_SEC  = -7,   /* Required section not present */
     TIGRIS_ERR_ENDIAN       = -8,   /* Platform is not little-endian */
     TIGRIS_ERR_PLAN_LIMITS  = -9,   /* Plan exceeds compiled executor limits */
+    TIGRIS_ERR_BAD_TENSOR   = -10,  /* Tensor metadata is not executable */
+    TIGRIS_ERR_BAD_OPERATOR = -11,  /* Operator contract is not executable */
 } tigris_error_t;
 
 /* Sentinel: tile_plan_idx == 0xFFFF means no tile plan for this stage */

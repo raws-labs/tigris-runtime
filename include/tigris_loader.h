@@ -29,7 +29,11 @@ extern "C" {
  *
  * @param buf       Pointer to the loaded .tgrs file contents.
  * @param buf_len   Size of the buffer in bytes.
- * @param out_plan  Output: parsed plan handle.
+ * Structural bounds and cross-references, tensor metadata, and the executable
+ * operator contract are validated before any pointers are returned. On every
+ * failure, out_plan is cleared and contains no pointers into buf.
+ *
+ * @param out_plan  Output: parsed plan handle, or an empty handle on failure.
  * @return TIGRIS_OK on success, negative error code on failure.
  */
 tigris_error_t tigris_plan_load(

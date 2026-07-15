@@ -59,6 +59,8 @@ static int s_conv_sram = 0, s_conv_psram = 0, s_conv_fallback = 0;
 static void *s_dw_out_buf   = NULL;   /* DW output bounce (16-align) */
 static void *s_pad_buf      = NULL;   /* asymmetric padding pre-pad */
 static int   s_pad_size     = 0;
+static int32_t *s_quant_buf = NULL;   /* scalar-to-per-channel expansion */
+static uint32_t s_quant_channels = 0;
 
 /* Helpers */
 
@@ -74,6 +76,37 @@ static inline int32_t get_shft(
 {
     uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
     return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
+}
+
+static int esp_per_channel_quant(
+    const tigris_plan_t *plan, const tigris_quant_param_t *qp,
+    uint32_t channels, quant_data_t *quant)
+{
+    if (!plan || !quant || channels == 0)
+        return -1;
+
+    if (qp && qp->num_channels == channels) {
+        uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2
+            ? 0u : qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
+        quant->mult = (int32_t *)&plan->quant_data[
+            page + qp->multiplier_off];
+        quant->shift = (int32_t *)&plan->quant_data[page + qp->shift_off];
+        return 0;
+    }
+
+    if ((qp && qp->num_channels != 1u) || !s_quant_buf ||
+        channels > s_quant_channels)
+        return -1;
+
+    int32_t *mult = s_quant_buf;
+    int32_t *shift = s_quant_buf + s_quant_channels;
+    for (uint32_t channel = 0; channel < channels; channel++) {
+        mult[channel] = qp ? get_mult(plan, qp, 0) : 1;
+        shift[channel] = qp ? get_shft(plan, qp, 0) : 0;
+    }
+    quant->mult = mult;
+    quant->shift = shift;
+    return 0;
 }
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -97,6 +130,7 @@ void tigris_esp_nn_deinit(void)
     esp_nn_workspace_free(s_sram_scratch);
     esp_nn_workspace_free(s_dw_out_buf);
     esp_nn_workspace_free(s_pad_buf);
+    esp_nn_workspace_free(s_quant_buf);
     s_scratch_buf = NULL;
     s_scratch_size = 0;
     s_sram_scratch = NULL;
@@ -104,6 +138,8 @@ void tigris_esp_nn_deinit(void)
     s_dw_out_buf = NULL;
     s_pad_buf = NULL;
     s_pad_size = 0;
+    s_quant_buf = NULL;
+    s_quant_channels = 0;
 #ifdef __XTENSA__
     s_conv_sram = s_conv_psram = s_conv_fallback = 0;
 #endif
@@ -124,6 +160,7 @@ int tigris_esp_nn_prepare(
     int max_scratch = 0;
     int max_dw_out  = 0;
     int max_pad     = 0;
+    int max_quant_channels = 0;
 
     for (uint16_t i = 0; i < plan->header->num_ops; i++) {
         const tigris_op_t *op = &plan->ops[i];
@@ -188,6 +225,7 @@ int tigris_esp_nn_prepare(
                        i, IH,IW,IC, OH,OW,OC, KH,KW, s);
 #endif
             max_scratch = MAX(max_scratch, s);
+            max_quant_channels = MAX(max_quant_channels, OC);
 
         } else if (op->op_type == TIGRIS_OP_DEPTHWISE) {
             const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -232,6 +270,7 @@ int tigris_esp_nn_prepare(
 
             int s = esp_nn_get_depthwise_conv_scratch_size(&id, &fd, &od, &dp);
             max_scratch = MAX(max_scratch, s);
+            max_quant_channels = MAX(max_quant_channels, C);
 
             /* DW output bounce buffer: ee.vst.128.xp needs 16-byte alignment.
              * Size for tile height, not full tensor height. */
@@ -243,6 +282,12 @@ int tigris_esp_nn_prepare(
      * consecutive regions maintain 16-byte alignment. */
     uint32_t dw_aligned  = (uint32_t)((max_dw_out  + 15) & ~15);
     uint32_t pad_aligned = (uint32_t)((max_pad     + 15) & ~15);
+    if (max_quant_channels < 0 ||
+        (uint32_t)max_quant_channels >
+            (UINT32_MAX - 15u) / (2u * sizeof(int32_t)))
+        goto fail;
+    uint32_t quant_aligned = (
+        (uint32_t)max_quant_channels * 2u * sizeof(int32_t) + 15u) & ~15u;
 
     /* Allocate all ESP-NN buffers from heap (PSRAM) to avoid stealing
      * from the tensor arena, which the plan compiler sized for tensors. */
@@ -262,6 +307,11 @@ int tigris_esp_nn_prepare(
         /* Allocation failure is non-fatal: adapt_conv2d verifies this exact
          * workspace before changing vendor padding and falls back to s8_ref. */
         s_pad_size = s_pad_buf ? (int)pad_aligned : 0;
+    }
+    if (quant_aligned > 0) {
+        s_quant_buf = ESP_NN_ALLOC(quant_aligned);
+        if (!s_quant_buf) goto fail;
+        s_quant_channels = quant_aligned / (2u * sizeof(int32_t));
     }
     if (max_scratch > 0) {
         uint32_t scr_bytes = (uint32_t)((max_scratch + 16 + 15) & ~15);
@@ -414,13 +464,10 @@ static int adapt_conv2d(
     data_dims_t filter_dims = { .width = KW, .height = KH, .channels = 0, .extra = 0 };
     data_dims_t output_dims = { .width = OW, .height = OH, .channels = OC, .extra = 1 };
 
-    int32_t mult_arr[OC], shift_arr[OC];
-    for (int oc = 0; oc < OC; oc++) {
-        int ch = (out_qp && out_qp->num_channels > 1) ? oc : 0;
-        mult_arr[oc]  = out_qp ? get_mult(plan, out_qp, ch) : 1;
-        shift_arr[oc] = out_qp ? get_shft(plan, out_qp, ch) : 0;
-    }
-    quant_data_t quant = { .shift = shift_arr, .mult = mult_arr };
+    quant_data_t quant;
+    if (OC <= 0 || esp_per_channel_quant(
+            plan, out_qp, (uint32_t)OC, &quant) != 0)
+        return -99;
 
     conv_params_t params = {
         .in_offset  = in_offset,
@@ -489,13 +536,10 @@ static int adapt_depthwise_conv2d(
     data_dims_t filter_dims = { .width = KW, .height = KH, .channels = 0, .extra = 0 };
     data_dims_t output_dims = { .width = OW, .height = OH, .channels = C, .extra = 1 };
 
-    int32_t mult_arr[C], shift_arr[C];
-    for (int c = 0; c < C; c++) {
-        int ch = (out_qp && out_qp->num_channels > 1) ? c : 0;
-        mult_arr[c]  = out_qp ? get_mult(plan, out_qp, ch) : 1;
-        shift_arr[c] = out_qp ? get_shft(plan, out_qp, ch) : 0;
-    }
-    quant_data_t quant = { .shift = shift_arr, .mult = mult_arr };
+    quant_data_t quant;
+    if (C <= 0 || esp_per_channel_quant(
+            plan, out_qp, (uint32_t)C, &quant) != 0)
+        return -99;
 
     /* Depthwise weights are already in [KH, KW, C] (HWC) layout from
      * the compiler - matches ESP-NN's expected layout. */
@@ -564,11 +608,12 @@ static int adapt_fully_connected(
      * 8-byte aligned as required by ESP-NN S3 SIMD (ee.vld.l.64.ip). */
 
     if (out_qp && out_qp->num_channels > 1) {
-        int32_t mult_arr[OC], shift_arr[OC];
-        for (int oc = 0; oc < OC; oc++) {
-            mult_arr[oc]  = get_mult(plan, out_qp, oc);
-            shift_arr[oc] = get_shft(plan, out_qp, oc);
-        }
+        uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2
+            ? 0u : out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
+        const int32_t *mult_arr = &plan->quant_data[
+            page + out_qp->multiplier_off];
+        const int32_t *shift_arr = &plan->quant_data[
+            page + out_qp->shift_off];
         for (int n = 0; n < N; n++) {
             esp_nn_fully_connected_per_ch_s8(
                 X + n * row_len, in_offset, row_len,

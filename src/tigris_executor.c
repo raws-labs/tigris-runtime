@@ -32,17 +32,59 @@
 #  endif
 #endif
 
-/*
- * Executor limits - validated at plan load time (tigris_plan_load).
- * Exceeding these limits returns TIGRIS_ERR_PLAN_LIMITS.
- */
-#define MAX_STAGE_INPUTS      16
-#define MAX_STAGE_OUTPUTS     16
-#define MAX_CHAIN_STAGES      16
-#define MAX_SPATIAL_PER_STAGE  8
-#define TIGRIS_MAX_TENSORS   512  /* max tensor index for alive/last_use arrays */
-
 #define TILE_ALIGN_UP(x) (((x) + (TIGRIS_TENSOR_ALIGN - 1u)) & ~(TIGRIS_TENSOR_ALIGN - 1u))
+
+typedef struct {
+    int32_t full_in_h;
+    int32_t full_in_w;
+    int32_t full_out_h;
+    int32_t full_out_w;
+    int32_t stride_h;
+    int32_t eff_kh;
+    int32_t orig_pad_top;
+    int     sp_count;
+    int     sp_op_indices[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+    int32_t sp_strides[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+    int32_t sp_eff_khs[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+    int32_t sp_pad_tops[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+    int32_t sp_full_in_hs[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+    int32_t sp_full_in_ws[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+    int32_t sp_full_out_ws[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+} chain_stage_info_t;
+
+typedef struct {
+    uint16_t last_use_op[TIGRIS_MAX_TENSORS];
+    uint16_t last_consumer[TIGRIS_MAX_TENSORS];
+    void *input_ptrs[TIGRIS_MAX_STAGE_INPUTS];
+    void *output_ptrs[TIGRIS_MAX_STAGE_OUTPUTS];
+    const tigris_stage_t *stages[TIGRIS_MAX_CHAIN_STAGES];
+    chain_stage_info_t info[TIGRIS_MAX_CHAIN_STAGES];
+    uint8_t *weight_bases[TIGRIS_MAX_CHAIN_STAGES];
+    int32_t s_out[TIGRIS_MAX_CHAIN_STAGES];
+    int32_t s_in[TIGRIS_MAX_CHAIN_STAGES];
+    int32_t in_starts[TIGRIS_MAX_CHAIN_STAGES];
+    int32_t in_ends[TIGRIS_MAX_CHAIN_STAGES];
+    int32_t out_starts[TIGRIS_MAX_CHAIN_STAGES];
+    int32_t out_ends[TIGRIS_MAX_CHAIN_STAGES];
+    int32_t sp_tile_in_h[TIGRIS_MAX_CHAIN_STAGES]
+                            [TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+    int32_t sp_tile_out_h[TIGRIS_MAX_CHAIN_STAGES]
+                             [TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+    int32_t sp_tile_pt[TIGRIS_MAX_CHAIN_STAGES]
+                         [TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+    int32_t sp_tile_pb[TIGRIS_MAX_CHAIN_STAGES]
+                         [TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+} executor_workspace_impl_t;
+
+typedef char tigris_executor_workspace_too_small[
+    sizeof(executor_workspace_impl_t) <= sizeof(tigris_executor_workspace_t)
+        ? 1 : -1];
+
+static executor_workspace_impl_t *workspace_impl(
+    tigris_executor_workspace_t *workspace)
+{
+    return (executor_workspace_impl_t *)(void *)workspace->bytes;
+}
 
 /* Memory compaction */
 
@@ -50,46 +92,51 @@
  * Compact the fast pool: move alive tensors to the front, reclaim
  * space from dead ones.  Similar to compact_slow but for fast arena.
  */
-static void compact_fast(tigris_mem_t *mem, const tigris_plan_t *plan)
+static uint32_t compact_pool(
+    tigris_mem_t *mem, const tigris_plan_t *plan,
+    uint8_t *base, uint32_t first, uint32_t size)
 {
-    /* Collect alive fast-pool tensors, sorted by current address. */
-    uint16_t alive[TIGRIS_MAX_TENSORS];
-    uint16_t n = 0;
+    uintptr_t cursor = (uintptr_t)(base + first);
+    uintptr_t end = (uintptr_t)(base + size);
+    uint32_t wp = first;
 
-    for (uint16_t i = 0; i < mem->num_tensors && n < TIGRIS_MAX_TENSORS; i++) {
-        uint8_t *p = (uint8_t *)mem->tensor_ptrs[i];
-        if (p && p >= mem->fast_base + mem->fast_reserved &&
-            p < mem->fast_base + mem->fast_size)
-            alive[n++] = i;
-    }
-
-    if (n == 0) { mem->fast_used = mem->fast_reserved; return; }
-
-    /* Insertion sort by address (n is small) */
-    for (uint16_t i = 1; i < n; i++) {
-        uint16_t key = alive[i];
-        uint8_t *kp = (uint8_t *)mem->tensor_ptrs[key];
-        int j = (int)i - 1;
-        while (j >= 0 && (uint8_t *)mem->tensor_ptrs[alive[j]] > kp) {
-            alive[j + 1] = alive[j];
-            j--;
+    /* Select the next live allocation by address on each pass.  This is O(n²)
+     * in the configured tensor limit, but compaction is an exceptional OOM
+     * recovery path and no longer needs a max-tensor index array on the stack. */
+    while (cursor < end) {
+        uintptr_t next = end;
+        uint16_t tidx = UINT16_MAX;
+        for (uint16_t i = 0; i < mem->num_tensors; i++) {
+            uintptr_t p = (uintptr_t)mem->tensor_ptrs[i];
+            if (p >= cursor && p < next && p < end) {
+                next = p;
+                tidx = i;
+            }
         }
-        alive[j + 1] = key;
-    }
+        if (tidx == UINT16_MAX)
+            break;
 
-    /* Slide each alive tensor toward the front (after reserved area) */
-    uint32_t wp = mem->fast_reserved;
-    for (uint16_t i = 0; i < n; i++) {
-        uint16_t tidx = alive[i];
-        uint32_t sz = (plan->tensors[tidx].size_bytes + (TIGRIS_TENSOR_ALIGN - 1u)) & ~(TIGRIS_TENSOR_ALIGN - 1u);
-        uint8_t *src = (uint8_t *)mem->tensor_ptrs[tidx];
-        uint8_t *dst = mem->fast_base + wp;
+        uint32_t sz = TILE_ALIGN_UP(plan->tensors[tidx].size_bytes);
+        uint8_t *src = (uint8_t *)next;
+        uint8_t *dst = base + wp;
         if (dst != src)
             memmove(dst, src, sz);
-        mem->tensor_ptrs[tidx] = dst;
+
+        /* Preserve in-place aliases that point at the same allocation. */
+        for (uint16_t i = 0; i < mem->num_tensors; i++) {
+            if (mem->tensor_ptrs[i] == src)
+                mem->tensor_ptrs[i] = dst;
+        }
         wp += sz;
+        cursor = next + sz;
     }
-    mem->fast_used = wp;
+    return wp;
+}
+
+static void compact_fast(tigris_mem_t *mem, const tigris_plan_t *plan)
+{
+    mem->fast_used = compact_pool(
+        mem, plan, mem->fast_base, mem->fast_reserved, mem->fast_size);
 }
 
 /**
@@ -99,43 +146,7 @@ static void compact_fast(tigris_mem_t *mem, const tigris_plan_t *plan)
  */
 static void compact_slow(tigris_mem_t *mem, const tigris_plan_t *plan)
 {
-    /* Collect alive slow-pool tensors, sorted by current address. */
-    uint16_t alive[TIGRIS_MAX_TENSORS];
-    uint16_t n = 0;
-
-    for (uint16_t i = 0; i < mem->num_tensors && n < TIGRIS_MAX_TENSORS; i++) {
-        uint8_t *p = (uint8_t *)mem->tensor_ptrs[i];
-        if (p && p >= mem->slow_base && p < mem->slow_base + mem->slow_size)
-            alive[n++] = i;
-    }
-
-    if (n == 0) { mem->slow_used = 0; return; }
-
-    /* Insertion sort by address (n is small) */
-    for (uint16_t i = 1; i < n; i++) {
-        uint16_t key = alive[i];
-        uint8_t *kp = (uint8_t *)mem->tensor_ptrs[key];
-        int j = (int)i - 1;
-        while (j >= 0 && (uint8_t *)mem->tensor_ptrs[alive[j]] > kp) {
-            alive[j + 1] = alive[j];
-            j--;
-        }
-        alive[j + 1] = key;
-    }
-
-    /* Slide each alive tensor toward the front */
-    uint32_t wp = 0;
-    for (uint16_t i = 0; i < n; i++) {
-        uint16_t tidx = alive[i];
-        uint32_t sz = (plan->tensors[tidx].size_bytes + (TIGRIS_TENSOR_ALIGN - 1u)) & ~(TIGRIS_TENSOR_ALIGN - 1u);
-        uint8_t *src = (uint8_t *)mem->tensor_ptrs[tidx];
-        uint8_t *dst = mem->slow_base + wp;
-        if (dst != src)
-            memmove(dst, src, sz);
-        mem->tensor_ptrs[tidx] = dst;
-        wp += sz;
-    }
-    mem->slow_used = wp;
+    mem->slow_used = compact_pool(mem, plan, mem->slow_base, 0, mem->slow_size);
 }
 
 /* Helpers */
@@ -181,17 +192,18 @@ static tigris_exec_error_t exec_stage_normal(
     tigris_mem_t        *mem,
     tigris_kernel_fn     kernel,
     void                *user_ctx,
-    tigris_exec_stats_t *stats)
+    tigris_exec_stats_t *stats,
+    executor_workspace_impl_t *workspace)
 {
     const uint16_t *sin = tigris_stage_inputs(plan, stage);
     const uint16_t *sops = tigris_stage_ops(plan, stage);
     const uint16_t *sout = tigris_stage_outputs(plan, stage);
-    void *saved_slow[MAX_STAGE_INPUTS];
+    void **saved_slow = workspace->input_ptrs;
 
     /* Pre-compute last_use_op[t] = index within sops[] of last op that reads t.
      * After that op completes, t's fast memory can be reclaimed (if not a stage output). */
     uint16_t num_t = plan->header->num_tensors;
-    uint16_t last_use_op[TIGRIS_MAX_TENSORS];
+    uint16_t *last_use_op = workspace->last_use_op;
     if (num_t > TIGRIS_MAX_TENSORS) num_t = TIGRIS_MAX_TENSORS;
     for (uint16_t i = 0; i < num_t; i++)
         last_use_op[i] = UINT16_MAX;  /* not used in this stage */
@@ -215,7 +227,7 @@ static tigris_exec_error_t exec_stage_normal(
     }
 
     /* Load stage inputs */
-    for (uint16_t i = 0; i < stage->inputs_count && i < MAX_STAGE_INPUTS; i++) {
+    for (uint16_t i = 0; i < stage->inputs_count; i++) {
         uint16_t tidx = sin[i];
         saved_slow[i] = mem->tensor_ptrs[tidx];
 
@@ -286,7 +298,7 @@ static tigris_exec_error_t exec_stage_normal(
     tigris_mem_reset_fast(mem);
 
     /* Restore stage input pointers to slow */
-    for (uint16_t i = 0; i < stage->inputs_count && i < MAX_STAGE_INPUTS; i++) {
+    for (uint16_t i = 0; i < stage->inputs_count; i++) {
         uint16_t tidx = sin[i];
         mem->tensor_ptrs[tidx] = saved_slow[i];
     }
@@ -303,12 +315,13 @@ static tigris_exec_error_t exec_stage_tiled(
     tigris_kernel_fn          kernel,
     void                     *user_ctx,
     const uint16_t           *last_consumer,
-    uint16_t                  current_stage)
+    uint16_t                  current_stage,
+    executor_workspace_impl_t *workspace)
 {
     /* 1. Pre-allocate full output tensors in slow (or reuse input for in-place) */
     const uint16_t *sout = tigris_stage_outputs(plan, stage);
     const uint16_t *sin = tigris_stage_inputs(plan, stage);
-    void *out_slow_bases[MAX_STAGE_OUTPUTS];
+    void **out_slow_bases = workspace->output_ptrs;
     int in_place = 0;  /* set if output reuses input's slow memory */
 
     /* Spatial op + image dims, computed up front: the in-place halo guard below
@@ -327,7 +340,7 @@ static tigris_exec_error_t exec_stage_tiled(
     int32_t dh = (sp_attrs && sp_attrs->dilation_h) ? sp_attrs->dilation_h : 1;
     int32_t eff_kh = sp_attrs ? ((sp_attrs->kernel_h - 1) * dh + 1) : 1;
 
-    for (uint16_t i = 0; i < stage->outputs_count && i < MAX_STAGE_OUTPUTS; i++) {
+    for (uint16_t i = 0; i < stage->outputs_count; i++) {
         uint16_t tidx = sout[i];
         tigris_mem_error_t merr = tigris_mem_alloc_slow(
             mem, tidx, plan->tensors[tidx].size_bytes);
@@ -358,8 +371,8 @@ static tigris_exec_error_t exec_stage_tiled(
     }
 
     /* 2. Save slow ptrs for stage inputs */
-    void *in_slow_bases[MAX_STAGE_INPUTS];
-    for (uint16_t i = 0; i < stage->inputs_count && i < MAX_STAGE_INPUTS; i++)
+    void **in_slow_bases = workspace->input_ptrs;
+    for (uint16_t i = 0; i < stage->inputs_count; i++)
         in_slow_bases[i] = mem->tensor_ptrs[sin[i]];
 
     /* (Spatial op + image dims computed up front, above.) */
@@ -377,7 +390,7 @@ static tigris_exec_error_t exec_stage_tiled(
      */
     uint32_t in_row_cost = 0;   /* input bytes per output row (proportional) */
     uint32_t in_fixed_cost = 0; /* input bytes from kernel overlap (one-time per tile) */
-    for (uint16_t i = 0; i < stage->inputs_count && i < MAX_STAGE_INPUTS; i++) {
+    for (uint16_t i = 0; i < stage->inputs_count; i++) {
         const tigris_tensor_t *t = &plan->tensors[sin[i]];
         const int32_t *sh = tigris_tensor_shape(plan, t);
         /* NHWC: row_bytes = W * C * elem_size, where one row = one H-position */
@@ -470,7 +483,7 @@ static tigris_exec_error_t exec_stage_tiled(
         mem->tile.active = 1;
 
         /* d. LOAD: load tile for each stage input */
-        for (uint16_t i = 0; i < stage->inputs_count && i < MAX_STAGE_INPUTS; i++) {
+        for (uint16_t i = 0; i < stage->inputs_count; i++) {
             uint16_t tidx = sin[i];
             mem->tensor_ptrs[tidx] = in_slow_bases[i]; /* restore before load */
             tigris_mem_error_t merr = tigris_mem_load_tile(
@@ -539,7 +552,7 @@ static tigris_exec_error_t exec_stage_tiled(
         }
 
         /* f. SPILL: spill tile for each stage output */
-        for (uint16_t i = 0; i < stage->outputs_count && i < MAX_STAGE_OUTPUTS; i++) {
+        for (uint16_t i = 0; i < stage->outputs_count; i++) {
             uint16_t tidx = sout[i];
             tigris_mem_error_t merr = tigris_mem_spill_tile(
                 mem, plan, tidx, out_slow_bases[i],
@@ -566,11 +579,11 @@ static tigris_exec_error_t exec_stage_tiled(
      *    fast-arena pointers with full-size metadata. */
     memset(&mem->tile, 0, sizeof(mem->tile));
     if (!in_place) {
-        for (uint16_t i = 0; i < stage->inputs_count && i < MAX_STAGE_INPUTS; i++)
+        for (uint16_t i = 0; i < stage->inputs_count; i++)
             mem->tensor_ptrs[sin[i]] = in_slow_bases[i];
     } else {
         /* In-place: input was overwritten, clear its pointer */
-        for (uint16_t i = 0; i < stage->inputs_count && i < MAX_STAGE_INPUTS; i++)
+        for (uint16_t i = 0; i < stage->inputs_count; i++)
             mem->tensor_ptrs[sin[i]] = NULL;
     }
 
@@ -618,26 +631,6 @@ static const tigris_weight_block_t *find_weight_block(
 
 /* Chained tiled execution */
 
-typedef struct {
-    int32_t full_in_h;
-    int32_t full_in_w;
-    int32_t full_out_h;
-    int32_t full_out_w;
-    /* Composed receptive field for inter-stage back-propagation */
-    int32_t stride_h;        /* product of all spatial strides */
-    int32_t eff_kh;          /* composed effective kernel height */
-    int32_t orig_pad_top;    /* composed top padding */
-    /* Per-spatial-op tracking within the stage */
-    int     sp_count;
-    int     sp_op_indices[MAX_SPATIAL_PER_STAGE];
-    int32_t sp_strides[MAX_SPATIAL_PER_STAGE];
-    int32_t sp_eff_khs[MAX_SPATIAL_PER_STAGE];
-    int32_t sp_pad_tops[MAX_SPATIAL_PER_STAGE];    /* original op padding */
-    int32_t sp_full_in_hs[MAX_SPATIAL_PER_STAGE];  /* full input H of each spatial op */
-    int32_t sp_full_in_ws[MAX_SPATIAL_PER_STAGE];  /* full input W */
-    int32_t sp_full_out_ws[MAX_SPATIAL_PER_STAGE];  /* full output W */
-} chain_stage_info_t;
-
 /**
  * Execute a chain of stages with tile-through streaming.
  *
@@ -658,13 +651,14 @@ static tigris_exec_error_t exec_chain_tiled(
     uint16_t             num_chain,
     tigris_mem_t        *mem,
     tigris_kernel_fn     kernel,
-    void                *user_ctx)
+    void                *user_ctx,
+    executor_workspace_impl_t *workspace)
 {
-    if (num_chain < 2 || num_chain > MAX_CHAIN_STAGES)
+    if (num_chain < 2 || num_chain > TIGRIS_MAX_CHAIN_STAGES)
         return TIGRIS_EXEC_ERR_TILE;
 
-    const tigris_stage_t *stages[MAX_CHAIN_STAGES];
-    chain_stage_info_t info[MAX_CHAIN_STAGES];
+    const tigris_stage_t **stages = workspace->stages;
+    chain_stage_info_t *info = workspace->info;
 
     for (uint16_t c = 0; c < num_chain; c++) {
         stages[c] = &plan->stages[first_idx + c];
@@ -702,7 +696,7 @@ static tigris_exec_error_t exec_chain_tiled(
                 const uint16_t *op_outs = tigris_op_outputs(plan, &plan->ops[sops[j]]);
                 const int32_t *op_osh = tigris_tensor_shape(plan, &plan->tensors[op_outs[0]]);
 
-                if (sp_count < MAX_SPATIAL_PER_STAGE) {
+                if (sp_count < (int)TIGRIS_MAX_SPATIAL_OPS_PER_STAGE) {
                     info[c].sp_op_indices[sp_count] = (int)sops[j];
                     info[c].sp_strides[sp_count] = sh;
                     info[c].sp_eff_khs[sp_count] = ekh;
@@ -730,8 +724,9 @@ static tigris_exec_error_t exec_chain_tiled(
     }
 
     /* 0. Decompress all chain stages' weight blocks into fast prefix */
-    uint8_t *weight_bases[MAX_CHAIN_STAGES];
-    memset(weight_bases, 0, sizeof(weight_bases));
+    uint8_t **weight_bases = workspace->weight_bases;
+    memset(weight_bases, 0,
+           TIGRIS_MAX_CHAIN_STAGES * sizeof(*weight_bases));
 
     int32_t chain_tile_h_override = 0;
 
@@ -788,7 +783,8 @@ static tigris_exec_error_t exec_chain_tiled(
             int32_t mid = (lo + hi) / 2;
 
             /* Back-propagate heights for this tile_h */
-            int32_t s_out[MAX_CHAIN_STAGES], s_in[MAX_CHAIN_STAGES];
+            int32_t *s_out = workspace->s_out;
+            int32_t *s_in = workspace->s_in;
             s_out[num_chain - 1] = mid;
             for (int c = num_chain - 1; c >= 0; c--) {
                 if (c < num_chain - 1)
@@ -875,10 +871,11 @@ static tigris_exec_error_t exec_chain_tiled(
      *    Last stage may have multiple outputs consumed by later stages. */
     const tigris_stage_t *last_stage = stages[num_chain - 1];
     const uint16_t *last_sout = tigris_stage_outputs(plan, last_stage);
-    void *out_slow_bases[MAX_STAGE_OUTPUTS];
-    memset(out_slow_bases, 0, sizeof(out_slow_bases));
+    void **out_slow_bases = workspace->output_ptrs;
+    memset(out_slow_bases, 0,
+           TIGRIS_MAX_STAGE_OUTPUTS * sizeof(*out_slow_bases));
 
-    for (uint16_t i = 0; i < last_stage->outputs_count && i < MAX_STAGE_OUTPUTS; i++) {
+    for (uint16_t i = 0; i < last_stage->outputs_count; i++) {
         uint16_t tidx = last_sout[i];
         tigris_mem_error_t merr = tigris_mem_alloc_slow(
             mem, tidx, plan->tensors[tidx].size_bytes);
@@ -894,8 +891,8 @@ static tigris_exec_error_t exec_chain_tiled(
     /* 2. Save slow ptrs for first stage's inputs */
     const tigris_stage_t *first_stage = stages[0];
     const uint16_t *first_sin = tigris_stage_inputs(plan, first_stage);
-    void *in_slow_bases[MAX_STAGE_INPUTS];
-    for (uint16_t i = 0; i < first_stage->inputs_count && i < MAX_STAGE_INPUTS; i++)
+    void **in_slow_bases = workspace->input_ptrs;
+    for (uint16_t i = 0; i < first_stage->inputs_count; i++)
         in_slow_bases[i] = mem->tensor_ptrs[first_sin[i]];
 
     /* 3. Get chain tile height - use validated override (accounts for
@@ -917,14 +914,20 @@ static tigris_exec_error_t exec_chain_tiled(
         /* b. Back-propagate ranges through chain: last->first.
          *    Uses COMPOSED receptive fields so stages with multiple
          *    spatial ops get enough input rows for all of them. */
-        int32_t in_starts[MAX_CHAIN_STAGES], in_ends[MAX_CHAIN_STAGES];
-        int32_t out_starts[MAX_CHAIN_STAGES], out_ends[MAX_CHAIN_STAGES];
+        int32_t *in_starts = workspace->in_starts;
+        int32_t *in_ends = workspace->in_ends;
+        int32_t *out_starts = workspace->out_starts;
+        int32_t *out_ends = workspace->out_ends;
 
         /* Per-spatial-op tile info (computed per tile) */
-        int32_t sp_tile_in_h[MAX_CHAIN_STAGES][MAX_SPATIAL_PER_STAGE];
-        int32_t sp_tile_out_h[MAX_CHAIN_STAGES][MAX_SPATIAL_PER_STAGE];
-        int32_t sp_tile_pt[MAX_CHAIN_STAGES][MAX_SPATIAL_PER_STAGE];
-        int32_t sp_tile_pb[MAX_CHAIN_STAGES][MAX_SPATIAL_PER_STAGE];
+        int32_t (*sp_tile_in_h)[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE] =
+            workspace->sp_tile_in_h;
+        int32_t (*sp_tile_out_h)[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE] =
+            workspace->sp_tile_out_h;
+        int32_t (*sp_tile_pt)[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE] =
+            workspace->sp_tile_pt;
+        int32_t (*sp_tile_pb)[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE] =
+            workspace->sp_tile_pb;
 
         {
             int32_t os = out_start, oe = out_end;
@@ -973,7 +976,7 @@ static tigris_exec_error_t exec_chain_tiled(
         }
 
         /* c. Load first stage's input tile from slow -> fast */
-        for (uint16_t i = 0; i < first_stage->inputs_count && i < MAX_STAGE_INPUTS; i++) {
+        for (uint16_t i = 0; i < first_stage->inputs_count; i++) {
             uint16_t tidx = first_sin[i];
             mem->tensor_ptrs[tidx] = in_slow_bases[i];
             tigris_mem_error_t merr = tigris_mem_load_tile(
@@ -1101,7 +1104,7 @@ static tigris_exec_error_t exec_chain_tiled(
         }
 
         /* e. Spill last stage's output tile to slow */
-        for (uint16_t oi = 0; oi < last_stage->outputs_count && oi < MAX_STAGE_OUTPUTS; oi++) {
+        for (uint16_t oi = 0; oi < last_stage->outputs_count; oi++) {
             uint16_t tidx = last_sout[oi];
             if (!out_slow_bases[oi]) continue;
             tigris_mem_error_t merr = tigris_mem_spill_tile(
@@ -1136,7 +1139,7 @@ static tigris_exec_error_t exec_chain_tiled(
      *    reset.  If left dangling, compact_fast() will find them, use their
      *    full plan sizes (not tile sizes), and push fast_used past the arena. */
     memset(&mem->tile, 0, sizeof(mem->tile));
-    for (uint16_t i = 0; i < first_stage->inputs_count && i < MAX_STAGE_INPUTS; i++)
+    for (uint16_t i = 0; i < first_stage->inputs_count; i++)
         mem->tensor_ptrs[first_sin[i]] = in_slow_bases[i];
 
     for (uint16_t c = 0; c < num_chain; c++) {
@@ -1164,15 +1167,20 @@ static tigris_exec_error_t exec_chain_tiled(
 
 /* Public API */
 
-tigris_exec_error_t tigris_run(
-    const tigris_plan_t *plan,
-    tigris_mem_t        *mem,
-    tigris_kernel_fn     kernel,
-    void                *user_ctx,
-    tigris_exec_stats_t *stats)
+tigris_exec_error_t tigris_run_with_workspace(
+    const tigris_plan_t          *plan,
+    tigris_mem_t                 *mem,
+    tigris_kernel_fn              kernel,
+    void                         *user_ctx,
+    tigris_exec_stats_t          *stats,
+    tigris_executor_workspace_t  *workspace_storage)
 {
     if (!plan || !mem || !kernel)
         return TIGRIS_EXEC_ERR_NULL;
+    if (!workspace_storage)
+        return TIGRIS_EXEC_ERR_WORKSPACE;
+
+    executor_workspace_impl_t *workspace = workspace_impl(workspace_storage);
 
     if (plan->header->num_stages == 0 || !plan->stages)
         return TIGRIS_EXEC_ERR_NO_STAGES;
@@ -1195,7 +1203,7 @@ tigris_exec_error_t tigris_run(
     /* Pre-compute last_consumer[t] = last stage that reads tensor t.
      * After that stage completes, t's slow memory can be reclaimed. */
     uint16_t num_t = plan->header->num_tensors;
-    uint16_t last_consumer[TIGRIS_MAX_TENSORS];
+    uint16_t *last_consumer = workspace->last_consumer;
     if (num_t > TIGRIS_MAX_TENSORS) num_t = TIGRIS_MAX_TENSORS;
     for (uint16_t i = 0; i < num_t; i++)
         last_consumer[i] = 0;
@@ -1264,7 +1272,8 @@ tigris_exec_error_t tigris_run(
         if (stage->chain_len >= 2 && stage->chain_id == s) {
             /* First stage of a chain - execute entire chain */
             tigris_exec_error_t err = exec_chain_tiled(
-                run_plan, s, stage->chain_len, mem, kernel, user_ctx);
+                run_plan, s, stage->chain_len, mem, kernel, user_ctx,
+                workspace);
             if (err != TIGRIS_EXEC_OK) {
                 TIGRIS_PLATFORM_DBG("S%u chain(%u) ERR=%d fast=%lu/%lu slow=%lu/%lu\n",
                     s, stage->chain_len, (int)err,
@@ -1303,7 +1312,7 @@ tigris_exec_error_t tigris_run(
                 total_io > (mem->fast_size - mem->fast_reserved)) {
                 tigris_exec_error_t err = exec_stage_tiled(
                     run_plan, stage, mem, kernel, user_ctx,
-                    last_consumer, s);
+                    last_consumer, s, workspace);
                 if (err != TIGRIS_EXEC_OK) {
                     TIGRIS_PLATFORM_DBG("S%u tiled ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
                         s, (int)err, (unsigned long)total_io,
@@ -1315,7 +1324,7 @@ tigris_exec_error_t tigris_run(
                 if (stats) stats->stages_tiled++;
             } else {
                 tigris_exec_error_t err = exec_stage_normal(
-                    run_plan, stage, mem, kernel, user_ctx, stats);
+                    run_plan, stage, mem, kernel, user_ctx, stats, workspace);
                 if (err != TIGRIS_EXEC_OK) {
                     TIGRIS_PLATFORM_DBG("S%u normal ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
                         s, (int)err, (unsigned long)total_io,
@@ -1361,6 +1370,32 @@ restore_fast_arena:
     return result;
 }
 
+size_t tigris_executor_workspace_size(void)
+{
+    return sizeof(tigris_executor_workspace_t);
+}
+
+tigris_exec_error_t tigris_run(
+    const tigris_plan_t *plan,
+    tigris_mem_t        *mem,
+    tigris_kernel_fn     kernel,
+    void                *user_ctx,
+    tigris_exec_stats_t *stats)
+{
+#if TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE
+    static tigris_executor_workspace_t default_workspace;
+    return tigris_run_with_workspace(
+        plan, mem, kernel, user_ctx, stats, &default_workspace);
+#else
+    (void)plan;
+    (void)mem;
+    (void)kernel;
+    (void)user_ctx;
+    (void)stats;
+    return TIGRIS_EXEC_ERR_WORKSPACE;
+#endif
+}
+
 const char *tigris_exec_error_str(tigris_exec_error_t err)
 {
     switch (err) {
@@ -1370,6 +1405,7 @@ const char *tigris_exec_error_str(tigris_exec_error_t err)
         case TIGRIS_EXEC_ERR_KERNEL:     return "kernel callback error";
         case TIGRIS_EXEC_ERR_NO_STAGES:  return "plan has no stages";
         case TIGRIS_EXEC_ERR_TILE:       return "tiled execution error";
+        case TIGRIS_EXEC_ERR_WORKSPACE:  return "executor workspace unavailable";
         default:                         return "unknown error";
     }
 }

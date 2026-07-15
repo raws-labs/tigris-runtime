@@ -17,6 +17,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "tigris_config.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

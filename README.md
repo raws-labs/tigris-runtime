@@ -41,14 +41,14 @@ validate the selected dtype/operator route.
 
 ESP-NN and CMSIS-NN also require a successful preparation call after
 `tigris_mem_init()` and before inference. ESP-NN preparation obtains
-platform-managed workspace; CMSIS-NN reserves scratch from the top of the fast
-buffer and reduces `mem.fast_size`. ESP preparation may be repeated safely to
+platform-managed workspace; CMSIS-NN reserves vendor and quantization workspace
+from the top of the fast buffer and reduces `mem.fast_size`. ESP preparation may be repeated safely to
 replace its workspace and `tigris_esp_nn_deinit()` releases it after inference.
 CMSIS preparation is idempotent for the same arena when its existing scratch
 is sufficient; call `tigris_cmsis_nn_deinit()` before changing arena or plan.
 Use `tigris_cmsis_nn_fast_arena_required()` to size that arena before
 initialization; it preserves the full core activation/weight capacity below the
-exact scratch requirement reported by the linked CMSIS-NN library.
+exact workspace requirement reported by the linked CMSIS-NN library.
 
 ## Memory contract
 
@@ -57,6 +57,13 @@ The caller owns:
 - a fast arena, normally SRAM;
 - a slow arena, normally PSRAM or another writable RAM region; and
 - one `void *` entry per tensor.
+
+New integrations should also provide a static or otherwise non-stack
+`tigris_executor_workspace_t` and call `tigris_run_with_workspace()`. The
+source-compatible `tigris_run()` uses one process-global workspace and is not
+safe for concurrent inference. Compile-time plan limits, workspace sizing,
+measured target frames, and the CI budget are documented in
+[STACK_USAGE.md](STACK_USAGE.md).
 
 The plan's `budget` is the modeled activation requirement. For an arena whose
 base satisfies `TIGRIS_TENSOR_ALIGN`, `tigris_fast_arena_required()` returns
@@ -82,7 +89,7 @@ weight reservation still execute within that bound.
 
 The core executor performs no unbounded heap fallback. Normal stages may spill
 to the supplied slow arena; if neither bounded arena can satisfy an operation,
-`tigris_run()` returns an error. `mem.fast_peak` records the measured core
+the executor returns an error. `mem.fast_peak` records the measured core
 fast-arena high-water mark.
 
 ## Build and test

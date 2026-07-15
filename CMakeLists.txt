@@ -18,6 +18,7 @@ if(COMMAND idf_component_register)
         REQUIRES esp-nn
     )
     target_compile_definitions(${COMPONENT_LIB} PUBLIC TIGRIS_HAS_ESP_NN)
+    target_compile_options(${COMPONENT_LIB} PRIVATE -Werror=vla)
     target_link_libraries(${COMPONENT_LIB} PUBLIC m)
     return()
 endif()
@@ -25,11 +26,21 @@ endif()
 project(tigris_runtime C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-add_compile_options(-Wall -Wextra -Wpedantic -Werror)
+add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wvla)
+
+option(TIGRIS_STACK_USAGE
+    "Emit compiler .su files for runtime stack-budget checks" OFF)
 
 add_library(tigris_runtime STATIC ${TIGRIS_RUNTIME_SRCS})
 target_include_directories(tigris_runtime PUBLIC include)
 target_link_libraries(tigris_runtime PUBLIC m)
+if(TIGRIS_STACK_USAGE)
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(tigris_runtime PRIVATE -fstack-usage)
+    else()
+        message(FATAL_ERROR "TIGRIS_STACK_USAGE requires GCC")
+    endif()
+endif()
 
 # Optional: ESP-NN backend (define TIGRIS_HAS_ESP_NN and link esp-nn)
 # target_compile_definitions(tigris_runtime PUBLIC TIGRIS_HAS_ESP_NN)
@@ -95,6 +106,24 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_compile_definitions(cmsis_adapter_compile PRIVATE TIGRIS_HAS_CMSIS_NN)
     target_include_directories(cmsis_adapter_compile PRIVATE
         include src test/cmsis_stub)
+    if(TIGRIS_STACK_USAGE)
+        target_compile_options(cmsis_adapter_compile PRIVATE -fstack-usage)
+    endif()
+
+    # Compile the executor and loader with reduced public limits and without
+    # the compatibility workspace. This keeps all configuration knobs live
+    # and verifies that the opaque workspace formula still bounds its private
+    # implementation when integrators tune for a smaller target.
+    add_library(stack_config_compile OBJECT
+        src/tigris_executor.c src/tigris_loader.c)
+    target_include_directories(stack_config_compile PRIVATE include)
+    target_compile_definitions(stack_config_compile PRIVATE
+        TIGRIS_MAX_TENSORS=8
+        TIGRIS_MAX_STAGE_INPUTS=2
+        TIGRIS_MAX_STAGE_OUTPUTS=2
+        TIGRIS_MAX_CHAIN_STAGES=3
+        TIGRIS_MAX_SPATIAL_OPS_PER_STAGE=2
+        TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE=0)
 
     add_executable(test_cmsis_arena
         test/test_cmsis_arena.c $<TARGET_OBJECTS:cmsis_adapter_compile>)

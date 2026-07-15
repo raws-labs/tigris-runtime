@@ -80,4 +80,22 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi.cmake
           -DCMAKE_C_FLAGS="-mcpu=cortex-m4 -mthumb"
+          -DTIGRIS_STACK_USAGE=ON
       - run: cmake --build build-arm --target tigris_runtime --parallel
+      - run: python3 scripts/check_stack_usage.py --max-frame 1024 build-arm
+
+  stack-usage:
+    name: Stack usage budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: >-
+          cmake -S . -B build-stack
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=gcc
+          -DTIGRIS_STACK_USAGE=ON
+      - run: >-
+          cmake --build build-stack
+          --target tigris_runtime cmsis_adapter_compile
+          --parallel
+      - run: python3 scripts/check_stack_usage.py --max-frame 1024 build-stack

@@ -44,6 +44,7 @@ static int plan_has_int8_io(const tigris_plan_t *plan)
 
 int main(int argc, char **argv)
 {
+    static tigris_executor_workspace_t executor_workspace;
     FILE *file = NULL;
     void *plan_storage = NULL;
     void *fast_buf = NULL;
@@ -150,8 +151,9 @@ int main(int argc, char **argv)
 
         {
             tigris_exec_stats_t stats;
-            tigris_exec_error_t exec_err = tigris_run(
-                &plan, &mem, tigris_dispatch_kernel_s8, NULL, &stats);
+            tigris_exec_error_t exec_err = tigris_run_with_workspace(
+                &plan, &mem, tigris_dispatch_kernel_s8, NULL, &stats,
+                &executor_workspace);
             uint16_t out_idx;
             const int8_t *output;
             uint32_t show;

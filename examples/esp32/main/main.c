@@ -82,6 +82,7 @@ static const char *TAG = "tigris";
 
 void app_main(void)
 {
+    static tigris_executor_workspace_t executor_workspace;
 #ifdef TIGRIS_HAS_ESP_NN
     int esp_nn_prepared = 0;
 #endif
@@ -325,8 +326,8 @@ void app_main(void)
     tigris_exec_stats_t exec_stats;
     int64_t t0 = esp_timer_get_time();
 
-    tigris_exec_error_t eerr = tigris_run(
-        &plan, &mem, dispatch, NULL, &exec_stats);
+    tigris_exec_error_t eerr = tigris_run_with_workspace(
+        &plan, &mem, dispatch, NULL, &exec_stats, &executor_workspace);
 
     int64_t t1 = esp_timer_get_time();
     float elapsed_ms = (float)(t1 - t0) / 1000.0f;

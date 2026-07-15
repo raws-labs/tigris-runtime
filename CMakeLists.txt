@@ -88,6 +88,20 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_include_directories(test_accel_routing PRIVATE src)
     target_link_libraries(test_accel_routing tigris_runtime)
 
+    # Compile the CMSIS adapter in native CI even when the vendor library is
+    # unavailable. The stub supplies declarations only; this target catches
+    # API/type/warning regressions in code hidden by TIGRIS_HAS_CMSIS_NN.
+    add_library(cmsis_adapter_compile OBJECT src/tigris_kernels_cmsis_nn.c)
+    target_compile_definitions(cmsis_adapter_compile PRIVATE TIGRIS_HAS_CMSIS_NN)
+    target_include_directories(cmsis_adapter_compile PRIVATE
+        include src test/cmsis_stub)
+
+    add_executable(test_cmsis_arena
+        test/test_cmsis_arena.c $<TARGET_OBJECTS:cmsis_adapter_compile>)
+    target_compile_definitions(test_cmsis_arena PRIVATE TIGRIS_HAS_CMSIS_NN)
+    target_include_directories(test_cmsis_arena PRIVATE test/cmsis_stub)
+    target_link_libraries(test_cmsis_arena tigris_runtime)
+
     add_executable(test_avg_pool_s8 test/test_avg_pool_s8.c)
     target_include_directories(test_avg_pool_s8 PRIVATE src)
     target_link_libraries(test_avg_pool_s8 tigris_runtime)
@@ -121,5 +135,6 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_test(NAME weight_arena COMMAND test_weight_arena)
     add_test(NAME tile_padding COMMAND test_tile_padding)
     add_test(NAME accel_routing COMMAND test_accel_routing)
+    add_test(NAME cmsis_arena COMMAND test_cmsis_arena)
     add_test(NAME avg_pool_s8 COMMAND test_avg_pool_s8)
 endif()

@@ -46,6 +46,9 @@ buffer and reduces `mem.fast_size`. ESP preparation may be repeated safely to
 replace its workspace and `tigris_esp_nn_deinit()` releases it after inference.
 CMSIS preparation is idempotent for the same arena when its existing scratch
 is sufficient; call `tigris_cmsis_nn_deinit()` before changing arena or plan.
+Use `tigris_cmsis_nn_fast_arena_required()` to size that arena before
+initialization; it preserves the full core activation/weight capacity below the
+exact scratch requirement reported by the linked CMSIS-NN library.
 
 ## Memory contract
 
@@ -62,6 +65,13 @@ weights. Account for base-alignment padding when using an unaligned buffer and
 provision backend workspace separately.
 Optimized Cortex-M builds require the plan base and tensors to satisfy
 `TIGRIS_TENSOR_ALIGN` (16 bytes with DSP enabled).
+
+For CMSIS-NN, “separately” is enforceable rather than an estimate:
+`tigris_cmsis_nn_scratch_required()` queries the linked vendor library and
+`tigris_cmsis_nn_fast_arena_required()` combines that result with the core
+requirement. Generated standalone CMSIS harnesses reserve 4 KiB by default,
+validate it at startup, and report the exact required total when a larger model
+needs `TIGRIS_CMSIS_NN_SCRATCH_BYTES` overridden at build time.
 
 The compiler's current cost model aligns each activation to 32 bytes, which is
 conservative for the supported host, Cortex-M, and ESP targets. `mem.fast_peak`

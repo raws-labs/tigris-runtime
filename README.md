@@ -62,8 +62,8 @@ New integrations should also provide a static or otherwise non-stack
 `tigris_executor_workspace_t` and call `tigris_run_with_workspace()`. The
 source-compatible `tigris_run()` uses one process-global workspace and is not
 safe for concurrent inference. Compile-time plan limits, workspace sizing,
-measured target frames, and the CI budget are documented in
-[STACK_USAGE.md](STACK_USAGE.md).
+stack provisioning, and re-entrant execution are documented in the
+[runtime integration guide](https://tigris-ml.dev/docs/runtime/integration/).
 
 The plan's `budget` is the modeled activation requirement. For an arena whose
 base satisfies `TIGRIS_TENSOR_ALIGN`, `tigris_fast_arena_required()` returns

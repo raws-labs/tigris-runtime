@@ -636,6 +636,20 @@ static inline const tigris_quant_param_t *tigris_tensor_quant(
  */
 uint32_t tigris_weight_decompression_overhead(const tigris_plan_t *plan);
 
+/**
+ * Compute the core fast-arena capacity required by a loaded plan.
+ *
+ * This is the plan's activation budget plus the simultaneous compressed-weight
+ * reservation returned by tigris_weight_decompression_overhead(). The result
+ * assumes the arena base satisfies TIGRIS_TENSOR_ALIGN. Leading padding for an
+ * unaligned base and backend-specific scratch/workspace are not included.
+ *
+ * @param plan  Loaded plan.
+ * @return Required core arena capacity in bytes, or UINT32_MAX if plan/header
+ *         is NULL or the sum cannot be represented.
+ */
+uint32_t tigris_fast_arena_required(const tigris_plan_t *plan);
+
 #ifdef __cplusplus
 }
 #endif

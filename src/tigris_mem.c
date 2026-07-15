@@ -293,3 +293,14 @@ uint32_t tigris_weight_decompression_overhead(const tigris_plan_t *plan)
 
     return max_required;
 }
+
+uint32_t tigris_fast_arena_required(const tigris_plan_t *plan)
+{
+    if (!plan || !plan->header)
+        return UINT32_MAX;
+
+    uint32_t overhead = tigris_weight_decompression_overhead(plan);
+    if (overhead == UINT32_MAX)
+        return UINT32_MAX;
+    return saturating_add_u32(plan->header->budget, overhead);
+}

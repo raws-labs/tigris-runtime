@@ -293,6 +293,34 @@ static void test_overhead_sizing(void)
                    "unrepresentable aligned overhead saturates");
 }
 
+static void test_required_arena_sizing(void)
+{
+    printf("  test_required_arena_sizing...\n");
+    plan_fixture_t fx;
+    build_chain_plan(&fx);
+
+    fx.header.budget = 4096;
+    uint32_t overhead = tigris_weight_decompression_overhead(&fx.plan);
+    TEST_ASSERT_EQ(tigris_fast_arena_required(&fx.plan), 4096u + overhead,
+                   "required arena combines activation budget and weights");
+
+    fx.plan.num_weight_blocks = 0;
+    fx.plan.weight_blocks = NULL;
+    TEST_ASSERT_EQ(tigris_fast_arena_required(&fx.plan), 4096,
+                   "uncompressed required arena equals activation budget");
+
+    TEST_ASSERT_EQ(tigris_fast_arena_required(NULL), UINT32_MAX,
+                   "null plan has no representable requirement");
+    fx.plan.header = NULL;
+    TEST_ASSERT_EQ(tigris_fast_arena_required(&fx.plan), UINT32_MAX,
+                   "plan without header has no representable requirement");
+
+    build_chain_plan(&fx);
+    fx.header.budget = UINT32_MAX;
+    TEST_ASSERT_EQ(tigris_fast_arena_required(&fx.plan), UINT32_MAX,
+                   "activation plus weight overflow saturates");
+}
+
 static void test_chain_success_and_repeat(void)
 {
     printf("  test_chain_success_and_repeat...\n");
@@ -402,6 +430,7 @@ int main(void)
 {
     printf("TiGrIS Compressed Weight Arena Tests\n\n");
     test_overhead_sizing();
+    test_required_arena_sizing();
     test_chain_success_and_repeat();
     test_standalone_stages_reclaim_between_groups();
     test_chain_oom_restores_state();

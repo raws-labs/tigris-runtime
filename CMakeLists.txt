@@ -4,6 +4,7 @@ set(TIGRIS_RUNTIME_SRCS
     src/tigris_loader.c
     src/tigris_mem.c
     src/tigris_executor.c
+    src/tigris_executor_compat.c
     src/tigris_kernels.c
     src/tigris_kernels_s8.c
     src/tigris_kernels_esp_nn.c
@@ -77,6 +78,13 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(test_executor test/test_executor.c)
     target_link_libraries(test_executor tigris_runtime)
 
+    # This executable references only the explicit executor API. The legacy
+    # wrapper lives in a separate archive member and must not add its second
+    # workspace to the linked BSS.
+    add_executable(explicit_workspace_link_smoke
+        test/explicit_workspace_link_smoke.c)
+    target_link_libraries(explicit_workspace_link_smoke tigris_runtime)
+
     add_executable(test_kernels test/test_kernels.c)
     target_link_libraries(test_kernels tigris_runtime)
 
@@ -115,7 +123,8 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     # and verifies that the opaque workspace formula still bounds its private
     # implementation when integrators tune for a smaller target.
     add_library(stack_config_compile OBJECT
-        src/tigris_executor.c src/tigris_loader.c)
+        src/tigris_executor.c src/tigris_executor_compat.c
+        src/tigris_loader.c)
     target_include_directories(stack_config_compile PRIVATE include)
     target_compile_definitions(stack_config_compile PRIVATE
         TIGRIS_MAX_TENSORS=8
@@ -158,6 +167,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     # contain the generated .tgrs model fixtures they require.
     add_test(NAME loader COMMAND test_loader)
     add_test(NAME executor COMMAND test_executor)
+    add_test(NAME explicit_workspace_link COMMAND explicit_workspace_link_smoke)
     add_test(NAME kernels_f32 COMMAND test_kernels)
     add_test(NAME kernels_s8 COMMAND test_kernels_s8)
     add_test(NAME lz4 COMMAND test_lz4)

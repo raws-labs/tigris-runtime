@@ -158,6 +158,21 @@ tigris_error_t tigris_plan_load(
     if (hdr->num_quant_params && !section_offsets[TIGRIS_SEC_QUANT_PARAMS])
         return TIGRIS_ERR_MISSING_SEC;
 
+    /* The on-disk tables are otherwise byte-addressable, but these pools are
+     * dereferenced through uint16_t/int32_t pointers below.  Reject malformed
+     * offsets before exposing an unaligned pointer to a target that faults on
+     * it (or to UBSan during loader fuzzing). */
+    if ((section_offsets[TIGRIS_SEC_INDEX_POOL] % sizeof(uint16_t)) != 0 &&
+        (hdr->num_ops || hdr->num_stages || hdr->num_model_inputs ||
+         hdr->num_model_outputs))
+        return TIGRIS_ERR_BAD_SECTION;
+    if ((section_offsets[TIGRIS_SEC_SHAPE_POOL] % sizeof(int32_t)) != 0 &&
+        hdr->num_tensors)
+        return TIGRIS_ERR_BAD_SECTION;
+    if ((section_offsets[TIGRIS_SEC_QUANT_PARAMS] % sizeof(int32_t)) != 0 &&
+        hdr->num_quant_params)
+        return TIGRIS_ERR_BAD_SECTION;
+
     /* Set pointers */
 
     /* Tensors */

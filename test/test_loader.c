@@ -183,6 +183,29 @@ static void test_section_directory_guards(void)
                    TIGRIS_ERR_BAD_SECTION, "section overlaps directory");
 }
 
+static void test_pool_alignment_guards(void)
+{
+    printf("  test_pool_alignment_guards...\n");
+    _Alignas(4) uint8_t buf[MINIMAL_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_file_header_t *hdr;
+
+    /* The minimal plan deliberately puts all empty pools at byte 99.  They
+     * are valid while unused, but a count must not make an unaligned typed
+     * pool dereference reachable. */
+    build_minimal_plan(buf);
+    hdr = (tigris_file_header_t *)buf;
+    hdr->num_model_inputs = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "unaligned index pool rejected");
+
+    build_minimal_plan(buf);
+    hdr = (tigris_file_header_t *)buf;
+    hdr->num_tensors = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "unaligned shape pool rejected");
+}
+
 static void test_v2_plan_header_is_still_accepted(void)
 {
     printf("  test_v2_plan_header_is_still_accepted...\n");
@@ -879,6 +902,7 @@ int main(int argc, char *argv[])
     test_size_mismatch();
     test_error_strings();
     test_section_directory_guards();
+    test_pool_alignment_guards();
     test_v2_plan_header_is_still_accepted();
     test_v2_quant_plan_is_still_accepted();
     test_counted_sections_required();

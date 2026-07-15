@@ -525,6 +525,68 @@ static void test_global_avg_pool(void)
         TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "global_avg_pool output");
 }
 
+/* AveragePool test */
+
+static void test_avg_pool(void)
+{
+    printf("  test_avg_pool...\n");
+
+    /* NHWC: 1x4x4x1, 2x2 stride 2 -> 1x2x2x1. */
+    int32_t x_shape[] = {1, 4, 4, 1};
+    int32_t y_shape[] = {1, 2, 2, 1};
+    float input[16];
+    for (int i = 0; i < 16; i++) input[i] = (float)(i + 1);
+    float expected[] = {3.5f, 5.5f, 11.5f, 13.5f};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(input); tensors[0].dtype = 1;
+    tensors[1].shape_off = 4; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(expected); tensors[1].dtype = 1;
+
+    int32_t shape_pool[8];
+    memcpy(shape_pool, x_shape, sizeof(x_shape));
+    memcpy(shape_pool + 4, y_shape, sizeof(y_shape));
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_AVG_POOL;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.spatial.kernel_h = 2; op.spatial.kernel_w = 2;
+    op.spatial.stride_h = 2; op.spatial.stride_w = 2;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+
+    void *ptrs[2];
+    float output[4];
+    ptrs[0] = input; ptrs[1] = output;
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "dispatch returns 0");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(output[i], expected[i], EPS, "avg_pool output");
+}
+
 /* FullyConnected (Gemm) test */
 
 static void test_fully_connected(void)
@@ -940,6 +1002,58 @@ static void test_sigmoid(void)
         TEST_ASSERT_NEAR(out_buf[i], expected[i], 1e-4f, "sigmoid output");
 }
 
+static void test_softmax(void)
+{
+    printf("  test_softmax...\n");
+
+    /* Two independent class vectors: [0,1,-1] and [0,0,0]. */
+    float X[6] = {0.0f, 1.0f, -1.0f, 0.0f, 0.0f, 0.0f};
+    float expected[6] = {0.244728f, 0.665241f, 0.090031f,
+                         0.333333f, 0.333333f, 0.333333f};
+    int32_t shape[] = {2, 3};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 2;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 1;
+    tensors[1].shape_off = 0; tensors[1].ndim = 2;
+    tensors[1].size_bytes = sizeof(X); tensors[1].dtype = 1;
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_SOFTMAX;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape;
+    plan.strings = g_strings;
+
+    void *ptrs[2];
+    float out_buf[6];
+    ptrs[0] = X; ptrs[1] = out_buf;
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "softmax dispatch returns 0");
+    for (int i = 0; i < 6; i++)
+        TEST_ASSERT_NEAR(out_buf[i], expected[i], 1e-5f, "softmax output");
+}
+
 /* Mul test */
 
 static void test_mul(void)
@@ -1212,6 +1326,47 @@ static void test_unsupported_op(void)
     TEST_ASSERT(ret == -1, "unsupported op returns -1");
 }
 
+static void test_transpose(void)
+{
+    printf("  test_transpose...\n");
+    int32_t shapes[] = {2, 3, 3, 2};
+    uint16_t indices[] = {0, 1};
+    float input[] = {1, 2, 3, 4, 5, 6};
+    float expected[] = {1, 4, 2, 5, 3, 6};
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 2;
+    tensors[0].dtype = 1; tensors[0].size_bytes = sizeof(input);
+    tensors[1].shape_off = 2; tensors[1].ndim = 2;
+    tensors[1].dtype = 1; tensors[1].size_bytes = sizeof(expected);
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_TRANSPOSE;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_TRANSPOSE_PERM, 2, 0};
+    const uint8_t perm[] = {1, 0};
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header; plan.tensors = tensors; plan.ops = &op;
+    plan.index_pool = indices; plan.shape_pool = shapes;
+    plan.op_attributes = &attr; plan.op_attribute_data = perm;
+    plan.num_op_attributes = 1;
+    void *ptrs[2]; uint8_t fast[128], slow[128]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, 2, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, 0, sizeof(input));
+    memcpy(ptrs[0], input, sizeof(input));
+    tigris_mem_alloc_fast(&mem, 1, sizeof(expected));
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "transpose returns 0");
+    for (int i = 0; i < 6; i++)
+        TEST_ASSERT_NEAR(((float *)ptrs[1])[i], expected[i], EPS,
+                         "transpose value");
+}
+
 /* Main */
 
 int main(void)
@@ -1224,15 +1379,18 @@ int main(void)
     test_relu6();
     test_add();
     test_global_avg_pool();
+    test_avg_pool();
     test_fully_connected();
     test_reshape();
     test_max_pool();
     test_concat();
     test_resize_nearest();
     test_sigmoid();
+    test_softmax();
     test_mul();
     test_constant_binary_f32();
     test_malformed_constant_binary_f32();
+    test_transpose();
     test_unsupported_op();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

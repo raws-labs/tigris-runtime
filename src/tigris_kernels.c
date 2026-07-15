@@ -285,6 +285,52 @@ static int kern_tanh(
     return 0;
 }
 
+/* Softmax over the final dimension.  Supported plans use ONNX's default
+ * final-axis form; Softmax is deliberately not tileable. */
+static int kern_softmax(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    if (!plan || !op || !mem || op->num_inputs != 1 || op->num_outputs != 1 ||
+        mem->tile.active)
+        return -1;
+
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const tigris_tensor_t *x_tensor = &plan->tensors[ins[0]];
+    const tigris_tensor_t *y_tensor = &plan->tensors[outs[0]];
+    if (!tensor_is_f32(plan, x_tensor) || !tensor_is_f32(plan, y_tensor) ||
+        !tensor_shapes_equal(plan, x_tensor, y_tensor) || x_tensor->ndim == 0)
+        return -1;
+
+    const int32_t *shape = tigris_tensor_shape(plan, x_tensor);
+    const uint32_t classes = (uint32_t)shape[x_tensor->ndim - 1];
+    const uint32_t count = tensor_numel(plan, ins[0]);
+    if (classes == 0 || count % classes != 0)
+        return -1;
+
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (!X || !Y)
+        return -1;
+
+    for (uint32_t row = 0; row < count / classes; row++) {
+        const float *x = X + (size_t)row * classes;
+        float *y = Y + (size_t)row * classes;
+        float maximum = x[0];
+        for (uint32_t c = 1; c < classes; c++)
+            if (x[c] > maximum) maximum = x[c];
+
+        float sum = 0.0f;
+        for (uint32_t c = 0; c < classes; c++)
+            sum += expf(x[c] - maximum);
+        if (sum == 0.0f)
+            return -1;
+        for (uint32_t c = 0; c < classes; c++)
+            y[c] = expf(x[c] - maximum) / sum;
+    }
+    return 0;
+}
+
 static int kern_conv1d(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -560,6 +606,69 @@ static int kern_max_pool(
     return 0;
 }
 
+/* ONNX AveragePool with the representable default: exclude padded samples
+ * from the divisor. The tiled executor supplies tile-local height and padding
+ * so the same bounds checks are valid for full and tiled tensors. */
+static int kern_avg_pool(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+
+    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+    int N  = x_shape[0];
+    int IH = x_shape[1];
+    int IW = x_shape[2];
+    int C  = x_shape[3];
+    int OH = y_shape[1];
+    int OW = y_shape[2];
+    int KH = op->spatial.kernel_h;
+    int KW = op->spatial.kernel_w;
+    int SH = op->spatial.stride_h ? op->spatial.stride_h : 1;
+    int SW = op->spatial.stride_w ? op->spatial.stride_w : 1;
+    int PT = op->spatial.pad_top;
+    int PL = op->spatial.pad_left;
+
+    if (!X || !Y || KH <= 0 || KW <= 0)
+        return -1;
+
+    if (mem->tile.active) {
+        IH = mem->tile.in_h;
+        OH = mem->tile.out_h;
+        IW = mem->tile.in_w;
+        OW = mem->tile.out_w;
+        PT = mem->tile.pad_top;
+    }
+
+    for (int n = 0; n < N; n++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+                for (int c = 0; c < C; c++) {
+                    float sum = 0.0f;
+                    int count = 0;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int ih = oh * SH - PT + kh;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int iw = ow * SW - PL + kw;
+                            if (iw < 0 || iw >= IW) continue;
+                            sum += X[((n * IH + ih) * IW + iw) * C + c];
+                            count++;
+                        }
+                    }
+                    if (count == 0)
+                        return -1;
+                    Y[((n * OH + oh) * OW + ow) * C + c] = sum / (float)count;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static int kern_concat(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -649,6 +758,56 @@ static int kern_resize_nearest(
     return 0;
 }
 
+int tigris_transpose_execute(
+    const tigris_plan_t *plan, const tigris_op_t *op,
+    uint16_t op_index, tigris_mem_t *mem)
+{
+    if (!plan || !op || !mem || op->num_inputs != 1 || op->num_outputs != 1)
+        return -1;
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const tigris_tensor_t *input = &plan->tensors[ins[0]];
+    const tigris_tensor_t *output = &plan->tensors[outs[0]];
+    uint8_t rank = 0;
+    const uint8_t *perm = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_TRANSPOSE_PERM, &rank);
+    if (!perm || rank != input->ndim || output->ndim != rank ||
+        input->size_bytes != output->size_bytes)
+        return -1;
+    const uint8_t *src = (const uint8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    uint8_t *dst = (uint8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (!src || !dst)
+        return -1;
+    const int32_t *input_shape = tigris_tensor_shape(plan, input);
+    const int32_t *output_shape = tigris_tensor_shape(plan, output);
+    uint32_t elements = 1;
+    for (uint8_t axis = 0; axis < rank; axis++) {
+        if (output_shape[axis] <= 0 || perm[axis] >= rank)
+            return -1;
+        elements *= (uint32_t)output_shape[axis];
+    }
+    if (elements == 0 || input->size_bytes % elements != 0)
+        return -1;
+    uint32_t element_size = input->size_bytes / elements;
+
+    for (uint32_t output_index = 0; output_index < elements; output_index++) {
+        uint32_t remainder = output_index;
+        uint32_t input_index = 0;
+        for (uint8_t reverse_axis = rank; reverse_axis > 0; reverse_axis--) {
+            uint8_t output_axis = reverse_axis - 1u;
+            uint32_t coordinate = remainder % (uint32_t)output_shape[output_axis];
+            remainder /= (uint32_t)output_shape[output_axis];
+            uint32_t stride = 1;
+            for (uint8_t axis = perm[output_axis] + 1u; axis < rank; axis++)
+                stride *= (uint32_t)input_shape[axis];
+            input_index += coordinate * stride;
+        }
+        memcpy(dst + (size_t)output_index * element_size,
+               src + (size_t)input_index * element_size, element_size);
+    }
+    return 0;
+}
+
 /* Dispatch */
 
 int tigris_dispatch_kernel(
@@ -658,7 +817,6 @@ int tigris_dispatch_kernel(
     tigris_mem_t        *mem,
     void                *user_ctx)
 {
-    (void)op_index;
     (void)user_ctx;
 
     switch ((tigris_op_type_t)op->op_type) {
@@ -668,6 +826,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_RELU6:       return kern_relu6(plan, op, mem);
     case TIGRIS_OP_SIGMOID:     return kern_sigmoid(plan, op, mem);
     case TIGRIS_OP_TANH:        return kern_tanh(plan, op, mem);
+    case TIGRIS_OP_SOFTMAX:     return kern_softmax(plan, op, mem);
     case TIGRIS_OP_ADD:         return kern_add(plan, op, mem);
     case TIGRIS_OP_MUL:         return kern_mul(plan, op, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d(plan, op, mem);
@@ -676,8 +835,10 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_RESHAPE:     return kern_reshape(plan, op, mem);
     case TIGRIS_OP_FLATTEN:     return kern_reshape(plan, op, mem);
     case TIGRIS_OP_MAX_POOL:    return kern_max_pool(plan, op, mem);
+    case TIGRIS_OP_AVG_POOL:    return kern_avg_pool(plan, op, mem);
     case TIGRIS_OP_CONCAT:      return kern_concat(plan, op, mem);
     case TIGRIS_OP_RESIZE:      return kern_resize_nearest(plan, op, mem);
+    case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */
     }

@@ -25,13 +25,15 @@
 static inline int32_t get_mult(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    return plan->quant_data[qp->multiplier_off + ch];
+    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off + ch];
 }
 
 static inline int32_t get_shft(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    return plan->quant_data[qp->shift_off + ch];
+    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
 }
 
 /* Scratch reservation.
@@ -50,6 +52,8 @@ static inline int32_t get_shft(
 #endif
 static uint8_t  *s_scratch = NULL;       /* arena region set by prepare(), or NULL */
 static uint32_t  s_scratch_size = 0;
+static tigris_mem_t *s_prepared_mem = NULL;
+static uint32_t s_prepared_fast_size = 0;
 static uint8_t   s_scratch_fallback[TIGRIS_CMSIS_SCRATCH_FALLBACK]
     __attribute__((aligned(16)));
 
@@ -280,8 +284,8 @@ static int adapt_fully_connected(
     arm_cmsis_nn_status status;
     if (per_channel) {
         cmsis_nn_per_channel_quant_params quant = {
-            .multiplier = (int32_t *)&plan->quant_data[out_qp->multiplier_off],
-            .shift      = (int32_t *)&plan->quant_data[out_qp->shift_off] };
+            .multiplier = (int32_t *)&plan->quant_data[(plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS) + out_qp->multiplier_off],
+            .shift      = (int32_t *)&plan->quant_data[(plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS) + out_qp->shift_off] };
         status = arm_fully_connected_per_channel_s8(
             &ctx, &fc_params, &quant, &input_dims, X,
             &filter_dims, W, &bias_dims, B, &output_dims, Y);
@@ -367,7 +371,7 @@ static int adapt_avg_pool(
 
 int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem)
 {
-    if (!plan || !mem)
+    if (!plan || !plan->header || !mem || !mem->fast_base)
         return -1;
 
     uint32_t max_scratch = 0;
@@ -435,21 +439,40 @@ int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem)
             max_scratch = (uint32_t)s;
     }
 
-    if (max_scratch == 0) {            /* no op needs scratch */
-        s_scratch = NULL;
-        s_scratch_size = 0;
+    uint32_t want = (max_scratch + 15u) & ~15u;
+    if (s_prepared_mem) {
+        /* The adapter has one global CMSIS context. Never silently shrink a
+         * second arena or replace a reservation which may still be in use. */
+        if (s_prepared_mem != mem || want > s_scratch_size)
+            return -1;
         return 0;
     }
 
+    if (want == 0)                    /* no op needs scratch */
+        return 0;
+
     /* Carve a 16-aligned region from the top of the fast arena, reducing
      * fast_size so the executor's activation allocations never overlap it. */
-    uint32_t want = (max_scratch + 15u) & ~15u;
     if (want + 16u > mem->fast_size)
         return -1;                     /* arena too small for scratch */
     uint32_t new_size = (mem->fast_size - want) & ~15u;
     s_scratch = mem->fast_base + new_size;
     s_scratch_size = mem->fast_size - new_size;   /* >= want, 16-aligned base */
+    s_prepared_mem = mem;
+    s_prepared_fast_size = mem->fast_size;
     mem->fast_size = new_size;
+    return 0;
+}
+
+int tigris_cmsis_nn_deinit(tigris_mem_t *mem)
+{
+    if (!mem || s_prepared_mem != mem)
+        return -1;
+    mem->fast_size = s_prepared_fast_size;
+    s_scratch = NULL;
+    s_scratch_size = 0;
+    s_prepared_mem = NULL;
+    s_prepared_fast_size = 0;
     return 0;
 }
 

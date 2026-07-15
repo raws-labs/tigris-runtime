@@ -8,7 +8,7 @@ import struct
 from pathlib import Path
 
 
-PLAN_SIZE = 96
+PLAN_SIZE = 100
 SECTION_DIR_OFFSET = 48
 SCHEMA_VERSION = 2
 REQUIRED_SECTIONS = (1, 2, 5, 6, 7)
@@ -35,8 +35,9 @@ def main() -> None:
             plan,
             SECTION_DIR_OFFSET + index * 8,
             section_type,
-            PLAN_SIZE,
+            PLAN_SIZE - 1,
         )
+    plan[PLAN_SIZE - 1] = 0
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(plan)

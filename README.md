@@ -42,7 +42,10 @@ validate the selected dtype/operator route.
 ESP-NN and CMSIS-NN also require a successful preparation call after
 `tigris_mem_init()` and before inference. ESP-NN preparation obtains
 platform-managed workspace; CMSIS-NN reserves scratch from the top of the fast
-buffer and reduces `mem.fast_size`.
+buffer and reduces `mem.fast_size`. ESP preparation may be repeated safely to
+replace its workspace and `tigris_esp_nn_deinit()` releases it after inference.
+CMSIS preparation is idempotent for the same arena when its existing scratch
+is sufficient; call `tigris_cmsis_nn_deinit()` before changing arena or plan.
 
 ## Memory contract
 
@@ -101,10 +104,14 @@ idf.py build
 idf.py flash
 ```
 
+The example's portable int8 path is the default. With the `espressif/esp-nn`
+managed component available, pass `-DTIGRIS_ENABLE_ESP_NN=ON` to build the
+ESP-NN adapter.
+
 The plan should live in a memory-mapped flash partition. Allocate the fast
 arena from internal SRAM and the slow arena from PSRAM when available. When
-using ESP-NN, call `tigris_esp_nn_prepare()` exactly once and check its return
-value before `tigris_run()`.
+using ESP-NN, call `tigris_esp_nn_prepare()` and check its return value before
+`tigris_run()`, then call `tigris_esp_nn_deinit()` after the final inference.
 
 ## Further reading
 

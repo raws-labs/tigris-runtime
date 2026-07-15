@@ -821,6 +821,54 @@ static void test_tanh_s8(void)
     TEST_ASSERT_EQ(out[2], -122, "tanh(-2.0) = -122");
 }
 
+/* Softmax is a terminal classifier operation and must be available through
+ * the reference fallback used by accelerator backends. */
+static void test_softmax_s8(void)
+{
+    printf("  test_softmax_s8...\n");
+    plan_reset();
+    tigris_plan_t plan;
+
+    uint16_t in_qp = add_quant_param(0.5f, -3, 1, NULL, NULL);
+    /* TFLite's common int8 Softmax representation: [0,1] -> [-128,127]. */
+    uint16_t out_qp = add_quant_param(1.0f / 256.0f, -128, 1, NULL, NULL);
+    int32_t shape[] = {2, 3};
+    uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, 6, in_qp);
+    uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, 6, out_qp);
+
+    test_ops[0].op_type = TIGRIS_OP_SOFTMAX;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in}; uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[1024], slow[1024];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    /* Rows encode real logits [0, 1, -1] and [0, 0, 0]. */
+    int8_t input_data[] = {-3, -1, -5, -3, -3, -3};
+    tigris_mem_alloc_fast(&mem, t_in, 6);
+    memcpy(ptrs[t_in], input_data, 6);
+    tigris_mem_alloc_fast(&mem, t_out, 6);
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "softmax_s8 returns 0");
+    int8_t *out = (int8_t *)ptrs[t_out];
+    /* Quantized probabilities: [0.2447, .6652, .0900] and [1/3,1/3,1/3]. */
+    TEST_ASSERT_EQ(out[0], -65, "softmax row 0 class 0");
+    TEST_ASSERT_EQ(out[1], 42,  "softmax row 0 class 1");
+    TEST_ASSERT_EQ(out[2], -105,"softmax row 0 class 2");
+    TEST_ASSERT_EQ(out[3], -43, "softmax row 1 class 0");
+    TEST_ASSERT_EQ(out[4], -43, "softmax row 1 class 1");
+    TEST_ASSERT_EQ(out[5], -43, "softmax row 1 class 2");
+}
+
 /* INT8 Conv1D (regression: s8 dispatch must handle TIGRIS_OP_CONV1D). NLC input
  * [1,3,2], weights [OC=1,K=2,IC=2] all ones, identity requant -> output = acc. */
 static void test_conv1d_s8(void)
@@ -878,6 +926,46 @@ static void test_conv1d_s8(void)
     TEST_ASSERT_EQ(out[1], 18, "conv1d y[1]=18");
 }
 
+static void test_transpose_s8(void)
+{
+    printf("  test_transpose_s8...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    int32_t input_shape[] = {2, 3};
+    int32_t output_shape[] = {3, 2};
+    uint16_t input = add_tensor(&plan, "x", input_shape, 2, 3, 6,
+                                TIGRIS_NO_QUANT_PARAM);
+    uint16_t output = add_tensor(&plan, "y", output_shape, 2, 3, 6,
+                                 TIGRIS_NO_QUANT_PARAM);
+    uint16_t ins[] = {input}, outs[] = {output};
+    test_ops[0].op_type = TIGRIS_OP_TRANSPOSE;
+    test_ops[0].num_inputs = 1; test_ops[0].num_outputs = 1;
+    test_ops[0].inputs_off = add_indices(ins, 1);
+    test_ops[0].outputs_off = add_indices(outs, 1);
+    test_header.num_ops = 1;
+    build_plan(&plan);
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_TRANSPOSE_PERM, 2, 0};
+    const uint8_t perm[] = {1, 0};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = perm;
+    plan.num_op_attributes = 1;
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[256]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
+                    slow, sizeof(slow));
+    const int8_t values[] = {1, 2, 3, 4, 5, 6};
+    const int8_t expected[] = {1, 4, 2, 5, 3, 6};
+    tigris_mem_alloc_fast(&mem, input, sizeof(values));
+    memcpy(ptrs[input], values, sizeof(values));
+    tigris_mem_alloc_fast(&mem, output, sizeof(expected));
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                             NULL), 0,
+                   "transpose_s8 returns 0");
+    for (int i = 0; i < 6; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[output])[i], expected[i],
+                       "transpose_s8 value");
+}
+
 /* Main */
 
 int main(void)
@@ -894,7 +982,9 @@ int main(void)
     test_fc_s8();
     test_global_avg_pool_s8();
     test_tanh_s8();
+    test_softmax_s8();
     test_conv1d_s8();
+    test_transpose_s8();
     test_unsupported_op_s8();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

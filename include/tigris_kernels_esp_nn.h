@@ -32,9 +32,9 @@ extern "C" {
  * causes the affected op to fall back to s8_ref rather than changing its
  * semantics, and no workspace allocation occurs inside tigris_run().
  *
- * Must be called ONCE after tigris_mem_init() and before tigris_run().
- * Workspace is held in process-lifetime adapter state; the current API has no
- * deinitialization or repeat-prepare ownership contract.
+ * Call after tigris_mem_init() and before tigris_run(). A repeated call safely
+ * replaces the previous adapter workspace for this process; preparation and
+ * dispatch are not concurrent/thread-safe.
  *
  * @param plan  Loaded plan (read-only, used to scan op shapes).
  * @param mem   Initialized memory manager (read-only sizing input).
@@ -44,6 +44,13 @@ extern "C" {
 int tigris_esp_nn_prepare(
     const tigris_plan_t *plan,
     tigris_mem_t        *mem);
+
+/**
+ * Release all platform-managed ESP-NN workspace and clear vendor scratch
+ * pointers. Call only after inference has finished; it is safe to call when
+ * no preparation succeeded.
+ */
+void tigris_esp_nn_deinit(void);
 
 /**
  * Print Conv dispatch statistics (SRAM scratch vs PSRAM scratch vs fallback).

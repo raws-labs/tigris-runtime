@@ -17,6 +17,16 @@ idf.py build
 idf.py flash
 ```
 
+The default build uses the portable int8 kernels. To enable ESP-NN, make the
+`espressif/esp-nn` managed component available to the project and build with:
+
+```
+idf.py build -DTIGRIS_ENABLE_ESP_NN=ON
+```
+
+The example exercises backend preparation before inference and releases the
+workspace before it exits.
+
 ## Flash a Plan
 
 ```

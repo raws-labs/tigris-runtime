@@ -47,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: mkdir -p fuzz-artifacts
-      - run: python3 test/make_fuzz_seed.py fuzz-corpus/minimal.tgrs
+      - run: python3 test/make_fuzz_corpus.py fuzz-corpus
       - run: >-
           clang -std=c11 -Wall -Wextra -Wpedantic -Werror
           -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer

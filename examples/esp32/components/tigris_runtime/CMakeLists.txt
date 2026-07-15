@@ -10,6 +10,12 @@ if(NOT EXISTS "${TIGRIS_RUNTIME_DIR}/include/tigris.h")
         "Set -DTIGRIS_RUNTIME_DIR=/path/to/tigris-runtime")
 endif()
 
+option(TIGRIS_ENABLE_ESP_NN "Enable the ESP-NN accelerated backend" OFF)
+set(TIGRIS_RUNTIME_REQUIRES)
+if(TIGRIS_ENABLE_ESP_NN)
+    list(APPEND TIGRIS_RUNTIME_REQUIRES espressif__esp-nn)
+endif()
+
 idf_component_register(
     SRCS "${TIGRIS_RUNTIME_DIR}/src/tigris_loader.c"
          "${TIGRIS_RUNTIME_DIR}/src/tigris_mem.c"
@@ -19,12 +25,13 @@ idf_component_register(
          "${TIGRIS_RUNTIME_DIR}/src/tigris_kernels_esp_nn.c"
          "${TIGRIS_RUNTIME_DIR}/src/tigris_lz4.c"
     INCLUDE_DIRS "${TIGRIS_RUNTIME_DIR}/include"
+    REQUIRES ${TIGRIS_RUNTIME_REQUIRES}
 )
 
-# Enable ESP-NN backend when esp-nn component is available
-idf_build_get_property(components BUILD_COMPONENTS)
-if("esp-nn" IN_LIST components)
+if(TIGRIS_ENABLE_ESP_NN)
+    # The managed esp-nn component is named espressif__esp-nn in ESP-IDF's
+    # build graph. Make the adapter available to its consumers and link it.
     target_compile_definitions(${COMPONENT_LIB} PUBLIC TIGRIS_HAS_ESP_NN)
-    idf_component_get_property(esp_nn_lib esp-nn COMPONENT_LIB)
+    idf_component_get_property(esp_nn_lib espressif__esp-nn COMPONENT_LIB)
     target_link_libraries(${COMPONENT_LIB} PUBLIC ${esp_nn_lib})
 endif()

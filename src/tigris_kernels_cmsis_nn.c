@@ -48,10 +48,29 @@ static inline int32_t get_shft(
  * A plan with a positive scratch query must be prepared before dispatch. */
 static uint8_t  *s_scratch = NULL;       /* arena region set by prepare(), or NULL */
 static uint32_t  s_scratch_size = 0;
+static int32_t  *s_quant_mult = NULL;
+static int32_t  *s_quant_shift = NULL;
+static uint32_t  s_quant_channels = 0;
+static uint32_t  s_workspace_size = 0;
 static tigris_mem_t *s_prepared_mem = NULL;
 static uint32_t s_prepared_fast_size = 0;
 static uint8_t   s_zero_scratch[16]
     __attribute__((aligned(16)));
+
+static void cmsis_partition_workspace(
+    uint8_t *workspace, uint32_t workspace_size, uint32_t quant_bytes)
+{
+    s_quant_mult = NULL;
+    s_quant_shift = NULL;
+    s_quant_channels = 0;
+    if (quant_bytes) {
+        s_quant_mult = (int32_t *)workspace;
+        s_quant_channels = quant_bytes / (2u * sizeof(int32_t));
+        s_quant_shift = s_quant_mult + s_quant_channels;
+    }
+    s_scratch = workspace + quant_bytes;
+    s_scratch_size = workspace_size - quant_bytes;
+}
 
 /* Return a 16-aligned scratch buffer of at least `need` bytes, or NULL. */
 static uint8_t *cmsis_scratch(uint32_t need)
@@ -61,6 +80,35 @@ static uint8_t *cmsis_scratch(uint32_t need)
     if (need == 0)
         return s_zero_scratch;
     return NULL;
+}
+
+static int cmsis_per_channel_quant(
+    const tigris_plan_t *plan, const tigris_quant_param_t *qp,
+    uint32_t channels, cmsis_nn_per_channel_quant_params *quant)
+{
+    if (!plan || !quant || channels == 0)
+        return -1;
+
+    if (qp && qp->num_channels == channels) {
+        uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2
+            ? 0u : qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
+        quant->multiplier = (int32_t *)&plan->quant_data[
+            page + qp->multiplier_off];
+        quant->shift = (int32_t *)&plan->quant_data[page + qp->shift_off];
+        return 0;
+    }
+
+    if ((qp && qp->num_channels != 1u) ||
+        !s_quant_mult || !s_quant_shift || channels > s_quant_channels)
+        return -1;
+
+    for (uint32_t channel = 0; channel < channels; channel++) {
+        s_quant_mult[channel] = qp ? get_mult(plan, qp, 0) : 1;
+        s_quant_shift[channel] = qp ? get_shft(plan, qp, 0) : 0;
+    }
+    quant->multiplier = s_quant_mult;
+    quant->shift = s_quant_shift;
+    return 0;
 }
 
 /* Conv2D */
@@ -87,14 +135,6 @@ static int adapt_conv2d(
     int OH = y_shape[1], OW = y_shape[2], OC = y_shape[3];
     int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
 
-    /* Build per-channel multiplier/shift arrays */
-    int32_t mult_arr[OC], shift_arr[OC];
-    for (int oc = 0; oc < OC; oc++) {
-        int ch = (out_qp && out_qp->num_channels > 1) ? oc : 0;
-        mult_arr[oc]  = out_qp ? get_mult(plan, out_qp, ch) : 1;
-        shift_arr[oc] = out_qp ? get_shft(plan, out_qp, ch) : 0;
-    }
-
     cmsis_nn_conv_params conv_params = {
         .input_offset  = in_qp  ? -in_qp->zero_point  : 0,
         .output_offset = out_qp ? out_qp->zero_point : 0,
@@ -105,10 +145,10 @@ static int adapt_conv2d(
         .activation = { .min = op->act_min, .max = op->act_max },
     };
 
-    cmsis_nn_per_channel_quant_params quant = {
-        .multiplier = mult_arr,
-        .shift = shift_arr,
-    };
+    cmsis_nn_per_channel_quant_params quant;
+    if (OC <= 0 || cmsis_per_channel_quant(
+            plan, out_qp, (uint32_t)OC, &quant) != 0)
+        return -1;
 
     cmsis_nn_dims input_dims  = { .n = N, .h = IH, .w = IW, .c = IC };
     cmsis_nn_dims filter_dims = { .n = OC, .h = KH, .w = KW, .c = IC };
@@ -164,13 +204,6 @@ static int adapt_depthwise_conv2d(
     /* Weight layout: [KH, KW, C] (HWC) from compiler.
      * CMSIS-NN expects [1, KH, KW, C] via filter_dims.n=1 - same data. */
 
-    int32_t mult_arr[C], shift_arr[C];
-    for (int c = 0; c < C; c++) {
-        int ch = (out_qp && out_qp->num_channels > 1) ? c : 0;
-        mult_arr[c]  = out_qp ? get_mult(plan, out_qp, ch) : 1;
-        shift_arr[c] = out_qp ? get_shft(plan, out_qp, ch) : 0;
-    }
-
     cmsis_nn_dw_conv_params dw_params = {
         .input_offset  = in_qp  ? -in_qp->zero_point  : 0,
         .output_offset = out_qp ? out_qp->zero_point : 0,
@@ -182,10 +215,10 @@ static int adapt_depthwise_conv2d(
         .activation = { .min = op->act_min, .max = op->act_max },
     };
 
-    cmsis_nn_per_channel_quant_params quant = {
-        .multiplier = mult_arr,
-        .shift = shift_arr,
-    };
+    cmsis_nn_per_channel_quant_params quant;
+    if (C <= 0 || cmsis_per_channel_quant(
+            plan, out_qp, (uint32_t)C, &quant) != 0)
+        return -1;
 
     cmsis_nn_dims input_dims  = { .n = N, .h = IH, .w = IW, .c = C };
     cmsis_nn_dims filter_dims = { .n = 1, .h = KH, .w = KW, .c = C };
@@ -365,7 +398,8 @@ static int adapt_avg_pool(
 
 /* Scratch sizing and reservation. */
 
-uint32_t tigris_cmsis_nn_scratch_required(const tigris_plan_t *plan)
+static uint32_t cmsis_workspace_required(
+    const tigris_plan_t *plan, uint32_t *quant_bytes_out)
 {
     if (!plan || !plan->header ||
         (plan->header->num_ops > 0 &&
@@ -374,6 +408,7 @@ uint32_t tigris_cmsis_nn_scratch_required(const tigris_plan_t *plan)
         return UINT32_MAX;
 
     uint32_t max_scratch = 0;
+    uint32_t max_broadcast_channels = 0;
     for (uint16_t i = 0; i < plan->header->num_ops; i++) {
         const tigris_op_t *op = &plan->ops[i];
         if (tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, plan, op, 0) ==
@@ -383,6 +418,8 @@ uint32_t tigris_cmsis_nn_scratch_required(const tigris_plan_t *plan)
         const uint16_t *outs = tigris_op_outputs(plan, op);
         const int32_t *xs = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
         const int32_t *ys = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+        const tigris_quant_param_t *out_qp =
+            tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
         int32_t s = 0;
 
         switch ((tigris_op_type_t)op->op_type) {
@@ -398,6 +435,9 @@ uint32_t tigris_cmsis_nn_scratch_required(const tigris_plan_t *plan)
                               .h = op->spatial.dilation_h ? op->spatial.dilation_h : 1 },
             };
             s = arm_convolve_wrapper_s8_get_buffer_size(&cp, &id, &fd, &od);
+            if ((!out_qp || out_qp->num_channels == 1u) && ys[3] > 0 &&
+                (uint32_t)ys[3] > max_broadcast_channels)
+                max_broadcast_channels = (uint32_t)ys[3];
             break;
         }
         case TIGRIS_OP_DEPTHWISE: {
@@ -413,6 +453,9 @@ uint32_t tigris_cmsis_nn_scratch_required(const tigris_plan_t *plan)
                               .h = op->spatial.dilation_h ? op->spatial.dilation_h : 1 },
             };
             s = arm_depthwise_conv_wrapper_s8_get_buffer_size(&dp, &id, &fd, &od);
+            if ((!out_qp || out_qp->num_channels == 1u) && xs[3] > 0 &&
+                (uint32_t)xs[3] > max_broadcast_channels)
+                max_broadcast_channels = (uint32_t)xs[3];
             break;
         }
         case TIGRIS_OP_FULLY_CONN: {
@@ -439,9 +482,22 @@ uint32_t tigris_cmsis_nn_scratch_required(const tigris_plan_t *plan)
             max_scratch = (uint32_t)s;
     }
 
-    if (max_scratch > UINT32_MAX - 15u)
+    if (max_scratch > UINT32_MAX - 15u ||
+        max_broadcast_channels > (UINT32_MAX - 15u) / (2u * sizeof(int32_t)))
         return UINT32_MAX;
-    return (max_scratch + 15u) & ~15u;
+    uint32_t kernel_bytes = (max_scratch + 15u) & ~15u;
+    uint32_t quant_bytes = (
+        max_broadcast_channels * 2u * sizeof(int32_t) + 15u) & ~15u;
+    if (quant_bytes > UINT32_MAX - kernel_bytes)
+        return UINT32_MAX;
+    if (quant_bytes_out)
+        *quant_bytes_out = quant_bytes;
+    return kernel_bytes + quant_bytes;
+}
+
+uint32_t tigris_cmsis_nn_scratch_required(const tigris_plan_t *plan)
+{
+    return cmsis_workspace_required(plan, NULL);
 }
 
 uint32_t tigris_cmsis_nn_fast_arena_required(const tigris_plan_t *plan)
@@ -466,15 +522,18 @@ int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem)
     if (!plan || !plan->header || !mem || !mem->fast_base)
         return -1;
 
-    uint32_t want = tigris_cmsis_nn_scratch_required(plan);
+    uint32_t quant_bytes = 0;
+    uint32_t want = cmsis_workspace_required(plan, &quant_bytes);
     if (want == UINT32_MAX)
         return -1;
 
     if (s_prepared_mem) {
         /* The adapter has one global CMSIS context. Never silently shrink a
          * second arena or replace a reservation which may still be in use. */
-        if (s_prepared_mem != mem || want > s_scratch_size)
+        if (s_prepared_mem != mem || want > s_workspace_size)
             return -1;
+        cmsis_partition_workspace(
+            mem->fast_base + mem->fast_size, s_workspace_size, quant_bytes);
         return 0;
     }
 
@@ -488,8 +547,9 @@ int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem)
     /* Carve a 16-aligned region from the top of the fast arena, reducing
      * fast_size so the executor's activation allocations never overlap it. */
     uint32_t new_size = (mem->fast_size - want) & ~15u;
-    s_scratch = mem->fast_base + new_size;
-    s_scratch_size = mem->fast_size - new_size;   /* >= want, 16-aligned base */
+    uint8_t *workspace = mem->fast_base + new_size;
+    s_workspace_size = mem->fast_size - new_size; /* >= want, aligned base */
+    cmsis_partition_workspace(workspace, s_workspace_size, quant_bytes);
     s_prepared_mem = mem;
     s_prepared_fast_size = mem->fast_size;
     mem->fast_size = new_size;
@@ -503,6 +563,10 @@ int tigris_cmsis_nn_deinit(tigris_mem_t *mem)
     mem->fast_size = s_prepared_fast_size;
     s_scratch = NULL;
     s_scratch_size = 0;
+    s_quant_mult = NULL;
+    s_quant_shift = NULL;
+    s_quant_channels = 0;
+    s_workspace_size = 0;
     s_prepared_mem = NULL;
     s_prepared_fast_size = 0;
     return 0;

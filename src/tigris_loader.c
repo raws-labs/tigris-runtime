@@ -14,12 +14,6 @@
 /* Helpers */
 
 /* Keep these in sync with the executor's fixed-size working arrays. */
-#define LOADER_MAX_STAGE_INPUTS       16u
-#define LOADER_MAX_STAGE_OUTPUTS      16u
-#define LOADER_MAX_CHAIN_STAGES       16u
-#define LOADER_MAX_CHAIN_SPATIAL_OPS   8u
-#define LOADER_MAX_TENSORS           512u
-
 /** Check that [offset, offset+size) fits within buf_len. */
 static inline int bounds_ok(uint32_t offset, uint32_t size, uint32_t buf_len)
 {
@@ -695,7 +689,7 @@ tigris_error_t tigris_plan_load(
             return TIGRIS_ERR_BAD_SECTION;
     }
 
-    if (hdr->num_tensors > LOADER_MAX_TENSORS)
+    if (hdr->num_tensors > TIGRIS_MAX_TENSORS)
         return TIGRIS_ERR_PLAN_LIMITS;
 
     for (uint16_t i = 0; i < hdr->num_tensors; i++) {
@@ -929,11 +923,11 @@ tigris_error_t tigris_plan_load(
             (stage->chain_len == 0 && stage->chain_id != TIGRIS_NO_CHAIN) ||
             (stage->chain_len > 0 && stage->chain_id == TIGRIS_NO_CHAIN))
             return TIGRIS_ERR_BAD_SECTION;
-        if (stage->inputs_count > LOADER_MAX_STAGE_INPUTS)
+        if (stage->inputs_count > TIGRIS_MAX_STAGE_INPUTS)
             return TIGRIS_ERR_PLAN_LIMITS;
-        if (stage->outputs_count > LOADER_MAX_STAGE_OUTPUTS)
+        if (stage->outputs_count > TIGRIS_MAX_STAGE_OUTPUTS)
             return TIGRIS_ERR_PLAN_LIMITS;
-        if (stage->chain_len > LOADER_MAX_CHAIN_STAGES)
+        if (stage->chain_len > TIGRIS_MAX_CHAIN_STAGES)
             return TIGRIS_ERR_PLAN_LIMITS;
 
         /* A chain is represented redundantly on every member.  The executor
@@ -1015,7 +1009,7 @@ tigris_error_t tigris_plan_load(
                 uint8_t op_type = candidate.ops[op_idx].op_type;
                 if (op_type == TIGRIS_OP_CONV || op_type == TIGRIS_OP_DEPTHWISE) {
                     spatial_count++;
-                    if (spatial_count > LOADER_MAX_CHAIN_SPATIAL_OPS)
+                    if (spatial_count > TIGRIS_MAX_SPATIAL_OPS_PER_STAGE)
                         return TIGRIS_ERR_PLAN_LIMITS;
                 }
             }

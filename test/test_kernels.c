@@ -1326,6 +1326,47 @@ static void test_unsupported_op(void)
     TEST_ASSERT(ret == -1, "unsupported op returns -1");
 }
 
+static void test_transpose(void)
+{
+    printf("  test_transpose...\n");
+    int32_t shapes[] = {2, 3, 3, 2};
+    uint16_t indices[] = {0, 1};
+    float input[] = {1, 2, 3, 4, 5, 6};
+    float expected[] = {1, 4, 2, 5, 3, 6};
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 2;
+    tensors[0].dtype = 1; tensors[0].size_bytes = sizeof(input);
+    tensors[1].shape_off = 2; tensors[1].ndim = 2;
+    tensors[1].dtype = 1; tensors[1].size_bytes = sizeof(expected);
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_TRANSPOSE;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_TRANSPOSE_PERM, 2, 0};
+    const uint8_t perm[] = {1, 0};
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header; plan.tensors = tensors; plan.ops = &op;
+    plan.index_pool = indices; plan.shape_pool = shapes;
+    plan.op_attributes = &attr; plan.op_attribute_data = perm;
+    plan.num_op_attributes = 1;
+    void *ptrs[2]; uint8_t fast[128], slow[128]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, 2, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, 0, sizeof(input));
+    memcpy(ptrs[0], input, sizeof(input));
+    tigris_mem_alloc_fast(&mem, 1, sizeof(expected));
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "transpose returns 0");
+    for (int i = 0; i < 6; i++)
+        TEST_ASSERT_NEAR(((float *)ptrs[1])[i], expected[i], EPS,
+                         "transpose value");
+}
+
 /* Main */
 
 int main(void)
@@ -1349,6 +1390,7 @@ int main(void)
     test_mul();
     test_constant_binary_f32();
     test_malformed_constant_binary_f32();
+    test_transpose();
     test_unsupported_op();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

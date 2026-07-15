@@ -926,6 +926,46 @@ static void test_conv1d_s8(void)
     TEST_ASSERT_EQ(out[1], 18, "conv1d y[1]=18");
 }
 
+static void test_transpose_s8(void)
+{
+    printf("  test_transpose_s8...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    int32_t input_shape[] = {2, 3};
+    int32_t output_shape[] = {3, 2};
+    uint16_t input = add_tensor(&plan, "x", input_shape, 2, 3, 6,
+                                TIGRIS_NO_QUANT_PARAM);
+    uint16_t output = add_tensor(&plan, "y", output_shape, 2, 3, 6,
+                                 TIGRIS_NO_QUANT_PARAM);
+    uint16_t ins[] = {input}, outs[] = {output};
+    test_ops[0].op_type = TIGRIS_OP_TRANSPOSE;
+    test_ops[0].num_inputs = 1; test_ops[0].num_outputs = 1;
+    test_ops[0].inputs_off = add_indices(ins, 1);
+    test_ops[0].outputs_off = add_indices(outs, 1);
+    test_header.num_ops = 1;
+    build_plan(&plan);
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_TRANSPOSE_PERM, 2, 0};
+    const uint8_t perm[] = {1, 0};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = perm;
+    plan.num_op_attributes = 1;
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[256]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
+                    slow, sizeof(slow));
+    const int8_t values[] = {1, 2, 3, 4, 5, 6};
+    const int8_t expected[] = {1, 4, 2, 5, 3, 6};
+    tigris_mem_alloc_fast(&mem, input, sizeof(values));
+    memcpy(ptrs[input], values, sizeof(values));
+    tigris_mem_alloc_fast(&mem, output, sizeof(expected));
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                             NULL), 0,
+                   "transpose_s8 returns 0");
+    for (int i = 0; i < 6; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[output])[i], expected[i],
+                       "transpose_s8 value");
+}
+
 /* Main */
 
 int main(void)
@@ -944,6 +984,7 @@ int main(void)
     test_tanh_s8();
     test_softmax_s8();
     test_conv1d_s8();
+    test_transpose_s8();
     test_unsupported_op_s8();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

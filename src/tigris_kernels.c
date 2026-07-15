@@ -758,6 +758,56 @@ static int kern_resize_nearest(
     return 0;
 }
 
+int tigris_transpose_execute(
+    const tigris_plan_t *plan, const tigris_op_t *op,
+    uint16_t op_index, tigris_mem_t *mem)
+{
+    if (!plan || !op || !mem || op->num_inputs != 1 || op->num_outputs != 1)
+        return -1;
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const tigris_tensor_t *input = &plan->tensors[ins[0]];
+    const tigris_tensor_t *output = &plan->tensors[outs[0]];
+    uint8_t rank = 0;
+    const uint8_t *perm = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_TRANSPOSE_PERM, &rank);
+    if (!perm || rank != input->ndim || output->ndim != rank ||
+        input->size_bytes != output->size_bytes)
+        return -1;
+    const uint8_t *src = (const uint8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    uint8_t *dst = (uint8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (!src || !dst)
+        return -1;
+    const int32_t *input_shape = tigris_tensor_shape(plan, input);
+    const int32_t *output_shape = tigris_tensor_shape(plan, output);
+    uint32_t elements = 1;
+    for (uint8_t axis = 0; axis < rank; axis++) {
+        if (output_shape[axis] <= 0 || perm[axis] >= rank)
+            return -1;
+        elements *= (uint32_t)output_shape[axis];
+    }
+    if (elements == 0 || input->size_bytes % elements != 0)
+        return -1;
+    uint32_t element_size = input->size_bytes / elements;
+
+    for (uint32_t output_index = 0; output_index < elements; output_index++) {
+        uint32_t remainder = output_index;
+        uint32_t input_index = 0;
+        for (uint8_t reverse_axis = rank; reverse_axis > 0; reverse_axis--) {
+            uint8_t output_axis = reverse_axis - 1u;
+            uint32_t coordinate = remainder % (uint32_t)output_shape[output_axis];
+            remainder /= (uint32_t)output_shape[output_axis];
+            uint32_t stride = 1;
+            for (uint8_t axis = perm[output_axis] + 1u; axis < rank; axis++)
+                stride *= (uint32_t)input_shape[axis];
+            input_index += coordinate * stride;
+        }
+        memcpy(dst + (size_t)output_index * element_size,
+               src + (size_t)input_index * element_size, element_size);
+    }
+    return 0;
+}
+
 /* Dispatch */
 
 int tigris_dispatch_kernel(
@@ -767,7 +817,6 @@ int tigris_dispatch_kernel(
     tigris_mem_t        *mem,
     void                *user_ctx)
 {
-    (void)op_index;
     (void)user_ctx;
 
     switch ((tigris_op_type_t)op->op_type) {
@@ -789,6 +838,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_AVG_POOL:    return kern_avg_pool(plan, op, mem);
     case TIGRIS_OP_CONCAT:      return kern_concat(plan, op, mem);
     case TIGRIS_OP_RESIZE:      return kern_resize_nearest(plan, op, mem);
+    case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */
     }

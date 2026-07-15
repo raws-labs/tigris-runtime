@@ -38,6 +38,13 @@ int tigris_dispatch_kernel(
     tigris_mem_t        *mem,
     void                *user_ctx);
 
+/** Execute a typed Transpose attribute for float or int8 reference routes. */
+int tigris_transpose_execute(
+    const tigris_plan_t *plan,
+    const tigris_op_t   *op,
+    uint16_t             op_index,
+    tigris_mem_t        *mem);
+
 #ifdef __cplusplus
 }
 #endif

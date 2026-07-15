@@ -142,6 +142,7 @@ using ESP-NN, call `tigris_esp_nn_prepare()` and check its return value before
 ## Further reading
 
 - [Getting started](https://tigris-ml.dev/docs)
+- [Compiler and plan compatibility](COMPATIBILITY.md)
 - [Runtime integration](https://tigris-ml.dev/docs/runtime/integration)
 - [Runtime API](https://tigris-ml.dev/docs/runtime/api-reference)
 - [Memory model](https://tigris-ml.dev/docs/architecture/memory-model)

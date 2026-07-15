@@ -55,11 +55,20 @@ The caller owns:
 - a slow arena, normally PSRAM or another writable RAM region; and
 - one `void *` entry per tensor.
 
-The plan's `budget` is the modeled activation requirement. Add
-`tigris_weight_decompression_overhead()` for compressed plans, account for
-base-alignment padding, and provision any backend workspace separately.
+The plan's `budget` is the modeled activation requirement. For an arena whose
+base satisfies `TIGRIS_TENSOR_ALIGN`, `tigris_fast_arena_required()` returns
+the core capacity needed for that budget plus any simultaneous compressed
+weights. Account for base-alignment padding when using an unaligned buffer and
+provision backend workspace separately.
 Optimized Cortex-M builds require the plan base and tensors to satisfy
 `TIGRIS_TENSOR_ALIGN` (16 bytes with DSP enabled).
+
+The compiler's current cost model aligns each activation to 32 bytes, which is
+conservative for the supported host, Cortex-M, and ESP targets. `mem.fast_peak`
+is the observed allocator high-water mark, not the scheduled minimum: a roomy
+arena may defer compaction and therefore report a larger value. Contract tests
+run with the compiler's scheduled limit to prove that compaction, tiling, and
+weight reservation still execute within that bound.
 
 The core executor performs no unbounded heap fallback. Normal stages may spill
 to the supplied slow arena; if neither bounded arena can satisfy an operation,

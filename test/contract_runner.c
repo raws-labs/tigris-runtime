@@ -2,7 +2,7 @@
  * Host-only compiler/runtime contract bridge.
  *
  * Usage:
- *   tigris_contract_runner plan.tgrs inputs.bin outputs.bin
+ *   tigris_contract_runner plan.tgrs inputs.bin outputs.bin [activation-limit]
  *
  * inputs.bin and outputs.bin concatenate model tensors in model-I/O order.
  * The companion compiler gate owns ONNX Runtime comparison and malformed-plan
@@ -11,6 +11,7 @@
  */
 #define _POSIX_C_SOURCE 200112L
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,6 +195,8 @@ int main(int argc, char **argv)
     void *fast_buf = NULL;
     void *slow_buf = NULL;
     uint32_t fast_size;
+    uint32_t required_size;
+    uint32_t activation_limit;
     uint32_t slow_size;
     uint32_t overhead;
     tigris_plan_t plan;
@@ -201,8 +204,10 @@ int main(int argc, char **argv)
     tigris_kernel_fn dispatch = NULL;
     int result = 1;
 
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s plan.tgrs inputs.bin outputs.bin\n", argv[0]);
+    if (argc != 4 && argc != 5) {
+        fprintf(stderr,
+                "usage: %s plan.tgrs inputs.bin outputs.bin [activation-limit]\n",
+                argv[0]);
         return 2;
     }
     if (load_file_aligned(argv[1], &plan_data, &plan_size) != 0) {
@@ -221,13 +226,29 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     overhead = tigris_weight_decompression_overhead(&plan);
+    required_size = tigris_fast_arena_required(&plan);
     if (plan.header->budget == 0 || overhead == UINT32_MAX ||
-        plan.header->budget > UINT32_MAX - overhead ||
+        required_size == UINT32_MAX ||
         slow_requirement(&plan, &slow_size) != 0) {
         fprintf(stderr, "plan has unrepresentable arena requirements\n");
         goto cleanup;
     }
-    fast_size = plan.header->budget + overhead;
+    activation_limit = plan.header->budget;
+    if (argc == 5) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(argv[4], &end, 10);
+        if (!argv[4][0] || !end || *end != '\0' || parsed == 0 ||
+            parsed > plan.header->budget || parsed > UINT32_MAX) {
+            fprintf(stderr, "invalid activation limit: %s\n", argv[4]);
+            goto cleanup;
+        }
+        activation_limit = (uint32_t)parsed;
+    }
+    if (activation_limit > UINT32_MAX - overhead) {
+        fprintf(stderr, "activation limit plus reserve is unrepresentable\n");
+        goto cleanup;
+    }
+    fast_size = activation_limit + overhead;
     tensor_ptrs = calloc(plan.header->num_tensors, sizeof(*tensor_ptrs));
     if (!tensor_ptrs ||
         allocate_aligned(TIGRIS_TENSOR_ALIGN, fast_size, &fast_buf) != 0 ||
@@ -258,6 +279,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "could not write model outputs\n");
         goto cleanup;
     }
+    printf(
+        "TIGRIS_CONTRACT_MEMORY budget=%" PRIu32 " activation_limit=%" PRIu32
+        " reserve=%" PRIu32 " required=%" PRIu32 " allocated=%" PRIu32
+        " peak=%" PRIu32 "\n",
+        plan.header->budget, activation_limit, overhead, required_size,
+        fast_size, mem.fast_peak);
     result = 0;
 
 cleanup:

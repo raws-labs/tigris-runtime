@@ -77,7 +77,7 @@ typedef struct {
     uint32_t     fast_size;         /* capacity in bytes */
     uint32_t     fast_used;         /* bump offset */
     uint32_t     fast_reserved;    /* bytes reserved at start (survives reset) */
-    uint32_t     fast_peak;         /* high-water mark for fast_used (true SRAM working set) */
+    uint32_t     fast_peak;         /* observed high-water mark for fast_used */
     uint8_t     *slow_base;         /* slow buffer */
     uint32_t     slow_size;         /* capacity in bytes */
     uint32_t     slow_used;         /* bump offset */
@@ -87,8 +87,9 @@ typedef struct {
 /**
  * Record a new fast-arena high-water mark if fast_used grew.
  * Called at every site that increases fast_used (the bump allocator and the
- * executor's direct scratch/weight bumps) so fast_peak is the true measured
- * peak SRAM working set, not a compile-time estimate.
+ * executor's direct scratch/weight bumps) so fast_peak is the observed arena
+ * high-water mark, not a compile-time estimate. Normal execution compacts on
+ * memory pressure, so a roomier arena can intentionally report a higher peak.
  */
 static inline void tigris_mem_note_fast_peak(tigris_mem_t *mem)
 {

@@ -25,7 +25,9 @@ build. The storage may instead be heap-backed or task-local, but putting it on
 the task stack adds its full size to that task's requirement.
 
 The source-compatible `tigris_run()` wrapper owns one static workspace. It is
-not re-entrant and must not be used concurrently. Define
+not re-entrant and must not be used concurrently. The wrapper lives in a
+separate static-library object, so explicit-API applications do not link its
+workspace. Define
 `TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE=0` when building the runtime to omit
 that compatibility workspace; callers must then use
 `tigris_run_with_workspace()`.

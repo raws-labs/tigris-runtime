@@ -1375,27 +1375,6 @@ size_t tigris_executor_workspace_size(void)
     return sizeof(tigris_executor_workspace_t);
 }
 
-tigris_exec_error_t tigris_run(
-    const tigris_plan_t *plan,
-    tigris_mem_t        *mem,
-    tigris_kernel_fn     kernel,
-    void                *user_ctx,
-    tigris_exec_stats_t *stats)
-{
-#if TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE
-    static tigris_executor_workspace_t default_workspace;
-    return tigris_run_with_workspace(
-        plan, mem, kernel, user_ctx, stats, &default_workspace);
-#else
-    (void)plan;
-    (void)mem;
-    (void)kernel;
-    (void)user_ctx;
-    (void)stats;
-    return TIGRIS_EXEC_ERR_WORKSPACE;
-#endif
-}
-
 const char *tigris_exec_error_str(tigris_exec_error_t err)
 {
     switch (err) {

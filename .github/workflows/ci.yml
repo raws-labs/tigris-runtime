@@ -96,6 +96,9 @@ jobs:
           -DTIGRIS_STACK_USAGE=ON
       - run: >-
           cmake --build build-stack
-          --target tigris_runtime cmsis_adapter_compile
+          --target tigris_runtime cmsis_adapter_compile explicit_workspace_link_smoke
           --parallel
       - run: python3 scripts/check_stack_usage.py --max-frame 1024 build-stack
+      - run: >-
+          python3 scripts/check_workspace_link.py
+          build-stack/explicit_workspace_link_smoke

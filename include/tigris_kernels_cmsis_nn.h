@@ -46,6 +46,32 @@ int tigris_dispatch_kernel_cmsis_nn(
     void                *user_ctx);
 
 /**
+ * Query the exact CMSIS-NN scratch reservation for a loaded plan.
+ *
+ * The result is computed by the linked CMSIS-NN buffer-size APIs and is
+ * therefore authoritative for that library version. It is rounded up to the
+ * adapter's 16-byte scratch alignment.
+ *
+ * @param plan  Loaded plan.
+ * @return Scratch bytes, 0 when no native op needs scratch, or UINT32_MAX for
+ *         an invalid plan or an unrepresentable vendor result.
+ */
+uint32_t tigris_cmsis_nn_scratch_required(const tigris_plan_t *plan);
+
+/**
+ * Query the total fast arena required for CMSIS-NN execution.
+ *
+ * Combines tigris_fast_arena_required() with the exact CMSIS-NN scratch
+ * reservation while preserving the plan's full core activation capacity.
+ * The arena base must be aligned to TIGRIS_TENSOR_ALIGN.
+ *
+ * @param plan  Loaded plan.
+ * @return Total bytes, or UINT32_MAX when the requirement is invalid or
+ *         cannot be represented.
+ */
+uint32_t tigris_cmsis_nn_fast_arena_required(const tigris_plan_t *plan);
+
+/**
  * Reserve the CMSIS-NN kernel scratch buffer from the top of the fast arena.
  *
  * Sizes a single 16-aligned scratch to the largest kernel buffer across the
@@ -53,12 +79,14 @@ int tigris_dispatch_kernel_cmsis_nn(
  * scratch is never allocated on the stack. Repeated calls for the same memory
  * manager are idempotent when the existing reservation is large enough; a
  * different manager or a larger reservation requires deinitialization first.
- * Optional - if not called, a small bounded static fallback covers tiny models
- * and oversized ops fail rather than overflow.
+ * Required before dispatch when tigris_cmsis_nn_scratch_required(plan) is
+ * positive. Dispatch fails closed rather than falling back to hidden static
+ * scratch when preparation was skipped.
  *
  * @param plan  Loaded plan.
  * @param mem   Memory manager (fast_size is reduced in place).
- * @return 0 on success, -1 if mem/plan is NULL or the arena is too small.
+ * @return 0 on success, -1 if mem/plan is NULL or the arena is smaller than
+ *         tigris_cmsis_nn_fast_arena_required(plan).
  */
 int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem);
 

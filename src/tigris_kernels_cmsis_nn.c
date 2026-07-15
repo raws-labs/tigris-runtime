@@ -19,6 +19,7 @@
 #include "tigris_kernels_s8.h"
 
 #include "arm_nnfunctions.h"
+#include <limits.h>
 
 /* Helpers */
 
@@ -44,17 +45,12 @@ static inline int32_t get_shft(
  * instead of stack VLAs - so the per-op CMSIS scratch (conv im2col can be many
  * KB on large models) can never overflow the stack.
  *
- * If prepare() was not called, a small bounded static fallback covers tiny
- * models (e.g. DS-CNN needs <512 B); a kernel needing more than the fallback
- * returns an error rather than overflowing the stack. */
-#ifndef TIGRIS_CMSIS_SCRATCH_FALLBACK
-#define TIGRIS_CMSIS_SCRATCH_FALLBACK 4096u
-#endif
+ * A plan with a positive scratch query must be prepared before dispatch. */
 static uint8_t  *s_scratch = NULL;       /* arena region set by prepare(), or NULL */
 static uint32_t  s_scratch_size = 0;
 static tigris_mem_t *s_prepared_mem = NULL;
 static uint32_t s_prepared_fast_size = 0;
-static uint8_t   s_scratch_fallback[TIGRIS_CMSIS_SCRATCH_FALLBACK]
+static uint8_t   s_zero_scratch[16]
     __attribute__((aligned(16)));
 
 /* Return a 16-aligned scratch buffer of at least `need` bytes, or NULL. */
@@ -62,8 +58,8 @@ static uint8_t *cmsis_scratch(uint32_t need)
 {
     if (s_scratch && need <= s_scratch_size)
         return s_scratch;
-    if (need <= sizeof(s_scratch_fallback))
-        return s_scratch_fallback;
+    if (need == 0)
+        return s_zero_scratch;
     return NULL;
 }
 
@@ -367,12 +363,15 @@ static int adapt_avg_pool(
     return (status == ARM_CMSIS_NN_SUCCESS) ? 0 : -1;
 }
 
-/* Scratch reservation (call once after tigris_mem_init, before inference). */
+/* Scratch sizing and reservation. */
 
-int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem)
+uint32_t tigris_cmsis_nn_scratch_required(const tigris_plan_t *plan)
 {
-    if (!plan || !plan->header || !mem || !mem->fast_base)
-        return -1;
+    if (!plan || !plan->header ||
+        (plan->header->num_ops > 0 &&
+         (!plan->ops || !plan->tensors || !plan->index_pool ||
+          !plan->shape_pool)))
+        return UINT32_MAX;
 
     uint32_t max_scratch = 0;
     for (uint16_t i = 0; i < plan->header->num_ops; i++) {
@@ -418,12 +417,11 @@ int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem)
         }
         case TIGRIS_OP_FULLY_CONN: {
             int OC = (plan->tensors[outs[0]].ndim >= 2) ? ys[1] : ys[0];
-            uint32_t x_numel = 1;
             const tigris_tensor_t *xt = &plan->tensors[ins[0]];
-            for (uint8_t d = 0; d < xt->ndim; d++)
-                x_numel *= (uint32_t)xs[d];
             int N = (plan->tensors[outs[0]].ndim >= 2) ? ys[0] : 1;
-            cmsis_nn_dims fd = { .n = (int)(x_numel / (uint32_t)N),
+            if (N <= 0 || xt->size_bytes > (uint32_t)INT_MAX)
+                return UINT32_MAX;
+            cmsis_nn_dims fd = { .n = (int)(xt->size_bytes / (uint32_t)N),
                                  .h = 1, .w = 1, .c = OC };
             s = arm_fully_connected_s8_get_buffer_size(&fd);
             break;
@@ -435,11 +433,43 @@ int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem)
         default:
             break;
         }
+        if (s < 0)
+            return UINT32_MAX;
         if (s > 0 && (uint32_t)s > max_scratch)
             max_scratch = (uint32_t)s;
     }
 
-    uint32_t want = (max_scratch + 15u) & ~15u;
+    if (max_scratch > UINT32_MAX - 15u)
+        return UINT32_MAX;
+    return (max_scratch + 15u) & ~15u;
+}
+
+uint32_t tigris_cmsis_nn_fast_arena_required(const tigris_plan_t *plan)
+{
+    uint32_t core = tigris_fast_arena_required(plan);
+    uint32_t scratch = tigris_cmsis_nn_scratch_required(plan);
+    if (core == UINT32_MAX || scratch == UINT32_MAX)
+        return UINT32_MAX;
+    if (scratch == 0)
+        return core;
+    if (core > UINT32_MAX - 15u)
+        return UINT32_MAX;
+
+    uint32_t aligned_core = (core + 15u) & ~15u;
+    if (scratch > UINT32_MAX - aligned_core)
+        return UINT32_MAX;
+    return aligned_core + scratch;
+}
+
+int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem)
+{
+    if (!plan || !plan->header || !mem || !mem->fast_base)
+        return -1;
+
+    uint32_t want = tigris_cmsis_nn_scratch_required(plan);
+    if (want == UINT32_MAX)
+        return -1;
+
     if (s_prepared_mem) {
         /* The adapter has one global CMSIS context. Never silently shrink a
          * second arena or replace a reservation which may still be in use. */
@@ -451,10 +481,12 @@ int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem)
     if (want == 0)                    /* no op needs scratch */
         return 0;
 
+    uint32_t total_required = tigris_cmsis_nn_fast_arena_required(plan);
+    if (total_required == UINT32_MAX || mem->fast_size < total_required)
+        return -1;
+
     /* Carve a 16-aligned region from the top of the fast arena, reducing
      * fast_size so the executor's activation allocations never overlap it. */
-    if (want + 16u > mem->fast_size)
-        return -1;                     /* arena too small for scratch */
     uint32_t new_size = (mem->fast_size - want) & ~15u;
     s_scratch = mem->fast_base + new_size;
     s_scratch_size = mem->fast_size - new_size;   /* >= want, 16-aligned base */

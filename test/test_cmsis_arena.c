@@ -117,12 +117,12 @@ static void test_queries_and_prepare(void)
 
     CHECK(tigris_cmsis_nn_scratch_required(NULL) == UINT32_MAX,
           "null plan fails closed");
-    CHECK(tigris_cmsis_nn_scratch_required(&fx.plan) == 48,
-          "vendor scratch is rounded to 16 bytes");
-    CHECK(tigris_cmsis_nn_fast_arena_required(&fx.plan) == 160,
-          "total preserves aligned core capacity plus scratch");
+    CHECK(tigris_cmsis_nn_scratch_required(&fx.plan) == 80,
+          "workspace includes aligned vendor and quant-expansion scratch");
+    CHECK(tigris_cmsis_nn_fast_arena_required(&fx.plan) == 192,
+          "total preserves aligned core capacity plus all workspace");
 
-    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[160];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[192];
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[64];
     void *ptrs[2];
     tigris_mem_t mem;
@@ -136,11 +136,11 @@ static void test_queries_and_prepare(void)
           "scratch carve leaves at least the full core requirement");
     CHECK(tigris_cmsis_nn_prepare(&fx.plan, &mem) == 0,
           "repeated prepare is idempotent");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0 && mem.fast_size == 160,
+    CHECK(tigris_cmsis_nn_deinit(&mem) == 0 && mem.fast_size == sizeof(fast),
           "deinit restores original capacity");
 
     CHECK(tigris_mem_init(
-              &mem, ptrs, 2, fast, 159, slow, sizeof(slow)) == TIGRIS_MEM_OK,
+              &mem, ptrs, 2, fast, 191, slow, sizeof(slow)) == TIGRIS_MEM_OK,
           "undersized arena still initializes");
     CHECK(tigris_cmsis_nn_prepare(&fx.plan, &mem) == -1,
           "one byte below total requirement fails before carving");

@@ -50,7 +50,10 @@ static void test_null_args(void)
     tigris_plan_t plan;
     uint8_t buf[48] = {0};
 
+    memset(&plan, 0xA5, sizeof(plan));
     TEST_ASSERT_EQ(tigris_plan_load(NULL, 48, &plan), TIGRIS_ERR_NULL, "null buf");
+    TEST_ASSERT(plan.header == NULL && plan.ops == NULL,
+                "null buffer clears output plan");
     TEST_ASSERT_EQ(tigris_plan_load(buf, 48, NULL), TIGRIS_ERR_NULL, "null plan");
 }
 
@@ -111,6 +114,10 @@ static void test_error_strings(void)
     printf("  test_error_strings...\n");
     TEST_ASSERT(strlen(tigris_error_str(TIGRIS_OK)) > 0, "OK string");
     TEST_ASSERT(strlen(tigris_error_str(TIGRIS_ERR_BAD_MAGIC)) > 0, "magic string");
+    TEST_ASSERT(strlen(tigris_error_str(TIGRIS_ERR_BAD_TENSOR)) > 0,
+                "tensor contract string");
+    TEST_ASSERT(strlen(tigris_error_str(TIGRIS_ERR_BAD_OPERATOR)) > 0,
+                "operator contract string");
     TEST_ASSERT(strlen(tigris_error_str((tigris_error_t)999)) > 0, "unknown string");
 }
 
@@ -272,6 +279,11 @@ static void test_v2_quant_plan_is_still_accepted(void)
     TEST_ASSERT_EQ(plan.num_quant_params, 1, "v2 quant param count");
     TEST_ASSERT_EQ(plan.quant_data[0], 123, "v2 multiplier data");
     TEST_ASSERT_EQ(plan.quant_data[1], -7, "v2 shift data");
+
+    build_v2_quant_plan(buf);
+    ((tigris_quant_param_t *)(buf + 112u))->scale = 0.0f;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_TENSOR, "non-positive quant scale rejected");
 }
 
 static void test_counted_sections_required(void)
@@ -307,11 +319,13 @@ static void test_counted_sections_required(void)
 }
 
 #define STAGED_PLAN_SIZE 704u
+#define STAGED_TENSORS_OFF 112u
 #define STAGED_OPS_OFF   128u
 #define STAGED_STAGES_OFF 480u
 #define STAGED_INDEX_OFF 544u
 #define STAGED_SHAPES_OFF 640u
-#define STAGED_STRINGS_OFF 644u
+#define STAGED_STRINGS_OFF 656u
+#define STAGED_WEIGHTS_OFF 660u
 
 static void build_staged_plan(uint8_t *buf)
 {
@@ -322,35 +336,78 @@ static void build_staged_plan(uint8_t *buf)
     hdr->version = TIGRIS_SCHEMA_VERSION;
     hdr->file_size = STAGED_PLAN_SIZE;
     hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 1;
     hdr->num_ops = 9;
     hdr->num_stages = 2;
+    hdr->num_weights = 1;
 
     tigris_section_entry_t *dir =
         (tigris_section_entry_t *)(buf + hdr->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, STAGED_OPS_OFF};
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, STAGED_TENSORS_OFF};
     dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, STAGED_OPS_OFF};
     dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, STAGED_STAGES_OFF};
     dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, STAGED_INDEX_OFF};
     dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, STAGED_SHAPES_OFF};
     dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, STAGED_STRINGS_OFF};
+    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHTS, STAGED_WEIGHTS_OFF};
+
+    tigris_tensor_t *tensor =
+        (tigris_tensor_t *)(buf + STAGED_TENSORS_OFF);
+    tensor->size_bytes = sizeof(float);
+    tensor->ndim = 4;
+    tensor->dtype = 1;
+    tensor->quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    int32_t *shape = (int32_t *)(buf + STAGED_SHAPES_OFF);
+    shape[0] = 1;
+    shape[1] = 1;
+    shape[2] = 1;
+    shape[3] = 1;
+
+    tigris_weight_entry_t *weight =
+        (tigris_weight_entry_t *)(buf + STAGED_WEIGHTS_OFF);
+    weight->size_bytes = sizeof(float);
 
     tigris_op_t *ops = (tigris_op_t *)(buf + STAGED_OPS_OFF);
     uint16_t *indices = (uint16_t *)(buf + STAGED_INDEX_OFF);
     for (uint16_t i = 0; i < hdr->num_ops; i++) {
         ops[i].op_type = TIGRIS_OP_CONV;
-        ops[i].weight_idx = TIGRIS_NO_WEIGHT;
+        ops[i].num_inputs = 1;
+        ops[i].num_outputs = 1;
+        ops[i].stage = i < 4 ? 0 : 1;
+        ops[i].inputs_off = 2u * i;
+        ops[i].outputs_off = 2u * i + 1u;
+        ops[i].spatial.kernel_h = 1;
+        ops[i].spatial.kernel_w = 1;
+        ops[i].spatial.stride_h = 1;
+        ops[i].spatial.stride_w = 1;
+        ops[i].spatial.dilation_h = 1;
+        ops[i].spatial.dilation_w = 1;
+        ops[i].spatial.group = 1;
+        ops[i].weight_idx = 0;
         ops[i].bias_idx = TIGRIS_NO_WEIGHT;
-        indices[i] = i;
+        indices[2u * i] = 0;
+        indices[2u * i + 1u] = 0;
     }
+    for (uint16_t i = 0; i < hdr->num_ops; i++)
+        indices[18u + i] = i;
 
     tigris_stage_t *stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
     stages[0].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
     stages[0].chain_id = TIGRIS_NO_CHAIN;
+    stages[0].ops_off = 18;
     stages[0].ops_count = 4;
+    stages[0].inputs_off = 27;
+    stages[0].inputs_count = 1;
+    stages[0].outputs_off = 28;
+    stages[0].outputs_count = 1;
     stages[1].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
     stages[1].chain_id = TIGRIS_NO_CHAIN;
-    stages[1].ops_off = 4;
+    stages[1].ops_off = 22;
     stages[1].ops_count = 5;
+    stages[1].inputs_off = 29;
+    stages[1].inputs_count = 1;
+    stages[1].outputs_off = 30;
+    stages[1].outputs_count = 1;
 }
 
 static void test_chain_limit_guards(void)
@@ -413,14 +470,18 @@ static void test_chain_limit_guards(void)
     stages[1].chain_id = 0;
     stages[1].chain_len = 2;
     stages[0].ops_count = 8;
-    stages[1].ops_off = 8;
+    stages[1].ops_off = 26;
     stages[1].ops_count = 1;
+    tigris_op_t *ops = (tigris_op_t *)(buf + STAGED_OPS_OFF);
+    for (uint16_t i = 0; i < 8; i++)
+        ops[i].stage = 0;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "eight chain spatial ops fit fixed metadata");
 
     stages[0].ops_count = 9;
-    stages[1].ops_off = 9;
+    stages[1].ops_off = 27;
     stages[1].ops_count = 0;
+    ops[8].stage = 0;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_PLAN_LIMITS, "ninth chain spatial op rejected");
 }
@@ -579,7 +640,7 @@ static void test_cross_reference_guards(void)
     build_referenced_plan(buf);
     ((tigris_tensor_t *)(buf + REF_TENSORS_OFF))->shape_off = 1;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
-                   TIGRIS_ERR_BAD_SECTION, "tensor shape range");
+                   TIGRIS_ERR_BAD_TENSOR, "tensor shape range");
 
     build_referenced_plan(buf);
     ((tigris_tensor_t *)(buf + REF_TENSORS_OFF))->name_str = 1;
@@ -589,12 +650,12 @@ static void test_cross_reference_guards(void)
     build_referenced_plan(buf);
     ((tigris_tensor_t *)(buf + REF_TENSORS_OFF))->size_bytes = 3;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
-                   TIGRIS_ERR_BAD_SECTION, "tensor size matches shape and dtype");
+                   TIGRIS_ERR_BAD_TENSOR, "tensor size matches shape and dtype");
 
     build_referenced_plan(buf);
     ((tigris_tensor_t *)(buf + REF_TENSORS_OFF))->dtype = 2;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
-                   TIGRIS_ERR_BAD_SECTION, "unsupported activation dtype");
+                   TIGRIS_ERR_BAD_TENSOR, "unsupported activation dtype");
 }
 
 /* A compact schema-v4 plan that carries the required Transpose permutation
@@ -716,6 +777,112 @@ static void test_transpose_attribute_guards(void)
     ((tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u))->type = 99;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION, "unknown attribute type rejected");
+}
+
+static void build_unary_plan(uint8_t *buf)
+{
+    build_transpose_plan(buf);
+
+    /* End the directory before the optional attribute section and turn the
+     * Transpose into a plain exact-shape Relu plan.  The remaining bytes are
+     * harmless string-section tail data. */
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(
+        buf + sizeof(tigris_file_header_t));
+    memset(&dir[6], 0, sizeof(dir[6]));
+
+    tigris_op_t *op = (tigris_op_t *)(buf + TRANSPOSE_OPS_OFF);
+    op->op_type = TIGRIS_OP_RELU;
+    int32_t *shapes = (int32_t *)(buf + TRANSPOSE_SHAPES_OFF);
+    shapes[2] = 2;
+    shapes[3] = 3;
+}
+
+static void test_operator_semantic_guards(void)
+{
+    printf("  test_operator_semantic_guards...\n");
+    _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_unary_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid unary plan loads");
+
+    build_unary_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_UNKNOWN;
+    memset(&plan, 0xA5, sizeof(plan));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "unknown opcode rejected");
+    TEST_ASSERT(plan.header == NULL && plan.ops == NULL,
+                "failed load exposes no partial plan");
+
+    build_unary_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_CLIP;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "undispatched opcode rejected");
+
+    build_unary_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->num_inputs = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "empty operator input rejected");
+
+    build_unary_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->fused_act = TIGRIS_ACT_RELU;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "fused activation on unsupported operator rejected");
+
+    build_unary_plan(buf);
+    int32_t *shapes = (int32_t *)(buf + TRANSPOSE_SHAPES_OFF);
+    shapes[2] = 1;
+    shapes[3] = 6;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "unary shape mismatch rejected");
+
+    build_unary_plan(buf);
+    tigris_tensor_t *tensors =
+        (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
+    tensors[1].dtype = 3;
+    tensors[1].size_bytes = 6;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "mixed activation dtype rejected");
+
+    build_unary_plan(buf);
+    tensors = (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
+    tensors[1].flags = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_TENSOR, "model output flag mismatch rejected");
+}
+
+static void test_convolution_semantic_guards(void)
+{
+    printf("  test_convolution_semantic_guards...\n");
+    _Alignas(4) uint8_t buf[STAGED_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_staged_plan(buf);
+    tigris_op_t *ops = (tigris_op_t *)(buf + STAGED_OPS_OFF);
+    ops[0].spatial.group = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "unsupported Conv group rejected");
+
+    build_staged_plan(buf);
+    ops = (tigris_op_t *)(buf + STAGED_OPS_OFF);
+    ops[0].spatial.stride_h = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "zero Conv stride rejected");
+
+    build_staged_plan(buf);
+    tigris_weight_entry_t *weight =
+        (tigris_weight_entry_t *)(buf + STAGED_WEIGHTS_OFF);
+    weight->size_bytes = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "undersized Conv weights rejected");
+
+    build_staged_plan(buf);
+    ops = (tigris_op_t *)(buf + STAGED_OPS_OFF);
+    ops[0].stage = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "operator stage mismatch rejected");
 }
 
 /* Struct size validation */
@@ -911,6 +1078,8 @@ int main(int argc, char *argv[])
     test_compressed_block_guards();
     test_cross_reference_guards();
     test_transpose_attribute_guards();
+    test_operator_semantic_guards();
+    test_convolution_semantic_guards();
 
     printf("\nStruct size tests:\n");
     test_struct_sizes();

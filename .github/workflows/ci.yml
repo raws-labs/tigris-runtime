@@ -8,6 +8,31 @@ permissions:
   contents: read
 
 jobs:
+  capability-contract:
+    name: Compiler capability contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: raws-labs/tigris
+          path: tigris-compiler
+          ref: develop
+      - name: Use matching compiler branch when available
+        env:
+          COMPILER_REF: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+        run: |
+          if git -C tigris-compiler ls-remote --exit-code --heads origin "$COMPILER_REF"; then
+            git -C tigris-compiler fetch --depth=1 origin "$COMPILER_REF"
+            git -C tigris-compiler checkout --detach FETCH_HEAD
+          fi
+      - name: Compare runtime dispatch with the canonical matrix
+        env:
+          PYTHONPATH: tigris-compiler/src
+        run: >-
+          python3 tigris-compiler/scripts/validate_runtime_capabilities.py
+          --runtime .
+
   native:
     name: Native ${{ matrix.compiler }}
     runs-on: ubuntu-latest

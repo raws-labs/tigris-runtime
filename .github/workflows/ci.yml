@@ -48,6 +48,19 @@ jobs:
           -DCMAKE_C_COMPILER=${{ matrix.compiler }}
       - run: cmake --build build-${{ matrix.compiler }} --parallel
       - run: ctest --test-dir build-${{ matrix.compiler }} --output-on-failure
+      - run: >-
+          cmake --install build-${{ matrix.compiler }}
+          --prefix ${{ github.workspace }}/install-${{ matrix.compiler }}
+      - run: >-
+          cmake -S test/package_consumer
+          -B build-consumer-${{ matrix.compiler }}
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/install-${{ matrix.compiler }}
+      - run: cmake --build build-consumer-${{ matrix.compiler }} --parallel
+      - run: >-
+          ctest --test-dir build-consumer-${{ matrix.compiler }}
+          --output-on-failure
 
   sanitizers:
     name: ASan and UBSan

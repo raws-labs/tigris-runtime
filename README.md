@@ -119,6 +119,27 @@ See [examples/posix/main.c](examples/posix/main.c) for checked loader, arena,
 input, execution, and output handling. Production integrations normally use
 the harness emitted by `tigris codegen`.
 
+## Install for CMake consumers
+
+Install the runtime to a prefix:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix /path/to/tigris-runtime
+```
+
+An external project can then consume the installed headers and library without
+depending on the TiGrIS source tree:
+
+```cmake
+find_package(tigris_runtime 0.4 REQUIRED CONFIG)
+target_link_libraries(my_app PRIVATE tigris::runtime)
+```
+
+Pass the installation prefix through `CMAKE_PREFIX_PATH` when it is outside a
+standard system location.
+
 ## ESP32 (ESP-IDF)
 
 The ESP-IDF example lives in `examples/esp32`:

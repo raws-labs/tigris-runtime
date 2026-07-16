@@ -24,16 +24,24 @@ if(COMMAND idf_component_register)
     return()
 endif()
 
-project(tigris_runtime C)
+project(tigris_runtime VERSION 0.4.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wvla)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 option(TIGRIS_STACK_USAGE
     "Emit compiler .su files for runtime stack-budget checks" OFF)
 
 add_library(tigris_runtime STATIC ${TIGRIS_RUNTIME_SRCS})
-target_include_directories(tigris_runtime PUBLIC include)
+add_library(tigris::runtime ALIAS tigris_runtime)
+set_target_properties(tigris_runtime PROPERTIES EXPORT_NAME runtime)
+target_include_directories(tigris_runtime PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
 target_link_libraries(tigris_runtime PUBLIC m)
 if(TIGRIS_STACK_USAGE)
     if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
@@ -57,6 +65,39 @@ if(TIGRIS_HAS_CMSIS_NN)
     target_compile_definitions(tigris_runtime PUBLIC TIGRIS_HAS_CMSIS_NN)
     target_link_libraries(tigris_runtime PUBLIC cmsis-nn)
 endif()
+
+# Install a relocatable package for external CMake consumers. The export file
+# is itself the package config, so no hand-maintained config template is needed.
+set(TIGRIS_RUNTIME_CMAKE_INSTALL_DIR
+    "${CMAKE_INSTALL_LIBDIR}/cmake/tigris_runtime")
+install(TARGETS tigris_runtime
+    EXPORT tigris_runtimeTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+install(DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.h"
+)
+install(FILES LICENSE
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/tigris_runtime
+)
+install(EXPORT tigris_runtimeTargets
+    FILE tigris_runtimeConfig.cmake
+    NAMESPACE tigris::
+    DESTINATION ${TIGRIS_RUNTIME_CMAKE_INSTALL_DIR}
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/tigris_runtimeConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    # TiGrIS is pre-1.0: keep compatibility within the 0.4.x release line.
+    COMPATIBILITY SameMinorVersion
+)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/tigris_runtimeConfigVersion.cmake"
+    DESTINATION ${TIGRIS_RUNTIME_CMAKE_INSTALL_DIR}
+)
 
 # Tests (only when built as top-level project)
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)

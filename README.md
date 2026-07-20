@@ -58,11 +58,14 @@ The caller owns:
 - a slow arena, normally PSRAM or another writable RAM region; and
 - one `void *` entry per tensor.
 
-New integrations should also provide a static or otherwise non-stack
-`tigris_executor_workspace_t` and call `tigris_run_with_workspace()`. The
-source-compatible `tigris_run()` uses one process-global workspace and is not
-safe for concurrent inference. Compile-time plan limits, workspace sizing,
-stack provisioning, and re-entrant execution are documented in the
+Generated integrations reserve a plan-sized executor buffer automatically; no
+workspace limit tuning is required. Manual integrations can query
+`tigris_executor_workspace_required()` after loading the plan and pass that many
+caller-owned bytes to `tigris_run_with_workspace_buffer()`. The fixed
+`tigris_executor_workspace_t` and `tigris_run_with_workspace()` remain available
+for source compatibility. `tigris_run()` uses one process-global fixed
+workspace and is not safe for concurrent inference. Arena sizing, stack
+provisioning, and re-entrant execution are documented in the
 [runtime integration guide](https://tigris-ml.dev/docs/runtime/integration/).
 
 The plan's `budget` is the modeled activation requirement. For an arena whose

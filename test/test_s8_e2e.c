@@ -79,11 +79,22 @@ int main(int argc, char **argv)
                tidx, data[0], data[1], data[2], data[3], data[4], sz);
     }
 
-    /* Run with s8_ref kernel */
+    /* Run with the exact plan-sized workspace so fixture/model sweeps exercise
+     * the same API generated embedded applications use. */
+    size_t workspace_size = tigris_executor_workspace_required(&plan);
+    void *workspace = malloc(workspace_size);
+    if (!workspace) {
+        fprintf(stderr, "Workspace allocation failed (%zu bytes)\n",
+                workspace_size);
+        return 1;
+    }
     tigris_exec_stats_t stats;
-    tigris_exec_error_t eerr = tigris_run(&plan, &mem, tigris_dispatch_kernel_s8, NULL, &stats);
+    tigris_exec_error_t eerr = tigris_run_with_workspace_buffer(
+        &plan, &mem, tigris_dispatch_kernel_s8, NULL, &stats,
+        workspace, workspace_size);
     if (eerr != TIGRIS_EXEC_OK) {
         fprintf(stderr, "Inference failed: %s\n", tigris_exec_error_str(eerr));
+        free(workspace);
         return 1;
     }
 
@@ -99,6 +110,7 @@ int main(int argc, char **argv)
         printf(" %d", (int)out[j]);
     printf("\n");
 
+    free(workspace);
     free(ptrs);
     free(slow_buf);
     free(fast_buf);

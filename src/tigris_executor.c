@@ -42,48 +42,217 @@ typedef struct {
     int32_t stride_h;
     int32_t eff_kh;
     int32_t orig_pad_top;
-    int     sp_count;
-    int     sp_op_indices[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
-    int32_t sp_strides[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
-    int32_t sp_eff_khs[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
-    int32_t sp_pad_tops[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
-    int32_t sp_full_in_hs[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
-    int32_t sp_full_in_ws[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
-    int32_t sp_full_out_ws[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+    int32_t sp_count;
 } chain_stage_info_t;
 
 typedef struct {
-    uint16_t last_use_op[TIGRIS_MAX_TENSORS];
-    uint16_t last_consumer[TIGRIS_MAX_TENSORS];
-    void *input_ptrs[TIGRIS_MAX_STAGE_INPUTS];
-    void *output_ptrs[TIGRIS_MAX_STAGE_OUTPUTS];
-    const tigris_stage_t *stages[TIGRIS_MAX_CHAIN_STAGES];
-    chain_stage_info_t info[TIGRIS_MAX_CHAIN_STAGES];
-    uint8_t *weight_bases[TIGRIS_MAX_CHAIN_STAGES];
-    int32_t s_out[TIGRIS_MAX_CHAIN_STAGES];
-    int32_t s_in[TIGRIS_MAX_CHAIN_STAGES];
-    int32_t in_starts[TIGRIS_MAX_CHAIN_STAGES];
-    int32_t in_ends[TIGRIS_MAX_CHAIN_STAGES];
-    int32_t out_starts[TIGRIS_MAX_CHAIN_STAGES];
-    int32_t out_ends[TIGRIS_MAX_CHAIN_STAGES];
-    int32_t sp_tile_in_h[TIGRIS_MAX_CHAIN_STAGES]
-                            [TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
-    int32_t sp_tile_out_h[TIGRIS_MAX_CHAIN_STAGES]
-                             [TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
-    int32_t sp_tile_pt[TIGRIS_MAX_CHAIN_STAGES]
-                         [TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
-    int32_t sp_tile_pb[TIGRIS_MAX_CHAIN_STAGES]
-                         [TIGRIS_MAX_SPATIAL_OPS_PER_STAGE];
+    void **input_ptrs;
+    void **output_ptrs;
+    const tigris_stage_t **stages;
+    uint8_t **weight_bases;
+    chain_stage_info_t *info;
+    int32_t *s_out;
+    int32_t *s_in;
+    int32_t *in_starts;
+    int32_t *in_ends;
+    int32_t *out_starts;
+    int32_t *out_ends;
+    int32_t *sp_op_indices;
+    int32_t *sp_strides;
+    int32_t *sp_eff_khs;
+    int32_t *sp_pad_tops;
+    int32_t *sp_full_in_hs;
+    int32_t *sp_full_in_ws;
+    int32_t *sp_full_out_ws;
+    int32_t *sp_tile_in_h;
+    int32_t *sp_tile_out_h;
+    int32_t *sp_tile_pt;
+    int32_t *sp_tile_pb;
+    uint16_t *last_use_op;
+    uint16_t *last_consumer;
+    uint16_t tensor_capacity;
+    uint16_t input_capacity;
+    uint16_t output_capacity;
+    uint16_t chain_capacity;
+    uint16_t spatial_capacity;
 } executor_workspace_impl_t;
 
-typedef char tigris_executor_workspace_too_small[
-    sizeof(executor_workspace_impl_t) <= sizeof(tigris_executor_workspace_t)
+typedef struct {
+    uint16_t tensors;
+    uint16_t inputs;
+    uint16_t outputs;
+    uint16_t chain_stages;
+    uint16_t spatial_ops;
+} executor_workspace_limits_t;
+
+typedef char tigris_executor_compat_workspace_too_small[
+    TIGRIS_EXECUTOR_WORKSPACE_BYTES >=
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(
+            TIGRIS_MAX_TENSORS, TIGRIS_MAX_STAGE_INPUTS,
+            TIGRIS_MAX_STAGE_OUTPUTS, TIGRIS_MAX_CHAIN_STAGES,
+            TIGRIS_MAX_SPATIAL_OPS_PER_STAGE)
         ? 1 : -1];
 
-static executor_workspace_impl_t *workspace_impl(
-    tigris_executor_workspace_t *workspace)
+static uintptr_t align_address(uintptr_t address, size_t alignment)
 {
-    return (executor_workspace_impl_t *)(void *)workspace->bytes;
+    return (address + alignment - 1u) & ~(uintptr_t)(alignment - 1u);
+}
+
+static int workspace_limits(
+    const tigris_plan_t *plan, executor_workspace_limits_t *limits)
+{
+    if (!plan || !limits || !plan->header || !plan->stages ||
+        !plan->ops || !plan->index_pool)
+        return 0;
+
+    memset(limits, 0, sizeof(*limits));
+    limits->tensors = plan->header->num_tensors;
+
+    for (uint16_t s = 0; s < plan->header->num_stages; s++) {
+        const tigris_stage_t *stage = &plan->stages[s];
+        if (stage->inputs_count > limits->inputs)
+            limits->inputs = stage->inputs_count;
+        if (stage->outputs_count > limits->outputs)
+            limits->outputs = stage->outputs_count;
+
+        if (stage->chain_len >= 2 && stage->chain_id == s) {
+            uint16_t chain_end;
+            if (stage->chain_len > UINT16_MAX - s)
+                return 0;
+            chain_end = (uint16_t)(s + stage->chain_len);
+            if (chain_end > plan->header->num_stages)
+                return 0;
+            if (stage->chain_len > limits->chain_stages)
+                limits->chain_stages = stage->chain_len;
+
+            for (uint16_t c = s; c < chain_end; c++) {
+                const tigris_stage_t *chain_stage = &plan->stages[c];
+                const uint16_t *ops = tigris_stage_ops(plan, chain_stage);
+                uint16_t spatial = 0;
+                for (uint16_t j = 0; j < chain_stage->ops_count; j++) {
+                    if (ops[j] >= plan->header->num_ops)
+                        return 0;
+                    uint8_t type = plan->ops[ops[j]].op_type;
+                    if (type == TIGRIS_OP_CONV ||
+                        type == TIGRIS_OP_DEPTHWISE)
+                        spatial++;
+                }
+                if (spatial > limits->spatial_ops)
+                    limits->spatial_ops = spatial;
+            }
+        }
+    }
+    return 1;
+}
+
+static size_t workspace_bytes_for_limits(
+    const executor_workspace_limits_t *limits)
+{
+    size_t total = TIGRIS_EXECUTOR_POINTER_ALIGNMENT - 1u;
+    size_t count =
+        (size_t)limits->inputs + limits->outputs +
+        2u * (size_t)limits->chain_stages;
+    if (count > (SIZE_MAX - total) / sizeof(void *))
+        return 0;
+    total += count * sizeof(void *);
+
+    if (total > SIZE_MAX - (TIGRIS_EXECUTOR_INT32_ALIGNMENT - 1u))
+        return 0;
+    total += TIGRIS_EXECUTOR_INT32_ALIGNMENT - 1u;
+    count = 14u + 11u * (size_t)limits->spatial_ops;
+    if (limits->chain_stages != 0 &&
+        count > SIZE_MAX / limits->chain_stages)
+        return 0;
+    count *= limits->chain_stages;
+    if (count > (SIZE_MAX - total) / sizeof(int32_t))
+        return 0;
+    total += count * sizeof(int32_t);
+
+    if (total > SIZE_MAX - (TIGRIS_EXECUTOR_UINT16_ALIGNMENT - 1u))
+        return 0;
+    total += TIGRIS_EXECUTOR_UINT16_ALIGNMENT - 1u;
+    count = 2u * (size_t)limits->tensors;
+    if (count > (SIZE_MAX - total) / sizeof(uint16_t))
+        return 0;
+    return total + count * sizeof(uint16_t);
+}
+
+static int workspace_layout(
+    void *storage, size_t storage_size,
+    const executor_workspace_limits_t *limits,
+    executor_workspace_impl_t *workspace)
+{
+    size_t required = workspace_bytes_for_limits(limits);
+    if (!storage || !workspace || required == 0 ||
+        storage_size < required ||
+        storage_size > UINTPTR_MAX - (uintptr_t)storage)
+        return 0;
+
+    uintptr_t cursor = align_address(
+        (uintptr_t)storage, TIGRIS_EXECUTOR_POINTER_ALIGNMENT);
+    workspace->input_ptrs = (void **)cursor;
+    cursor += (size_t)limits->inputs * sizeof(void *);
+    workspace->output_ptrs = (void **)cursor;
+    cursor += (size_t)limits->outputs * sizeof(void *);
+    workspace->stages = (const tigris_stage_t **)cursor;
+    cursor += (size_t)limits->chain_stages * sizeof(void *);
+    workspace->weight_bases = (uint8_t **)cursor;
+    cursor += (size_t)limits->chain_stages * sizeof(void *);
+
+    cursor = align_address(cursor, TIGRIS_EXECUTOR_INT32_ALIGNMENT);
+    workspace->info = (chain_stage_info_t *)cursor;
+    cursor += (size_t)limits->chain_stages * sizeof(chain_stage_info_t);
+#define TIGRIS_LAYOUT_CHAIN_FIELD(field)                                      \
+    do {                                                                       \
+        workspace->field = (int32_t *)cursor;                                 \
+        cursor += (size_t)limits->chain_stages * sizeof(int32_t);              \
+    } while (0)
+    TIGRIS_LAYOUT_CHAIN_FIELD(s_out);
+    TIGRIS_LAYOUT_CHAIN_FIELD(s_in);
+    TIGRIS_LAYOUT_CHAIN_FIELD(in_starts);
+    TIGRIS_LAYOUT_CHAIN_FIELD(in_ends);
+    TIGRIS_LAYOUT_CHAIN_FIELD(out_starts);
+    TIGRIS_LAYOUT_CHAIN_FIELD(out_ends);
+#undef TIGRIS_LAYOUT_CHAIN_FIELD
+
+#define TIGRIS_LAYOUT_SPATIAL_FIELD(field)                                     \
+    do {                                                                       \
+        workspace->field = (int32_t *)cursor;                                 \
+        cursor += (size_t)limits->chain_stages *                               \
+                  (size_t)limits->spatial_ops * sizeof(int32_t);               \
+    } while (0)
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_op_indices);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_strides);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_eff_khs);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_pad_tops);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_full_in_hs);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_full_in_ws);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_full_out_ws);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_tile_in_h);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_tile_out_h);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_tile_pt);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_tile_pb);
+#undef TIGRIS_LAYOUT_SPATIAL_FIELD
+
+    cursor = align_address(cursor, TIGRIS_EXECUTOR_UINT16_ALIGNMENT);
+    workspace->last_use_op = (uint16_t *)cursor;
+    cursor += (size_t)limits->tensors * sizeof(uint16_t);
+    workspace->last_consumer = (uint16_t *)cursor;
+    cursor += (size_t)limits->tensors * sizeof(uint16_t);
+
+    workspace->tensor_capacity = limits->tensors;
+    workspace->input_capacity = limits->inputs;
+    workspace->output_capacity = limits->outputs;
+    workspace->chain_capacity = limits->chain_stages;
+    workspace->spatial_capacity = limits->spatial_ops;
+
+    return cursor <= (uintptr_t)storage + storage_size;
+}
+
+static size_t spatial_index(
+    const executor_workspace_impl_t *workspace, uint16_t chain, uint16_t op)
+{
+    return (size_t)chain * workspace->spatial_capacity + op;
 }
 
 /* Memory compaction */
@@ -204,7 +373,6 @@ static tigris_exec_error_t exec_stage_normal(
      * After that op completes, t's fast memory can be reclaimed (if not a stage output). */
     uint16_t num_t = plan->header->num_tensors;
     uint16_t *last_use_op = workspace->last_use_op;
-    if (num_t > TIGRIS_MAX_TENSORS) num_t = TIGRIS_MAX_TENSORS;
     for (uint16_t i = 0; i < num_t; i++)
         last_use_op[i] = UINT16_MAX;  /* not used in this stage */
 
@@ -654,7 +822,7 @@ static tigris_exec_error_t exec_chain_tiled(
     void                *user_ctx,
     executor_workspace_impl_t *workspace)
 {
-    if (num_chain < 2 || num_chain > TIGRIS_MAX_CHAIN_STAGES)
+    if (num_chain < 2 || num_chain > workspace->chain_capacity)
         return TIGRIS_EXEC_ERR_TILE;
 
     const tigris_stage_t **stages = workspace->stages;
@@ -696,15 +864,17 @@ static tigris_exec_error_t exec_chain_tiled(
                 const uint16_t *op_outs = tigris_op_outputs(plan, &plan->ops[sops[j]]);
                 const int32_t *op_osh = tigris_tensor_shape(plan, &plan->tensors[op_outs[0]]);
 
-                if (sp_count < (int)TIGRIS_MAX_SPATIAL_OPS_PER_STAGE) {
-                    info[c].sp_op_indices[sp_count] = (int)sops[j];
-                    info[c].sp_strides[sp_count] = sh;
-                    info[c].sp_eff_khs[sp_count] = ekh;
-                    info[c].sp_pad_tops[sp_count] = pt;
-                    info[c].sp_full_in_hs[sp_count] = op_ish[1];
-                    info[c].sp_full_in_ws[sp_count] = op_ish[2];
-                    info[c].sp_full_out_ws[sp_count] = op_osh[2];
-                }
+                if (sp_count >= workspace->spatial_capacity)
+                    return TIGRIS_EXEC_ERR_WORKSPACE;
+                size_t spi = spatial_index(
+                    workspace, c, (uint16_t)sp_count);
+                workspace->sp_op_indices[spi] = (int32_t)sops[j];
+                workspace->sp_strides[spi] = sh;
+                workspace->sp_eff_khs[spi] = ekh;
+                workspace->sp_pad_tops[spi] = pt;
+                workspace->sp_full_in_hs[spi] = op_ish[1];
+                workspace->sp_full_in_ws[spi] = op_ish[2];
+                workspace->sp_full_out_ws[spi] = op_osh[2];
 
                 /* Compose: eff_kh_new = eff_kh + (ekh - 1) * stride
                  *          pad_top_new = pad_top + pt * stride
@@ -725,8 +895,7 @@ static tigris_exec_error_t exec_chain_tiled(
 
     /* 0. Decompress all chain stages' weight blocks into fast prefix */
     uint8_t **weight_bases = workspace->weight_bases;
-    memset(weight_bases, 0,
-           TIGRIS_MAX_CHAIN_STAGES * sizeof(*weight_bases));
+    memset(weight_bases, 0, num_chain * sizeof(*weight_bases));
 
     int32_t chain_tile_h_override = 0;
 
@@ -825,9 +994,11 @@ static tigris_exec_error_t exec_chain_tiled(
                     /* Spatial ops reduce height */
                     if ((ot == TIGRIS_OP_CONV || ot == TIGRIS_OP_DEPTHWISE) &&
                         sp_j < info[c].sp_count) {
-                        int32_t ekh = info[c].sp_eff_khs[sp_j];
-                        int32_t sh  = info[c].sp_strides[sp_j];
-                        int32_t pt  = info[c].sp_pad_tops[sp_j];
+                        size_t spi = spatial_index(
+                            workspace, c, (uint16_t)sp_j);
+                        int32_t ekh = workspace->sp_eff_khs[spi];
+                        int32_t sh  = workspace->sp_strides[spi];
+                        int32_t pt  = workspace->sp_pad_tops[spi];
                         /* Worst case (with full padding at boundary) */
                         int32_t oh = (cur_h + pt - ekh) / sh + 1;
                         cur_h = oh;
@@ -873,7 +1044,7 @@ static tigris_exec_error_t exec_chain_tiled(
     const uint16_t *last_sout = tigris_stage_outputs(plan, last_stage);
     void **out_slow_bases = workspace->output_ptrs;
     memset(out_slow_bases, 0,
-           TIGRIS_MAX_STAGE_OUTPUTS * sizeof(*out_slow_bases));
+           workspace->output_capacity * sizeof(*out_slow_bases));
 
     for (uint16_t i = 0; i < last_stage->outputs_count; i++) {
         uint16_t tidx = last_sout[i];
@@ -919,16 +1090,6 @@ static tigris_exec_error_t exec_chain_tiled(
         int32_t *out_starts = workspace->out_starts;
         int32_t *out_ends = workspace->out_ends;
 
-        /* Per-spatial-op tile info (computed per tile) */
-        int32_t (*sp_tile_in_h)[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE] =
-            workspace->sp_tile_in_h;
-        int32_t (*sp_tile_out_h)[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE] =
-            workspace->sp_tile_out_h;
-        int32_t (*sp_tile_pt)[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE] =
-            workspace->sp_tile_pt;
-        int32_t (*sp_tile_pb)[TIGRIS_MAX_SPATIAL_OPS_PER_STAGE] =
-            workspace->sp_tile_pb;
-
         {
             int32_t os = out_start, oe = out_end;
             for (int c = num_chain - 1; c >= 0; c--) {
@@ -939,12 +1100,14 @@ static tigris_exec_error_t exec_chain_tiled(
                  * to get per-op tile info and the stage's input range. */
                 int32_t cur_os = os, cur_oe = oe;
                 for (int j = info[c].sp_count - 1; j >= 0; j--) {
-                    sp_tile_out_h[c][j] = cur_oe - cur_os;
+                    size_t spi = spatial_index(
+                        workspace, (uint16_t)c, (uint16_t)j);
+                    workspace->sp_tile_out_h[spi] = cur_oe - cur_os;
 
-                    int32_t sh  = info[c].sp_strides[j];
-                    int32_t ekh = info[c].sp_eff_khs[j];
-                    int32_t pt  = info[c].sp_pad_tops[j];
-                    int32_t fih = info[c].sp_full_in_hs[j];
+                    int32_t sh  = workspace->sp_strides[spi];
+                    int32_t ekh = workspace->sp_eff_khs[spi];
+                    int32_t pt  = workspace->sp_pad_tops[spi];
+                    int32_t fih = workspace->sp_full_in_hs[spi];
 
                     int32_t is_ = cur_os * sh - pt;
                     int32_t ie_ = (cur_oe - 1) * sh - pt + ekh;
@@ -953,9 +1116,9 @@ static tigris_exec_error_t exec_chain_tiled(
                     if (is_ < 0) { ept = -is_; is_ = 0; }
                     if (ie_ > fih) { epb = ie_ - fih; ie_ = fih; }
 
-                    sp_tile_pt[c][j] = ept;
-                    sp_tile_pb[c][j] = epb;
-                    sp_tile_in_h[c][j] = ie_ - is_;
+                    workspace->sp_tile_pt[spi] = ept;
+                    workspace->sp_tile_pb[spi] = epb;
+                    workspace->sp_tile_in_h[spi] = ie_ - is_;
 
                     cur_os = is_;
                     cur_oe = ie_;
@@ -1012,8 +1175,9 @@ static tigris_exec_error_t exec_chain_tiled(
             mem->tile.in_w       = info[c].full_in_w;
             mem->tile.out_w      = info[c].full_out_w;
             if (info[c].sp_count > 0) {
-                mem->tile.pad_top    = sp_tile_pt[c][0];
-                mem->tile.pad_bottom = sp_tile_pb[c][0];
+                size_t spi = spatial_index(workspace, c, 0);
+                mem->tile.pad_top    = workspace->sp_tile_pt[spi];
+                mem->tile.pad_bottom = workspace->sp_tile_pb[spi];
             } else {
                 mem->tile.pad_top    = 0;
                 mem->tile.pad_bottom = 0;
@@ -1031,21 +1195,23 @@ static tigris_exec_error_t exec_chain_tiled(
                 const tigris_op_t *op = &cplan->ops[op_idx];
 
                 /* Detect spatial op and set per-op tile context */
+                size_t spi = spatial_index(
+                    workspace, c, (uint16_t)sp_j);
                 int is_spatial = (sp_j < info[c].sp_count &&
-                    (int)op_idx == info[c].sp_op_indices[sp_j]);
+                    (int32_t)op_idx == workspace->sp_op_indices[spi]);
                 if (is_spatial) {
-                    mem->tile.in_h       = sp_tile_in_h[c][sp_j];
-                    mem->tile.out_h      = sp_tile_out_h[c][sp_j];
-                    mem->tile.pad_top    = sp_tile_pt[c][sp_j];
-                    mem->tile.pad_bottom = sp_tile_pb[c][sp_j];
-                    mem->tile.in_w       = info[c].sp_full_in_ws[sp_j];
-                    mem->tile.out_w      = info[c].sp_full_out_ws[sp_j];
+                    mem->tile.in_h       = workspace->sp_tile_in_h[spi];
+                    mem->tile.out_h      = workspace->sp_tile_out_h[spi];
+                    mem->tile.pad_top    = workspace->sp_tile_pt[spi];
+                    mem->tile.pad_bottom = workspace->sp_tile_pb[spi];
+                    mem->tile.in_w       = workspace->sp_full_in_ws[spi];
+                    mem->tile.out_w      = workspace->sp_full_out_ws[spi];
                 }
 
                 /* Spatial op outputs have fewer rows than input (stride).
                  * Non-spatial (pointwise) ops preserve height. */
                 int32_t alloc_h = is_spatial
-                    ? sp_tile_out_h[c][sp_j] : cur_data_h;
+                    ? workspace->sp_tile_out_h[spi] : cur_data_h;
 
                 /* Allocate op output at correct tile height */
                 const uint16_t *outs = tigris_op_outputs(cplan, op);
@@ -1089,15 +1255,17 @@ static tigris_exec_error_t exec_chain_tiled(
                 /* After spatial op: advance to next, update data height
                  * and tile context for pointwise followers. */
                 if (sp_j < info[c].sp_count &&
-                    (int)op_idx == info[c].sp_op_indices[sp_j]) {
-                    cur_data_h = sp_tile_out_h[c][sp_j];
+                    (int32_t)op_idx == workspace->sp_op_indices[spi]) {
+                    cur_data_h = workspace->sp_tile_out_h[spi];
                     mem->tile.in_h = cur_data_h;
-                    mem->tile.in_w = info[c].sp_full_out_ws[sp_j];
+                    mem->tile.in_w = workspace->sp_full_out_ws[spi];
                     sp_j++;
                     /* Pre-set pad for next spatial op (if any) */
                     if (sp_j < info[c].sp_count) {
-                        mem->tile.pad_top = sp_tile_pt[c][sp_j];
-                        mem->tile.pad_bottom = sp_tile_pb[c][sp_j];
+                        spi = spatial_index(
+                            workspace, c, (uint16_t)sp_j);
+                        mem->tile.pad_top = workspace->sp_tile_pt[spi];
+                        mem->tile.pad_bottom = workspace->sp_tile_pb[spi];
                     }
                 }
             }
@@ -1167,23 +1335,32 @@ static tigris_exec_error_t exec_chain_tiled(
 
 /* Public API */
 
-tigris_exec_error_t tigris_run_with_workspace(
-    const tigris_plan_t          *plan,
-    tigris_mem_t                 *mem,
-    tigris_kernel_fn              kernel,
-    void                         *user_ctx,
-    tigris_exec_stats_t          *stats,
-    tigris_executor_workspace_t  *workspace_storage)
+tigris_exec_error_t tigris_run_with_workspace_buffer(
+    const tigris_plan_t *plan,
+    tigris_mem_t        *mem,
+    tigris_kernel_fn     kernel,
+    void                *user_ctx,
+    tigris_exec_stats_t *stats,
+    void                *workspace_storage,
+    size_t               workspace_size)
 {
     if (!plan || !mem || !kernel)
+        return TIGRIS_EXEC_ERR_NULL;
+    if (!plan->header)
         return TIGRIS_EXEC_ERR_NULL;
     if (!workspace_storage)
         return TIGRIS_EXEC_ERR_WORKSPACE;
 
-    executor_workspace_impl_t *workspace = workspace_impl(workspace_storage);
-
     if (plan->header->num_stages == 0 || !plan->stages)
         return TIGRIS_EXEC_ERR_NO_STAGES;
+
+    executor_workspace_limits_t limits;
+    executor_workspace_impl_t workspace_view;
+    if (!workspace_limits(plan, &limits) ||
+        !workspace_layout(
+            workspace_storage, workspace_size, &limits, &workspace_view))
+        return TIGRIS_EXEC_ERR_WORKSPACE;
+    executor_workspace_impl_t *workspace = &workspace_view;
 
     /* Preserve the caller's fast-arena state across all temporary stage and
      * chain weight reservations.  During the run, fast_used is also the reset
@@ -1204,7 +1381,6 @@ tigris_exec_error_t tigris_run_with_workspace(
      * After that stage completes, t's slow memory can be reclaimed. */
     uint16_t num_t = plan->header->num_tensors;
     uint16_t *last_consumer = workspace->last_consumer;
-    if (num_t > TIGRIS_MAX_TENSORS) num_t = TIGRIS_MAX_TENSORS;
     for (uint16_t i = 0; i < num_t; i++)
         last_consumer[i] = 0;
     for (uint16_t s = 0; s < plan->header->num_stages; s++) {
@@ -1368,6 +1544,29 @@ restore_fast_arena:
     mem->fast_used = caller_fast_used;
     mem->fast_reserved = caller_fast_reserved;
     return result;
+}
+
+size_t tigris_executor_workspace_required(const tigris_plan_t *plan)
+{
+    executor_workspace_limits_t limits;
+    if (!workspace_limits(plan, &limits))
+        return 0;
+    return workspace_bytes_for_limits(&limits);
+}
+
+tigris_exec_error_t tigris_run_with_workspace(
+    const tigris_plan_t          *plan,
+    tigris_mem_t                 *mem,
+    tigris_kernel_fn              kernel,
+    void                         *user_ctx,
+    tigris_exec_stats_t          *stats,
+    tigris_executor_workspace_t  *workspace)
+{
+    if (!workspace)
+        return TIGRIS_EXEC_ERR_WORKSPACE;
+    return tigris_run_with_workspace_buffer(
+        plan, mem, kernel, user_ctx, stats,
+        workspace->bytes, sizeof(workspace->bytes));
 }
 
 size_t tigris_executor_workspace_size(void)

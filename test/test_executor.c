@@ -433,6 +433,8 @@ static void test_exec_workspace_contract(void)
 {
     printf("  test_exec_workspace_contract...\n");
     tigris_executor_workspace_t workspace;
+    tigris_plan_t empty_plan;
+    memset(&empty_plan, 0, sizeof(empty_plan));
 
     TEST_ASSERT_EQ(tigris_executor_workspace_size(), sizeof(workspace),
                    "workspace query matches public type");
@@ -440,8 +442,65 @@ static void test_exec_workspace_contract(void)
                 "workspace has configured byte size");
     TEST_ASSERT(((uintptr_t)&workspace % _Alignof(void *)) == 0,
                 "workspace is pointer aligned");
+    TEST_ASSERT_EQ(tigris_executor_workspace_required(NULL), 0,
+                   "null plan has no workspace requirement");
+    TEST_ASSERT_EQ(tigris_executor_workspace_required(&empty_plan), 0,
+                   "incomplete plan has no workspace requirement");
     TEST_ASSERT(strlen(tigris_exec_error_str(TIGRIS_EXEC_ERR_WORKSPACE)) > 0,
                 "workspace error string");
+}
+
+static void test_exec_workspace_chain_sizing(void)
+{
+    printf("  test_exec_workspace_chain_sizing...\n");
+    tigris_file_header_t header;
+    tigris_op_t ops[3];
+    tigris_stage_t stages[2];
+    tigris_plan_t plan;
+    const uint16_t indices[] = {
+        0, 1,       /* stage 0 ops */
+        0, 1,       /* stage 0 inputs */
+        2,          /* stage 0 output */
+        2,          /* stage 1 op */
+        2,          /* stage 1 input */
+        2, 3, 4,    /* stage 1 outputs */
+    };
+
+    memset(&header, 0, sizeof(header));
+    memset(ops, 0, sizeof(ops));
+    memset(stages, 0, sizeof(stages));
+    memset(&plan, 0, sizeof(plan));
+    header.num_tensors = 5;
+    header.num_ops = 3;
+    header.num_stages = 2;
+    ops[0].op_type = TIGRIS_OP_CONV;
+    ops[1].op_type = TIGRIS_OP_DEPTHWISE;
+    ops[2].op_type = TIGRIS_OP_CONV;
+    stages[0].ops_off = 0;
+    stages[0].ops_count = 2;
+    stages[0].inputs_off = 2;
+    stages[0].inputs_count = 2;
+    stages[0].outputs_off = 4;
+    stages[0].outputs_count = 1;
+    stages[0].chain_id = 0;
+    stages[0].chain_len = 2;
+    stages[1].ops_off = 5;
+    stages[1].ops_count = 1;
+    stages[1].inputs_off = 6;
+    stages[1].inputs_count = 1;
+    stages[1].outputs_off = 7;
+    stages[1].outputs_count = 3;
+    stages[1].chain_id = 0;
+    stages[1].chain_len = 2;
+    plan.header = &header;
+    plan.ops = ops;
+    plan.stages = stages;
+    plan.index_pool = indices;
+
+    TEST_ASSERT_EQ(
+        tigris_executor_workspace_required(&plan),
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(5, 2, 3, 2, 2),
+        "query includes actual chain and spatial capacities");
 }
 
 /** Helper: compute sum of all non-constant tensor sizes for slow buffer sizing. */
@@ -623,7 +682,8 @@ static void test_exec_compaction_preserves_data(void)
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[96];
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[128];
     tigris_mem_t mem;
-    tigris_executor_workspace_t workspace;
+    uint8_t workspace[
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
     tigris_exec_stats_t stats;
     compaction_ctx_t ctx = {0};
 
@@ -670,6 +730,12 @@ static void test_exec_compaction_preserves_data(void)
     plan.model_inputs = &indices[6];
     plan.model_outputs = &indices[7];
 
+    size_t workspace_required = tigris_executor_workspace_required(&plan);
+    TEST_ASSERT_EQ(workspace_required, sizeof(workspace),
+                   "simple plan gets exact compile-time workspace size");
+    TEST_ASSERT(workspace_required < tigris_executor_workspace_size(),
+                "simple plan avoids generic workspace reservation");
+
     TEST_ASSERT_EQ(tigris_mem_init(
                        &mem, ptrs, 3, fast, sizeof(fast), slow, sizeof(slow)),
                    TIGRIS_MEM_OK, "compaction memory init");
@@ -677,9 +743,14 @@ static void test_exec_compaction_preserves_data(void)
                    TIGRIS_MEM_OK, "compaction input allocation");
     memset(mem.tensor_ptrs[0], 0x11, tensors[0].size_bytes);
 
-    TEST_ASSERT_EQ(tigris_run_with_workspace(
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(
                        &plan, &mem, compaction_kernel, &ctx, &stats,
-                       &workspace),
+                       workspace, workspace_required - 1),
+                   TIGRIS_EXEC_ERR_WORKSPACE,
+                   "one-byte-short workspace is rejected");
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(
+                       &plan, &mem, compaction_kernel, &ctx, &stats,
+                       workspace, sizeof(workspace)),
                    TIGRIS_EXEC_OK, "compaction execution");
     TEST_ASSERT_EQ(stats.compactions, 1, "fast arena compacted once");
     TEST_ASSERT(ctx.preserved, "live tensor data survives compaction");
@@ -715,6 +786,7 @@ int main(int argc, char *argv[])
     printf("\nExecutor error tests:\n");
     test_exec_null_args();
     test_exec_workspace_contract();
+    test_exec_workspace_chain_sizing();
     test_exec_compaction_preserves_data();
     test_exec_error_strings();
 

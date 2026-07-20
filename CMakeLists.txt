@@ -66,38 +66,42 @@ if(TIGRIS_HAS_CMSIS_NN)
     target_link_libraries(tigris_runtime PUBLIC cmsis-nn)
 endif()
 
-# Install a relocatable package for external CMake consumers. The export file
-# is itself the package config, so no hand-maintained config template is needed.
-set(TIGRIS_RUNTIME_CMAKE_INSTALL_DIR
-    "${CMAKE_INSTALL_LIBDIR}/cmake/tigris_runtime")
-install(TARGETS tigris_runtime
-    EXPORT tigris_runtimeTargets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
-install(DIRECTORY include/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-    FILES_MATCHING PATTERN "*.h"
-)
-install(FILES LICENSE
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/tigris_runtime
-)
-install(EXPORT tigris_runtimeTargets
-    FILE tigris_runtimeConfig.cmake
-    NAMESPACE tigris::
-    DESTINATION ${TIGRIS_RUNTIME_CMAKE_INSTALL_DIR}
-)
-write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/tigris_runtimeConfigVersion.cmake"
-    VERSION ${PROJECT_VERSION}
-    # TiGrIS is pre-1.0: keep compatibility within the 0.4.x release line.
-    COMPATIBILITY SameMinorVersion
-)
-install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/tigris_runtimeConfigVersion.cmake"
-    DESTINATION ${TIGRIS_RUNTIME_CMAKE_INSTALL_DIR}
-)
+# Install a relocatable package for external CMake consumers when the runtime
+# is configured directly. An embedding project owns its own install/export
+# graph; registering our export there would also try to export its optional
+# private backend targets (for example cmsis-nn).
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    set(TIGRIS_RUNTIME_CMAKE_INSTALL_DIR
+        "${CMAKE_INSTALL_LIBDIR}/cmake/tigris_runtime")
+    install(TARGETS tigris_runtime
+        EXPORT tigris_runtimeTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(DIRECTORY include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h"
+    )
+    install(FILES LICENSE
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/tigris_runtime
+    )
+    install(EXPORT tigris_runtimeTargets
+        FILE tigris_runtimeConfig.cmake
+        NAMESPACE tigris::
+        DESTINATION ${TIGRIS_RUNTIME_CMAKE_INSTALL_DIR}
+    )
+    write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/tigris_runtimeConfigVersion.cmake"
+        VERSION ${PROJECT_VERSION}
+        # TiGrIS is pre-1.0: keep compatibility within the 0.4.x release line.
+        COMPATIBILITY SameMinorVersion
+    )
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/tigris_runtimeConfigVersion.cmake"
+        DESTINATION ${TIGRIS_RUNTIME_CMAKE_INSTALL_DIR}
+    )
+endif()
 
 # Tests (only when built as top-level project)
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
@@ -160,9 +164,8 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     endif()
 
     # Compile the executor and loader with reduced public limits and without
-    # the compatibility workspace. This keeps all configuration knobs live
-    # and verifies that the opaque workspace formula still bounds its private
-    # implementation when integrators tune for a smaller target.
+    # the compatibility workspace. This keeps every loader limit and the
+    # legacy fixed-workspace sizing contract live.
     add_library(stack_config_compile OBJECT
         src/tigris_executor.c src/tigris_executor_compat.c
         src/tigris_loader.c)

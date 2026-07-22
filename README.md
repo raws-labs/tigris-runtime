@@ -41,11 +41,14 @@ validate the selected dtype/operator route.
 
 ESP-NN and CMSIS-NN also require a successful preparation call after
 `tigris_mem_init()` and before inference. ESP-NN preparation obtains
-platform-managed workspace; CMSIS-NN reserves scratch from the top of the fast
-buffer and reduces `mem.fast_size`. ESP preparation may be repeated safely to
+platform-managed workspace; CMSIS-NN reserves vendor and quantization workspace
+from the top of the fast buffer and reduces `mem.fast_size`. ESP preparation may be repeated safely to
 replace its workspace and `tigris_esp_nn_deinit()` releases it after inference.
 CMSIS preparation is idempotent for the same arena when its existing scratch
 is sufficient; call `tigris_cmsis_nn_deinit()` before changing arena or plan.
+Use `tigris_cmsis_nn_fast_arena_required()` to size that arena before
+initialization; it preserves the full core activation/weight capacity below the
+exact workspace requirement reported by the linked CMSIS-NN library.
 
 ## Memory contract
 
@@ -55,15 +58,41 @@ The caller owns:
 - a slow arena, normally PSRAM or another writable RAM region; and
 - one `void *` entry per tensor.
 
-The plan's `budget` is the modeled activation requirement. Add
-`tigris_weight_decompression_overhead()` for compressed plans, account for
-base-alignment padding, and provision any backend workspace separately.
+Generated integrations reserve a plan-sized executor buffer automatically; no
+workspace limit tuning is required. Manual integrations can query
+`tigris_executor_workspace_required()` after loading the plan and pass that many
+caller-owned bytes to `tigris_run_with_workspace_buffer()`. The fixed
+`tigris_executor_workspace_t` and `tigris_run_with_workspace()` remain available
+for source compatibility. `tigris_run()` uses one process-global fixed
+workspace and is not safe for concurrent inference. Arena sizing, stack
+provisioning, and re-entrant execution are documented in the
+[runtime integration guide](https://tigris-ml.dev/docs/runtime/integration/).
+
+The plan's `budget` is the modeled activation requirement. For an arena whose
+base satisfies `TIGRIS_TENSOR_ALIGN`, `tigris_fast_arena_required()` returns
+the core capacity needed for that budget plus any simultaneous compressed
+weights. Account for base-alignment padding when using an unaligned buffer and
+provision backend workspace separately.
 Optimized Cortex-M builds require the plan base and tensors to satisfy
 `TIGRIS_TENSOR_ALIGN` (16 bytes with DSP enabled).
 
+For CMSIS-NN, “separately” is enforceable rather than an estimate:
+`tigris_cmsis_nn_scratch_required()` queries the linked vendor library and
+`tigris_cmsis_nn_fast_arena_required()` combines that result with the core
+requirement. Generated standalone CMSIS harnesses reserve 4 KiB by default,
+validate it at startup, and report the exact required total when a larger model
+needs `TIGRIS_CMSIS_NN_SCRATCH_BYTES` overridden at build time.
+
+The compiler's current cost model aligns each activation to 32 bytes, which is
+conservative for the supported host, Cortex-M, and ESP targets. `mem.fast_peak`
+is the observed allocator high-water mark, not the scheduled minimum: a roomy
+arena may defer compaction and therefore report a larger value. Contract tests
+run with the compiler's scheduled limit to prove that compaction, tiling, and
+weight reservation still execute within that bound.
+
 The core executor performs no unbounded heap fallback. Normal stages may spill
 to the supplied slow arena; if neither bounded arena can satisfy an operation,
-`tigris_run()` returns an error. `mem.fast_peak` records the measured core
+the executor returns an error. `mem.fast_peak` records the measured core
 fast-arena high-water mark.
 
 ## Build and test
@@ -93,6 +122,27 @@ See [examples/posix/main.c](examples/posix/main.c) for checked loader, arena,
 input, execution, and output handling. Production integrations normally use
 the harness emitted by `tigris codegen`.
 
+## Install for CMake consumers
+
+Install the runtime to a prefix:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix /path/to/tigris-runtime
+```
+
+An external project can then consume the installed headers and library without
+depending on the TiGrIS source tree:
+
+```cmake
+find_package(tigris_runtime 0.5 REQUIRED CONFIG)
+target_link_libraries(my_app PRIVATE tigris::runtime)
+```
+
+Pass the installation prefix through `CMAKE_PREFIX_PATH` when it is outside a
+standard system location.
+
 ## ESP32 (ESP-IDF)
 
 The ESP-IDF example lives in `examples/esp32`:
@@ -116,6 +166,7 @@ using ESP-NN, call `tigris_esp_nn_prepare()` and check its return value before
 ## Further reading
 
 - [Getting started](https://tigris-ml.dev/docs)
+- [Compiler and plan compatibility data](https://github.com/raws-labs/tigris/blob/main/compatibility.json)
 - [Runtime integration](https://tigris-ml.dev/docs/runtime/integration)
 - [Runtime API](https://tigris-ml.dev/docs/runtime/api-reference)
 - [Memory model](https://tigris-ml.dev/docs/architecture/memory-model)

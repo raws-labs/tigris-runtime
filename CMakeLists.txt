@@ -4,6 +4,7 @@ set(TIGRIS_RUNTIME_SRCS
     src/tigris_loader.c
     src/tigris_mem.c
     src/tigris_executor.c
+    src/tigris_executor_compat.c
     src/tigris_kernels.c
     src/tigris_kernels_s8.c
     src/tigris_kernels_esp_nn.c
@@ -18,18 +19,37 @@ if(COMMAND idf_component_register)
         REQUIRES esp-nn
     )
     target_compile_definitions(${COMPONENT_LIB} PUBLIC TIGRIS_HAS_ESP_NN)
+    target_compile_options(${COMPONENT_LIB} PRIVATE -Werror=vla)
     target_link_libraries(${COMPONENT_LIB} PUBLIC m)
     return()
 endif()
 
-project(tigris_runtime C)
+project(tigris_runtime VERSION 0.5.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-add_compile_options(-Wall -Wextra -Wpedantic -Werror)
+add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wvla)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+option(TIGRIS_STACK_USAGE
+    "Emit compiler .su files for runtime stack-budget checks" OFF)
 
 add_library(tigris_runtime STATIC ${TIGRIS_RUNTIME_SRCS})
-target_include_directories(tigris_runtime PUBLIC include)
+add_library(tigris::runtime ALIAS tigris_runtime)
+set_target_properties(tigris_runtime PROPERTIES EXPORT_NAME runtime)
+target_include_directories(tigris_runtime PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
 target_link_libraries(tigris_runtime PUBLIC m)
+if(TIGRIS_STACK_USAGE)
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(tigris_runtime PRIVATE -fstack-usage)
+    else()
+        message(FATAL_ERROR "TIGRIS_STACK_USAGE requires GCC")
+    endif()
+endif()
 
 # Optional: ESP-NN backend (define TIGRIS_HAS_ESP_NN and link esp-nn)
 # target_compile_definitions(tigris_runtime PUBLIC TIGRIS_HAS_ESP_NN)
@@ -44,6 +64,43 @@ option(TIGRIS_HAS_CMSIS_NN "Enable the CMSIS-NN int8 kernel backend" OFF)
 if(TIGRIS_HAS_CMSIS_NN)
     target_compile_definitions(tigris_runtime PUBLIC TIGRIS_HAS_CMSIS_NN)
     target_link_libraries(tigris_runtime PUBLIC cmsis-nn)
+endif()
+
+# Install a relocatable package for external CMake consumers when the runtime
+# is configured directly. An embedding project owns its own install/export
+# graph; registering our export there would also try to export its optional
+# private backend targets (for example cmsis-nn).
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    set(TIGRIS_RUNTIME_CMAKE_INSTALL_DIR
+        "${CMAKE_INSTALL_LIBDIR}/cmake/tigris_runtime")
+    install(TARGETS tigris_runtime
+        EXPORT tigris_runtimeTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(DIRECTORY include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h"
+    )
+    install(FILES LICENSE
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/tigris_runtime
+    )
+    install(EXPORT tigris_runtimeTargets
+        FILE tigris_runtimeConfig.cmake
+        NAMESPACE tigris::
+        DESTINATION ${TIGRIS_RUNTIME_CMAKE_INSTALL_DIR}
+    )
+    write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/tigris_runtimeConfigVersion.cmake"
+        VERSION ${PROJECT_VERSION}
+        # TiGrIS is pre-1.0: keep compatibility within the 0.5.x release line.
+        COMPATIBILITY SameMinorVersion
+    )
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/tigris_runtimeConfigVersion.cmake"
+        DESTINATION ${TIGRIS_RUNTIME_CMAKE_INSTALL_DIR}
+    )
 endif()
 
 # Tests (only when built as top-level project)
@@ -66,6 +123,13 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(test_executor test/test_executor.c)
     target_link_libraries(test_executor tigris_runtime)
 
+    # This executable references only the explicit executor API. The legacy
+    # wrapper lives in a separate archive member and must not add its second
+    # workspace to the linked BSS.
+    add_executable(explicit_workspace_link_smoke
+        test/explicit_workspace_link_smoke.c)
+    target_link_libraries(explicit_workspace_link_smoke tigris_runtime)
+
     add_executable(test_kernels test/test_kernels.c)
     target_link_libraries(test_kernels tigris_runtime)
 
@@ -87,6 +151,38 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(test_accel_routing test/test_accel_routing.c)
     target_include_directories(test_accel_routing PRIVATE src)
     target_link_libraries(test_accel_routing tigris_runtime)
+
+    # Compile the CMSIS adapter in native CI even when the vendor library is
+    # unavailable. The stub supplies declarations only; this target catches
+    # API/type/warning regressions in code hidden by TIGRIS_HAS_CMSIS_NN.
+    add_library(cmsis_adapter_compile OBJECT src/tigris_kernels_cmsis_nn.c)
+    target_compile_definitions(cmsis_adapter_compile PRIVATE TIGRIS_HAS_CMSIS_NN)
+    target_include_directories(cmsis_adapter_compile PRIVATE
+        include src test/cmsis_stub)
+    if(TIGRIS_STACK_USAGE)
+        target_compile_options(cmsis_adapter_compile PRIVATE -fstack-usage)
+    endif()
+
+    # Compile the executor and loader with reduced public limits and without
+    # the compatibility workspace. This keeps every loader limit and the
+    # legacy fixed-workspace sizing contract live.
+    add_library(stack_config_compile OBJECT
+        src/tigris_executor.c src/tigris_executor_compat.c
+        src/tigris_loader.c)
+    target_include_directories(stack_config_compile PRIVATE include)
+    target_compile_definitions(stack_config_compile PRIVATE
+        TIGRIS_MAX_TENSORS=8
+        TIGRIS_MAX_STAGE_INPUTS=2
+        TIGRIS_MAX_STAGE_OUTPUTS=2
+        TIGRIS_MAX_CHAIN_STAGES=3
+        TIGRIS_MAX_SPATIAL_OPS_PER_STAGE=2
+        TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE=0)
+
+    add_executable(test_cmsis_arena
+        test/test_cmsis_arena.c $<TARGET_OBJECTS:cmsis_adapter_compile>)
+    target_compile_definitions(test_cmsis_arena PRIVATE TIGRIS_HAS_CMSIS_NN)
+    target_include_directories(test_cmsis_arena PRIVATE test/cmsis_stub)
+    target_link_libraries(test_cmsis_arena tigris_runtime)
 
     add_executable(test_avg_pool_s8 test/test_avg_pool_s8.c)
     target_include_directories(test_avg_pool_s8 PRIVATE src)
@@ -115,11 +211,13 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     # contain the generated .tgrs model fixtures they require.
     add_test(NAME loader COMMAND test_loader)
     add_test(NAME executor COMMAND test_executor)
+    add_test(NAME explicit_workspace_link COMMAND explicit_workspace_link_smoke)
     add_test(NAME kernels_f32 COMMAND test_kernels)
     add_test(NAME kernels_s8 COMMAND test_kernels_s8)
     add_test(NAME lz4 COMMAND test_lz4)
     add_test(NAME weight_arena COMMAND test_weight_arena)
     add_test(NAME tile_padding COMMAND test_tile_padding)
     add_test(NAME accel_routing COMMAND test_accel_routing)
+    add_test(NAME cmsis_arena COMMAND test_cmsis_arena)
     add_test(NAME avg_pool_s8 COMMAND test_avg_pool_s8)
 endif()

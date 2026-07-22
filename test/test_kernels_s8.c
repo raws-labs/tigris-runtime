@@ -723,7 +723,9 @@ static void test_unsupported_op_s8(void)
     plan_reset();
     tigris_plan_t plan;
 
-    test_ops[0].op_type = TIGRIS_OP_SOFTMAX;  /* Not supported in s8 */
+    /* MatMul has a schema opcode but no runtime dispatcher. Softmax is
+     * intentionally supported by s8_ref for terminal classifiers. */
+    test_ops[0].op_type = TIGRIS_OP_MATMUL;
     test_header.num_ops = 1;
 
     build_plan(&plan);

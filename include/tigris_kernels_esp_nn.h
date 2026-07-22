@@ -26,8 +26,9 @@ extern "C" {
  * Prepare platform-managed ESP-NN workspace.
  *
  * Scans all ops in the plan to compute maximum scratch, depthwise output,
- * and asymmetric-padding buffer sizes. On ESP-IDF it obtains aligned PSRAM
- * workspace and may use otherwise-free internal SRAM for faster Conv scratch.
+ * asymmetric-padding, and scalar quantization-expansion buffer sizes. On
+ * ESP-IDF it obtains aligned PSRAM workspace and may use otherwise-free
+ * internal SRAM for faster Conv scratch.
  * The supplied TiGrIS fast arena is not reduced. Missing optional workspace
  * causes the affected op to fall back to s8_ref rather than changing its
  * semantics, and no workspace allocation occurs inside tigris_run().

@@ -8,17 +8,12 @@
 
 #include "tigris_loader.h"
 
+#include <math.h>
 #include <string.h>
 
 /* Helpers */
 
 /* Keep these in sync with the executor's fixed-size working arrays. */
-#define LOADER_MAX_STAGE_INPUTS       16u
-#define LOADER_MAX_STAGE_OUTPUTS      16u
-#define LOADER_MAX_CHAIN_STAGES       16u
-#define LOADER_MAX_CHAIN_SPATIAL_OPS   8u
-#define LOADER_MAX_TENSORS           512u
-
 /** Check that [offset, offset+size) fits within buf_len. */
 static inline int bounds_ok(uint32_t offset, uint32_t size, uint32_t buf_len)
 {
@@ -39,13 +34,354 @@ static int string_ok(const char *strings, uint32_t strings_len, uint32_t offset)
     return memchr(strings + offset, '\0', strings_len - offset) != NULL;
 }
 
+static int tensor_shapes_equal(
+    const tigris_plan_t *plan,
+    const tigris_tensor_t *a,
+    const tigris_tensor_t *b)
+{
+    if (a->ndim != b->ndim)
+        return 0;
+    const int32_t *a_shape = tigris_tensor_shape(plan, a);
+    const int32_t *b_shape = tigris_tensor_shape(plan, b);
+    for (uint8_t i = 0; i < a->ndim; i++) {
+        if (a_shape[i] != b_shape[i])
+            return 0;
+    }
+    return 1;
+}
+
+static uint32_t tensor_elements(const tigris_tensor_t *tensor)
+{
+    return tensor->size_bytes / (tensor->dtype == 1 ? sizeof(float) : 1u);
+}
+
+static int weight_size_is(
+    const tigris_plan_t *plan, uint16_t index, uint64_t expected)
+{
+    return index != TIGRIS_NO_WEIGHT && plan->weight_entries &&
+           expected <= UINT32_MAX &&
+           plan->weight_entries[index].size_bytes == (uint32_t)expected;
+}
+
+static int optional_bias_size_is(
+    const tigris_plan_t *plan, uint16_t index, uint64_t expected)
+{
+    return index == TIGRIS_NO_WEIGHT || weight_size_is(plan, index, expected);
+}
+
+static int output_dim_is_valid(
+    int32_t input, int32_t output, uint8_t kernel, uint8_t stride,
+    uint16_t pad_before, uint16_t pad_after, uint16_t dilation)
+{
+    if (input <= 0 || output <= 0 || kernel == 0 || stride == 0)
+        return 0;
+    uint64_t effective_dilation = dilation ? dilation : 1u;
+    uint64_t effective_kernel =
+        ((uint64_t)kernel - 1u) * effective_dilation + 1u;
+    uint64_t padded = (uint64_t)input + pad_before + pad_after;
+    if (padded < effective_kernel)
+        return 0;
+    return (padded - effective_kernel) / stride + 1u == (uint64_t)output;
+}
+
+static int quant_channels_fit(
+    const tigris_plan_t *plan, const tigris_tensor_t *tensor,
+    uint32_t channels)
+{
+    if (tensor->dtype != 3 || tensor->quant_param_idx == TIGRIS_NO_QUANT_PARAM)
+        return 1;
+    const tigris_quant_param_t *qp =
+        &plan->quant_params[tensor->quant_param_idx];
+    return qp->num_channels == 1 || qp->num_channels == channels;
+}
+
+static int op_has_plain_io(
+    const tigris_op_t *op, uint8_t inputs, uint8_t outputs)
+{
+    return op->num_inputs == inputs && op->num_outputs == outputs &&
+           op->weight_idx == TIGRIS_NO_WEIGHT &&
+           op->bias_idx == TIGRIS_NO_WEIGHT;
+}
+
+static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
+{
+    const tigris_file_header_t *hdr = plan->header;
+
+    for (uint16_t op_index = 0; op_index < hdr->num_ops; op_index++) {
+        const tigris_op_t *op = &plan->ops[op_index];
+        if (op->num_inputs == 0 || op->num_outputs == 0 ||
+            op->fused_act > TIGRIS_ACT_RELU6 || op->_pad1 != 0)
+            return TIGRIS_ERR_BAD_OPERATOR;
+
+        const uint16_t *inputs = tigris_op_inputs(plan, op);
+        const uint16_t *outputs = tigris_op_outputs(plan, op);
+        const tigris_tensor_t *input = &plan->tensors[inputs[0]];
+        const tigris_tensor_t *output = &plan->tensors[outputs[0]];
+        uint8_t dtype = input->dtype;
+
+        for (uint8_t i = 0; i < op->num_inputs; i++) {
+            if (plan->tensors[inputs[i]].dtype != dtype)
+                return TIGRIS_ERR_BAD_OPERATOR;
+        }
+        for (uint8_t i = 0; i < op->num_outputs; i++) {
+            if (plan->tensors[outputs[i]].dtype != dtype)
+                return TIGRIS_ERR_BAD_OPERATOR;
+        }
+        if (dtype == 3 && op->act_min > op->act_max)
+            return TIGRIS_ERR_BAD_OPERATOR;
+
+        int allows_fused_activation =
+            op->op_type == TIGRIS_OP_CONV ||
+            op->op_type == TIGRIS_OP_DEPTHWISE ||
+            op->op_type == TIGRIS_OP_FULLY_CONN ||
+            op->op_type == TIGRIS_OP_CONV1D;
+        if (!allows_fused_activation && op->fused_act != TIGRIS_ACT_NONE)
+            return TIGRIS_ERR_BAD_OPERATOR;
+
+        switch ((tigris_op_type_t)op->op_type) {
+        case TIGRIS_OP_CONV:
+        case TIGRIS_OP_DEPTHWISE: {
+            if (op->num_inputs != 1 || op->num_outputs != 1 ||
+                op->weight_idx == TIGRIS_NO_WEIGHT ||
+                input->ndim != 4 || output->ndim != 4)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *in_shape = tigris_tensor_shape(plan, input);
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            uint32_t input_channels = (uint32_t)in_shape[3];
+            uint32_t output_channels = (uint32_t)out_shape[3];
+            if (in_shape[0] != out_shape[0] ||
+                !output_dim_is_valid(
+                    in_shape[1], out_shape[1], op->spatial.kernel_h,
+                    op->spatial.stride_h, op->spatial.pad_top,
+                    op->spatial.pad_bottom, op->spatial.dilation_h) ||
+                !output_dim_is_valid(
+                    in_shape[2], out_shape[2], op->spatial.kernel_w,
+                    op->spatial.stride_w, op->spatial.pad_left,
+                    op->spatial.pad_right, op->spatial.dilation_w))
+                return TIGRIS_ERR_BAD_OPERATOR;
+
+            uint64_t weight_elements =
+                (uint64_t)op->spatial.kernel_h * op->spatial.kernel_w *
+                input_channels;
+            if (op->op_type == TIGRIS_OP_CONV) {
+                if (op->spatial.group != 1)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                weight_elements *= output_channels;
+            } else {
+                if (op->spatial.group != input_channels ||
+                    output_channels != input_channels)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
+            uint64_t weight_bytes = weight_elements *
+                (dtype == 1 ? sizeof(float) : sizeof(int8_t));
+            uint64_t bias_bytes = (uint64_t)output_channels * sizeof(int32_t);
+            if (!weight_size_is(plan, op->weight_idx, weight_bytes) ||
+                !optional_bias_size_is(plan, op->bias_idx, bias_bytes) ||
+                !quant_channels_fit(plan, output, output_channels))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
+
+        case TIGRIS_OP_CONV1D: {
+            if (op->num_inputs != 1 || op->num_outputs != 1 ||
+                op->weight_idx == TIGRIS_NO_WEIGHT ||
+                input->ndim != 3 || output->ndim != 3)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *in_shape = tigris_tensor_shape(plan, input);
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            uint32_t input_channels = (uint32_t)in_shape[2];
+            uint32_t output_channels = (uint32_t)out_shape[2];
+            if (in_shape[0] != out_shape[0] || op->spatial.group != 1 ||
+                !output_dim_is_valid(
+                    in_shape[1], out_shape[1], op->spatial.kernel_h,
+                    op->spatial.stride_h, op->spatial.pad_top,
+                    op->spatial.pad_bottom, op->spatial.dilation_h))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            uint64_t weight_bytes =
+                (uint64_t)output_channels * op->spatial.kernel_h *
+                input_channels * (dtype == 1 ? sizeof(float) : sizeof(int8_t));
+            uint64_t bias_bytes = (uint64_t)output_channels * sizeof(int32_t);
+            if (!weight_size_is(plan, op->weight_idx, weight_bytes) ||
+                !optional_bias_size_is(plan, op->bias_idx, bias_bytes) ||
+                !quant_channels_fit(plan, output, output_channels))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
+
+        case TIGRIS_OP_FULLY_CONN: {
+            if (op->num_inputs != 1 || op->num_outputs != 1 ||
+                op->weight_idx == TIGRIS_NO_WEIGHT || output->ndim == 0)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            uint32_t output_channels =
+                (uint32_t)out_shape[output->ndim - 1u];
+            uint32_t input_elements = tensor_elements(input);
+            uint32_t output_elements = tensor_elements(output);
+            uint32_t batches = 1;
+            if (dtype == 3 && output->ndim == 2)
+                batches = (uint32_t)out_shape[0];
+            if ((dtype == 1 && output_elements != output_channels) ||
+                (dtype == 3 &&
+                 (output->ndim > 2 || output_elements != batches * output_channels ||
+                  input_elements % batches != 0)))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            uint32_t inputs_per_batch = input_elements / batches;
+            uint64_t weight_bytes =
+                (uint64_t)output_channels * inputs_per_batch *
+                (dtype == 1 ? sizeof(float) : sizeof(int8_t));
+            uint64_t bias_bytes = (uint64_t)output_channels * sizeof(int32_t);
+            if (!weight_size_is(plan, op->weight_idx, weight_bytes) ||
+                !optional_bias_size_is(plan, op->bias_idx, bias_bytes) ||
+                !quant_channels_fit(plan, output, output_channels))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
+
+        case TIGRIS_OP_RELU:
+        case TIGRIS_OP_RELU6:
+        case TIGRIS_OP_SIGMOID:
+        case TIGRIS_OP_TANH:
+        case TIGRIS_OP_SOFTMAX:
+            if (!op_has_plain_io(op, 1, 1) ||
+                !tensor_shapes_equal(plan, input, output) ||
+                (op->op_type == TIGRIS_OP_SOFTMAX && input->ndim == 0))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+
+        case TIGRIS_OP_RESHAPE:
+        case TIGRIS_OP_FLATTEN:
+            if (!op_has_plain_io(op, 1, 1) ||
+                input->size_bytes != output->size_bytes)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+
+        case TIGRIS_OP_TRANSPOSE:
+            if (!op_has_plain_io(op, 1, 1) ||
+                input->size_bytes != output->size_bytes)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+
+        case TIGRIS_OP_ADD:
+        case TIGRIS_OP_MUL:
+            if (op->num_outputs != 1 ||
+                (op->num_inputs != 1 && op->num_inputs != 2) ||
+                op->bias_idx != TIGRIS_NO_WEIGHT ||
+                !tensor_shapes_equal(plan, input, output))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            if (op->num_inputs == 2) {
+                if (op->weight_idx != TIGRIS_NO_WEIGHT ||
+                    !tensor_shapes_equal(
+                        plan, input, &plan->tensors[inputs[1]]))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            } else {
+                if (dtype != 1 || op->weight_idx == TIGRIS_NO_WEIGHT ||
+                    !plan->weight_entries ||
+                    (plan->weight_entries[op->weight_idx].size_bytes !=
+                         sizeof(float) &&
+                     plan->weight_entries[op->weight_idx].size_bytes !=
+                         input->size_bytes))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
+            break;
+
+        case TIGRIS_OP_MAX_POOL:
+        case TIGRIS_OP_AVG_POOL: {
+            if (!op_has_plain_io(op, 1, 1) ||
+                input->ndim != 4 || output->ndim != 4 ||
+                (op->spatial.dilation_h > 1) ||
+                (op->spatial.dilation_w > 1) ||
+                op->spatial.pad_top >= op->spatial.kernel_h ||
+                op->spatial.pad_bottom >= op->spatial.kernel_h ||
+                op->spatial.pad_left >= op->spatial.kernel_w ||
+                op->spatial.pad_right >= op->spatial.kernel_w)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *in_shape = tigris_tensor_shape(plan, input);
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            if (in_shape[0] != out_shape[0] || in_shape[3] != out_shape[3] ||
+                !output_dim_is_valid(
+                    in_shape[1], out_shape[1], op->spatial.kernel_h,
+                    op->spatial.stride_h, op->spatial.pad_top,
+                    op->spatial.pad_bottom, 1) ||
+                !output_dim_is_valid(
+                    in_shape[2], out_shape[2], op->spatial.kernel_w,
+                    op->spatial.stride_w, op->spatial.pad_left,
+                    op->spatial.pad_right, 1))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
+
+        case TIGRIS_OP_GLOBAL_AVG: {
+            if (!op_has_plain_io(op, 1, 1) ||
+                input->ndim != 4 || output->ndim != 4)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *in_shape = tigris_tensor_shape(plan, input);
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            if (out_shape[0] != in_shape[0] || out_shape[1] != 1 ||
+                out_shape[2] != 1 || out_shape[3] != in_shape[3])
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
+
+        case TIGRIS_OP_CONCAT: {
+            if (op->num_inputs == 0 || op->num_outputs != 1 ||
+                op->weight_idx != TIGRIS_NO_WEIGHT ||
+                op->bias_idx != TIGRIS_NO_WEIGHT || output->ndim != 4)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            uint64_t channels = 0;
+            for (uint8_t i = 0; i < op->num_inputs; i++) {
+                const tigris_tensor_t *part = &plan->tensors[inputs[i]];
+                if (part->ndim != 4)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                const int32_t *shape = tigris_tensor_shape(plan, part);
+                if (shape[0] != out_shape[0] || shape[1] != out_shape[1] ||
+                    shape[2] != out_shape[2])
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                channels += (uint32_t)shape[3];
+            }
+            if (channels != (uint32_t)out_shape[3])
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
+
+        case TIGRIS_OP_RESIZE: {
+            if (!op_has_plain_io(op, 1, 1) ||
+                input->ndim != 4 || output->ndim != 4 ||
+                op->spatial.stride_h == 0 || op->spatial.stride_w == 0)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *in_shape = tigris_tensor_shape(plan, input);
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            if (in_shape[0] != out_shape[0] || in_shape[3] != out_shape[3] ||
+                (uint64_t)in_shape[1] * op->spatial.stride_h !=
+                    (uint32_t)out_shape[1] ||
+                (uint64_t)in_shape[2] * op->spatial.stride_w !=
+                    (uint32_t)out_shape[2])
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
+
+        default:
+            return TIGRIS_ERR_BAD_OPERATOR;
+        }
+    }
+
+    return TIGRIS_OK;
+}
+
 /* Public API */
 
 tigris_error_t tigris_plan_load(
     const uint8_t *buf, uint32_t buf_len, tigris_plan_t *out_plan)
 {
-    if (!buf || !out_plan)
+    if (!out_plan)
         return TIGRIS_ERR_NULL;
+
+    /* Never expose pointers from a plan that later fails validation. */
+    memset(out_plan, 0, sizeof(*out_plan));
+    if (!buf)
+        return TIGRIS_ERR_NULL;
+    tigris_plan_t candidate;
+    memset(&candidate, 0, sizeof(candidate));
 
     /* Verify little-endian platform (plan format assumes LE) */
     {
@@ -53,8 +389,6 @@ tigris_error_t tigris_plan_load(
         if (*(const uint8_t *)&endian_test != 1)
             return TIGRIS_ERR_ENDIAN;
     }
-
-    memset(out_plan, 0, sizeof(*out_plan));
 
     /* Header validation */
 
@@ -74,7 +408,7 @@ tigris_error_t tigris_plan_load(
     if (hdr->file_size != buf_len)
         return TIGRIS_ERR_BAD_SIZE;
 
-    out_plan->header = hdr;
+    candidate.header = hdr;
 
     /* Section directory */
 
@@ -181,7 +515,7 @@ tigris_error_t tigris_plan_load(
         uint32_t need = (uint32_t)hdr->num_tensors * sizeof(tigris_tensor_t);
         if (!bounds_ok(off, need, section_ends[TIGRIS_SEC_TENSORS]))
             return TIGRIS_ERR_BAD_SECTION;
-        out_plan->tensors = (const tigris_tensor_t *)(buf + off);
+        candidate.tensors = (const tigris_tensor_t *)(buf + off);
     }
 
     /* Ops */
@@ -190,7 +524,7 @@ tigris_error_t tigris_plan_load(
         uint32_t need = (uint32_t)hdr->num_ops * sizeof(tigris_op_t);
         if (!bounds_ok(off, need, section_ends[TIGRIS_SEC_OPS]))
             return TIGRIS_ERR_BAD_SECTION;
-        out_plan->ops = (const tigris_op_t *)(buf + off);
+        candidate.ops = (const tigris_op_t *)(buf + off);
     }
 
     /* Stages (optional - 0 stages is valid for un-partitioned graphs) */
@@ -199,7 +533,7 @@ tigris_error_t tigris_plan_load(
         uint32_t need = (uint32_t)hdr->num_stages * sizeof(tigris_stage_t);
         if (!bounds_ok(off, need, section_ends[TIGRIS_SEC_STAGES]))
             return TIGRIS_ERR_BAD_SECTION;
-        out_plan->stages = (const tigris_stage_t *)(buf + off);
+        candidate.stages = (const tigris_stage_t *)(buf + off);
     }
 
     /* Tile plans (optional) */
@@ -208,7 +542,7 @@ tigris_error_t tigris_plan_load(
         uint32_t need = (uint32_t)hdr->num_tile_plans * sizeof(tigris_tile_plan_t);
         if (!bounds_ok(off, need, section_ends[TIGRIS_SEC_TILE_PLANS]))
             return TIGRIS_ERR_BAD_SECTION;
-        out_plan->tile_plans = (const tigris_tile_plan_t *)(buf + off);
+        candidate.tile_plans = (const tigris_tile_plan_t *)(buf + off);
     }
 
     /* Weights (optional) */
@@ -217,7 +551,7 @@ tigris_error_t tigris_plan_load(
         uint32_t entries_size = (uint32_t)hdr->num_weights * sizeof(tigris_weight_entry_t);
         if (!bounds_ok(off, entries_size, section_ends[TIGRIS_SEC_WEIGHTS]))
             return TIGRIS_ERR_BAD_SECTION;
-        out_plan->weight_entries = (const tigris_weight_entry_t *)(buf + off);
+        candidate.weight_entries = (const tigris_weight_entry_t *)(buf + off);
         /* weight_blob set below only if no compressed blocks */
     }
 
@@ -229,13 +563,13 @@ tigris_error_t tigris_plan_load(
         uint16_t num_blocks, compression;
         memcpy(&num_blocks, buf + off, 2);
         memcpy(&compression, buf + off + 2, 2);
-        out_plan->num_weight_blocks = num_blocks;
-        out_plan->weight_compression = compression;
+        candidate.num_weight_blocks = num_blocks;
+        candidate.weight_compression = compression;
         uint32_t entries_size = (uint32_t)num_blocks * sizeof(tigris_weight_block_t);
         if (!bounds_ok(off + 4, entries_size, section_ends[TIGRIS_SEC_WEIGHT_BLOCKS]))
             return TIGRIS_ERR_BAD_SECTION;
-        out_plan->weight_blocks = (const tigris_weight_block_t *)(buf + off + 4);
-        out_plan->weight_blocks_data = buf + off + 4 + entries_size;
+        candidate.weight_blocks = (const tigris_weight_block_t *)(buf + off + 4);
+        candidate.weight_blocks_data = buf + off + 4 + entries_size;
     }
 
     /* Per-operator attributes (optional, schema v4+). */
@@ -252,17 +586,17 @@ tigris_error_t tigris_plan_load(
             !bounds_ok(off + 4u, entries_size,
                        section_ends[TIGRIS_SEC_OP_ATTRIBUTES]))
             return TIGRIS_ERR_BAD_SECTION;
-        out_plan->num_op_attributes = count;
-        out_plan->op_attributes =
+        candidate.num_op_attributes = count;
+        candidate.op_attributes =
             (const tigris_op_attribute_t *)(buf + off + 4u);
-        out_plan->op_attribute_data = buf + off + 4u + entries_size;
+        candidate.op_attribute_data = buf + off + 4u + entries_size;
     }
 
     /* Set weight_blob for XIP only when no compressed blocks */
-    if (out_plan->weight_entries && !out_plan->weight_blocks) {
+    if (candidate.weight_entries && !candidate.weight_blocks) {
         uint32_t off = section_offsets[TIGRIS_SEC_WEIGHTS];
         uint32_t entries_size = (uint32_t)hdr->num_weights * sizeof(tigris_weight_entry_t);
-        out_plan->weight_blob = buf + off + entries_size;
+        candidate.weight_blob = buf + off + entries_size;
     }
 
     /* Quant params (optional) */
@@ -275,7 +609,7 @@ tigris_error_t tigris_plan_load(
         uint16_t nqp, qd_field;
         memcpy(&nqp, buf + off, 2);
         memcpy(&qd_field, buf + off + 2, 2);
-        out_plan->num_quant_params = nqp;
+        candidate.num_quant_params = nqp;
         uint32_t entries_size = (uint32_t)nqp * sizeof(tigris_quant_param_t);
         uint32_t data_size;
         if (hdr->version == TIGRIS_SCHEMA_VERSION_V2)
@@ -300,27 +634,27 @@ tigris_error_t tigris_plan_load(
         if (!bounds_ok(off + 4, entries_size + data_size,
                        section_ends[TIGRIS_SEC_QUANT_PARAMS]))
             return TIGRIS_ERR_BAD_SECTION;
-        out_plan->quant_params = (const tigris_quant_param_t *)(buf + off + 4);
+        candidate.quant_params = (const tigris_quant_param_t *)(buf + off + 4);
         if (data_size > 0)
-            out_plan->quant_data = (const int32_t *)(buf + off + 4 + entries_size);
+            candidate.quant_data = (const int32_t *)(buf + off + 4 + entries_size);
     }
 
     /* Index pool */
     {
         uint32_t off = section_offsets[TIGRIS_SEC_INDEX_POOL];
-        out_plan->index_pool = (const uint16_t *)(buf + off);
+        candidate.index_pool = (const uint16_t *)(buf + off);
     }
 
     /* Shape pool */
     {
         uint32_t off = section_offsets[TIGRIS_SEC_SHAPE_POOL];
-        out_plan->shape_pool = (const int32_t *)(buf + off);
+        candidate.shape_pool = (const int32_t *)(buf + off);
     }
 
     /* String table */
     {
         uint32_t off = section_offsets[TIGRIS_SEC_STRINGS];
-        out_plan->strings = (const char *)(buf + off);
+        candidate.strings = (const char *)(buf + off);
     }
 
     /* Validate every table span and cross-reference before exposing the plan
@@ -341,36 +675,43 @@ tigris_error_t tigris_plan_load(
     uint32_t index_count = index_bytes / sizeof(uint16_t);
     uint32_t shape_count = shape_bytes / sizeof(int32_t);
 
-    if (!string_ok(out_plan->strings, strings_len, hdr->model_name_str))
+    if (!string_ok(candidate.strings, strings_len, hdr->model_name_str))
         return TIGRIS_ERR_BAD_SECTION;
 
     uint32_t model_io_count = (uint32_t)hdr->num_model_inputs +
                               (uint32_t)hdr->num_model_outputs;
     if (!elements_ok(hdr->model_io_off, model_io_count, index_count))
         return TIGRIS_ERR_BAD_SECTION;
-    out_plan->model_inputs  = out_plan->index_pool + hdr->model_io_off;
-    out_plan->model_outputs = out_plan->model_inputs + hdr->num_model_inputs;
+    candidate.model_inputs  = candidate.index_pool + hdr->model_io_off;
+    candidate.model_outputs = candidate.model_inputs + hdr->num_model_inputs;
     for (uint32_t i = 0; i < model_io_count; i++) {
-        if (out_plan->model_inputs[i] >= hdr->num_tensors)
+        if (candidate.model_inputs[i] >= hdr->num_tensors)
             return TIGRIS_ERR_BAD_SECTION;
     }
 
-    if (hdr->num_tensors > LOADER_MAX_TENSORS)
+    if (hdr->num_tensors > TIGRIS_MAX_TENSORS)
         return TIGRIS_ERR_PLAN_LIMITS;
 
     for (uint16_t i = 0; i < hdr->num_tensors; i++) {
-        const tigris_tensor_t *tensor = &out_plan->tensors[i];
-        if (!string_ok(out_plan->strings, strings_len, tensor->name_str) ||
+        const tigris_tensor_t *tensor = &candidate.tensors[i];
+        if (!string_ok(candidate.strings, strings_len, tensor->name_str) ||
             !elements_ok(tensor->shape_off, tensor->ndim, shape_count))
             return TIGRIS_ERR_BAD_SECTION;
         if (tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM &&
             tensor->quant_param_idx >= hdr->num_quant_params)
             return TIGRIS_ERR_BAD_SECTION;
+        if ((tensor->flags & ~(TIGRIS_TENSOR_CONSTANT |
+                               TIGRIS_TENSOR_MODEL_INPUT |
+                               TIGRIS_TENSOR_MODEL_OUTPUT)) != 0 ||
+            tensor->_pad != 0 ||
+            (tensor->dtype == 1 &&
+             tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM))
+            return TIGRIS_ERR_BAD_TENSOR;
         uint32_t elements = 1;
         for (uint8_t dim = 0; dim < tensor->ndim; dim++) {
-            int32_t value = out_plan->shape_pool[tensor->shape_off + dim];
+            int32_t value = candidate.shape_pool[tensor->shape_off + dim];
             if (value <= 0 || (uint32_t)value > UINT32_MAX / elements)
-                return TIGRIS_ERR_BAD_SECTION;
+                return TIGRIS_ERR_BAD_TENSOR;
             elements *= (uint32_t)value;
         }
         uint32_t element_size;
@@ -379,15 +720,46 @@ tigris_error_t tigris_plan_load(
         else if (tensor->dtype == 3)
             element_size = sizeof(int8_t);
         else
-            return TIGRIS_ERR_BAD_SECTION;
+            return TIGRIS_ERR_BAD_TENSOR;
         if (elements > UINT32_MAX / element_size ||
             tensor->size_bytes != elements * element_size)
-            return TIGRIS_ERR_BAD_SECTION;
+            return TIGRIS_ERR_BAD_TENSOR;
+        if (tensor->dtype == 3 &&
+            tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM) {
+            const tigris_quant_param_t *qp =
+                &candidate.quant_params[tensor->quant_param_idx];
+            if (!isfinite(qp->scale) || qp->scale <= 0.0f ||
+                qp->zero_point < -128 || qp->zero_point > 127)
+                return TIGRIS_ERR_BAD_TENSOR;
+        }
+    }
+
+    for (uint8_t i = 0; i < hdr->num_model_inputs; i++) {
+        if (!(candidate.tensors[candidate.model_inputs[i]].flags &
+              TIGRIS_TENSOR_MODEL_INPUT))
+            return TIGRIS_ERR_BAD_TENSOR;
+    }
+    for (uint8_t i = 0; i < hdr->num_model_outputs; i++) {
+        if (!(candidate.tensors[candidate.model_outputs[i]].flags &
+              TIGRIS_TENSOR_MODEL_OUTPUT))
+            return TIGRIS_ERR_BAD_TENSOR;
+    }
+    for (uint16_t tensor_idx = 0; tensor_idx < hdr->num_tensors; tensor_idx++) {
+        const tigris_tensor_t *tensor = &candidate.tensors[tensor_idx];
+        int found_input = 0;
+        int found_output = 0;
+        for (uint8_t i = 0; i < hdr->num_model_inputs; i++)
+            found_input |= candidate.model_inputs[i] == tensor_idx;
+        for (uint8_t i = 0; i < hdr->num_model_outputs; i++)
+            found_output |= candidate.model_outputs[i] == tensor_idx;
+        if (((tensor->flags & TIGRIS_TENSOR_MODEL_INPUT) != 0) != found_input ||
+            ((tensor->flags & TIGRIS_TENSOR_MODEL_OUTPUT) != 0) != found_output)
+            return TIGRIS_ERR_BAD_TENSOR;
     }
 
     for (uint16_t i = 0; i < hdr->num_ops; i++) {
-        const tigris_op_t *op = &out_plan->ops[i];
-        if (!string_ok(out_plan->strings, strings_len, op->name_str) ||
+        const tigris_op_t *op = &candidate.ops[i];
+        if (!string_ok(candidate.strings, strings_len, op->name_str) ||
             !elements_ok(op->inputs_off, op->num_inputs, index_count) ||
             !elements_ok(op->outputs_off, op->num_outputs, index_count))
             return TIGRIS_ERR_BAD_SECTION;
@@ -399,43 +771,43 @@ tigris_error_t tigris_plan_load(
              op->bias_idx >= hdr->num_weights))
             return TIGRIS_ERR_BAD_SECTION;
         for (uint8_t j = 0; j < op->num_inputs; j++) {
-            if (out_plan->index_pool[op->inputs_off + j] >= hdr->num_tensors)
+            if (candidate.index_pool[op->inputs_off + j] >= hdr->num_tensors)
                 return TIGRIS_ERR_BAD_SECTION;
         }
         for (uint8_t j = 0; j < op->num_outputs; j++) {
-            if (out_plan->index_pool[op->outputs_off + j] >= hdr->num_tensors)
+            if (candidate.index_pool[op->outputs_off + j] >= hdr->num_tensors)
                 return TIGRIS_ERR_BAD_SECTION;
         }
     }
 
     /* Attribute records are ordered and typed.  Validate their payloads
      * against the referenced operators before any kernel can use them. */
-    if (out_plan->op_attributes) {
+    if (candidate.op_attributes) {
         uint32_t attrs_off = section_offsets[TIGRIS_SEC_OP_ATTRIBUTES];
         uint32_t attrs_data_off = attrs_off + 4u +
-            (uint32_t)out_plan->num_op_attributes *
+            (uint32_t)candidate.num_op_attributes *
             sizeof(tigris_op_attribute_t);
         uint32_t attrs_data_len = section_ends[TIGRIS_SEC_OP_ATTRIBUTES] -
             attrs_data_off;
         uint16_t previous_op = 0;
-        for (uint16_t i = 0; i < out_plan->num_op_attributes; i++) {
-            const tigris_op_attribute_t *attr = &out_plan->op_attributes[i];
+        for (uint16_t i = 0; i < candidate.num_op_attributes; i++) {
+            const tigris_op_attribute_t *attr = &candidate.op_attributes[i];
             if (attr->op_index >= hdr->num_ops ||
                 (i > 0 && attr->op_index <= previous_op) ||
                 !bounds_ok(attr->data_offset, attr->data_len, attrs_data_len))
                 return TIGRIS_ERR_BAD_SECTION;
-            const tigris_op_t *op = &out_plan->ops[attr->op_index];
+            const tigris_op_t *op = &candidate.ops[attr->op_index];
             if (attr->type != TIGRIS_OP_ATTR_TRANSPOSE_PERM ||
                 op->op_type != TIGRIS_OP_TRANSPOSE ||
                 op->num_inputs != 1 || op->num_outputs != 1)
                 return TIGRIS_ERR_BAD_SECTION;
-            uint16_t input_idx = out_plan->index_pool[op->inputs_off];
-            uint16_t output_idx = out_plan->index_pool[op->outputs_off];
-            const tigris_tensor_t *input = &out_plan->tensors[input_idx];
-            const tigris_tensor_t *output = &out_plan->tensors[output_idx];
+            uint16_t input_idx = candidate.index_pool[op->inputs_off];
+            uint16_t output_idx = candidate.index_pool[op->outputs_off];
+            const tigris_tensor_t *input = &candidate.tensors[input_idx];
+            const tigris_tensor_t *output = &candidate.tensors[output_idx];
             if (attr->data_len != input->ndim || output->ndim != input->ndim)
                 return TIGRIS_ERR_BAD_SECTION;
-            const uint8_t *perm = out_plan->op_attribute_data + attr->data_offset;
+            const uint8_t *perm = candidate.op_attribute_data + attr->data_offset;
             for (uint8_t axis = 0; axis < attr->data_len; axis++) {
                 if (perm[axis] >= attr->data_len ||
                     output->size_bytes != input->size_bytes)
@@ -444,8 +816,8 @@ tigris_error_t tigris_plan_load(
                     if (perm[prior] == perm[axis])
                         return TIGRIS_ERR_BAD_SECTION;
                 }
-                const int32_t *in_shape = tigris_tensor_shape(out_plan, input);
-                const int32_t *out_shape = tigris_tensor_shape(out_plan, output);
+                const int32_t *in_shape = tigris_tensor_shape(&candidate, input);
+                const int32_t *out_shape = tigris_tensor_shape(&candidate, output);
                 if (out_shape[axis] != in_shape[perm[axis]])
                     return TIGRIS_ERR_BAD_SECTION;
             }
@@ -453,29 +825,29 @@ tigris_error_t tigris_plan_load(
         }
         uint16_t attr_cursor = 0;
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
-            int has_attr = attr_cursor < out_plan->num_op_attributes &&
-                out_plan->op_attributes[attr_cursor].op_index == op_idx;
+            int has_attr = attr_cursor < candidate.num_op_attributes &&
+                candidate.op_attributes[attr_cursor].op_index == op_idx;
             if (has_attr)
                 attr_cursor++;
-            if ((out_plan->ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE) != has_attr)
+            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE) != has_attr)
                 return TIGRIS_ERR_BAD_SECTION;
         }
     } else {
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
-            if (out_plan->ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE)
+            if (candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE)
                 return TIGRIS_ERR_BAD_SECTION;
         }
     }
 
-    if (out_plan->weight_entries && !out_plan->weight_blocks) {
+    if (candidate.weight_entries && !candidate.weight_blocks) {
         uint32_t weights_off = section_offsets[TIGRIS_SEC_WEIGHTS];
         uint32_t entries_size = (uint32_t)hdr->num_weights *
                                 sizeof(tigris_weight_entry_t);
         uint32_t blob_len = section_ends[TIGRIS_SEC_WEIGHTS] -
                             weights_off - entries_size;
         for (uint16_t i = 0; i < hdr->num_weights; i++) {
-            const tigris_weight_entry_t *weight = &out_plan->weight_entries[i];
-            if (!string_ok(out_plan->strings, strings_len, weight->name_str) ||
+            const tigris_weight_entry_t *weight = &candidate.weight_entries[i];
+            if (!string_ok(candidate.strings, strings_len, weight->name_str) ||
                 !bounds_ok(weight->offset, weight->size_bytes, blob_len))
                 return TIGRIS_ERR_BAD_SECTION;
         }
@@ -492,10 +864,12 @@ tigris_error_t tigris_plan_load(
         if (nqp != hdr->num_quant_params)
             return TIGRIS_ERR_BAD_SECTION;
         for (uint16_t i = 0; i < nqp; i++) {
-            const tigris_quant_param_t *qp = &out_plan->quant_params[i];
+            const tigris_quant_param_t *qp = &candidate.quant_params[i];
             uint32_t page = hdr->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
             uint32_t moff = page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off;
             uint32_t soff = page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off;
+            if (!isfinite(qp->scale) || qp->scale <= 0.0f)
+                return TIGRIS_ERR_BAD_TENSOR;
             if (qp->num_channels == 0 ||
                 (hdr->version != TIGRIS_SCHEMA_VERSION_V2 &&
                  (page >= qd_field ||
@@ -507,21 +881,21 @@ tigris_error_t tigris_plan_load(
         }
     }
 
-    if (out_plan->weight_blocks) {
+    if (candidate.weight_blocks) {
         uint32_t wb_off = section_offsets[TIGRIS_SEC_WEIGHT_BLOCKS];
-        uint32_t block_entries = (uint32_t)out_plan->num_weight_blocks *
+        uint32_t block_entries = (uint32_t)candidate.num_weight_blocks *
                                  sizeof(tigris_weight_block_t);
         uint32_t blobs_off = wb_off + 4u + block_entries;
         uint32_t blobs_len = section_ends[TIGRIS_SEC_WEIGHT_BLOCKS] - blobs_off;
-        if (out_plan->weight_compression != TIGRIS_COMPRESS_NONE &&
-            out_plan->weight_compression != TIGRIS_COMPRESS_LZ4)
+        if (candidate.weight_compression != TIGRIS_COMPRESS_NONE &&
+            candidate.weight_compression != TIGRIS_COMPRESS_LZ4)
             return TIGRIS_ERR_BAD_SECTION;
-        if (out_plan->num_weight_blocks == 0 || hdr->num_weights == 0 ||
-            out_plan->num_weight_blocks > hdr->num_stages)
+        if (candidate.num_weight_blocks == 0 || hdr->num_weights == 0 ||
+            candidate.num_weight_blocks > hdr->num_stages)
             return TIGRIS_ERR_BAD_SECTION;
         uint16_t previous_stage = TIGRIS_NO_CHAIN;
-        for (uint16_t i = 0; i < out_plan->num_weight_blocks; i++) {
-            const tigris_weight_block_t *block = &out_plan->weight_blocks[i];
+        for (uint16_t i = 0; i < candidate.num_weight_blocks; i++) {
+            const tigris_weight_block_t *block = &candidate.weight_blocks[i];
             if (block->stage_idx >= hdr->num_stages ||
                 (i > 0 && block->stage_idx <= previous_stage) ||
                 !elements_ok(block->first_weight_idx, block->num_weights,
@@ -529,7 +903,7 @@ tigris_error_t tigris_plan_load(
                 block->num_weights == 0 || block->compressed_size == 0 ||
                 block->uncompressed_size == 0 ||
                 !bounds_ok(block->blob_offset, block->compressed_size, blobs_len) ||
-                (out_plan->weight_compression == TIGRIS_COMPRESS_NONE &&
+                (candidate.weight_compression == TIGRIS_COMPRESS_NONE &&
                  block->compressed_size != block->uncompressed_size))
                 return TIGRIS_ERR_BAD_SECTION;
             previous_stage = block->stage_idx;
@@ -540,7 +914,7 @@ tigris_error_t tigris_plan_load(
 
     uint16_t next_scheduled_op = 0;
     for (uint16_t i = 0; i < hdr->num_stages; i++) {
-        const tigris_stage_t *stage = &out_plan->stages[i];
+        const tigris_stage_t *stage = &candidate.stages[i];
         if (!elements_ok(stage->ops_off, stage->ops_count, index_count) ||
             !elements_ok(stage->inputs_off, stage->inputs_count, index_count) ||
             !elements_ok(stage->outputs_off, stage->outputs_count, index_count) ||
@@ -549,11 +923,11 @@ tigris_error_t tigris_plan_load(
             (stage->chain_len == 0 && stage->chain_id != TIGRIS_NO_CHAIN) ||
             (stage->chain_len > 0 && stage->chain_id == TIGRIS_NO_CHAIN))
             return TIGRIS_ERR_BAD_SECTION;
-        if (stage->inputs_count > LOADER_MAX_STAGE_INPUTS)
+        if (stage->inputs_count > TIGRIS_MAX_STAGE_INPUTS)
             return TIGRIS_ERR_PLAN_LIMITS;
-        if (stage->outputs_count > LOADER_MAX_STAGE_OUTPUTS)
+        if (stage->outputs_count > TIGRIS_MAX_STAGE_OUTPUTS)
             return TIGRIS_ERR_PLAN_LIMITS;
-        if (stage->chain_len > LOADER_MAX_CHAIN_STAGES)
+        if (stage->chain_len > TIGRIS_MAX_CHAIN_STAGES)
             return TIGRIS_ERR_PLAN_LIMITS;
 
         /* A chain is represented redundantly on every member.  The executor
@@ -563,7 +937,7 @@ tigris_error_t tigris_plan_load(
             if (stage->chain_len < 2 || stage->chain_id > i ||
                 stage->chain_len > hdr->num_stages - stage->chain_id)
                 return TIGRIS_ERR_BAD_SECTION;
-            const tigris_stage_t *head = &out_plan->stages[stage->chain_id];
+            const tigris_stage_t *head = &candidate.stages[stage->chain_id];
             if (head->chain_id != stage->chain_id ||
                 head->chain_len != stage->chain_len ||
                 head->chain_tile_h == 0 ||
@@ -573,7 +947,7 @@ tigris_error_t tigris_plan_load(
             if (i == stage->chain_id) {
                 for (uint16_t member = i + 1u;
                      member < i + stage->chain_len; member++) {
-                    const tigris_stage_t *next = &out_plan->stages[member];
+                    const tigris_stage_t *next = &candidate.stages[member];
                     if (next->chain_id != i ||
                         next->chain_len != stage->chain_len ||
                         next->chain_tile_h != 0 ||
@@ -586,7 +960,7 @@ tigris_error_t tigris_plan_load(
         }
 
         for (uint16_t j = 0; j < stage->ops_count; j++) {
-            uint16_t op_idx = out_plan->index_pool[stage->ops_off + j];
+            uint16_t op_idx = candidate.index_pool[stage->ops_off + j];
             if (op_idx >= hdr->num_ops)
                 return TIGRIS_ERR_BAD_SECTION;
             /* The binary plan contract is a forward, partitioned schedule.
@@ -594,14 +968,16 @@ tigris_error_t tigris_plan_load(
              * omitting work or running the same operation more than once. */
             if (op_idx != next_scheduled_op)
                 return TIGRIS_ERR_BAD_SECTION;
+            if (candidate.ops[op_idx].stage != i)
+                return TIGRIS_ERR_BAD_OPERATOR;
             next_scheduled_op++;
         }
         for (uint16_t j = 0; j < stage->inputs_count; j++) {
-            if (out_plan->index_pool[stage->inputs_off + j] >= hdr->num_tensors)
+            if (candidate.index_pool[stage->inputs_off + j] >= hdr->num_tensors)
                 return TIGRIS_ERR_BAD_SECTION;
         }
         for (uint16_t j = 0; j < stage->outputs_count; j++) {
-            if (out_plan->index_pool[stage->outputs_off + j] >= hdr->num_tensors)
+            if (candidate.index_pool[stage->outputs_off + j] >= hdr->num_tensors)
                 return TIGRIS_ERR_BAD_SECTION;
         }
 
@@ -630,10 +1006,10 @@ tigris_error_t tigris_plan_load(
                 if (op_idx >= hdr->num_ops)
                     return TIGRIS_ERR_BAD_SECTION;
 
-                uint8_t op_type = out_plan->ops[op_idx].op_type;
+                uint8_t op_type = candidate.ops[op_idx].op_type;
                 if (op_type == TIGRIS_OP_CONV || op_type == TIGRIS_OP_DEPTHWISE) {
                     spatial_count++;
-                    if (spatial_count > LOADER_MAX_CHAIN_SPATIAL_OPS)
+                    if (spatial_count > TIGRIS_MAX_SPATIAL_OPS_PER_STAGE)
                         return TIGRIS_ERR_PLAN_LIMITS;
                 }
             }
@@ -646,26 +1022,26 @@ tigris_error_t tigris_plan_load(
     /* A compressed stage redirects weight_entry offsets into its own decoded
      * block.  Check that every referenced weight/bias is present in that
      * block before any executor or kernel can dereference the offset. */
-    if (out_plan->weight_blocks) {
+    if (candidate.weight_blocks) {
         uint16_t block_cursor = 0;
         for (uint16_t s = 0; s < hdr->num_stages; s++) {
             const tigris_weight_block_t *block = NULL;
-            if (block_cursor < out_plan->num_weight_blocks &&
-                out_plan->weight_blocks[block_cursor].stage_idx == s) {
-                block = &out_plan->weight_blocks[block_cursor++];
+            if (block_cursor < candidate.num_weight_blocks &&
+                candidate.weight_blocks[block_cursor].stage_idx == s) {
+                block = &candidate.weight_blocks[block_cursor++];
             }
 
-            const tigris_stage_t *stage = &out_plan->stages[s];
+            const tigris_stage_t *stage = &candidate.stages[s];
             for (uint16_t j = 0; j < stage->ops_count; j++) {
                 const tigris_op_t *op =
-                    &out_plan->ops[out_plan->index_pool[stage->ops_off + j]];
+                    &candidate.ops[candidate.index_pool[stage->ops_off + j]];
                 uint16_t refs[2] = {op->weight_idx, op->bias_idx};
                 for (uint8_t r = 0; r < 2; r++) {
                     if (refs[r] == TIGRIS_NO_WEIGHT)
                         continue;
                     if (!block ||
-                        !bounds_ok(out_plan->weight_entries[refs[r]].offset,
-                                   out_plan->weight_entries[refs[r]].size_bytes,
+                        !bounds_ok(candidate.weight_entries[refs[r]].offset,
+                                   candidate.weight_entries[refs[r]].size_bytes,
                                    block->uncompressed_size))
                         return TIGRIS_ERR_BAD_SECTION;
                 }
@@ -673,6 +1049,11 @@ tigris_error_t tigris_plan_load(
         }
     }
 
+    tigris_error_t semantic_error = validate_operator_semantics(&candidate);
+    if (semantic_error != TIGRIS_OK)
+        return semantic_error;
+
+    *out_plan = candidate;
     return TIGRIS_OK;
 }
 
@@ -689,6 +1070,8 @@ const char *tigris_error_str(tigris_error_t err)
         case TIGRIS_ERR_MISSING_SEC:return "required section missing";
         case TIGRIS_ERR_ENDIAN:     return "platform is not little-endian";
         case TIGRIS_ERR_PLAN_LIMITS:return "plan exceeds executor limits";
+        case TIGRIS_ERR_BAD_TENSOR: return "tensor contract is not executable";
+        case TIGRIS_ERR_BAD_OPERATOR:return "operator contract is not executable";
         default:                    return "unknown error";
     }
 }

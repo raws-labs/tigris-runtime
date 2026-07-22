@@ -17,6 +17,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "tigris_config.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -125,6 +127,8 @@ typedef enum {
     TIGRIS_ERR_MISSING_SEC  = -7,   /* Required section not present */
     TIGRIS_ERR_ENDIAN       = -8,   /* Platform is not little-endian */
     TIGRIS_ERR_PLAN_LIMITS  = -9,   /* Plan exceeds compiled executor limits */
+    TIGRIS_ERR_BAD_TENSOR   = -10,  /* Tensor metadata is not executable */
+    TIGRIS_ERR_BAD_OPERATOR = -11,  /* Operator contract is not executable */
 } tigris_error_t;
 
 /* Sentinel: tile_plan_idx == 0xFFFF means no tile plan for this stage */
@@ -633,6 +637,20 @@ static inline const tigris_quant_param_t *tigris_tensor_quant(
  *         UINT32_MAX if the required aligned sum cannot be represented.
  */
 uint32_t tigris_weight_decompression_overhead(const tigris_plan_t *plan);
+
+/**
+ * Compute the core fast-arena capacity required by a loaded plan.
+ *
+ * This is the plan's activation budget plus the simultaneous compressed-weight
+ * reservation returned by tigris_weight_decompression_overhead(). The result
+ * assumes the arena base satisfies TIGRIS_TENSOR_ALIGN. Leading padding for an
+ * unaligned base and backend-specific scratch/workspace are not included.
+ *
+ * @param plan  Loaded plan.
+ * @return Required core arena capacity in bytes, or UINT32_MAX if plan/header
+ *         is NULL or the sum cannot be represented.
+ */
+uint32_t tigris_fast_arena_required(const tigris_plan_t *plan);
 
 #ifdef __cplusplus
 }

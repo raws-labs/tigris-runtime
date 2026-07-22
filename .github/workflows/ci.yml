@@ -8,6 +8,31 @@ permissions:
   contents: read
 
 jobs:
+  capability-contract:
+    name: Compiler capability contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: raws-labs/tigris
+          path: tigris-compiler
+          ref: develop
+      - name: Use matching compiler branch when available
+        env:
+          COMPILER_REF: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+        run: |
+          if git -C tigris-compiler ls-remote --exit-code --heads origin "$COMPILER_REF"; then
+            git -C tigris-compiler fetch --depth=1 origin "$COMPILER_REF"
+            git -C tigris-compiler checkout --detach FETCH_HEAD
+          fi
+      - name: Compare runtime dispatch with the canonical matrix
+        env:
+          PYTHONPATH: tigris-compiler/src
+        run: >-
+          python3 tigris-compiler/scripts/validate_runtime_capabilities.py
+          --runtime .
+
   native:
     name: Native ${{ matrix.compiler }}
     runs-on: ubuntu-latest
@@ -23,6 +48,19 @@ jobs:
           -DCMAKE_C_COMPILER=${{ matrix.compiler }}
       - run: cmake --build build-${{ matrix.compiler }} --parallel
       - run: ctest --test-dir build-${{ matrix.compiler }} --output-on-failure
+      - run: >-
+          cmake --install build-${{ matrix.compiler }}
+          --prefix ${{ github.workspace }}/install-${{ matrix.compiler }}
+      - run: >-
+          cmake -S test/package_consumer
+          -B build-consumer-${{ matrix.compiler }}
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/install-${{ matrix.compiler }}
+      - run: cmake --build build-consumer-${{ matrix.compiler }} --parallel
+      - run: >-
+          ctest --test-dir build-consumer-${{ matrix.compiler }}
+          --output-on-failure
 
   sanitizers:
     name: ASan and UBSan
@@ -80,4 +118,25 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi.cmake
           -DCMAKE_C_FLAGS="-mcpu=cortex-m4 -mthumb"
+          -DTIGRIS_STACK_USAGE=ON
       - run: cmake --build build-arm --target tigris_runtime --parallel
+      - run: python3 scripts/check_stack_usage.py --max-frame 1024 build-arm
+
+  stack-usage:
+    name: Stack usage budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: >-
+          cmake -S . -B build-stack
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=gcc
+          -DTIGRIS_STACK_USAGE=ON
+      - run: >-
+          cmake --build build-stack
+          --target tigris_runtime cmsis_adapter_compile explicit_workspace_link_smoke
+          --parallel
+      - run: python3 scripts/check_stack_usage.py --max-frame 1024 build-stack
+      - run: >-
+          python3 scripts/check_workspace_link.py
+          build-stack/explicit_workspace_link_smoke

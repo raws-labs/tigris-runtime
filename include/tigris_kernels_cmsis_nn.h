@@ -46,19 +46,47 @@ int tigris_dispatch_kernel_cmsis_nn(
     void                *user_ctx);
 
 /**
- * Reserve the CMSIS-NN kernel scratch buffer from the top of the fast arena.
+ * Query the exact CMSIS-NN workspace reservation for a loaded plan.
  *
- * Sizes a single 16-aligned scratch to the largest kernel buffer across the
- * plan and carves it from mem (reducing mem->fast_size), so the per-op CMSIS-NN
- * scratch is never allocated on the stack. Repeated calls for the same memory
- * manager are idempotent when the existing reservation is large enough; a
- * different manager or a larger reservation requires deinitialization first.
- * Optional - if not called, a small bounded static fallback covers tiny models
- * and oversized ops fail rather than overflow.
+ * The result combines the linked CMSIS-NN buffer-size APIs with bounded
+ * scalar-to-per-channel quantization expansion storage. Each region is
+ * rounded up to the adapter's 16-byte alignment.
+ *
+ * @param plan  Loaded plan.
+ * @return Workspace bytes, 0 when no native op needs workspace, or UINT32_MAX
+ *         for an invalid plan or an unrepresentable result.
+ */
+uint32_t tigris_cmsis_nn_scratch_required(const tigris_plan_t *plan);
+
+/**
+ * Query the total fast arena required for CMSIS-NN execution.
+ *
+ * Combines tigris_fast_arena_required() with the exact CMSIS-NN workspace
+ * reservation while preserving the plan's full core activation capacity.
+ * The arena base must be aligned to TIGRIS_TENSOR_ALIGN.
+ *
+ * @param plan  Loaded plan.
+ * @return Total bytes, or UINT32_MAX when the requirement is invalid or
+ *         cannot be represented.
+ */
+uint32_t tigris_cmsis_nn_fast_arena_required(const tigris_plan_t *plan);
+
+/**
+ * Reserve the CMSIS-NN workspace from the top of the fast arena.
+ *
+ * Sizes the largest kernel buffer and scalar quantization expansion across the
+ * plan and carves aligned regions from mem (reducing mem->fast_size), so no
+ * per-op CMSIS-NN workspace is allocated on the stack. Repeated calls for the
+ * same memory manager are idempotent when the existing reservation is large
+ * enough; a different manager or larger reservation requires deinitialization.
+ * Required before dispatch when tigris_cmsis_nn_scratch_required(plan) is
+ * positive. Dispatch fails closed rather than falling back to hidden static
+ * scratch when preparation was skipped.
  *
  * @param plan  Loaded plan.
  * @param mem   Memory manager (fast_size is reduced in place).
- * @return 0 on success, -1 if mem/plan is NULL or the arena is too small.
+ * @return 0 on success, -1 if mem/plan is NULL or the arena is smaller than
+ *         tigris_cmsis_nn_fast_arena_required(plan).
  */
 int tigris_cmsis_nn_prepare(const tigris_plan_t *plan, tigris_mem_t *mem);
 

@@ -44,6 +44,7 @@ static int plan_has_int8_io(const tigris_plan_t *plan)
 
 int main(int argc, char **argv)
 {
+    static tigris_executor_workspace_t executor_workspace;
     FILE *file = NULL;
     void *plan_storage = NULL;
     void *fast_buf = NULL;
@@ -70,7 +71,6 @@ int main(int argc, char **argv)
         tigris_mem_t mem;
         tigris_error_t load_err;
         tigris_mem_error_t mem_err;
-        uint32_t weight_overhead;
         uint32_t fast_size;
         uint32_t slow_size = EXAMPLE_SLOW_BYTES;
         uint8_t i;
@@ -110,13 +110,11 @@ int main(int argc, char **argv)
             goto cleanup;
         }
 
-        weight_overhead = tigris_weight_decompression_overhead(&plan);
-        if (weight_overhead == UINT32_MAX ||
-            plan.header->budget > UINT32_MAX - weight_overhead) {
+        fast_size = tigris_fast_arena_required(&plan);
+        if (fast_size == UINT32_MAX) {
             fprintf(stderr, "invalid fast-buffer requirement\n");
             goto cleanup;
         }
-        fast_size = plan.header->budget + weight_overhead;
         if (fast_size == 0 ||
             posix_memalign(&fast_buf, alignment, fast_size) != 0 ||
             posix_memalign(&slow_buf, alignment, slow_size) != 0) {
@@ -153,8 +151,9 @@ int main(int argc, char **argv)
 
         {
             tigris_exec_stats_t stats;
-            tigris_exec_error_t exec_err = tigris_run(
-                &plan, &mem, tigris_dispatch_kernel_s8, NULL, &stats);
+            tigris_exec_error_t exec_err = tigris_run_with_workspace(
+                &plan, &mem, tigris_dispatch_kernel_s8, NULL, &stats,
+                &executor_workspace);
             uint16_t out_idx;
             const int8_t *output;
             uint32_t show;

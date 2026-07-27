@@ -337,20 +337,42 @@ static int find_spatial_op(const tigris_plan_t *plan, const tigris_stage_t *stag
 }
 
 /**
- * Count total spatial ops (Conv/DWConv/Pool) in a stage.
- * exec_stage_tiled only handles stages with at most 1 spatial op.
+ * Return whether every op in a standalone stage implements the schema-v4
+ * height-stripe contract used by exec_stage_tiled.
+ *
+ * This is intentionally an audited allow-list.  An operator being executable
+ * as a full tensor does not imply that its kernel consumes the tile geometry
+ * correctly.  In particular, global reductions and shape-changing Resize
+ * must stay on the normal path until they have dedicated range propagation.
  */
-static int count_spatial_ops(const tigris_plan_t *plan, const tigris_stage_t *stage)
+static int stage_supports_height_tiling(
+    const tigris_plan_t *plan, const tigris_stage_t *stage)
 {
     const uint16_t *sops = tigris_stage_ops(plan, stage);
-    int count = 0;
+    int spatial_count = 0;
+
     for (uint16_t j = 0; j < stage->ops_count; j++) {
-        uint8_t t = plan->ops[sops[j]].op_type;
-        if (t == TIGRIS_OP_CONV || t == TIGRIS_OP_DEPTHWISE ||
-            t == TIGRIS_OP_MAX_POOL || t == TIGRIS_OP_AVG_POOL)
-            count++;
+        uint8_t type = plan->ops[sops[j]].op_type;
+        switch (type) {
+            case TIGRIS_OP_CONV:
+            case TIGRIS_OP_DEPTHWISE:
+            case TIGRIS_OP_MAX_POOL:
+            case TIGRIS_OP_AVG_POOL:
+                spatial_count++;
+                break;
+            case TIGRIS_OP_RELU:
+            case TIGRIS_OP_RELU6:
+            case TIGRIS_OP_SIGMOID:
+            case TIGRIS_OP_TANH:
+            case TIGRIS_OP_ADD:
+            case TIGRIS_OP_MUL:
+            case TIGRIS_OP_CONCAT:
+                break;
+            default:
+                return 0;
+        }
     }
-    return count;
+    return spatial_count <= 1;
 }
 
 /* Non-tiled stage execution */
@@ -1477,15 +1499,29 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
                 if (run_plan->tensors[sout[i]].ndim != 4) all_4d = 0;
             }
 
-            /* Only tile stages with at most 1 spatial op (Conv/DWConv/Pool).
-             * Multi-spatial stages (e.g. full backbone with stride changes,
-             * MaxPool, Resize) can't be tiled by exec_stage_tiled which
-             * assumes a single spatial transition.  Run those as normal -
-             * exec_stage_normal handles OOM via compaction + slow overflow. */
-            int sp_count = count_spatial_ops(run_plan, stage);
+            /* Only tile stages whose complete operator sequence implements
+             * schema-v4 height stripes.  A serialized tile plan is a compiler
+             * promise: fail closed if an older or malformed plan attaches that
+             * promise to a stage the runtime cannot tile safely.  Without a
+             * tile plan, unsupported stages retain ordinary full-tensor
+             * execution and may use slow overflow. */
+            int height_tileable =
+                stage_supports_height_tiling(run_plan, stage);
+            int needs_tiling =
+                all_4d &&
+                total_io > (mem->fast_size - mem->fast_reserved);
 
-            if (all_4d && sp_count <= 1 &&
-                total_io > (mem->fast_size - mem->fast_reserved)) {
+            if (needs_tiling &&
+                stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
+                (stage->tile_plan_idx >= run_plan->header->num_tile_plans ||
+                 !run_plan->tile_plans ||
+                 !run_plan->tile_plans[stage->tile_plan_idx].tileable ||
+                 !height_tileable)) {
+                result = TIGRIS_EXEC_ERR_TILE;
+                goto restore_fast_arena;
+            }
+
+            if (needs_tiling && height_tileable) {
                 tigris_exec_error_t err = exec_stage_tiled(
                     run_plan, stage, mem, kernel, user_ctx,
                     last_consumer, s, workspace);

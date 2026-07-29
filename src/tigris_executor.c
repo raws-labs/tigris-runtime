@@ -98,6 +98,26 @@ static uintptr_t align_address(uintptr_t address, size_t alignment)
     return (address + alignment - 1u) & ~(uintptr_t)(alignment - 1u);
 }
 
+static int is_height_spatial_op(uint8_t type)
+{
+    return type == TIGRIS_OP_CONV ||
+           type == TIGRIS_OP_DEPTHWISE ||
+           type == TIGRIS_OP_MAX_POOL ||
+           type == TIGRIS_OP_AVG_POOL;
+}
+
+static int is_height_tiling_op(uint8_t type)
+{
+    return is_height_spatial_op(type) ||
+           type == TIGRIS_OP_RELU ||
+           type == TIGRIS_OP_RELU6 ||
+           type == TIGRIS_OP_SIGMOID ||
+           type == TIGRIS_OP_TANH ||
+           type == TIGRIS_OP_ADD ||
+           type == TIGRIS_OP_MUL ||
+           type == TIGRIS_OP_CONCAT;
+}
+
 static int workspace_limits(
     const tigris_plan_t *plan, executor_workspace_limits_t *limits)
 {
@@ -133,8 +153,7 @@ static int workspace_limits(
                     if (ops[j] >= plan->header->num_ops)
                         return 0;
                     uint8_t type = plan->ops[ops[j]].op_type;
-                    if (type == TIGRIS_OP_CONV ||
-                        type == TIGRIS_OP_DEPTHWISE)
+                    if (is_height_spatial_op(type))
                         spatial++;
                 }
                 if (spatial > limits->spatial_ops)
@@ -329,8 +348,7 @@ static int find_spatial_op(const tigris_plan_t *plan, const tigris_stage_t *stag
     const uint16_t *sops = tigris_stage_ops(plan, stage);
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         uint8_t t = plan->ops[sops[j]].op_type;
-        if (t == TIGRIS_OP_CONV || t == TIGRIS_OP_DEPTHWISE ||
-            t == TIGRIS_OP_MAX_POOL || t == TIGRIS_OP_AVG_POOL)
+        if (is_height_spatial_op(t))
             return (int)sops[j];
     }
     return -1;
@@ -353,24 +371,10 @@ static int stage_supports_height_tiling(
 
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         uint8_t type = plan->ops[sops[j]].op_type;
-        switch (type) {
-            case TIGRIS_OP_CONV:
-            case TIGRIS_OP_DEPTHWISE:
-            case TIGRIS_OP_MAX_POOL:
-            case TIGRIS_OP_AVG_POOL:
-                spatial_count++;
-                break;
-            case TIGRIS_OP_RELU:
-            case TIGRIS_OP_RELU6:
-            case TIGRIS_OP_SIGMOID:
-            case TIGRIS_OP_TANH:
-            case TIGRIS_OP_ADD:
-            case TIGRIS_OP_MUL:
-            case TIGRIS_OP_CONCAT:
-                break;
-            default:
-                return 0;
-        }
+        if (!is_height_tiling_op(type))
+            return 0;
+        if (is_height_spatial_op(type))
+            spatial_count++;
     }
     return spatial_count <= 1;
 }
@@ -864,16 +868,18 @@ static tigris_exec_error_t exec_chain_tiled(
         info[c].full_out_w = osh[2];
 
         /* Compose receptive fields of ALL spatial ops in this stage.
-         * When a stage has multiple spatial ops (e.g. Conv S2 -> DW S1 -> PW),
-         * the composed parameters determine how many stage-input rows are
-         * needed to produce a given number of stage-output rows. */
+         * When a stage has multiple spatial ops (including pool), the composed
+         * parameters determine how many stage-input rows are needed to produce
+         * a given number of stage-output rows. */
         int32_t comp_stride = 1, comp_eff_kh = 1, comp_pad_top = 0;
         int sp_count = 0;
 
         const uint16_t *sops = tigris_stage_ops(plan, stages[c]);
         for (uint16_t j = 0; j < stages[c]->ops_count; j++) {
             uint8_t t = plan->ops[sops[j]].op_type;
-            if (t == TIGRIS_OP_CONV || t == TIGRIS_OP_DEPTHWISE) {
+            if (!is_height_tiling_op(t))
+                return TIGRIS_EXEC_ERR_TILE;
+            if (is_height_spatial_op(t)) {
                 const tigris_spatial_attrs_t *sp = &plan->ops[sops[j]].spatial;
                 int32_t sh = sp->stride_h;
                 int32_t dh = sp->dilation_h ? sp->dilation_h : 1;
@@ -1014,7 +1020,7 @@ static tigris_exec_error_t exec_chain_tiled(
                     uint8_t ot = op->op_type;
 
                     /* Spatial ops reduce height */
-                    if ((ot == TIGRIS_OP_CONV || ot == TIGRIS_OP_DEPTHWISE) &&
+                    if (is_height_spatial_op(ot) &&
                         sp_j < info[c].sp_count) {
                         size_t spi = spatial_index(
                             workspace, c, (uint16_t)sp_j);

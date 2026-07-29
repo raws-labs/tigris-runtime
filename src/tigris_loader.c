@@ -987,9 +987,9 @@ tigris_error_t tigris_plan_load(
                 stage->chain_len > hdr->num_stages - stage->chain_id)
                 return TIGRIS_ERR_BAD_SECTION;
 
-            /* Chain execution stores spatial-op metadata in a fixed [8] array.
-             * Validate only the stage-op slice needed for that limit here; full
-             * plan cross-reference validation belongs to the hardening pass. */
+            /* Chain execution stores bounded spatial-op metadata in its
+             * caller-provided workspace. Validate the stage-op slice and the
+             * audited height-stripe operator contract before execution. */
             uint32_t pool_off = section_offsets[TIGRIS_SEC_INDEX_POOL];
             uint32_t prefix = (uint32_t)stage->ops_off * sizeof(uint16_t);
             uint32_t bytes = (uint32_t)stage->ops_count * sizeof(uint16_t);
@@ -1007,10 +1007,21 @@ tigris_error_t tigris_plan_load(
                     return TIGRIS_ERR_BAD_SECTION;
 
                 uint8_t op_type = candidate.ops[op_idx].op_type;
-                if (op_type == TIGRIS_OP_CONV || op_type == TIGRIS_OP_DEPTHWISE) {
+                if (op_type == TIGRIS_OP_CONV ||
+                    op_type == TIGRIS_OP_DEPTHWISE ||
+                    op_type == TIGRIS_OP_MAX_POOL ||
+                    op_type == TIGRIS_OP_AVG_POOL) {
                     spatial_count++;
                     if (spatial_count > TIGRIS_MAX_SPATIAL_OPS_PER_STAGE)
                         return TIGRIS_ERR_PLAN_LIMITS;
+                } else if (op_type != TIGRIS_OP_RELU &&
+                           op_type != TIGRIS_OP_RELU6 &&
+                           op_type != TIGRIS_OP_SIGMOID &&
+                           op_type != TIGRIS_OP_TANH &&
+                           op_type != TIGRIS_OP_ADD &&
+                           op_type != TIGRIS_OP_MUL &&
+                           op_type != TIGRIS_OP_CONCAT) {
+                    return TIGRIS_ERR_BAD_OPERATOR;
                 }
             }
         }

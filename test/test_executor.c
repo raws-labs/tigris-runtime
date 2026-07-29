@@ -474,7 +474,7 @@ static void test_exec_workspace_chain_sizing(void)
     header.num_ops = 3;
     header.num_stages = 2;
     ops[0].op_type = TIGRIS_OP_CONV;
-    ops[1].op_type = TIGRIS_OP_DEPTHWISE;
+    ops[1].op_type = TIGRIS_OP_AVG_POOL;
     ops[2].op_type = TIGRIS_OP_CONV;
     stages[0].ops_off = 0;
     stages[0].ops_count = 2;
@@ -500,7 +500,7 @@ static void test_exec_workspace_chain_sizing(void)
     TEST_ASSERT_EQ(
         tigris_executor_workspace_required(&plan),
         TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(5, 2, 3, 2, 2),
-        "query includes actual chain and spatial capacities");
+        "query includes pool in actual chain spatial capacity");
 }
 
 /** Helper: compute sum of all non-constant tensor sizes for slow buffer sizing. */

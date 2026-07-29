@@ -478,12 +478,33 @@ static void test_chain_limit_guards(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "eight chain spatial ops fit fixed metadata");
 
+    ops[7].op_type = TIGRIS_OP_AVG_POOL;
+    ops[7].weight_idx = TIGRIS_NO_WEIGHT;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "pool counts as supported chain spatial metadata");
+
     stages[0].ops_count = 9;
     stages[1].ops_off = 27;
     stages[1].ops_count = 0;
     ops[8].stage = 0;
+    ops[8].op_type = TIGRIS_OP_MAX_POOL;
+    ops[8].weight_idx = TIGRIS_NO_WEIGHT;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_PLAN_LIMITS, "ninth chain spatial op rejected");
+
+    build_staged_plan(buf);
+    stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
+    stages[0].chain_id = 0;
+    stages[0].chain_len = 2;
+    stages[0].chain_tile_h = 1;
+    stages[1].chain_id = 0;
+    stages[1].chain_len = 2;
+    ops = (tigris_op_t *)(buf + STAGED_OPS_OFF);
+    ops[0].op_type = TIGRIS_OP_GLOBAL_AVG;
+    ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "global reduction cannot enter height chain");
 }
 
 static void test_stage_schedule_guards(void)

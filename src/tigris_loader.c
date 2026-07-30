@@ -400,9 +400,8 @@ tigris_error_t tigris_plan_load(
     if (memcmp(hdr->magic, TIGRIS_MAGIC_BYTES, 4) != 0)
         return TIGRIS_ERR_BAD_MAGIC;
 
-    if (hdr->version != TIGRIS_SCHEMA_VERSION &&
-        hdr->version != TIGRIS_SCHEMA_VERSION_V3 &&
-        hdr->version != TIGRIS_SCHEMA_VERSION_V2)
+    if (hdr->version < TIGRIS_SCHEMA_VERSION_MIN ||
+        hdr->version > TIGRIS_SCHEMA_VERSION)
         return TIGRIS_ERR_BAD_VERSION;
 
     if (hdr->file_size != buf_len)
@@ -572,9 +571,11 @@ tigris_error_t tigris_plan_load(
         candidate.weight_blocks_data = buf + off + 4 + entries_size;
     }
 
-    /* Per-operator attributes (optional, schema v4+). */
+    /* Per-operator attributes (optional, schema v4+). Compare against the
+     * feature's introduction version, not the latest schema: otherwise a
+     * future schema bump would accidentally make valid v4 plans fail. */
     if (section_offsets[TIGRIS_SEC_OP_ATTRIBUTES]) {
-        if (hdr->version < TIGRIS_SCHEMA_VERSION)
+        if (hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES)
             return TIGRIS_ERR_BAD_SECTION;
         uint32_t off = section_offsets[TIGRIS_SEC_OP_ATTRIBUTES];
         if (!bounds_ok(off, 4, section_ends[TIGRIS_SEC_OP_ATTRIBUTES]))
@@ -781,7 +782,12 @@ tigris_error_t tigris_plan_load(
     }
 
     /* Attribute records are ordered and typed.  Validate their payloads
-     * against the referenced operators before any kernel can use them. */
+     * against the referenced operators before any kernel can use them.
+     *
+     * Schemas v2/v3 predate typed attributes and intentionally allowed custom
+     * dispatch callbacks to implement operators such as legacy Transpose,
+     * MatMul, and application opcodes. Preserve that structural-loader
+     * contract; schema v4 introduced the strict built-in semantic contract. */
     if (candidate.op_attributes) {
         uint32_t attrs_off = section_offsets[TIGRIS_SEC_OP_ATTRIBUTES];
         uint32_t attrs_data_off = attrs_off + 4u +
@@ -832,7 +838,7 @@ tigris_error_t tigris_plan_load(
             if ((candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE) != has_attr)
                 return TIGRIS_ERR_BAD_SECTION;
         }
-    } else {
+    } else if (hdr->version >= TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES) {
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
             if (candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE)
                 return TIGRIS_ERR_BAD_SECTION;
@@ -1060,9 +1066,11 @@ tigris_error_t tigris_plan_load(
         }
     }
 
-    tigris_error_t semantic_error = validate_operator_semantics(&candidate);
-    if (semantic_error != TIGRIS_OK)
-        return semantic_error;
+    if (hdr->version >= TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES) {
+        tigris_error_t semantic_error = validate_operator_semantics(&candidate);
+        if (semantic_error != TIGRIS_OK)
+            return semantic_error;
+    }
 
     *out_plan = candidate;
     return TIGRIS_OK;

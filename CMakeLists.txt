@@ -118,6 +118,8 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_link_libraries(tigris_posix_example tigris_runtime)
 
     add_executable(test_loader test/test_loader.c)
+    target_compile_definitions(test_loader PRIVATE
+        TIGRIS_SCHEMA_COMPAT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/schema_compat")
     target_link_libraries(test_loader tigris_runtime)
 
     add_executable(test_executor test/test_executor.c)

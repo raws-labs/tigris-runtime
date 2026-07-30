@@ -798,6 +798,43 @@ static void test_transpose_attribute_guards(void)
     ((tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u))->type = 99;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION, "unknown attribute type rejected");
+
+    build_transpose_plan(buf);
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "v2 cannot claim the v4 attribute section");
+
+    /* v2/v3 plans predate typed attributes and may rely on the public custom
+     * dispatcher for legacy Transpose and application operators. The hardened
+     * loader must preserve that structural compatibility while v4 remains
+     * strict. */
+    build_transpose_plan(buf);
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(
+        buf + sizeof(tigris_file_header_t));
+    memset(&dir[6], 0, sizeof(dir[6]));
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "attribute-free v2 custom Transpose loads");
+
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "attribute-free v3 custom Transpose loads");
+
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "attribute-free v4 Transpose remains rejected");
+
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_UNKNOWN;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "v2 custom opcode loads for caller dispatcher");
+
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "v4 custom opcode remains fail-closed");
 }
 
 static void build_unary_plan(uint8_t *buf)
@@ -1076,6 +1113,66 @@ static void test_fixture(const char *path)
     free(buf);
 }
 
+static void test_schema_compatibility_fixtures(void)
+{
+    /*
+     * Immutable compiler-emitted artifacts, selected to exercise the feature
+     * introduced by each supported schema:
+     *   v2 linear:   tigris b47664926e7a484d6638ecd0fd372da477236619
+     *   v3 QDQ Conv: tigris 0fe37d3a53292cf532ba8628d2284c00a896fbb2
+     *   v4 Transpose:tigris 208b322cab7f97c9960c63a8075944374fdfff2c
+     */
+    static const struct {
+        const char *filename;
+        uint32_t version;
+        uint16_t quant_params;
+        uint16_t op_attributes;
+    } fixtures[] = {
+        {"schema-v2-linear.tgrs", TIGRIS_SCHEMA_VERSION_V2, 0, 0},
+        {"schema-v3-qdq-conv.tgrs", TIGRIS_SCHEMA_VERSION_V3, 3, 0},
+        {"schema-v4-transpose.tgrs", TIGRIS_SCHEMA_VERSION_V4, 0, 1},
+    };
+    const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
+
+    printf("  test_schema_compatibility_fixtures...\n");
+    TEST_ASSERT_EQ(fixture_count,
+                   TIGRIS_SCHEMA_VERSION - TIGRIS_SCHEMA_VERSION_MIN + 1u,
+                   "every supported schema has a fixed fixture");
+    for (size_t i = 0; i < fixture_count; i++) {
+        TEST_ASSERT_EQ(fixtures[i].version,
+                       TIGRIS_SCHEMA_VERSION_MIN + i,
+                       "schema fixture versions are contiguous");
+        char path[512];
+        int path_len = snprintf(path, sizeof(path), "%s/%s",
+                                TIGRIS_SCHEMA_COMPAT_DIR,
+                                fixtures[i].filename);
+        TEST_ASSERT(path_len > 0 && (size_t)path_len < sizeof(path),
+                    "schema fixture path fits");
+        if (path_len <= 0 || (size_t)path_len >= sizeof(path))
+            continue;
+
+        uint32_t buf_len = 0;
+        uint8_t *buf = load_file(path, &buf_len);
+        TEST_ASSERT(buf != NULL, "schema fixture is readable");
+        if (!buf)
+            continue;
+
+        tigris_plan_t plan;
+        tigris_error_t err = tigris_plan_load(buf, buf_len, &plan);
+        TEST_ASSERT_EQ(err, TIGRIS_OK, "schema fixture loads");
+        if (err == TIGRIS_OK) {
+            TEST_ASSERT_EQ(plan.header->version, fixtures[i].version,
+                           "schema fixture has expected version");
+            TEST_ASSERT_EQ(plan.header->num_quant_params,
+                           fixtures[i].quant_params,
+                           "schema fixture has expected quant metadata");
+            TEST_ASSERT_EQ(plan.num_op_attributes, fixtures[i].op_attributes,
+                           "schema fixture has expected operator attributes");
+        }
+        free(buf);
+    }
+}
+
 /* Main */
 
 int main(int argc, char *argv[])
@@ -1101,6 +1198,9 @@ int main(int argc, char *argv[])
     test_transpose_attribute_guards();
     test_operator_semantic_guards();
     test_convolution_semantic_guards();
+
+    printf("\nSchema compatibility fixtures:\n");
+    test_schema_compatibility_fixtures();
 
     printf("\nStruct size tests:\n");
     test_struct_sizes();

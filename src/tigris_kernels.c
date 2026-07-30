@@ -356,6 +356,12 @@ static int kern_conv1d(
     int D  = op->spatial.dilation_h ? op->spatial.dilation_h : 1;
     int PB = op->spatial.pad_top;    /* pad_begin stored in pad_top */
 
+    if (mem->tile.active) {
+        IT = mem->tile.in_h;
+        OT = mem->tile.out_h;
+        PB = mem->tile.pad_top;
+    }
+
     /* Weight layout: [OC, K, IC] (transposed from [OC, IC, K]) */
     for (int n = 0; n < N; n++) {
         for (int ot = 0; ot < OT; ot++) {

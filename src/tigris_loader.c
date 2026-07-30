@@ -542,6 +542,18 @@ tigris_error_t tigris_plan_load(
         if (!bounds_ok(off, need, section_ends[TIGRIS_SEC_TILE_PLANS]))
             return TIGRIS_ERR_BAD_SECTION;
         candidate.tile_plans = (const tigris_tile_plan_t *)(buf + off);
+        for (uint16_t i = 0; i < hdr->num_tile_plans; i++) {
+            const tigris_tile_plan_t *tile = &candidate.tile_plans[i];
+            if (tile->tileable > 1)
+                return TIGRIS_ERR_BAD_SECTION;
+            if (hdr->version >= TIGRIS_SCHEMA_VERSION_TILE_AXIS) {
+                if ((tile->tileable &&
+                     tile->axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) ||
+                    (!tile->tileable &&
+                     tile->axis != TIGRIS_TILE_AXIS_NONE))
+                    return TIGRIS_ERR_BAD_SECTION;
+            }
+        }
     }
 
     /* Weights (optional) */
@@ -985,6 +997,81 @@ tigris_error_t tigris_plan_load(
         for (uint16_t j = 0; j < stage->outputs_count; j++) {
             if (candidate.index_pool[stage->outputs_off + j] >= hdr->num_tensors)
                 return TIGRIS_ERR_BAD_SECTION;
+        }
+
+        if (stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN) {
+            const tigris_tile_plan_t *tile =
+                &candidate.tile_plans[stage->tile_plan_idx];
+            uint8_t axis =
+                hdr->version >= TIGRIS_SCHEMA_VERSION_TILE_AXIS
+                    ? tile->axis
+                    : (tile->tileable
+                           ? TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH
+                           : TIGRIS_TILE_AXIS_NONE);
+            if (tile->tileable &&
+                axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) {
+                if (stage->inputs_count == 0 || stage->outputs_count == 0)
+                    return TIGRIS_ERR_BAD_SECTION;
+                uint16_t first_input =
+                    candidate.index_pool[stage->inputs_off];
+                uint16_t first_output =
+                    candidate.index_pool[stage->outputs_off];
+                uint8_t rank = candidate.tensors[first_input].ndim;
+                if ((rank != 3 && rank != 4) ||
+                    candidate.tensors[first_output].ndim != rank)
+                    return TIGRIS_ERR_BAD_SECTION;
+                for (uint16_t j = 0; j < stage->inputs_count; j++) {
+                    uint16_t tensor_idx =
+                        candidate.index_pool[stage->inputs_off + j];
+                    if (candidate.tensors[tensor_idx].ndim != rank)
+                        return TIGRIS_ERR_BAD_SECTION;
+                }
+                for (uint16_t j = 0; j < stage->outputs_count; j++) {
+                    uint16_t tensor_idx =
+                        candidate.index_pool[stage->outputs_off + j];
+                    if (candidate.tensors[tensor_idx].ndim != rank)
+                        return TIGRIS_ERR_BAD_SECTION;
+                }
+
+                /* Schema v5 adds the rank-3 NLC length contract. Keep that
+                 * first slice deliberately narrow: one standalone Conv1D.
+                 * Rank-4 axis-1 stages retain the existing audited height
+                 * contract and are checked again by the executor allow-list. */
+                if (rank == 3) {
+                    if (hdr->version < TIGRIS_SCHEMA_VERSION_TILE_AXIS ||
+                        stage->chain_len != 0 ||
+                        stage->ops_count != 1 ||
+                        stage->inputs_count != 1 ||
+                        stage->outputs_count != 1 ||
+                        candidate.ops[
+                            candidate.index_pool[stage->ops_off]
+                        ].op_type != TIGRIS_OP_CONV1D)
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                } else {
+                    uint16_t spatial_count = 0;
+                    for (uint16_t j = 0; j < stage->ops_count; j++) {
+                        uint8_t type = candidate.ops[
+                            candidate.index_pool[stage->ops_off + j]
+                        ].op_type;
+                        if (type == TIGRIS_OP_CONV ||
+                            type == TIGRIS_OP_DEPTHWISE ||
+                            type == TIGRIS_OP_MAX_POOL ||
+                            type == TIGRIS_OP_AVG_POOL) {
+                            spatial_count++;
+                        } else if (type != TIGRIS_OP_RELU &&
+                                   type != TIGRIS_OP_RELU6 &&
+                                   type != TIGRIS_OP_SIGMOID &&
+                                   type != TIGRIS_OP_TANH &&
+                                   type != TIGRIS_OP_ADD &&
+                                   type != TIGRIS_OP_MUL &&
+                                   type != TIGRIS_OP_CONCAT) {
+                            return TIGRIS_ERR_BAD_OPERATOR;
+                        }
+                    }
+                    if (spatial_count > 1)
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                }
+            }
         }
 
         if (stage->chain_len >= 2) {

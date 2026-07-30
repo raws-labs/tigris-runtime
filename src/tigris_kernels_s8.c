@@ -286,9 +286,7 @@ static int kern_conv2d_s8(
 }
 
 /* INT8 1D convolution. NLC activation layout, weights [OC, K, IC], per-channel
- * requant - the int8 analogue of kern_conv1d (float) / kern_conv2d_s8. Conv1D
- * tensors are 3D so they are never tiled (the tile path requires 4D I/O), hence
- * no mem->tile handling, matching the float kernel. */
+ * requant - the int8 analogue of kern_conv1d (float) / kern_conv2d_s8. */
 static int kern_conv1d_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -318,6 +316,12 @@ static int kern_conv1d_s8(
     int S  = op->spatial.stride_h   ? op->spatial.stride_h   : 1;
     int D  = op->spatial.dilation_h ? op->spatial.dilation_h : 1;
     int PB = op->spatial.pad_top;                              /* pad_begin in pad_top */
+
+    if (mem->tile.active) {
+        IT = mem->tile.in_h;
+        OT = mem->tile.out_h;
+        PB = mem->tile.pad_top;
+    }
 
     for (int n = 0; n < N; n++) {
         for (int ot = 0; ot < OT; ot++) {

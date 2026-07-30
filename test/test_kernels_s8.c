@@ -926,6 +926,19 @@ static void test_conv1d_s8(void)
     /* ot0 = (1+2)+(3+4)=10 ; ot1 = (3+4)+(5+6)=18 */
     TEST_ASSERT_EQ(out[0], 10, "conv1d y[0]=10");
     TEST_ASSERT_EQ(out[1], 18, "conv1d y[1]=18");
+
+    tigris_mem_reset_fast(&mem);
+    tigris_mem_alloc_fast(&mem, t_in, 4);
+    memcpy(ptrs[t_in], input_data, 4);
+    tigris_mem_alloc_fast(&mem, t_out, 1);
+    mem.tile.active = 1;
+    mem.tile.in_h = 2;
+    mem.tile.out_h = 1;
+    mem.tile.pad_top = 0;
+    ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "tiled conv1d_s8 returns 0");
+    out = (int8_t *)ptrs[t_out];
+    TEST_ASSERT_EQ(out[0], 10, "tiled conv1d y[0]=10");
 }
 
 static void test_transpose_s8(void)

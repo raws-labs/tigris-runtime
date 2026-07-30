@@ -146,11 +146,14 @@ tigris_mem_error_t tigris_mem_load_tile(
     const tigris_tensor_t *t = &plan->tensors[tensor_idx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
 
-    /* NHWC layout: [N, H, W, C] */
+    if (t->ndim != 3 && t->ndim != 4)
+        return TIGRIS_MEM_ERR_BAD_INDEX;
+
+    /* Serialized activations are NHWC [N,H,W,C] or NLC [N,L,C]. */
     int32_t N = shape[0];
     int32_t H = shape[1];
-    int32_t W = shape[2];
-    int32_t C = shape[3];
+    int32_t W = t->ndim == 4 ? shape[2] : 1;
+    int32_t C = shape[t->ndim - 1];
 
     int32_t tile_h = h_end - h_start;
     uint32_t elem_size = t->size_bytes / (uint32_t)(N * H * W * C);
@@ -168,7 +171,7 @@ tigris_mem_error_t tigris_mem_load_tile(
 
     uint8_t *fast_ptr = (uint8_t *)mem->tensor_ptrs[tensor_idx];
 
-    /* NHWC: rows [h_start, h_end) are contiguous per batch */
+    /* NHWC rows and NLC length ranges are contiguous per batch. */
     uint32_t full_batch_bytes = (uint32_t)H * row_bytes;
     uint32_t src_row_off = (uint32_t)h_start * row_bytes;
 
@@ -191,11 +194,14 @@ tigris_mem_error_t tigris_mem_spill_tile(
     const tigris_tensor_t *t = &plan->tensors[tensor_idx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
 
-    /* NHWC layout: [N, H, W, C] */
+    if (t->ndim != 3 && t->ndim != 4)
+        return TIGRIS_MEM_ERR_BAD_INDEX;
+
+    /* Serialized activations are NHWC [N,H,W,C] or NLC [N,L,C]. */
     int32_t N = shape[0];
     int32_t H = shape[1];
-    int32_t W = shape[2];
-    int32_t C = shape[3];
+    int32_t W = t->ndim == 4 ? shape[2] : 1;
+    int32_t C = shape[t->ndim - 1];
     int32_t tile_h = h_end - h_start;
     uint32_t elem_size = t->size_bytes / (uint32_t)(N * H * W * C);
     uint32_t row_bytes = (uint32_t)W * (uint32_t)C * elem_size;

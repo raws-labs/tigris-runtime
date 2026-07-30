@@ -177,8 +177,8 @@ tigris_mem_error_t tigris_mem_spill(
 void tigris_mem_reset_fast(tigris_mem_t *mem);
 
 /**
- * Load a height-band of an NHWC tensor from slow to fast.
- * Allocates N*tile_h*W*C*elem in fast, copies the [h_start, h_end) rows.
+ * Load an axis-1 band of an NHWC or NLC tensor from slow to fast.
+ * Allocates N*tile_extent*W*C*elem in fast and copies [h_start, h_end).
  *
  * @param mem         Memory manager.
  * @param plan        Loaded plan (for tensor shape lookup).
@@ -192,8 +192,8 @@ tigris_mem_error_t tigris_mem_load_tile(
     uint16_t tensor_idx, int32_t h_start, int32_t h_end);
 
 /**
- * Spill a height-band from fast to slow. Writes rows [h_start, h_end)
- * into the full tensor at slow_base, then restores tensor_ptrs[tensor_idx].
+ * Spill an axis-1 band from fast to slow. Writes [h_start, h_end) into the
+ * full NHWC/NLC tensor at slow_base, then restores tensor_ptrs[tensor_idx].
  *
  * @param mem         Memory manager.
  * @param plan        Loaded plan (for tensor shape lookup).

@@ -1121,16 +1121,21 @@ static void test_schema_compatibility_fixtures(void)
      *   v2 linear:   tigris b47664926e7a484d6638ecd0fd372da477236619
      *   v3 QDQ Conv: tigris 0fe37d3a53292cf532ba8628d2284c00a896fbb2
      *   v4 Transpose:tigris 208b322cab7f97c9960c63a8075944374fdfff2c
+     *   v5 Conv1D:   explicit serialized length axis
      */
     static const struct {
         const char *filename;
         uint32_t version;
         uint16_t quant_params;
         uint16_t op_attributes;
+        uint16_t tile_plans;
+        uint8_t tile_axis;
     } fixtures[] = {
-        {"schema-v2-linear.tgrs", TIGRIS_SCHEMA_VERSION_V2, 0, 0},
-        {"schema-v3-qdq-conv.tgrs", TIGRIS_SCHEMA_VERSION_V3, 3, 0},
-        {"schema-v4-transpose.tgrs", TIGRIS_SCHEMA_VERSION_V4, 0, 1},
+        {"schema-v2-linear.tgrs", TIGRIS_SCHEMA_VERSION_V2, 0, 0, 0, 0},
+        {"schema-v3-qdq-conv.tgrs", TIGRIS_SCHEMA_VERSION_V3, 3, 0, 0, 0},
+        {"schema-v4-transpose.tgrs", TIGRIS_SCHEMA_VERSION_V4, 0, 1, 0, 0},
+        {"schema-v5-conv1d-axis.tgrs", TIGRIS_SCHEMA_VERSION_V5, 0, 0, 1,
+         TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH},
     };
     const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
 
@@ -1168,6 +1173,22 @@ static void test_schema_compatibility_fixtures(void)
                            "schema fixture has expected quant metadata");
             TEST_ASSERT_EQ(plan.num_op_attributes, fixtures[i].op_attributes,
                            "schema fixture has expected operator attributes");
+            TEST_ASSERT_EQ(plan.header->num_tile_plans,
+                           fixtures[i].tile_plans,
+                           "schema fixture has expected tile plans");
+            if (fixtures[i].tile_plans > 0) {
+                TEST_ASSERT_EQ(plan.tile_plans[0].axis,
+                               fixtures[i].tile_axis,
+                               "schema fixture has expected explicit tile axis");
+
+                size_t tile_offset =
+                    (const uint8_t *)plan.tile_plans - buf;
+                ((tigris_tile_plan_t *)(buf + tile_offset))->axis =
+                    TIGRIS_TILE_AXIS_WIDTH;
+                TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan),
+                               TIGRIS_ERR_BAD_SECTION,
+                               "unsupported v5 tile axis fails closed");
+            }
         }
         free(buf);
     }

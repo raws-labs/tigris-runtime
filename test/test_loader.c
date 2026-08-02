@@ -911,6 +911,234 @@ static void test_operator_semantic_guards(void)
                    TIGRIS_ERR_BAD_TENSOR, "model output flag mismatch rejected");
 }
 
+/* Compact one-op plans for exercising the loader's non-weighted operator
+ * decision table. Keeping these plans in memory makes every condition
+ * reproducible without generated fixtures or a compiler checkout. */
+#define SEMANTIC_PLAN_SIZE    289u
+#define SEMANTIC_TENSORS_OFF  112u
+#define SEMANTIC_OPS_OFF      160u
+#define SEMANTIC_STAGES_OFF   200u
+#define SEMANTIC_INDEX_OFF    228u
+#define SEMANTIC_SHAPES_OFF   240u
+#define SEMANTIC_STRINGS_OFF  288u
+
+static void semantic_set_shape(
+    uint8_t *buf, uint16_t tensor_index, uint8_t ndim,
+    int32_t d0, int32_t d1, int32_t d2, int32_t d3)
+{
+    tigris_tensor_t *tensor =
+        &((tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF))[tensor_index];
+    int32_t *shape = (int32_t *)(buf + SEMANTIC_SHAPES_OFF) + 4u * tensor_index;
+    const int32_t dims[4] = {d0, d1, d2, d3};
+    uint32_t elements = 1;
+    tensor->ndim = ndim;
+    for (uint8_t i = 0; i < 4; i++) {
+        shape[i] = dims[i];
+        if (i < ndim)
+            elements *= (uint32_t)dims[i];
+    }
+    tensor->size_bytes = elements * sizeof(float);
+}
+
+static void build_semantic_plan(
+    uint8_t *buf, tigris_op_type_t op_type, uint8_t num_inputs)
+{
+    memset(buf, 0, SEMANTIC_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = SEMANTIC_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 3;
+    hdr->num_ops = 1;
+    hdr->num_stages = 1;
+    hdr->model_io_off = 3;
+    hdr->num_model_inputs = 1;
+    hdr->num_model_outputs = 1;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, SEMANTIC_TENSORS_OFF};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, SEMANTIC_OPS_OFF};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, SEMANTIC_STAGES_OFF};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, SEMANTIC_INDEX_OFF};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, SEMANTIC_SHAPES_OFF};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, SEMANTIC_STRINGS_OFF};
+
+    tigris_tensor_t *tensors =
+        (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF);
+    for (uint16_t i = 0; i < 3; i++) {
+        tensors[i].shape_off = 4u * i;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        semantic_set_shape(buf, i, 4, 1, 2, 2, 2);
+    }
+    tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    tensors[1].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+
+    tigris_op_t *op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->op_type = (uint8_t)op_type;
+    op->num_inputs = num_inputs;
+    op->num_outputs = 1;
+    op->inputs_off = 0;
+    op->outputs_off = 2;
+    op->weight_idx = TIGRIS_NO_WEIGHT;
+    op->bias_idx = TIGRIS_NO_WEIGHT;
+    op->spatial.kernel_h = 1;
+    op->spatial.kernel_w = 1;
+    op->spatial.stride_h = 1;
+    op->spatial.stride_w = 1;
+    op->spatial.dilation_h = 1;
+    op->spatial.dilation_w = 1;
+    op->spatial.group = 1;
+
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + SEMANTIC_STAGES_OFF);
+    stage->ops_off = 5;
+    stage->ops_count = 1;
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    uint16_t *indices = (uint16_t *)(buf + SEMANTIC_INDEX_OFF);
+    indices[0] = 0;
+    indices[1] = 2;
+    indices[2] = 1;
+    indices[3] = 0;
+    indices[4] = 1;
+    indices[5] = 0;
+    buf[SEMANTIC_STRINGS_OFF] = '\0';
+}
+
+static void test_nonweighted_operator_semantics(void)
+{
+    printf("  test_nonweighted_operator_semantics...\n");
+    _Alignas(4) uint8_t buf[SEMANTIC_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_op_t *op;
+
+    build_semantic_plan(buf, TIGRIS_OP_SOFTMAX, 1);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid Softmax loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_RESHAPE, 1);
+    semantic_set_shape(buf, 1, 2, 1, 8, 0, 0);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "equal-size Reshape loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_FLATTEN, 1);
+    semantic_set_shape(buf, 1, 2, 1, 8, 0, 0);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "equal-size Flatten loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_RESHAPE, 1);
+    semantic_set_shape(buf, 1, 2, 2, 8, 0, 0);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "size-changing Reshape rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_ADD, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid binary Add loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_MUL, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid binary Mul loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_ADD, 2);
+    semantic_set_shape(buf, 2, 4, 1, 1, 4, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "binary Add shape mismatch rejected");
+
+    for (int average = 0; average <= 1; average++) {
+        build_semantic_plan(
+            buf, average ? TIGRIS_OP_AVG_POOL : TIGRIS_OP_MAX_POOL, 1);
+        semantic_set_shape(buf, 0, 4, 1, 4, 4, 2);
+        semantic_set_shape(buf, 1, 4, 1, 2, 2, 2);
+        op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+        op->spatial.kernel_h = 2;
+        op->spatial.kernel_w = 2;
+        op->spatial.stride_h = 2;
+        op->spatial.stride_w = 2;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                       average ? "valid AveragePool loads" :
+                                 "valid MaxPool loads");
+    }
+
+    build_semantic_plan(buf, TIGRIS_OP_MAX_POOL, 1);
+    semantic_set_shape(buf, 0, 4, 1, 4, 4, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 2, 2);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.kernel_h = 2;
+    op->spatial.kernel_w = 2;
+    op->spatial.stride_h = 2;
+    op->spatial.stride_w = 2;
+    op->spatial.dilation_h = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "dilated pooling rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_AVG_POOL, 1);
+    semantic_set_shape(buf, 0, 4, 1, 4, 4, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 2, 2);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.kernel_h = 2;
+    op->spatial.kernel_w = 2;
+    op->spatial.stride_h = 2;
+    op->spatial.stride_w = 2;
+    op->spatial.pad_left = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "oversized pool padding rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_GLOBAL_AVG, 1);
+    semantic_set_shape(buf, 0, 4, 1, 4, 4, 2);
+    semantic_set_shape(buf, 1, 4, 1, 1, 1, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid GlobalAveragePool loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_GLOBAL_AVG, 1);
+    semantic_set_shape(buf, 0, 4, 1, 4, 4, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 1, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "non-global GlobalAveragePool output rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_CONCAT, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 2, 4);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid channel Concat loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_CONCAT, 2);
+    semantic_set_shape(buf, 2, 4, 1, 1, 4, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 2, 4);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "Concat spatial mismatch rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_CONCAT, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 2, 3);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "Concat channel sum rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_RESIZE, 1);
+    semantic_set_shape(buf, 0, 4, 1, 2, 3, 2);
+    semantic_set_shape(buf, 1, 4, 1, 4, 6, 2);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.stride_h = 2;
+    op->spatial.stride_w = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid integer Resize loads");
+
+    op->spatial.stride_h = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "zero Resize scale rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_RESIZE, 1);
+    semantic_set_shape(buf, 0, 4, 1, 2, 3, 2);
+    semantic_set_shape(buf, 1, 4, 1, 5, 6, 2);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.stride_h = 2;
+    op->spatial.stride_w = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "Resize geometry mismatch rejected");
+}
+
 static void test_convolution_semantic_guards(void)
 {
     printf("  test_convolution_semantic_guards...\n");
@@ -1218,6 +1446,7 @@ int main(int argc, char *argv[])
     test_cross_reference_guards();
     test_transpose_attribute_guards();
     test_operator_semantic_guards();
+    test_nonweighted_operator_semantics();
     test_convolution_semantic_guards();
 
     printf("\nSchema compatibility fixtures:\n");

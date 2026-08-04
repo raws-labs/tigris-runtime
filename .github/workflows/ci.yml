@@ -79,6 +79,36 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
 
+  static-analysis:
+    name: Static analysis and MISRA regression
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mutation-test the static-analysis checker
+        run: python3 scripts/check_static_analysis.py --self-test
+      - name: Fetch the exact reviewed Cppcheck source
+        env:
+          CPPCHECK_COMMIT: 904cfdcf774c44b17db789c8a212e2f1c69fc833
+        run: |
+          git init /tmp/cppcheck
+          git -C /tmp/cppcheck remote add origin https://github.com/cppcheck-opensource/cppcheck.git
+          git -C /tmp/cppcheck fetch --depth=1 origin "$CPPCHECK_COMMIT"
+          git -C /tmp/cppcheck checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/cppcheck rev-parse HEAD)" = "$CPPCHECK_COMMIT"
+      - name: Build pinned Cppcheck 2.21.1
+        run: >-
+          cmake -S /tmp/cppcheck -B /tmp/cppcheck-build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_GUI=OFF
+          -DBUILD_TESTING=OFF
+      - run: >-
+          cmake --build /tmp/cppcheck-build
+          --target cppcheck --parallel 2
+      - name: Enforce correctness and reviewed MISRA findings
+        run: >-
+          python3 scripts/check_static_analysis.py
+          --cppcheck /tmp/cppcheck-build/bin/cppcheck
+
   coverage:
     name: Deterministic runtime coverage
     runs-on: ubuntu-24.04

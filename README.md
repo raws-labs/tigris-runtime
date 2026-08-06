@@ -136,7 +136,7 @@ An external project can then consume the installed headers and library without
 depending on the TiGrIS source tree:
 
 ```cmake
-find_package(tigris_runtime 0.5 REQUIRED CONFIG)
+find_package(tigris_runtime 0.6 REQUIRED CONFIG)
 target_link_libraries(my_app PRIVATE tigris::runtime)
 ```
 

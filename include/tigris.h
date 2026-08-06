@@ -37,6 +37,7 @@ extern "C" {
 #define TIGRIS_SCHEMA_VERSION_MIN TIGRIS_SCHEMA_VERSION_V2
 #define TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES TIGRIS_SCHEMA_VERSION_V4
 #define TIGRIS_SCHEMA_VERSION_TILE_AXIS TIGRIS_SCHEMA_VERSION_V5
+#define TIGRIS_SCHEMA_VERSION_STAGE_TABLE_AUTHORITY TIGRIS_SCHEMA_VERSION_V5
 #define TIGRIS_QUANT_PAGE_ELEMS 65536u
 
 /* Section type IDs */
@@ -224,7 +225,7 @@ typedef struct {
     uint8_t     op_type;             /*  4: tigris_op_type_t */
     uint8_t     num_inputs;          /*  5 */
     uint8_t     num_outputs;         /*  6 */
-    uint8_t     stage;               /*  7: stage assignment */
+    uint8_t     stage;               /*  7: stage index (v2-v4); low-byte hint (v5+) */
     uint16_t    inputs_off;          /*  8: offset into index pool */
     uint16_t    outputs_off;         /* 10: offset into index pool */
     tigris_spatial_attrs_t spatial;  /* 12-29: spatial attributes (18 bytes, v2) */

@@ -789,7 +789,8 @@ tigris_error_t tigris_plan_load(
             !elements_ok(op->inputs_off, op->num_inputs, index_count) ||
             !elements_ok(op->outputs_off, op->num_outputs, index_count))
             return TIGRIS_ERR_BAD_SECTION;
-        if (hdr->num_stages && op->stage >= hdr->num_stages)
+        if (hdr->version < TIGRIS_SCHEMA_VERSION_STAGE_TABLE_AUTHORITY &&
+            hdr->num_stages && op->stage >= hdr->num_stages)
             return TIGRIS_ERR_BAD_SECTION;
         if ((op->weight_idx != TIGRIS_NO_WEIGHT &&
              op->weight_idx >= hdr->num_weights) ||
@@ -821,10 +822,14 @@ tigris_error_t tigris_plan_load(
         uint32_t attrs_data_len = section_ends[TIGRIS_SEC_OP_ATTRIBUTES] -
             attrs_data_off;
         uint16_t previous_op = 0;
+        uint8_t previous_attr_type = 0;
         for (uint16_t i = 0; i < candidate.num_op_attributes; i++) {
             const tigris_op_attribute_t *attr = &candidate.op_attributes[i];
             if (attr->op_index >= hdr->num_ops ||
-                (i > 0 && attr->op_index <= previous_op) ||
+                (i > 0 &&
+                 (attr->op_index < previous_op ||
+                  (attr->op_index == previous_op &&
+                   attr->type <= previous_attr_type))) ||
                 !bounds_ok(attr->data_offset, attr->data_len, attrs_data_len))
                 return TIGRIS_ERR_BAD_SECTION;
             const tigris_op_t *op = &candidate.ops[attr->op_index];
@@ -853,14 +858,20 @@ tigris_error_t tigris_plan_load(
                     return TIGRIS_ERR_BAD_SECTION;
             }
             previous_op = attr->op_index;
+            previous_attr_type = attr->type;
         }
         uint16_t attr_cursor = 0;
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
-            int has_attr = attr_cursor < candidate.num_op_attributes &&
-                candidate.op_attributes[attr_cursor].op_index == op_idx;
-            if (has_attr)
+            int has_transpose_perm = 0;
+            while (attr_cursor < candidate.num_op_attributes &&
+                   candidate.op_attributes[attr_cursor].op_index == op_idx) {
+                if (candidate.op_attributes[attr_cursor].type ==
+                    TIGRIS_OP_ATTR_TRANSPOSE_PERM)
+                    has_transpose_perm = 1;
                 attr_cursor++;
-            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE) != has_attr)
+            }
+            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE) !=
+                has_transpose_perm)
                 return TIGRIS_ERR_BAD_SECTION;
         }
     } else if (hdr->version >= TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES) {
@@ -999,7 +1010,14 @@ tigris_error_t tigris_plan_load(
              * omitting work or running the same operation more than once. */
             if (op_idx != next_scheduled_op)
                 return TIGRIS_ERR_BAD_SECTION;
-            if (candidate.ops[op_idx].stage != i)
+            /* In schema v5 the stage table is authoritative and the legacy
+             * operator byte is a canonical low-byte hint. This preserves the
+             * zero-copy v2-v4 record layout without imposing a 256-stage
+             * ceiling on larger v5 plans. */
+            if ((hdr->version < TIGRIS_SCHEMA_VERSION_STAGE_TABLE_AUTHORITY &&
+                 candidate.ops[op_idx].stage != i) ||
+                (hdr->version >= TIGRIS_SCHEMA_VERSION_STAGE_TABLE_AUTHORITY &&
+                 candidate.ops[op_idx].stage != (uint8_t)i))
                 return TIGRIS_ERR_BAD_OPERATOR;
             next_scheduled_op++;
         }

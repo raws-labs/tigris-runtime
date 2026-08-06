@@ -526,6 +526,111 @@ static void test_stage_schedule_guards(void)
                    TIGRIS_ERR_BAD_SECTION, "missing scheduled operation");
 }
 
+static uint32_t align4(uint32_t value)
+{
+    return (value + 3u) & ~3u;
+}
+
+static uint8_t *build_many_stage_plan(uint16_t stage_count, uint32_t *out_size)
+{
+    const uint32_t tensors_off = 104u;
+    const uint32_t ops_off = tensors_off + sizeof(tigris_tensor_t);
+    const uint32_t stages_off = align4(
+        ops_off + (uint32_t)stage_count * sizeof(tigris_op_t));
+    const uint32_t index_off = stages_off +
+        (uint32_t)stage_count * sizeof(tigris_stage_t);
+    const uint32_t index_count = (uint32_t)stage_count * 3u;
+    const uint32_t shapes_off = align4(
+        index_off + index_count * sizeof(uint16_t));
+    const uint32_t strings_off = shapes_off + sizeof(int32_t);
+    const uint32_t plan_size = strings_off + 1u;
+    uint8_t *buf = calloc(1, plan_size);
+    if (!buf)
+        return NULL;
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = plan_size;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 1;
+    hdr->num_ops = stage_count;
+    hdr->num_stages = stage_count;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, tensors_off};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, ops_off};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, stages_off};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, index_off};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, shapes_off};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, strings_off};
+
+    tigris_tensor_t *tensor = (tigris_tensor_t *)(buf + tensors_off);
+    tensor->size_bytes = sizeof(float);
+    tensor->ndim = 1;
+    tensor->dtype = 1;
+    tensor->quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    *(int32_t *)(buf + shapes_off) = 1;
+
+    tigris_op_t *ops = (tigris_op_t *)(buf + ops_off);
+    tigris_stage_t *stages = (tigris_stage_t *)(buf + stages_off);
+    uint16_t *indices = (uint16_t *)(buf + index_off);
+    for (uint16_t i = 0; i < stage_count; i++) {
+        ops[i].op_type = TIGRIS_OP_RELU;
+        ops[i].num_inputs = 1;
+        ops[i].num_outputs = 1;
+        ops[i].stage = (uint8_t)i;
+        ops[i].inputs_off = 2u * i;
+        ops[i].outputs_off = 2u * i + 1u;
+        ops[i].weight_idx = TIGRIS_NO_WEIGHT;
+        ops[i].bias_idx = TIGRIS_NO_WEIGHT;
+        stages[i].ops_off = (uint16_t)(2u * stage_count + i);
+        stages[i].ops_count = 1;
+        stages[i].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+        stages[i].chain_id = TIGRIS_NO_CHAIN;
+        indices[2u * stage_count + i] = i;
+    }
+
+    *out_size = plan_size;
+    return buf;
+}
+
+static void test_schema_v5_many_stage_schedule(void)
+{
+    printf("  test_schema_v5_many_stage_schedule...\n");
+    const uint16_t stage_count = 300;
+    uint32_t size = 0;
+    uint8_t *buf = build_many_stage_plan(stage_count, &size);
+    tigris_plan_t plan;
+
+    TEST_ASSERT(buf != NULL, "many-stage plan allocation");
+    if (!buf)
+        return;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_OK,
+                   "schema-v5 stage table supports more than 256 stages");
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    tigris_op_t *ops = (tigris_op_t *)(buf + dir[1].offset);
+    ops[stage_count - 1u].stage++;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "schema-v5 low-byte stage hint remains canonical");
+
+    free(buf);
+    buf = build_many_stage_plan(stage_count, &size);
+    TEST_ASSERT(buf != NULL, "legacy many-stage plan allocation");
+    if (!buf)
+        return;
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V4;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "schema-v4 retains its authoritative uint8 stage limit");
+    free(buf);
+}
+
 /* A compact valid compressed-weight plan.  It lets the loader tests exercise
  * block metadata without depending on generated model fixtures. */
 #define WEIGHT_BLOCK_PLAN_SIZE 191u
@@ -682,7 +787,7 @@ static void test_cross_reference_guards(void)
 /* A compact schema-v4 plan that carries the required Transpose permutation
  * attribute.  This exercises both the optional metadata section and the
  * loader's semantic validation before an executor can consume it. */
-#define TRANSPOSE_PLAN_SIZE      251u
+#define TRANSPOSE_PLAN_SIZE      259u
 #define TRANSPOSE_TENSORS_OFF    112u
 #define TRANSPOSE_OPS_OFF        144u
 #define TRANSPOSE_STAGES_OFF     182u
@@ -798,6 +903,19 @@ static void test_transpose_attribute_guards(void)
     ((tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u))->type = 99;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION, "unknown attribute type rejected");
+
+    build_transpose_plan(buf);
+    uint16_t two_attributes = 2;
+    memcpy(buf + TRANSPOSE_ATTRS_OFF, &two_attributes,
+           sizeof(two_attributes));
+    tigris_op_attribute_t *attrs = (tigris_op_attribute_t *)(
+        buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attrs[1] = attrs[0];
+    buf[TRANSPOSE_ATTR_DATA_OFF + sizeof(tigris_op_attribute_t)] = 1;
+    buf[TRANSPOSE_ATTR_DATA_OFF + sizeof(tigris_op_attribute_t) + 1u] = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "duplicate operator attribute type rejected");
 
     build_transpose_plan(buf);
     ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
@@ -1469,6 +1587,7 @@ int main(int argc, char *argv[])
     test_counted_sections_required();
     test_chain_limit_guards();
     test_stage_schedule_guards();
+    test_schema_v5_many_stage_schedule();
     test_compressed_block_guards();
     test_cross_reference_guards();
     test_transpose_attribute_guards();

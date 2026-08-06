@@ -376,6 +376,69 @@ static void test_binary_s8_contract(void)
                    -1, "unsupported quantized binary arity rejected");
 }
 
+static void test_tiled_rank3_binary_s8(void)
+{
+    printf("  test_tiled_rank3_binary_s8...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    int32_t shape[] = {1, 4, 2};
+    uint16_t t_a = add_tensor(&plan, "a", shape, 3, 3, 8, qp);
+    uint16_t t_b = add_tensor(&plan, "b", shape, 3, 3, 8, qp);
+    uint16_t t_y = add_tensor(&plan, "y", shape, 3, 3, 8, qp);
+    uint16_t inputs[] = {t_a, t_b};
+    uint16_t outputs[] = {t_y};
+
+    test_ops[0].op_type = TIGRIS_OP_ADD;
+    test_ops[0].num_inputs = 2;
+    test_ops[0].num_outputs = 1;
+    test_ops[0].inputs_off = add_indices(inputs, 2);
+    test_ops[0].outputs_off = add_indices(outputs, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[1024], slow[1024];
+    tigris_mem_t mem;
+    tigris_mem_init(
+        &mem, ptrs, test_header.num_tensors,
+        fast, sizeof(fast), slow, sizeof(slow));
+    const int8_t a[] = {1, 2, 3, 4, 50, 60, 70, 80};
+    const int8_t b[] = {2, -1, 3, 0, 1, 1, 1, 1};
+    const int8_t add_expected[] = {3, 1, 6, 4};
+    const int8_t mul_expected[] = {2, -2, 9, 0};
+    tigris_mem_alloc_fast(&mem, t_a, sizeof(a));
+    memcpy(ptrs[t_a], a, sizeof(a));
+    tigris_mem_alloc_fast(&mem, t_b, sizeof(b));
+    memcpy(ptrs[t_b], b, sizeof(b));
+    tigris_mem_alloc_fast(&mem, t_y, sizeof(a));
+    memset(ptrs[t_y], 0x55, sizeof(a));
+    mem.tile.active = 1;
+    mem.tile.out_h = 2;
+    mem.tile.out_w = 1;
+
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(
+                       &plan, &test_ops[0], 0, &mem, NULL),
+                   0, "tiled rank-3 Add succeeds");
+    TEST_ASSERT(memcmp(ptrs[t_y], add_expected, sizeof(add_expected)) == 0,
+                "tiled rank-3 Add processes the selected length range");
+    TEST_ASSERT(((int8_t *)ptrs[t_y])[4] == 0x55,
+                "tiled rank-3 Add does not process the full tensor");
+
+    memset(ptrs[t_y], 0x55, sizeof(a));
+    test_ops[0].op_type = TIGRIS_OP_MUL;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(
+                       &plan, &test_ops[0], 0, &mem, NULL),
+                   0, "tiled rank-3 Mul succeeds");
+    TEST_ASSERT(memcmp(ptrs[t_y], mul_expected, sizeof(mul_expected)) == 0,
+                "tiled rank-3 Mul processes the selected length range");
+    TEST_ASSERT(((int8_t *)ptrs[t_y])[4] == 0x55,
+                "tiled rank-3 Mul does not process the full tensor");
+}
+
 static void test_reshape_s8(void)
 {
     printf("  test_reshape_s8...\n");
@@ -991,6 +1054,7 @@ int main(void)
     test_relu6_s8();
     test_relu6_s8_rounds_ceiling();
     test_binary_s8_contract();
+    test_tiled_rank3_binary_s8();
     test_reshape_s8();
     test_conv2d_s8_per_tensor();
     test_conv2d_s8_v2();

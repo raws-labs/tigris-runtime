@@ -1245,6 +1245,23 @@ static void test_constant_binary_f32(void)
                 "scalar constant Add supports a tile");
     assert_f32_array(fx.output, add_scalar_expected,
                      "tiled scalar constant Add output");
+
+    /* NLC tiles use length and the final channel dimension, not NHWC width. */
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_ADD, &scalar, (uint32_t)sizeof(scalar));
+    fx.tensors[0].ndim = 3;
+    fx.tensors[1].ndim = 3;
+    fx.shapes[0] = fx.shapes[4] = 1;
+    fx.shapes[1] = fx.shapes[5] = 2;
+    fx.shapes[2] = fx.shapes[6] = 2;
+    fx.mem.tile.active = 1;
+    fx.mem.tile.out_h = 2;
+    fx.mem.tile.out_w = 99;  /* ignored for NLC */
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == 0,
+                "scalar constant Add supports a rank-3 tile");
+    assert_f32_array(fx.output, add_scalar_expected,
+                     "tiled rank-3 scalar constant Add output");
 }
 
 static void test_malformed_constant_binary_f32(void)

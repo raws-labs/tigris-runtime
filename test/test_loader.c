@@ -1409,6 +1409,33 @@ static void test_schema_compatibility_fixtures(void)
                                fixtures[i].tile_axis,
                                "schema fixture has expected explicit tile axis");
 
+                /* Exercise every rank-3 tile allow-list branch without
+                 * introducing another generated fixture. The Conv1D record's
+                 * weight metadata makes these opcode-only mutations invalid
+                 * operator records after their tile classification. */
+                size_t op_offset = (const uint8_t *)plan.ops - buf;
+                tigris_op_t *op = (tigris_op_t *)(buf + op_offset);
+                const uint8_t mutations[] = {
+                    TIGRIS_OP_RELU,
+                    TIGRIS_OP_RELU6,
+                    TIGRIS_OP_SIGMOID,
+                    TIGRIS_OP_TANH,
+                    TIGRIS_OP_ADD,
+                    TIGRIS_OP_MUL,
+                    TIGRIS_OP_CONCAT,
+                };
+                for (size_t m = 0;
+                     m < sizeof(mutations) / sizeof(mutations[0]); m++) {
+                    op->op_type = mutations[m];
+                    TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan),
+                                   TIGRIS_ERR_BAD_OPERATOR,
+                                   "malformed rank-3 tiled opcode fails closed");
+                }
+                op->op_type = TIGRIS_OP_CONV1D;
+                TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan),
+                               TIGRIS_OK,
+                               "restored rank-3 Conv1D fixture loads");
+
                 size_t tile_offset =
                     (const uint8_t *)plan.tile_plans - buf;
                 ((tigris_tile_plan_t *)(buf + tile_offset))->axis =

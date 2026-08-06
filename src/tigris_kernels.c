@@ -33,9 +33,10 @@ static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
         return tensor_numel(plan, tidx);
     const tigris_tensor_t *t = &plan->tensors[tidx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
-    /* NHWC: N * out_h * out_w * C */
+    /* Serialized activations are NHWC or NLC. */
+    uint32_t width = t->ndim == 4 ? (uint32_t)mem->tile.out_w : 1u;
     return (uint32_t)shape[0] * (uint32_t)mem->tile.out_h *
-           (uint32_t)mem->tile.out_w * (uint32_t)shape[3];
+           width * (uint32_t)shape[t->ndim - 1];
 }
 
 /** True when two tensor descriptors have the same logical shape. */
@@ -408,7 +409,7 @@ static int kern_binary_f32(
         !tensor_is_f32(plan, y_tensor) ||
         !tensor_shapes_equal(plan, a_tensor, y_tensor))
         return -1;
-    if (mem->tile.active && a_tensor->ndim != 4)
+    if (mem->tile.active && a_tensor->ndim != 3 && a_tensor->ndim != 4)
         return -1;
 
     const float *A = (const float *)tigris_mem_tensor_ptr(mem, a_idx);

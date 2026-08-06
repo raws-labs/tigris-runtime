@@ -103,6 +103,19 @@ static int op_has_plain_io(
            op->bias_idx == TIGRIS_NO_WEIGHT;
 }
 
+static int is_axis1_unary_pointwise_op(uint8_t type)
+{
+    return type == TIGRIS_OP_RELU ||
+           type == TIGRIS_OP_RELU6 ||
+           type == TIGRIS_OP_SIGMOID ||
+           type == TIGRIS_OP_TANH;
+}
+
+static int is_axis1_binary_pointwise_op(uint8_t type)
+{
+    return type == TIGRIS_OP_ADD || type == TIGRIS_OP_MUL;
+}
+
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     const tigris_file_header_t *hdr = plan->header;
@@ -1033,19 +1046,32 @@ tigris_error_t tigris_plan_load(
                         return TIGRIS_ERR_BAD_SECTION;
                 }
 
-                /* Schema v5 adds the rank-3 NLC length contract. Keep that
-                 * first slice deliberately narrow: one standalone Conv1D.
-                 * Rank-4 axis-1 stages retain the existing audited height
-                 * contract and are checked again by the executor allow-list. */
+                /* Schema v5 adds the rank-3 NLC length contract. Unary
+                 * pointwise ops may surround one Conv1D. Dynamic binary ops
+                 * remain pointwise-only: mixing an external binary operand
+                 * with a strided Conv1D can expose different length
+                 * resolutions. Rank-4 stages retain the existing audited
+                 * height contract and are checked again by the executor. */
                 if (rank == 3) {
+                    uint16_t conv_count = 0;
+                    uint16_t binary_count = 0;
                     if (hdr->version < TIGRIS_SCHEMA_VERSION_TILE_AXIS ||
-                        stage->chain_len != 0 ||
-                        stage->ops_count != 1 ||
-                        stage->inputs_count != 1 ||
-                        stage->outputs_count != 1 ||
-                        candidate.ops[
-                            candidate.index_pool[stage->ops_off]
-                        ].op_type != TIGRIS_OP_CONV1D)
+                        stage->chain_len != 0)
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                    for (uint16_t j = 0; j < stage->ops_count; j++) {
+                        uint8_t type = candidate.ops[
+                            candidate.index_pool[stage->ops_off + j]
+                        ].op_type;
+                        if (type == TIGRIS_OP_CONV1D) {
+                            conv_count++;
+                        } else if (is_axis1_binary_pointwise_op(type)) {
+                            binary_count++;
+                        } else if (!is_axis1_unary_pointwise_op(type)) {
+                            return TIGRIS_ERR_BAD_OPERATOR;
+                        }
+                    }
+                    if (conv_count > 1 ||
+                        (conv_count == 1 && binary_count > 0))
                         return TIGRIS_ERR_BAD_OPERATOR;
                 } else {
                     uint16_t spatial_count = 0;

@@ -118,6 +118,19 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_CONCAT;
 }
 
+static int is_axis1_unary_pointwise_op(uint8_t type)
+{
+    return type == TIGRIS_OP_RELU ||
+           type == TIGRIS_OP_RELU6 ||
+           type == TIGRIS_OP_SIGMOID ||
+           type == TIGRIS_OP_TANH;
+}
+
+static int is_axis1_binary_pointwise_op(uint8_t type)
+{
+    return type == TIGRIS_OP_ADD || type == TIGRIS_OP_MUL;
+}
+
 static int workspace_limits(
     const tigris_plan_t *plan, executor_workspace_limits_t *limits)
 {
@@ -370,11 +383,21 @@ static int stage_supports_axis1_tiling(
     int spatial_count = 0;
 
     if (rank == 3) {
-        return stage->chain_len == 0 &&
-               stage->ops_count == 1 &&
-               stage->inputs_count == 1 &&
-               stage->outputs_count == 1 &&
-               plan->ops[sops[0]].op_type == TIGRIS_OP_CONV1D;
+        int binary_count = 0;
+        if (stage->chain_len != 0)
+            return 0;
+        for (uint16_t j = 0; j < stage->ops_count; j++) {
+            uint8_t type = plan->ops[sops[j]].op_type;
+            if (type == TIGRIS_OP_CONV1D) {
+                spatial_count++;
+            } else if (is_axis1_binary_pointwise_op(type)) {
+                binary_count++;
+            } else if (!is_axis1_unary_pointwise_op(type)) {
+                return 0;
+            }
+        }
+        return spatial_count <= 1 &&
+               !(spatial_count == 1 && binary_count > 0);
     }
     if (rank != 4)
         return 0;

@@ -666,8 +666,8 @@ static int tile_probe_kernel(
 }
 
 static void run_height_tiling_contract_case(
-    uint8_t op_type, const int32_t output_shape[4],
-    tigris_exec_error_t expected)
+    uint8_t rank, uint8_t op_type, const int32_t output_shape[4],
+    uint32_t fast_size, tigris_exec_error_t expected)
 {
     tigris_file_header_t header;
     tigris_tensor_t tensors[2];
@@ -684,7 +684,7 @@ static void run_height_tiling_contract_case(
         1, /* model output */
     };
     int32_t shapes[] = {
-        1, 8, 8, 4,
+        1, 8, 8, rank == 3 ? 0 : 4,
         output_shape[0], output_shape[1], output_shape[2], output_shape[3],
     };
     tigris_plan_t plan;
@@ -704,6 +704,7 @@ static void run_height_tiling_contract_case(
     memset(&tile_plan, 0, sizeof(tile_plan));
     memset(&plan, 0, sizeof(plan));
 
+    header.version = TIGRIS_SCHEMA_VERSION;
     header.num_tensors = 2;
     header.num_ops = 1;
     header.num_stages = 1;
@@ -711,20 +712,25 @@ static void run_height_tiling_contract_case(
     header.num_model_inputs = 1;
     header.num_model_outputs = 1;
 
-    tensors[0].size_bytes = 1u * 8u * 8u * 4u;
+    tensors[0].size_bytes = rank == 3 ? 1u * 8u * 8u : 1u * 8u * 8u * 4u;
     tensors[0].shape_off = 0;
-    tensors[0].ndim = 4;
-    tensors[1].size_bytes =
-        (uint32_t)output_shape[0] * (uint32_t)output_shape[1] *
-        (uint32_t)output_shape[2] * (uint32_t)output_shape[3];
+    tensors[0].ndim = rank;
+    tensors[1].size_bytes = rank == 3
+        ? (uint32_t)output_shape[0] * (uint32_t)output_shape[1] *
+          (uint32_t)output_shape[2]
+        : (uint32_t)output_shape[0] * (uint32_t)output_shape[1] *
+          (uint32_t)output_shape[2] * (uint32_t)output_shape[3];
     tensors[1].shape_off = 4;
-    tensors[1].ndim = 4;
+    tensors[1].ndim = rank;
 
     op.op_type = op_type;
     op.num_inputs = 1;
     op.num_outputs = 1;
     op.inputs_off = 0;
     op.outputs_off = 1;
+    op.spatial.kernel_h = 1;
+    op.spatial.stride_h = 1;
+    op.spatial.dilation_h = 1;
 
     stage.ops_off = 2;
     stage.ops_count = 1;
@@ -736,6 +742,7 @@ static void run_height_tiling_contract_case(
     stage.chain_id = TIGRIS_NO_CHAIN;
 
     tile_plan.tileable = 1;
+    tile_plan.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
     tile_plan.tile_height = 1;
     tile_plan.num_tiles = 8;
     tile_plan.original_height = 8;
@@ -752,7 +759,7 @@ static void run_height_tiling_contract_case(
 
     TEST_ASSERT_EQ(
         tigris_mem_init(
-            &mem, ptrs, 2, fast, sizeof(fast), slow, sizeof(slow)),
+            &mem, ptrs, 2, fast, fast_size, slow, sizeof(slow)),
         TIGRIS_MEM_OK, "tiling-contract memory init");
     TEST_ASSERT_EQ(
         tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes),
@@ -782,13 +789,22 @@ static void test_exec_height_tiling_contract(void)
     const int32_t pointwise_shape[4] = {1, 8, 8, 4};
     const int32_t gap_shape[4] = {1, 1, 1, 4};
     const int32_t resize_shape[4] = {1, 16, 16, 4};
+    const int32_t rank3_shape[4] = {1, 8, 8, 0};
 
     run_height_tiling_contract_case(
-        TIGRIS_OP_RELU, pointwise_shape, TIGRIS_EXEC_OK);
+        4, TIGRIS_OP_RELU, pointwise_shape, 128, TIGRIS_EXEC_OK);
     run_height_tiling_contract_case(
-        TIGRIS_OP_GLOBAL_AVG, gap_shape, TIGRIS_EXEC_ERR_TILE);
+        4, TIGRIS_OP_GLOBAL_AVG, gap_shape, 128, TIGRIS_EXEC_ERR_TILE);
     run_height_tiling_contract_case(
-        TIGRIS_OP_RESIZE, resize_shape, TIGRIS_EXEC_ERR_TILE);
+        4, TIGRIS_OP_RESIZE, resize_shape, 128, TIGRIS_EXEC_ERR_TILE);
+    run_height_tiling_contract_case(
+        3, TIGRIS_OP_CONV1D, rank3_shape, 64, TIGRIS_EXEC_OK);
+    run_height_tiling_contract_case(
+        3, TIGRIS_OP_TANH, rank3_shape, 64, TIGRIS_EXEC_OK);
+    run_height_tiling_contract_case(
+        3, TIGRIS_OP_ADD, rank3_shape, 64, TIGRIS_EXEC_OK);
+    run_height_tiling_contract_case(
+        3, TIGRIS_OP_CONCAT, rank3_shape, 64, TIGRIS_EXEC_ERR_TILE);
 }
 
 typedef struct {

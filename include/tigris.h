@@ -29,9 +29,15 @@ extern "C" {
 
 #define TIGRIS_MAGIC           0x53524754  /* "TGRS" in little-endian */
 #define TIGRIS_MAGIC_BYTES     "TGRS"
-#define TIGRIS_SCHEMA_VERSION  4
+#define TIGRIS_SCHEMA_VERSION_V5 5
+#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V5
+#define TIGRIS_SCHEMA_VERSION_V4 4
 #define TIGRIS_SCHEMA_VERSION_V3 3
 #define TIGRIS_SCHEMA_VERSION_V2 2
+#define TIGRIS_SCHEMA_VERSION_MIN TIGRIS_SCHEMA_VERSION_V2
+#define TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES TIGRIS_SCHEMA_VERSION_V4
+#define TIGRIS_SCHEMA_VERSION_TILE_AXIS TIGRIS_SCHEMA_VERSION_V5
+#define TIGRIS_SCHEMA_VERSION_STAGE_TABLE_AUTHORITY TIGRIS_SCHEMA_VERSION_V5
 #define TIGRIS_QUANT_PAGE_ELEMS 65536u
 
 /* Section type IDs */
@@ -134,6 +140,11 @@ typedef enum {
 /* Sentinel: tile_plan_idx == 0xFFFF means no tile plan for this stage */
 #define TIGRIS_NO_TILE_PLAN     0xFFFF
 
+/* Serialized activation axes used by schema-v5 tile plans. */
+#define TIGRIS_TILE_AXIS_NONE             0
+#define TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH 1
+#define TIGRIS_TILE_AXIS_WIDTH            2
+
 /* Sentinel: chain_id == 0xFFFF means stage is not part of a chain */
 #define TIGRIS_NO_CHAIN         0xFFFF
 
@@ -214,7 +225,7 @@ typedef struct {
     uint8_t     op_type;             /*  4: tigris_op_type_t */
     uint8_t     num_inputs;          /*  5 */
     uint8_t     num_outputs;         /*  6 */
-    uint8_t     stage;               /*  7: stage assignment */
+    uint8_t     stage;               /*  7: stage index (v2-v4); low-byte hint (v5+) */
     uint16_t    inputs_off;          /*  8: offset into index pool */
     uint16_t    outputs_off;         /* 10: offset into index pool */
     tigris_spatial_attrs_t spatial;  /* 12-29: spatial attributes (18 bytes, v2) */
@@ -250,7 +261,7 @@ typedef struct {
  */
 typedef struct {
     uint8_t     tileable;           /*  0: 1=tileable, 0=not */
-    uint8_t     _pad0;              /*  1 */
+    uint8_t     axis;               /*  1: serialized activation axis (v5+) */
     uint16_t    tile_height;        /*  2 */
     uint16_t    num_tiles;          /*  4 */
     uint16_t    halo;               /*  6 */

@@ -103,6 +103,19 @@ static int op_has_plain_io(
            op->bias_idx == TIGRIS_NO_WEIGHT;
 }
 
+static int is_axis1_unary_pointwise_op(uint8_t type)
+{
+    return type == TIGRIS_OP_RELU ||
+           type == TIGRIS_OP_RELU6 ||
+           type == TIGRIS_OP_SIGMOID ||
+           type == TIGRIS_OP_TANH;
+}
+
+static int is_axis1_binary_pointwise_op(uint8_t type)
+{
+    return type == TIGRIS_OP_ADD || type == TIGRIS_OP_MUL;
+}
+
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     const tigris_file_header_t *hdr = plan->header;
@@ -400,9 +413,8 @@ tigris_error_t tigris_plan_load(
     if (memcmp(hdr->magic, TIGRIS_MAGIC_BYTES, 4) != 0)
         return TIGRIS_ERR_BAD_MAGIC;
 
-    if (hdr->version != TIGRIS_SCHEMA_VERSION &&
-        hdr->version != TIGRIS_SCHEMA_VERSION_V3 &&
-        hdr->version != TIGRIS_SCHEMA_VERSION_V2)
+    if (hdr->version < TIGRIS_SCHEMA_VERSION_MIN ||
+        hdr->version > TIGRIS_SCHEMA_VERSION)
         return TIGRIS_ERR_BAD_VERSION;
 
     if (hdr->file_size != buf_len)
@@ -543,6 +555,18 @@ tigris_error_t tigris_plan_load(
         if (!bounds_ok(off, need, section_ends[TIGRIS_SEC_TILE_PLANS]))
             return TIGRIS_ERR_BAD_SECTION;
         candidate.tile_plans = (const tigris_tile_plan_t *)(buf + off);
+        for (uint16_t i = 0; i < hdr->num_tile_plans; i++) {
+            const tigris_tile_plan_t *tile = &candidate.tile_plans[i];
+            if (tile->tileable > 1)
+                return TIGRIS_ERR_BAD_SECTION;
+            if (hdr->version >= TIGRIS_SCHEMA_VERSION_TILE_AXIS) {
+                if ((tile->tileable &&
+                     tile->axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) ||
+                    (!tile->tileable &&
+                     tile->axis != TIGRIS_TILE_AXIS_NONE))
+                    return TIGRIS_ERR_BAD_SECTION;
+            }
+        }
     }
 
     /* Weights (optional) */
@@ -572,9 +596,11 @@ tigris_error_t tigris_plan_load(
         candidate.weight_blocks_data = buf + off + 4 + entries_size;
     }
 
-    /* Per-operator attributes (optional, schema v4+). */
+    /* Per-operator attributes (optional, schema v4+). Compare against the
+     * feature's introduction version, not the latest schema: otherwise a
+     * future schema bump would accidentally make valid v4 plans fail. */
     if (section_offsets[TIGRIS_SEC_OP_ATTRIBUTES]) {
-        if (hdr->version < TIGRIS_SCHEMA_VERSION)
+        if (hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES)
             return TIGRIS_ERR_BAD_SECTION;
         uint32_t off = section_offsets[TIGRIS_SEC_OP_ATTRIBUTES];
         if (!bounds_ok(off, 4, section_ends[TIGRIS_SEC_OP_ATTRIBUTES]))
@@ -763,7 +789,8 @@ tigris_error_t tigris_plan_load(
             !elements_ok(op->inputs_off, op->num_inputs, index_count) ||
             !elements_ok(op->outputs_off, op->num_outputs, index_count))
             return TIGRIS_ERR_BAD_SECTION;
-        if (hdr->num_stages && op->stage >= hdr->num_stages)
+        if (hdr->version < TIGRIS_SCHEMA_VERSION_STAGE_TABLE_AUTHORITY &&
+            hdr->num_stages && op->stage >= hdr->num_stages)
             return TIGRIS_ERR_BAD_SECTION;
         if ((op->weight_idx != TIGRIS_NO_WEIGHT &&
              op->weight_idx >= hdr->num_weights) ||
@@ -781,7 +808,12 @@ tigris_error_t tigris_plan_load(
     }
 
     /* Attribute records are ordered and typed.  Validate their payloads
-     * against the referenced operators before any kernel can use them. */
+     * against the referenced operators before any kernel can use them.
+     *
+     * Schemas v2/v3 predate typed attributes and intentionally allowed custom
+     * dispatch callbacks to implement operators such as legacy Transpose,
+     * MatMul, and application opcodes. Preserve that structural-loader
+     * contract; schema v4 introduced the strict built-in semantic contract. */
     if (candidate.op_attributes) {
         uint32_t attrs_off = section_offsets[TIGRIS_SEC_OP_ATTRIBUTES];
         uint32_t attrs_data_off = attrs_off + 4u +
@@ -790,10 +822,14 @@ tigris_error_t tigris_plan_load(
         uint32_t attrs_data_len = section_ends[TIGRIS_SEC_OP_ATTRIBUTES] -
             attrs_data_off;
         uint16_t previous_op = 0;
+        uint8_t previous_attr_type = 0;
         for (uint16_t i = 0; i < candidate.num_op_attributes; i++) {
             const tigris_op_attribute_t *attr = &candidate.op_attributes[i];
             if (attr->op_index >= hdr->num_ops ||
-                (i > 0 && attr->op_index <= previous_op) ||
+                (i > 0 &&
+                 (attr->op_index < previous_op ||
+                  (attr->op_index == previous_op &&
+                   attr->type <= previous_attr_type))) ||
                 !bounds_ok(attr->data_offset, attr->data_len, attrs_data_len))
                 return TIGRIS_ERR_BAD_SECTION;
             const tigris_op_t *op = &candidate.ops[attr->op_index];
@@ -822,17 +858,23 @@ tigris_error_t tigris_plan_load(
                     return TIGRIS_ERR_BAD_SECTION;
             }
             previous_op = attr->op_index;
+            previous_attr_type = attr->type;
         }
         uint16_t attr_cursor = 0;
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
-            int has_attr = attr_cursor < candidate.num_op_attributes &&
-                candidate.op_attributes[attr_cursor].op_index == op_idx;
-            if (has_attr)
+            int has_transpose_perm = 0;
+            while (attr_cursor < candidate.num_op_attributes &&
+                   candidate.op_attributes[attr_cursor].op_index == op_idx) {
+                if (candidate.op_attributes[attr_cursor].type ==
+                    TIGRIS_OP_ATTR_TRANSPOSE_PERM)
+                    has_transpose_perm = 1;
                 attr_cursor++;
-            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE) != has_attr)
+            }
+            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE) !=
+                has_transpose_perm)
                 return TIGRIS_ERR_BAD_SECTION;
         }
-    } else {
+    } else if (hdr->version >= TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES) {
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
             if (candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE)
                 return TIGRIS_ERR_BAD_SECTION;
@@ -968,7 +1010,14 @@ tigris_error_t tigris_plan_load(
              * omitting work or running the same operation more than once. */
             if (op_idx != next_scheduled_op)
                 return TIGRIS_ERR_BAD_SECTION;
-            if (candidate.ops[op_idx].stage != i)
+            /* In schema v5 the stage table is authoritative and the legacy
+             * operator byte is a canonical low-byte hint. This preserves the
+             * zero-copy v2-v4 record layout without imposing a 256-stage
+             * ceiling on larger v5 plans. */
+            if ((hdr->version < TIGRIS_SCHEMA_VERSION_STAGE_TABLE_AUTHORITY &&
+                 candidate.ops[op_idx].stage != i) ||
+                (hdr->version >= TIGRIS_SCHEMA_VERSION_STAGE_TABLE_AUTHORITY &&
+                 candidate.ops[op_idx].stage != (uint8_t)i))
                 return TIGRIS_ERR_BAD_OPERATOR;
             next_scheduled_op++;
         }
@@ -981,15 +1030,103 @@ tigris_error_t tigris_plan_load(
                 return TIGRIS_ERR_BAD_SECTION;
         }
 
+        if (stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN) {
+            const tigris_tile_plan_t *tile =
+                &candidate.tile_plans[stage->tile_plan_idx];
+            uint8_t axis =
+                hdr->version >= TIGRIS_SCHEMA_VERSION_TILE_AXIS
+                    ? tile->axis
+                    : (tile->tileable
+                           ? TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH
+                           : TIGRIS_TILE_AXIS_NONE);
+            if (tile->tileable &&
+                axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) {
+                if (stage->inputs_count == 0 || stage->outputs_count == 0)
+                    return TIGRIS_ERR_BAD_SECTION;
+                uint16_t first_input =
+                    candidate.index_pool[stage->inputs_off];
+                uint16_t first_output =
+                    candidate.index_pool[stage->outputs_off];
+                uint8_t rank = candidate.tensors[first_input].ndim;
+                if ((rank != 3 && rank != 4) ||
+                    candidate.tensors[first_output].ndim != rank)
+                    return TIGRIS_ERR_BAD_SECTION;
+                for (uint16_t j = 0; j < stage->inputs_count; j++) {
+                    uint16_t tensor_idx =
+                        candidate.index_pool[stage->inputs_off + j];
+                    if (candidate.tensors[tensor_idx].ndim != rank)
+                        return TIGRIS_ERR_BAD_SECTION;
+                }
+                for (uint16_t j = 0; j < stage->outputs_count; j++) {
+                    uint16_t tensor_idx =
+                        candidate.index_pool[stage->outputs_off + j];
+                    if (candidate.tensors[tensor_idx].ndim != rank)
+                        return TIGRIS_ERR_BAD_SECTION;
+                }
+
+                /* Schema v5 adds the rank-3 NLC length contract. Unary
+                 * pointwise ops may surround one Conv1D. Dynamic binary ops
+                 * remain pointwise-only: mixing an external binary operand
+                 * with a strided Conv1D can expose different length
+                 * resolutions. Rank-4 stages retain the existing audited
+                 * height contract and are checked again by the executor. */
+                if (rank == 3) {
+                    uint16_t conv_count = 0;
+                    uint16_t binary_count = 0;
+                    if (hdr->version < TIGRIS_SCHEMA_VERSION_TILE_AXIS ||
+                        stage->chain_len != 0)
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                    for (uint16_t j = 0; j < stage->ops_count; j++) {
+                        uint8_t type = candidate.ops[
+                            candidate.index_pool[stage->ops_off + j]
+                        ].op_type;
+                        if (type == TIGRIS_OP_CONV1D) {
+                            conv_count++;
+                        } else if (is_axis1_binary_pointwise_op(type)) {
+                            binary_count++;
+                        } else if (!is_axis1_unary_pointwise_op(type)) {
+                            return TIGRIS_ERR_BAD_OPERATOR;
+                        }
+                    }
+                    if (conv_count > 1 ||
+                        (conv_count == 1 && binary_count > 0))
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                } else {
+                    uint16_t spatial_count = 0;
+                    for (uint16_t j = 0; j < stage->ops_count; j++) {
+                        uint8_t type = candidate.ops[
+                            candidate.index_pool[stage->ops_off + j]
+                        ].op_type;
+                        if (type == TIGRIS_OP_CONV ||
+                            type == TIGRIS_OP_DEPTHWISE ||
+                            type == TIGRIS_OP_MAX_POOL ||
+                            type == TIGRIS_OP_AVG_POOL) {
+                            spatial_count++;
+                        } else if (type != TIGRIS_OP_RELU &&
+                                   type != TIGRIS_OP_RELU6 &&
+                                   type != TIGRIS_OP_SIGMOID &&
+                                   type != TIGRIS_OP_TANH &&
+                                   type != TIGRIS_OP_ADD &&
+                                   type != TIGRIS_OP_MUL &&
+                                   type != TIGRIS_OP_CONCAT) {
+                            return TIGRIS_ERR_BAD_OPERATOR;
+                        }
+                    }
+                    if (spatial_count > 1)
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                }
+            }
+        }
+
         if (stage->chain_len >= 2) {
             if (stage->chain_id == TIGRIS_NO_CHAIN ||
                 stage->chain_id >= hdr->num_stages ||
                 stage->chain_len > hdr->num_stages - stage->chain_id)
                 return TIGRIS_ERR_BAD_SECTION;
 
-            /* Chain execution stores spatial-op metadata in a fixed [8] array.
-             * Validate only the stage-op slice needed for that limit here; full
-             * plan cross-reference validation belongs to the hardening pass. */
+            /* Chain execution stores bounded spatial-op metadata in its
+             * caller-provided workspace. Validate the stage-op slice and the
+             * audited height-stripe operator contract before execution. */
             uint32_t pool_off = section_offsets[TIGRIS_SEC_INDEX_POOL];
             uint32_t prefix = (uint32_t)stage->ops_off * sizeof(uint16_t);
             uint32_t bytes = (uint32_t)stage->ops_count * sizeof(uint16_t);
@@ -1007,10 +1144,21 @@ tigris_error_t tigris_plan_load(
                     return TIGRIS_ERR_BAD_SECTION;
 
                 uint8_t op_type = candidate.ops[op_idx].op_type;
-                if (op_type == TIGRIS_OP_CONV || op_type == TIGRIS_OP_DEPTHWISE) {
+                if (op_type == TIGRIS_OP_CONV ||
+                    op_type == TIGRIS_OP_DEPTHWISE ||
+                    op_type == TIGRIS_OP_MAX_POOL ||
+                    op_type == TIGRIS_OP_AVG_POOL) {
                     spatial_count++;
                     if (spatial_count > TIGRIS_MAX_SPATIAL_OPS_PER_STAGE)
                         return TIGRIS_ERR_PLAN_LIMITS;
+                } else if (op_type != TIGRIS_OP_RELU &&
+                           op_type != TIGRIS_OP_RELU6 &&
+                           op_type != TIGRIS_OP_SIGMOID &&
+                           op_type != TIGRIS_OP_TANH &&
+                           op_type != TIGRIS_OP_ADD &&
+                           op_type != TIGRIS_OP_MUL &&
+                           op_type != TIGRIS_OP_CONCAT) {
+                    return TIGRIS_ERR_BAD_OPERATOR;
                 }
             }
         }
@@ -1049,9 +1197,11 @@ tigris_error_t tigris_plan_load(
         }
     }
 
-    tigris_error_t semantic_error = validate_operator_semantics(&candidate);
-    if (semantic_error != TIGRIS_OK)
-        return semantic_error;
+    if (hdr->version >= TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES) {
+        tigris_error_t semantic_error = validate_operator_semantics(&candidate);
+        if (semantic_error != TIGRIS_OK)
+            return semantic_error;
+    }
 
     *out_plan = candidate;
     return TIGRIS_OK;

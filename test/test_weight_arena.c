@@ -388,6 +388,27 @@ static void test_chain_oom_restores_state(void)
     TEST_ASSERT(fast_state_restored(&arena), "chain OOM restores caller state");
 }
 
+static void test_chain_rejects_unsafe_operator(void)
+{
+    printf("  test_chain_rejects_unsafe_operator...\n");
+    plan_fixture_t plan_fx;
+    arena_fixture_t arena;
+    kernel_ctx_t ctx = {0, -1};
+    build_chain_plan(&plan_fx);
+    plan_fx.ops[0].op_type = TIGRIS_OP_RESIZE;
+
+    TEST_ASSERT(init_arena(&arena, TEST_FAST_STORAGE_SIZE, 3),
+                "initialise unsafe-chain arena");
+    TEST_ASSERT(allocate_input(&arena, 0, 2), "allocate unsafe-chain input");
+    TEST_ASSERT_EQ(tigris_run(
+                       &plan_fx.plan, &arena.mem, test_kernel, &ctx, NULL),
+                   TIGRIS_EXEC_ERR_TILE,
+                   "shape-changing op is rejected from height chain");
+    TEST_ASSERT_EQ(ctx.calls, 0, "unsafe chain fails before kernel");
+    TEST_ASSERT(fast_state_restored(&arena),
+                "unsafe chain rejection restores caller state");
+}
+
 static void test_standalone_success_and_errors(void)
 {
     printf("  test_standalone_success_and_errors...\n");
@@ -434,6 +455,7 @@ int main(void)
     test_chain_success_and_repeat();
     test_standalone_stages_reclaim_between_groups();
     test_chain_oom_restores_state();
+    test_chain_rejects_unsafe_operator();
     test_standalone_success_and_errors();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

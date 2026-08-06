@@ -27,11 +27,14 @@ extern "C" {
  * malloc'd host buffer should use aligned_alloc(TIGRIS_TENSOR_ALIGN, ...). The
  * reference (s8/f32) kernels do not require this; only the opt backends do.
  *
+ * Structural bounds, cross-references, and tensor metadata are validated for
+ * every supported schema. Schema v4 and newer also receive strict built-in
+ * operator validation. Schema v2/v3 plans may use their historical
+ * custom-dispatch semantics and must be run with the matching dispatcher.
+ *
  * @param buf       Pointer to the loaded .tgrs file contents.
  * @param buf_len   Size of the buffer in bytes.
- * Structural bounds and cross-references, tensor metadata, and the executable
- * operator contract are validated before any pointers are returned. On every
- * failure, out_plan is cleared and contains no pointers into buf.
+ * On every failure, out_plan is cleared and contains no pointers into buf.
  *
  * @param out_plan  Output: parsed plan handle, or an empty handle on failure.
  * @return TIGRIS_OK on success, negative error code on failure.

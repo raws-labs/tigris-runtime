@@ -478,12 +478,33 @@ static void test_chain_limit_guards(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "eight chain spatial ops fit fixed metadata");
 
+    ops[7].op_type = TIGRIS_OP_AVG_POOL;
+    ops[7].weight_idx = TIGRIS_NO_WEIGHT;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "pool counts as supported chain spatial metadata");
+
     stages[0].ops_count = 9;
     stages[1].ops_off = 27;
     stages[1].ops_count = 0;
     ops[8].stage = 0;
+    ops[8].op_type = TIGRIS_OP_MAX_POOL;
+    ops[8].weight_idx = TIGRIS_NO_WEIGHT;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_PLAN_LIMITS, "ninth chain spatial op rejected");
+
+    build_staged_plan(buf);
+    stages = (tigris_stage_t *)(buf + STAGED_STAGES_OFF);
+    stages[0].chain_id = 0;
+    stages[0].chain_len = 2;
+    stages[0].chain_tile_h = 1;
+    stages[1].chain_id = 0;
+    stages[1].chain_len = 2;
+    ops = (tigris_op_t *)(buf + STAGED_OPS_OFF);
+    ops[0].op_type = TIGRIS_OP_GLOBAL_AVG;
+    ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "global reduction cannot enter height chain");
 }
 
 static void test_stage_schedule_guards(void)
@@ -503,6 +524,111 @@ static void test_stage_schedule_guards(void)
     stages[1].ops_count = 4;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION, "missing scheduled operation");
+}
+
+static uint32_t align4(uint32_t value)
+{
+    return (value + 3u) & ~3u;
+}
+
+static uint8_t *build_many_stage_plan(uint16_t stage_count, uint32_t *out_size)
+{
+    const uint32_t tensors_off = 104u;
+    const uint32_t ops_off = tensors_off + sizeof(tigris_tensor_t);
+    const uint32_t stages_off = align4(
+        ops_off + (uint32_t)stage_count * sizeof(tigris_op_t));
+    const uint32_t index_off = stages_off +
+        (uint32_t)stage_count * sizeof(tigris_stage_t);
+    const uint32_t index_count = (uint32_t)stage_count * 3u;
+    const uint32_t shapes_off = align4(
+        index_off + index_count * sizeof(uint16_t));
+    const uint32_t strings_off = shapes_off + sizeof(int32_t);
+    const uint32_t plan_size = strings_off + 1u;
+    uint8_t *buf = calloc(1, plan_size);
+    if (!buf)
+        return NULL;
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = plan_size;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 1;
+    hdr->num_ops = stage_count;
+    hdr->num_stages = stage_count;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, tensors_off};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, ops_off};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, stages_off};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, index_off};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, shapes_off};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, strings_off};
+
+    tigris_tensor_t *tensor = (tigris_tensor_t *)(buf + tensors_off);
+    tensor->size_bytes = sizeof(float);
+    tensor->ndim = 1;
+    tensor->dtype = 1;
+    tensor->quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    *(int32_t *)(buf + shapes_off) = 1;
+
+    tigris_op_t *ops = (tigris_op_t *)(buf + ops_off);
+    tigris_stage_t *stages = (tigris_stage_t *)(buf + stages_off);
+    uint16_t *indices = (uint16_t *)(buf + index_off);
+    for (uint16_t i = 0; i < stage_count; i++) {
+        ops[i].op_type = TIGRIS_OP_RELU;
+        ops[i].num_inputs = 1;
+        ops[i].num_outputs = 1;
+        ops[i].stage = (uint8_t)i;
+        ops[i].inputs_off = 2u * i;
+        ops[i].outputs_off = 2u * i + 1u;
+        ops[i].weight_idx = TIGRIS_NO_WEIGHT;
+        ops[i].bias_idx = TIGRIS_NO_WEIGHT;
+        stages[i].ops_off = (uint16_t)(2u * stage_count + i);
+        stages[i].ops_count = 1;
+        stages[i].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+        stages[i].chain_id = TIGRIS_NO_CHAIN;
+        indices[2u * stage_count + i] = i;
+    }
+
+    *out_size = plan_size;
+    return buf;
+}
+
+static void test_schema_v5_many_stage_schedule(void)
+{
+    printf("  test_schema_v5_many_stage_schedule...\n");
+    const uint16_t stage_count = 300;
+    uint32_t size = 0;
+    uint8_t *buf = build_many_stage_plan(stage_count, &size);
+    tigris_plan_t plan;
+
+    TEST_ASSERT(buf != NULL, "many-stage plan allocation");
+    if (!buf)
+        return;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_OK,
+                   "schema-v5 stage table supports more than 256 stages");
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    tigris_op_t *ops = (tigris_op_t *)(buf + dir[1].offset);
+    ops[stage_count - 1u].stage++;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "schema-v5 low-byte stage hint remains canonical");
+
+    free(buf);
+    buf = build_many_stage_plan(stage_count, &size);
+    TEST_ASSERT(buf != NULL, "legacy many-stage plan allocation");
+    if (!buf)
+        return;
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V4;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "schema-v4 retains its authoritative uint8 stage limit");
+    free(buf);
 }
 
 /* A compact valid compressed-weight plan.  It lets the loader tests exercise
@@ -661,7 +787,7 @@ static void test_cross_reference_guards(void)
 /* A compact schema-v4 plan that carries the required Transpose permutation
  * attribute.  This exercises both the optional metadata section and the
  * loader's semantic validation before an executor can consume it. */
-#define TRANSPOSE_PLAN_SIZE      251u
+#define TRANSPOSE_PLAN_SIZE      259u
 #define TRANSPOSE_TENSORS_OFF    112u
 #define TRANSPOSE_OPS_OFF        144u
 #define TRANSPOSE_STAGES_OFF     182u
@@ -777,6 +903,56 @@ static void test_transpose_attribute_guards(void)
     ((tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u))->type = 99;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION, "unknown attribute type rejected");
+
+    build_transpose_plan(buf);
+    uint16_t two_attributes = 2;
+    memcpy(buf + TRANSPOSE_ATTRS_OFF, &two_attributes,
+           sizeof(two_attributes));
+    tigris_op_attribute_t *attrs = (tigris_op_attribute_t *)(
+        buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attrs[1] = attrs[0];
+    buf[TRANSPOSE_ATTR_DATA_OFF + sizeof(tigris_op_attribute_t)] = 1;
+    buf[TRANSPOSE_ATTR_DATA_OFF + sizeof(tigris_op_attribute_t) + 1u] = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "duplicate operator attribute type rejected");
+
+    build_transpose_plan(buf);
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "v2 cannot claim the v4 attribute section");
+
+    /* v2/v3 plans predate typed attributes and may rely on the public custom
+     * dispatcher for legacy Transpose and application operators. The hardened
+     * loader must preserve that structural compatibility while v4 remains
+     * strict. */
+    build_transpose_plan(buf);
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(
+        buf + sizeof(tigris_file_header_t));
+    memset(&dir[6], 0, sizeof(dir[6]));
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "attribute-free v2 custom Transpose loads");
+
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "attribute-free v3 custom Transpose loads");
+
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "attribute-free v4 Transpose remains rejected");
+
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_UNKNOWN;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "v2 custom opcode loads for caller dispatcher");
+
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "v4 custom opcode remains fail-closed");
 }
 
 static void build_unary_plan(uint8_t *buf)
@@ -851,6 +1027,234 @@ static void test_operator_semantic_guards(void)
     tensors[1].flags = 0;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_TENSOR, "model output flag mismatch rejected");
+}
+
+/* Compact one-op plans for exercising the loader's non-weighted operator
+ * decision table. Keeping these plans in memory makes every condition
+ * reproducible without generated fixtures or a compiler checkout. */
+#define SEMANTIC_PLAN_SIZE    289u
+#define SEMANTIC_TENSORS_OFF  112u
+#define SEMANTIC_OPS_OFF      160u
+#define SEMANTIC_STAGES_OFF   200u
+#define SEMANTIC_INDEX_OFF    228u
+#define SEMANTIC_SHAPES_OFF   240u
+#define SEMANTIC_STRINGS_OFF  288u
+
+static void semantic_set_shape(
+    uint8_t *buf, uint16_t tensor_index, uint8_t ndim,
+    int32_t d0, int32_t d1, int32_t d2, int32_t d3)
+{
+    tigris_tensor_t *tensor =
+        &((tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF))[tensor_index];
+    int32_t *shape = (int32_t *)(buf + SEMANTIC_SHAPES_OFF) + 4u * tensor_index;
+    const int32_t dims[4] = {d0, d1, d2, d3};
+    uint32_t elements = 1;
+    tensor->ndim = ndim;
+    for (uint8_t i = 0; i < 4; i++) {
+        shape[i] = dims[i];
+        if (i < ndim)
+            elements *= (uint32_t)dims[i];
+    }
+    tensor->size_bytes = elements * sizeof(float);
+}
+
+static void build_semantic_plan(
+    uint8_t *buf, tigris_op_type_t op_type, uint8_t num_inputs)
+{
+    memset(buf, 0, SEMANTIC_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = SEMANTIC_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 3;
+    hdr->num_ops = 1;
+    hdr->num_stages = 1;
+    hdr->model_io_off = 3;
+    hdr->num_model_inputs = 1;
+    hdr->num_model_outputs = 1;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, SEMANTIC_TENSORS_OFF};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, SEMANTIC_OPS_OFF};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, SEMANTIC_STAGES_OFF};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, SEMANTIC_INDEX_OFF};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, SEMANTIC_SHAPES_OFF};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, SEMANTIC_STRINGS_OFF};
+
+    tigris_tensor_t *tensors =
+        (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF);
+    for (uint16_t i = 0; i < 3; i++) {
+        tensors[i].shape_off = 4u * i;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        semantic_set_shape(buf, i, 4, 1, 2, 2, 2);
+    }
+    tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    tensors[1].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+
+    tigris_op_t *op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->op_type = (uint8_t)op_type;
+    op->num_inputs = num_inputs;
+    op->num_outputs = 1;
+    op->inputs_off = 0;
+    op->outputs_off = 2;
+    op->weight_idx = TIGRIS_NO_WEIGHT;
+    op->bias_idx = TIGRIS_NO_WEIGHT;
+    op->spatial.kernel_h = 1;
+    op->spatial.kernel_w = 1;
+    op->spatial.stride_h = 1;
+    op->spatial.stride_w = 1;
+    op->spatial.dilation_h = 1;
+    op->spatial.dilation_w = 1;
+    op->spatial.group = 1;
+
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + SEMANTIC_STAGES_OFF);
+    stage->ops_off = 5;
+    stage->ops_count = 1;
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    uint16_t *indices = (uint16_t *)(buf + SEMANTIC_INDEX_OFF);
+    indices[0] = 0;
+    indices[1] = 2;
+    indices[2] = 1;
+    indices[3] = 0;
+    indices[4] = 1;
+    indices[5] = 0;
+    buf[SEMANTIC_STRINGS_OFF] = '\0';
+}
+
+static void test_nonweighted_operator_semantics(void)
+{
+    printf("  test_nonweighted_operator_semantics...\n");
+    _Alignas(4) uint8_t buf[SEMANTIC_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_op_t *op;
+
+    build_semantic_plan(buf, TIGRIS_OP_SOFTMAX, 1);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid Softmax loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_RESHAPE, 1);
+    semantic_set_shape(buf, 1, 2, 1, 8, 0, 0);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "equal-size Reshape loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_FLATTEN, 1);
+    semantic_set_shape(buf, 1, 2, 1, 8, 0, 0);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "equal-size Flatten loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_RESHAPE, 1);
+    semantic_set_shape(buf, 1, 2, 2, 8, 0, 0);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "size-changing Reshape rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_ADD, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid binary Add loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_MUL, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid binary Mul loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_ADD, 2);
+    semantic_set_shape(buf, 2, 4, 1, 1, 4, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "binary Add shape mismatch rejected");
+
+    for (int average = 0; average <= 1; average++) {
+        build_semantic_plan(
+            buf, average ? TIGRIS_OP_AVG_POOL : TIGRIS_OP_MAX_POOL, 1);
+        semantic_set_shape(buf, 0, 4, 1, 4, 4, 2);
+        semantic_set_shape(buf, 1, 4, 1, 2, 2, 2);
+        op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+        op->spatial.kernel_h = 2;
+        op->spatial.kernel_w = 2;
+        op->spatial.stride_h = 2;
+        op->spatial.stride_w = 2;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                       average ? "valid AveragePool loads" :
+                                 "valid MaxPool loads");
+    }
+
+    build_semantic_plan(buf, TIGRIS_OP_MAX_POOL, 1);
+    semantic_set_shape(buf, 0, 4, 1, 4, 4, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 2, 2);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.kernel_h = 2;
+    op->spatial.kernel_w = 2;
+    op->spatial.stride_h = 2;
+    op->spatial.stride_w = 2;
+    op->spatial.dilation_h = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "dilated pooling rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_AVG_POOL, 1);
+    semantic_set_shape(buf, 0, 4, 1, 4, 4, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 2, 2);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.kernel_h = 2;
+    op->spatial.kernel_w = 2;
+    op->spatial.stride_h = 2;
+    op->spatial.stride_w = 2;
+    op->spatial.pad_left = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "oversized pool padding rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_GLOBAL_AVG, 1);
+    semantic_set_shape(buf, 0, 4, 1, 4, 4, 2);
+    semantic_set_shape(buf, 1, 4, 1, 1, 1, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid GlobalAveragePool loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_GLOBAL_AVG, 1);
+    semantic_set_shape(buf, 0, 4, 1, 4, 4, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 1, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "non-global GlobalAveragePool output rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_CONCAT, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 2, 4);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid channel Concat loads");
+
+    build_semantic_plan(buf, TIGRIS_OP_CONCAT, 2);
+    semantic_set_shape(buf, 2, 4, 1, 1, 4, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 2, 4);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "Concat spatial mismatch rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_CONCAT, 2);
+    semantic_set_shape(buf, 1, 4, 1, 2, 2, 3);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "Concat channel sum rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_RESIZE, 1);
+    semantic_set_shape(buf, 0, 4, 1, 2, 3, 2);
+    semantic_set_shape(buf, 1, 4, 1, 4, 6, 2);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.stride_h = 2;
+    op->spatial.stride_w = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid integer Resize loads");
+
+    op->spatial.stride_h = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "zero Resize scale rejected");
+
+    build_semantic_plan(buf, TIGRIS_OP_RESIZE, 1);
+    semantic_set_shape(buf, 0, 4, 1, 2, 3, 2);
+    semantic_set_shape(buf, 1, 4, 1, 5, 6, 2);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.stride_h = 2;
+    op->spatial.stride_w = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "Resize geometry mismatch rejected");
 }
 
 static void test_convolution_semantic_guards(void)
@@ -1055,6 +1459,114 @@ static void test_fixture(const char *path)
     free(buf);
 }
 
+static void test_schema_compatibility_fixtures(void)
+{
+    /*
+     * Immutable compiler-emitted artifacts, selected to exercise the feature
+     * introduced by each supported schema:
+     *   v2 linear:   tigris b47664926e7a484d6638ecd0fd372da477236619
+     *   v3 QDQ Conv: tigris 0fe37d3a53292cf532ba8628d2284c00a896fbb2
+     *   v4 Transpose:tigris 208b322cab7f97c9960c63a8075944374fdfff2c
+     *   v5 Conv1D:   explicit serialized length axis
+     */
+    static const struct {
+        const char *filename;
+        uint32_t version;
+        uint16_t quant_params;
+        uint16_t op_attributes;
+        uint16_t tile_plans;
+        uint8_t tile_axis;
+    } fixtures[] = {
+        {"schema-v2-linear.tgrs", TIGRIS_SCHEMA_VERSION_V2, 0, 0, 0, 0},
+        {"schema-v3-qdq-conv.tgrs", TIGRIS_SCHEMA_VERSION_V3, 3, 0, 0, 0},
+        {"schema-v4-transpose.tgrs", TIGRIS_SCHEMA_VERSION_V4, 0, 1, 0, 0},
+        {"schema-v5-conv1d-axis.tgrs", TIGRIS_SCHEMA_VERSION_V5, 0, 0, 1,
+         TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH},
+    };
+    const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
+
+    printf("  test_schema_compatibility_fixtures...\n");
+    TEST_ASSERT_EQ(fixture_count,
+                   TIGRIS_SCHEMA_VERSION - TIGRIS_SCHEMA_VERSION_MIN + 1u,
+                   "every supported schema has a fixed fixture");
+    for (size_t i = 0; i < fixture_count; i++) {
+        TEST_ASSERT_EQ(fixtures[i].version,
+                       TIGRIS_SCHEMA_VERSION_MIN + i,
+                       "schema fixture versions are contiguous");
+        char path[512];
+        int path_len = snprintf(path, sizeof(path), "%s/%s",
+                                TIGRIS_SCHEMA_COMPAT_DIR,
+                                fixtures[i].filename);
+        TEST_ASSERT(path_len > 0 && (size_t)path_len < sizeof(path),
+                    "schema fixture path fits");
+        if (path_len <= 0 || (size_t)path_len >= sizeof(path))
+            continue;
+
+        uint32_t buf_len = 0;
+        uint8_t *buf = load_file(path, &buf_len);
+        TEST_ASSERT(buf != NULL, "schema fixture is readable");
+        if (!buf)
+            continue;
+
+        tigris_plan_t plan;
+        tigris_error_t err = tigris_plan_load(buf, buf_len, &plan);
+        TEST_ASSERT_EQ(err, TIGRIS_OK, "schema fixture loads");
+        if (err == TIGRIS_OK) {
+            TEST_ASSERT_EQ(plan.header->version, fixtures[i].version,
+                           "schema fixture has expected version");
+            TEST_ASSERT_EQ(plan.header->num_quant_params,
+                           fixtures[i].quant_params,
+                           "schema fixture has expected quant metadata");
+            TEST_ASSERT_EQ(plan.num_op_attributes, fixtures[i].op_attributes,
+                           "schema fixture has expected operator attributes");
+            TEST_ASSERT_EQ(plan.header->num_tile_plans,
+                           fixtures[i].tile_plans,
+                           "schema fixture has expected tile plans");
+            if (fixtures[i].tile_plans > 0) {
+                TEST_ASSERT_EQ(plan.tile_plans[0].axis,
+                               fixtures[i].tile_axis,
+                               "schema fixture has expected explicit tile axis");
+
+                /* Exercise every rank-3 tile allow-list branch without
+                 * introducing another generated fixture. The Conv1D record's
+                 * weight metadata makes these opcode-only mutations invalid
+                 * operator records after their tile classification. */
+                size_t op_offset = (const uint8_t *)plan.ops - buf;
+                tigris_op_t *op = (tigris_op_t *)(buf + op_offset);
+                const uint8_t mutations[] = {
+                    TIGRIS_OP_RELU,
+                    TIGRIS_OP_RELU6,
+                    TIGRIS_OP_SIGMOID,
+                    TIGRIS_OP_TANH,
+                    TIGRIS_OP_ADD,
+                    TIGRIS_OP_MUL,
+                    TIGRIS_OP_CONCAT,
+                };
+                for (size_t m = 0;
+                     m < sizeof(mutations) / sizeof(mutations[0]); m++) {
+                    op->op_type = mutations[m];
+                    TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan),
+                                   TIGRIS_ERR_BAD_OPERATOR,
+                                   "malformed rank-3 tiled opcode fails closed");
+                }
+                op->op_type = TIGRIS_OP_CONV1D;
+                TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan),
+                               TIGRIS_OK,
+                               "restored rank-3 Conv1D fixture loads");
+
+                size_t tile_offset =
+                    (const uint8_t *)plan.tile_plans - buf;
+                ((tigris_tile_plan_t *)(buf + tile_offset))->axis =
+                    TIGRIS_TILE_AXIS_WIDTH;
+                TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan),
+                               TIGRIS_ERR_BAD_SECTION,
+                               "unsupported v5 tile axis fails closed");
+            }
+        }
+        free(buf);
+    }
+}
+
 /* Main */
 
 int main(int argc, char *argv[])
@@ -1075,11 +1587,16 @@ int main(int argc, char *argv[])
     test_counted_sections_required();
     test_chain_limit_guards();
     test_stage_schedule_guards();
+    test_schema_v5_many_stage_schedule();
     test_compressed_block_guards();
     test_cross_reference_guards();
     test_transpose_attribute_guards();
     test_operator_semantic_guards();
+    test_nonweighted_operator_semantics();
     test_convolution_semantic_guards();
+
+    printf("\nSchema compatibility fixtures:\n");
+    test_schema_compatibility_fixtures();
 
     printf("\nStruct size tests:\n");
     test_struct_sizes();

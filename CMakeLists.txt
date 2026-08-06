@@ -24,7 +24,7 @@ if(COMMAND idf_component_register)
     return()
 endif()
 
-project(tigris_runtime VERSION 0.5.0 LANGUAGES C)
+project(tigris_runtime VERSION 0.6.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wvla)
@@ -94,7 +94,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     write_basic_package_version_file(
         "${CMAKE_CURRENT_BINARY_DIR}/tigris_runtimeConfigVersion.cmake"
         VERSION ${PROJECT_VERSION}
-        # TiGrIS is pre-1.0: keep compatibility within the 0.5.x release line.
+        # TiGrIS is pre-1.0: keep compatibility within the 0.6.x release line.
         COMPATIBILITY SameMinorVersion
     )
     install(FILES
@@ -118,6 +118,8 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_link_libraries(tigris_posix_example tigris_runtime)
 
     add_executable(test_loader test/test_loader.c)
+    target_compile_definitions(test_loader PRIVATE
+        TIGRIS_SCHEMA_COMPAT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/schema_compat")
     target_link_libraries(test_loader tigris_runtime)
 
     add_executable(test_executor test/test_executor.c)

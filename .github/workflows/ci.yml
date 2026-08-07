@@ -18,13 +18,22 @@ jobs:
           repository: raws-labs/tigris
           path: tigris-compiler
           ref: develop
-      - name: Use matching compiler branch when available
+      - name: Use matching compiler ref when available
         env:
           COMPILER_REF: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+          COMPILER_REF_TYPE: ${{ github.ref_type }}
         run: |
-          if git -C tigris-compiler ls-remote --exit-code --heads origin "$COMPILER_REF"; then
-            git -C tigris-compiler fetch --depth=1 origin "$COMPILER_REF"
+          if [ "$COMPILER_REF_TYPE" = "tag" ]; then
+            remote_ref="refs/tags/$COMPILER_REF"
+          else
+            remote_ref="refs/heads/$COMPILER_REF"
+          fi
+          if git -C tigris-compiler ls-remote --exit-code --refs origin "$remote_ref"; then
+            git -C tigris-compiler fetch --depth=1 origin "$remote_ref"
             git -C tigris-compiler checkout --detach FETCH_HEAD
+          elif [ "$COMPILER_REF_TYPE" = "tag" ]; then
+            echo "Compiler tag $COMPILER_REF must exist before the runtime release tag" >&2
+            exit 1
           fi
       - name: Compare runtime dispatch with the canonical matrix
         env:

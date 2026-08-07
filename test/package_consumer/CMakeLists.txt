@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(tigris_runtime_package_consumer LANGUAGES C)
 
-find_package(tigris_runtime 0.5 REQUIRED CONFIG)
+find_package(tigris_runtime 0.6 REQUIRED CONFIG)
 
 add_executable(tigris_runtime_package_consumer main.c)
 set_target_properties(tigris_runtime_package_consumer PROPERTIES

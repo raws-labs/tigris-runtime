@@ -156,6 +156,31 @@ static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
            width * (uint32_t)shape[t->ndim - 1];
 }
 
+/** Per-row element count for pointwise row-offset pointer arithmetic:
+ * the same width*channels term tile_aware_numel multiplies by out_h. */
+static uint32_t tile_row_elems(const tigris_plan_t *plan, uint16_t tidx,
+                               const tigris_mem_t *mem)
+{
+    const tigris_tensor_t *t = &plan->tensors[tidx];
+    const int32_t *shape = tigris_tensor_shape(plan, t);
+    uint32_t width = t->ndim == 4 ? (uint32_t)mem->tile.out_w : 1u;
+    return width * (uint32_t)shape[t->ndim - 1];
+}
+
+/** Shift a pointwise (height-preserving) kernel's input/output base pointers
+ * to the current sub-range: X by in_row_start rows, Y by out_row_start rows.
+ * No-op when tiling is inactive (both offsets are then 0). */
+static void apply_pointwise_row_offset_s8(
+    const tigris_plan_t *plan, uint16_t tidx, const tigris_mem_t *mem,
+    const int8_t **x, int8_t **y)
+{
+    if (!mem->tile.active)
+        return;
+    uint32_t row_elems = tile_row_elems(plan, tidx, mem);
+    *x += (size_t)mem->tile.in_row_start * row_elems;
+    *y += (size_t)mem->tile.out_row_start * row_elems;
+}
+
 /** Validate exact-shape, two-dynamic-input int8 elementwise operands. */
 static int binary_s8_io_is_valid(
     const tigris_plan_t *plan, const tigris_op_t *op, const tigris_mem_t *mem)
@@ -244,6 +269,8 @@ static int kern_conv2d_s8(
     int PL = op->spatial.pad_left;
     int DH = op->spatial.dilation_h ? op->spatial.dilation_h : 1;
     int DW = op->spatial.dilation_w ? op->spatial.dilation_w : 1;
+    int32_t out_row_start = 0;
+    int32_t in_row_start = 0;
 
     /* Tile override */
     if (mem->tile.active) {
@@ -252,16 +279,19 @@ static int kern_conv2d_s8(
         IW = mem->tile.in_w;
         OW = mem->tile.out_w;
         PT = mem->tile.pad_top;
+        out_row_start = mem->tile.out_row_start;
+        in_row_start  = mem->tile.in_row_start;
     }
 
     /* Weight layout: [OC, KH, KW, IC] - OHWI */
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
+            int oh_g = oh + out_row_start;
             for (int ow = 0; ow < OW; ow++) {
                 for (int oc = 0; oc < OC; oc++) {
                     int32_t acc = B ? load_bias_s32(B, (uint32_t)oc) : 0;
                     for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh * SH - PT + kh * DH;
+                        int ih = oh_g * SH - PT + kh * DH - in_row_start;
                         if (ih < 0 || ih >= IH) continue;
                         for (int kw = 0; kw < KW; kw++) {
                             int iw = ow * SW - PL + kw * DW;
@@ -278,7 +308,7 @@ static int kern_conv2d_s8(
                     int32_t m = out_qp ? get_multiplier(plan, out_qp, ch) : 1;
                     int32_t s = out_qp ? get_shift(plan, out_qp, ch) : 0;
                     int32_t scaled = multiply_by_quantized_multiplier(acc, m, s);
-                    Y[((n*OH+oh)*OW+ow)*OC+oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
+                    Y[((n*OH+oh_g)*OW+ow)*OC+oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
                 }
             }
         }
@@ -381,6 +411,8 @@ static int kern_depthwise_conv2d_s8(
     int PL = op->spatial.pad_left;
     int DH = op->spatial.dilation_h ? op->spatial.dilation_h : 1;
     int DW = op->spatial.dilation_w ? op->spatial.dilation_w : 1;
+    int32_t out_row_start = 0;
+    int32_t in_row_start = 0;
 
     if (mem->tile.active) {
         IH = mem->tile.in_h;
@@ -388,16 +420,19 @@ static int kern_depthwise_conv2d_s8(
         IW = mem->tile.in_w;
         OW = mem->tile.out_w;
         PT = mem->tile.pad_top;
+        out_row_start = mem->tile.out_row_start;
+        in_row_start  = mem->tile.in_row_start;
     }
 
     /* Weight layout: [KH, KW, C] (HWC) */
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
+            int oh_g = oh + out_row_start;
             for (int ow = 0; ow < OW; ow++) {
                 for (int c = 0; c < C; c++) {
                     int32_t acc = B ? load_bias_s32(B, (uint32_t)c) : 0;
                     for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh * SH - PT + kh * DH;
+                        int ih = oh_g * SH - PT + kh * DH - in_row_start;
                         if (ih < 0 || ih >= IH) continue;
                         for (int kw = 0; kw < KW; kw++) {
                             int iw = ow * SW - PL + kw * DW;
@@ -411,7 +446,7 @@ static int kern_depthwise_conv2d_s8(
                     int32_t m = out_qp ? get_multiplier(plan, out_qp, ch) : 1;
                     int32_t s = out_qp ? get_shift(plan, out_qp, ch) : 0;
                     int32_t scaled = multiply_by_quantized_multiplier(acc, m, s);
-                    Y[((n*OH+oh)*OW+ow)*C+c] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
+                    Y[((n*OH+oh_g)*OW+ow)*C+c] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
                 }
             }
         }
@@ -483,6 +518,7 @@ static int kern_relu_s8(
     int8_t zp = in_qp ? (int8_t)in_qp->zero_point : 0;
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++) {
         Y[i] = X[i] > zp ? X[i] : zp;
     }
@@ -509,6 +545,7 @@ static int kern_relu6_s8(
     int8_t hi = clamp_s8((int32_t)lroundf(6.0f / scale) + zp);  /* quantized 6 */
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++) {
         int8_t v = X[i];
         if (v < lo) v = lo;
@@ -561,6 +598,12 @@ static int kern_add_s8(
                        &y_mult, &y_shift);
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    if (mem->tile.active) {
+        uint32_t row_elems = tile_row_elems(plan, ins[0], mem);
+        A += (size_t)mem->tile.in_row_start * row_elems;
+        B_ptr += (size_t)mem->tile.in_row_start * row_elems;
+        Y += (size_t)mem->tile.out_row_start * row_elems;
+    }
     for (uint32_t i = 0; i < n; i++) {
         int32_t av = ((int32_t)A[i] - za) * (1 << LEFT_SHIFT);
         int32_t bv = ((int32_t)B_ptr[i] - zb) * (1 << LEFT_SHIFT);
@@ -673,6 +716,8 @@ static int kern_avg_pool_s8(
     int SW = op->spatial.stride_w ? op->spatial.stride_w : 1;
     int PT = op->spatial.pad_top;
     int PL = op->spatial.pad_left;
+    int32_t out_row_start = 0;
+    int32_t in_row_start = 0;
 
     if (mem->tile.active) {
         IH = mem->tile.in_h;
@@ -680,6 +725,8 @@ static int kern_avg_pool_s8(
         IW = mem->tile.in_w;
         OW = mem->tile.out_w;
         PT = mem->tile.pad_top;
+        out_row_start = mem->tile.out_row_start;
+        in_row_start  = mem->tile.in_row_start;
     }
     if (KH <= 0 || KW <= 0)
         return -1;
@@ -689,7 +736,8 @@ static int kern_avg_pool_s8(
      * divisor. */
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
-            int ih_base = oh * SH - PT;
+            int oh_g = oh + out_row_start;
+            int ih_base = oh_g * SH - PT - in_row_start;
             int kh_start = ih_base < 0 ? -ih_base : 0;
             int kh_end = KH;
             if (ih_base + kh_end > IH)
@@ -738,7 +786,7 @@ static int kern_avg_pool_s8(
                         else
                             q = (int32_t)quantized;
                     }
-                    Y[((n * OH + oh) * OW + ow) * C + c] =
+                    Y[((n * OH + oh_g) * OW + ow) * C + c] =
                         clamp_act(q, op->act_min, op->act_max);
                 }
             }
@@ -787,6 +835,8 @@ static int kern_max_pool_s8(
     int SW = op->spatial.stride_w ? op->spatial.stride_w : 1;
     int PT = op->spatial.pad_top;
     int PL = op->spatial.pad_left;
+    int32_t out_row_start = 0;
+    int32_t in_row_start = 0;
 
     if (mem->tile.active) {
         IH = mem->tile.in_h;
@@ -794,16 +844,19 @@ static int kern_max_pool_s8(
         IW = mem->tile.in_w;
         OW = mem->tile.out_w;
         PT = mem->tile.pad_top;
+        out_row_start = mem->tile.out_row_start;
+        in_row_start  = mem->tile.in_row_start;
     }
 
     /* Max preserves scale/zp - no requantization needed */
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
+            int oh_g = oh + out_row_start;
             for (int ow = 0; ow < OW; ow++) {
                 for (int c = 0; c < C; c++) {
                     int8_t max_val = -128;
                     for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh * SH - PT + kh;
+                        int ih = oh_g * SH - PT + kh - in_row_start;
                         if (ih < 0 || ih >= IH) continue;
                         for (int kw = 0; kw < KW; kw++) {
                             int iw = ow * SW - PL + kw;
@@ -814,7 +867,7 @@ static int kern_max_pool_s8(
                     }
                     /* Apply the fused activation clamp, as TFLM/CMSIS MaxPool do
                      * (no-op when act range is the full [-128, 127]). */
-                    Y[((n * OH + oh) * OW + ow) * C + c] =
+                    Y[((n * OH + oh_g) * OW + ow) * C + c] =
                         clamp_act(max_val, op->act_min, op->act_max);
                 }
             }
@@ -1104,6 +1157,12 @@ static int kern_mul_s8(
     float combined_scale = (sa * sb) / sy;
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    if (mem->tile.active) {
+        uint32_t row_elems = tile_row_elems(plan, ins[0], mem);
+        A += (size_t)mem->tile.in_row_start * row_elems;
+        B_ptr += (size_t)mem->tile.in_row_start * row_elems;
+        Y += (size_t)mem->tile.out_row_start * row_elems;
+    }
     for (uint32_t i = 0; i < n; i++) {
         float real_prod = (float)((int32_t)A[i] - za) *
                           (float)((int32_t)B_ptr[i] - zb) * combined_scale;

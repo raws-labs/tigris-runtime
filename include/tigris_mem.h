@@ -39,6 +39,15 @@ typedef struct {
     int32_t  out_h;        /* tile output H (core) */
     int32_t  in_w;         /* input W (same as full, for convenience) */
     int32_t  out_w;        /* output W */
+    /* New-row offsets for line-buffered chains: a kernel computes exactly
+     * out_h output rows, writing them starting at out_row_start in the
+     * (possibly larger, persistent) output buffer, and reading input rows
+     * starting at in_row_start in the input buffer handed to it. Both
+     * default to 0, which reduces every existing full-tile kernel call to
+     * today's behavior byte-for-byte. Set by the roll loop to skip
+     * recomputing already-rolled overlap rows. */
+    int32_t  out_row_start; /* rows already written before this call */
+    int32_t  in_row_start;  /* rows already consumed before this call */
 } tigris_tile_ctx_t;
 
 /* Tensor alignment */

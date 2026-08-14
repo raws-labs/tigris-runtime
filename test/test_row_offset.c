@@ -1168,6 +1168,719 @@ static void test_add_row_offset_s8(void)
         "add_s8 rows before out_row_start are untouched");
 }
 
+/* f32: Relu6 (unary pointwise, exercises both the low and high clamp) */
+
+static void test_relu6_row_offset_f32(void)
+{
+    printf("  test_relu6_row_offset_f32...\n");
+
+    enum { H = 8, W = 2, C = 1, K = 3 };
+
+    float X[H * W * C] = {
+        -3, 5, -1, 2, 4, 9, 0, 8, -2, 6, 1, -9, 3, -4, 7, -5
+    };
+
+    int32_t shape[] = {1, H, W, C};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 1;
+    tensors[1].shape_off = 0; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(X); tensors[1].dtype = 1;
+
+    int32_t shape_pool[4];
+    memcpy(shape_pool, shape, sizeof(shape));
+
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_RELU6;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+
+    void *ptrs[2];
+    float full_out[H * W * C];
+    float tiled_out[H * W * C];
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    memset(full_out, 0, sizeof(full_out));
+    ptrs[0] = X;
+    ptrs[1] = full_out;
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "relu6 full run dispatch returns 0");
+
+    memset(tiled_out, 0, sizeof(tiled_out));
+    ptrs[0] = X;
+    ptrs[1] = tiled_out;
+
+    mem.tile.active = 1;
+    mem.tile.out_h = H - K;
+    mem.tile.out_w = W;
+    mem.tile.out_row_start = K;
+    mem.tile.in_row_start = K;
+
+    ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "relu6 tiled run dispatch returns 0");
+
+    TEST_ASSERT(bytes_match(
+        full_out + (size_t)K * W * C, tiled_out + (size_t)K * W * C,
+        (size_t)(H - K) * W * C * sizeof(float)),
+        "relu6 sub-range rows byte-identical to full run");
+    TEST_ASSERT(bytes_all_zero(tiled_out, (size_t)K * W * C * sizeof(float)),
+        "relu6 rows before out_row_start are untouched");
+}
+
+/* f32: Sigmoid (unary pointwise) */
+
+static void test_sigmoid_row_offset_f32(void)
+{
+    printf("  test_sigmoid_row_offset_f32...\n");
+
+    enum { H = 8, W = 2, C = 1, K = 3 };
+
+    float X[H * W * C] = {
+        -3, 5, -1, 2, 4, -7, 0, 8, -2, 6, 1, -9, 3, -4, 7, -5
+    };
+
+    int32_t shape[] = {1, H, W, C};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 1;
+    tensors[1].shape_off = 0; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(X); tensors[1].dtype = 1;
+
+    int32_t shape_pool[4];
+    memcpy(shape_pool, shape, sizeof(shape));
+
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_SIGMOID;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+
+    void *ptrs[2];
+    float full_out[H * W * C];
+    float tiled_out[H * W * C];
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    memset(full_out, 0, sizeof(full_out));
+    ptrs[0] = X;
+    ptrs[1] = full_out;
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "sigmoid full run dispatch returns 0");
+
+    memset(tiled_out, 0, sizeof(tiled_out));
+    ptrs[0] = X;
+    ptrs[1] = tiled_out;
+
+    mem.tile.active = 1;
+    mem.tile.out_h = H - K;
+    mem.tile.out_w = W;
+    mem.tile.out_row_start = K;
+    mem.tile.in_row_start = K;
+
+    ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "sigmoid tiled run dispatch returns 0");
+
+    TEST_ASSERT(bytes_match(
+        full_out + (size_t)K * W * C, tiled_out + (size_t)K * W * C,
+        (size_t)(H - K) * W * C * sizeof(float)),
+        "sigmoid sub-range rows byte-identical to full run");
+    TEST_ASSERT(bytes_all_zero(tiled_out, (size_t)K * W * C * sizeof(float)),
+        "sigmoid rows before out_row_start are untouched");
+}
+
+/* f32: Tanh (unary pointwise) */
+
+static void test_tanh_row_offset_f32(void)
+{
+    printf("  test_tanh_row_offset_f32...\n");
+
+    enum { H = 8, W = 2, C = 1, K = 3 };
+
+    float X[H * W * C] = {
+        -3, 5, -1, 2, 4, -7, 0, 8, -2, 6, 1, -9, 3, -4, 7, -5
+    };
+
+    int32_t shape[] = {1, H, W, C};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 1;
+    tensors[1].shape_off = 0; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(X); tensors[1].dtype = 1;
+
+    int32_t shape_pool[4];
+    memcpy(shape_pool, shape, sizeof(shape));
+
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_TANH;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+
+    void *ptrs[2];
+    float full_out[H * W * C];
+    float tiled_out[H * W * C];
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    memset(full_out, 0, sizeof(full_out));
+    ptrs[0] = X;
+    ptrs[1] = full_out;
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "tanh full run dispatch returns 0");
+
+    memset(tiled_out, 0, sizeof(tiled_out));
+    ptrs[0] = X;
+    ptrs[1] = tiled_out;
+
+    mem.tile.active = 1;
+    mem.tile.out_h = H - K;
+    mem.tile.out_w = W;
+    mem.tile.out_row_start = K;
+    mem.tile.in_row_start = K;
+
+    ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "tanh tiled run dispatch returns 0");
+
+    TEST_ASSERT(bytes_match(
+        full_out + (size_t)K * W * C, tiled_out + (size_t)K * W * C,
+        (size_t)(H - K) * W * C * sizeof(float)),
+        "tanh sub-range rows byte-identical to full run");
+    TEST_ASSERT(bytes_all_zero(tiled_out, (size_t)K * W * C * sizeof(float)),
+        "tanh rows before out_row_start are untouched");
+}
+
+/* f32: Mul (binary pointwise, dynamic second input) */
+
+static void test_mul_row_offset_f32(void)
+{
+    printf("  test_mul_row_offset_f32...\n");
+
+    enum { H = 8, W = 2, C = 1, K = 2 };
+
+    float A[H * W * C];
+    float Bv[H * W * C];
+    for (int i = 0; i < H * W * C; i++) {
+        A[i] = (float)(i % 5) - 2.0f;
+        Bv[i] = (float)(i % 3) - 1.0f;
+    }
+
+    int32_t shape[] = {1, H, W, C};
+
+    tigris_tensor_t tensors[3];
+    memset(tensors, 0, sizeof(tensors));
+    for (int i = 0; i < 3; i++) {
+        tensors[i].shape_off = 0; tensors[i].ndim = 4;
+        tensors[i].size_bytes = sizeof(A); tensors[i].dtype = 1;
+    }
+
+    int32_t shape_pool[4];
+    memcpy(shape_pool, shape, sizeof(shape));
+
+    uint16_t index_pool[3] = {0, 1, 2};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_MUL;
+    op.num_inputs = 2; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 2;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 3; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+
+    void *ptrs[3];
+    float full_out[H * W * C];
+    float tiled_out[H * W * C];
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 3;
+
+    memset(full_out, 0, sizeof(full_out));
+    ptrs[0] = A;
+    ptrs[1] = Bv;
+    ptrs[2] = full_out;
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "mul full run dispatch returns 0");
+
+    memset(tiled_out, 0, sizeof(tiled_out));
+    ptrs[0] = A;
+    ptrs[1] = Bv;
+    ptrs[2] = tiled_out;
+
+    mem.tile.active = 1;
+    mem.tile.out_h = H - K;
+    mem.tile.out_w = W;
+    mem.tile.out_row_start = K;
+    mem.tile.in_row_start = K;
+
+    ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "mul tiled run dispatch returns 0");
+
+    TEST_ASSERT(bytes_match(
+        full_out + (size_t)K * W * C, tiled_out + (size_t)K * W * C,
+        (size_t)(H - K) * W * C * sizeof(float)),
+        "mul sub-range rows byte-identical to full run");
+    TEST_ASSERT(bytes_all_zero(tiled_out, (size_t)K * W * C * sizeof(float)),
+        "mul rows before out_row_start are untouched");
+}
+
+/* s8: Relu6 (unary pointwise, exercises both the low and high clamp) */
+
+static void test_relu6_row_offset_s8(void)
+{
+    printf("  test_relu6_row_offset_s8...\n");
+
+    enum { H = 8, W = 2, C = 1, K = 3 };
+
+    int8_t X[H * W * C] = {
+        -10, 0, 30, 80, -5, 20, 60, 90, -20, 10, 40, 70, -1, 5, 25, 50
+    };
+
+    /* scale=0.1, zp=0: quantized range [0, 60] (matches test_relu6_s8 in
+     * test_kernels_s8.c). */
+    tigris_quant_param_t qp[1];
+    memset(qp, 0, sizeof(qp));
+    qp[0].scale = 0.1f; qp[0].zero_point = 0; qp[0].num_channels = 1;
+
+    int32_t shape[] = {1, H, W, C};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 3;
+    tensors[0].quant_param_idx = 0;
+    tensors[1].shape_off = 0; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(X); tensors[1].dtype = 3;
+    tensors[1].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+
+    int32_t shape_pool[4];
+    memcpy(shape_pool, shape, sizeof(shape));
+
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_RELU6;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+    plan.quant_params = qp;
+    plan.num_quant_params = 1;
+
+    void *ptrs[2];
+    int8_t full_out[H * W * C];
+    int8_t tiled_out[H * W * C];
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    memset(full_out, 0, sizeof(full_out));
+    ptrs[0] = X;
+    ptrs[1] = full_out;
+    int ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "relu6_s8 full run dispatch returns 0");
+
+    memset(tiled_out, 0, sizeof(tiled_out));
+    ptrs[0] = X;
+    ptrs[1] = tiled_out;
+
+    mem.tile.active = 1;
+    mem.tile.out_h = H - K;
+    mem.tile.out_w = W;
+    mem.tile.out_row_start = K;
+    mem.tile.in_row_start = K;
+
+    ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "relu6_s8 tiled run dispatch returns 0");
+
+    TEST_ASSERT(bytes_match(
+        full_out + (size_t)K * W * C, tiled_out + (size_t)K * W * C,
+        (size_t)(H - K) * W * C),
+        "relu6_s8 sub-range rows byte-identical to full run");
+    TEST_ASSERT(bytes_all_zero(tiled_out, (size_t)K * W * C),
+        "relu6_s8 rows before out_row_start are untouched");
+}
+
+/* s8: Sigmoid (unary pointwise, 256-entry LUT). This is the kernel the
+ * reviewer found missing the offset fix - regression-guards it. */
+
+static void test_sigmoid_row_offset_s8(void)
+{
+    printf("  test_sigmoid_row_offset_s8...\n");
+
+    enum { H = 8, W = 2, C = 1, K = 3 };
+
+    int8_t X[H * W * C] = {
+        -5, -2, 0, 10, 3, 7, -8, 1, 4, -3, 9, -6, 2, 5, -1, 8
+    };
+
+    tigris_quant_param_t qp[2];
+    memset(qp, 0, sizeof(qp));
+    qp[0].scale = 0.5f; qp[0].zero_point = -2; qp[0].num_channels = 1;
+    qp[1].scale = 1.0f / 256.0f; qp[1].zero_point = -128; qp[1].num_channels = 1;
+
+    int32_t shape[] = {1, H, W, C};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 3;
+    tensors[0].quant_param_idx = 0;
+    tensors[1].shape_off = 0; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(X); tensors[1].dtype = 3;
+    tensors[1].quant_param_idx = 1;
+
+    int32_t shape_pool[4];
+    memcpy(shape_pool, shape, sizeof(shape));
+
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_SIGMOID;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+    plan.quant_params = qp;
+    plan.num_quant_params = 2;
+
+    void *ptrs[2];
+    int8_t full_out[H * W * C];
+    int8_t tiled_out[H * W * C];
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    memset(full_out, 0, sizeof(full_out));
+    ptrs[0] = X;
+    ptrs[1] = full_out;
+    int ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "sigmoid_s8 full run dispatch returns 0");
+
+    memset(tiled_out, 0, sizeof(tiled_out));
+    ptrs[0] = X;
+    ptrs[1] = tiled_out;
+
+    mem.tile.active = 1;
+    mem.tile.out_h = H - K;
+    mem.tile.out_w = W;
+    mem.tile.out_row_start = K;
+    mem.tile.in_row_start = K;
+
+    ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "sigmoid_s8 tiled run dispatch returns 0");
+
+    TEST_ASSERT(bytes_match(
+        full_out + (size_t)K * W * C, tiled_out + (size_t)K * W * C,
+        (size_t)(H - K) * W * C),
+        "sigmoid_s8 sub-range rows byte-identical to full run");
+    TEST_ASSERT(bytes_all_zero(tiled_out, (size_t)K * W * C),
+        "sigmoid_s8 rows before out_row_start are untouched");
+}
+
+/* s8: Tanh (unary pointwise, 256-entry LUT). Mirrors the sigmoid_s8 case
+ * that motivated this fix round. */
+
+static void test_tanh_row_offset_s8(void)
+{
+    printf("  test_tanh_row_offset_s8...\n");
+
+    enum { H = 8, W = 2, C = 1, K = 3 };
+
+    int8_t X[H * W * C] = {
+        -5, -2, 0, 10, 3, 7, -8, 1, 4, -3, 9, -6, 2, 5, -1, 8
+    };
+
+    tigris_quant_param_t qp[2];
+    memset(qp, 0, sizeof(qp));
+    qp[0].scale = 0.5f; qp[0].zero_point = -2; qp[0].num_channels = 1;
+    qp[1].scale = 1.0f / 128.0f; qp[1].zero_point = 0; qp[1].num_channels = 1;
+
+    int32_t shape[] = {1, H, W, C};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 3;
+    tensors[0].quant_param_idx = 0;
+    tensors[1].shape_off = 0; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(X); tensors[1].dtype = 3;
+    tensors[1].quant_param_idx = 1;
+
+    int32_t shape_pool[4];
+    memcpy(shape_pool, shape, sizeof(shape));
+
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_TANH;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+    plan.quant_params = qp;
+    plan.num_quant_params = 2;
+
+    void *ptrs[2];
+    int8_t full_out[H * W * C];
+    int8_t tiled_out[H * W * C];
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    memset(full_out, 0, sizeof(full_out));
+    ptrs[0] = X;
+    ptrs[1] = full_out;
+    int ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "tanh_s8 full run dispatch returns 0");
+
+    memset(tiled_out, 0, sizeof(tiled_out));
+    ptrs[0] = X;
+    ptrs[1] = tiled_out;
+
+    mem.tile.active = 1;
+    mem.tile.out_h = H - K;
+    mem.tile.out_w = W;
+    mem.tile.out_row_start = K;
+    mem.tile.in_row_start = K;
+
+    ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "tanh_s8 tiled run dispatch returns 0");
+
+    TEST_ASSERT(bytes_match(
+        full_out + (size_t)K * W * C, tiled_out + (size_t)K * W * C,
+        (size_t)(H - K) * W * C),
+        "tanh_s8 sub-range rows byte-identical to full run");
+    TEST_ASSERT(bytes_all_zero(tiled_out, (size_t)K * W * C),
+        "tanh_s8 rows before out_row_start are untouched");
+}
+
+/* s8: Mul (binary pointwise, two dynamic inputs) */
+
+static void test_mul_row_offset_s8(void)
+{
+    printf("  test_mul_row_offset_s8...\n");
+
+    enum { H = 8, W = 2, C = 1, K = 2 };
+
+    int8_t A[H * W * C];
+    int8_t Bv[H * W * C];
+    for (int i = 0; i < H * W * C; i++) {
+        A[i] = (int8_t)((i % 5) - 2);
+        Bv[i] = (int8_t)((i % 3) - 1);
+    }
+
+    tigris_quant_param_t qp[3];
+    memset(qp, 0, sizeof(qp));
+    qp[0].scale = 1.0f; qp[0].zero_point = 0; qp[0].num_channels = 1;
+    qp[1].scale = 1.0f; qp[1].zero_point = 0; qp[1].num_channels = 1;
+    qp[2].scale = 1.0f; qp[2].zero_point = 0; qp[2].num_channels = 1;
+
+    int32_t shape[] = {1, H, W, C};
+
+    tigris_tensor_t tensors[3];
+    memset(tensors, 0, sizeof(tensors));
+    for (int i = 0; i < 3; i++) {
+        tensors[i].shape_off = 0; tensors[i].ndim = 4;
+        tensors[i].size_bytes = sizeof(A); tensors[i].dtype = 3;
+        tensors[i].quant_param_idx = (uint16_t)i;
+    }
+
+    int32_t shape_pool[4];
+    memcpy(shape_pool, shape, sizeof(shape));
+
+    uint16_t index_pool[3] = {0, 1, 2};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_MUL;
+    op.num_inputs = 2; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 2;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 3; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+    plan.quant_params = qp;
+    plan.num_quant_params = 3;
+
+    void *ptrs[3];
+    int8_t full_out[H * W * C];
+    int8_t tiled_out[H * W * C];
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 3;
+
+    memset(full_out, 0, sizeof(full_out));
+    ptrs[0] = A;
+    ptrs[1] = Bv;
+    ptrs[2] = full_out;
+    int ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "mul_s8 full run dispatch returns 0");
+
+    memset(tiled_out, 0, sizeof(tiled_out));
+    ptrs[0] = A;
+    ptrs[1] = Bv;
+    ptrs[2] = tiled_out;
+
+    mem.tile.active = 1;
+    mem.tile.out_h = H - K;
+    mem.tile.out_w = W;
+    mem.tile.out_row_start = K;
+    mem.tile.in_row_start = K;
+
+    ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "mul_s8 tiled run dispatch returns 0");
+
+    TEST_ASSERT(bytes_match(
+        full_out + (size_t)K * W * C, tiled_out + (size_t)K * W * C,
+        (size_t)(H - K) * W * C),
+        "mul_s8 sub-range rows byte-identical to full run");
+    TEST_ASSERT(bytes_all_zero(tiled_out, (size_t)K * W * C),
+        "mul_s8 rows before out_row_start are untouched");
+}
+
 int main(void)
 {
     printf("TiGrIS Row Offset Tests\n\n");
@@ -1176,14 +1889,22 @@ int main(void)
     test_depthwise_conv2d_row_offset_f32();
     test_max_pool_row_offset_f32();
     test_relu_row_offset_f32();
+    test_relu6_row_offset_f32();
+    test_sigmoid_row_offset_f32();
+    test_tanh_row_offset_f32();
     test_add_row_offset_f32();
+    test_mul_row_offset_f32();
 
     test_conv2d_row_offset_s8();
     test_depthwise_conv2d_row_offset_s8();
     test_avg_pool_row_offset_s8();
     test_max_pool_row_offset_s8();
     test_relu_row_offset_s8();
+    test_relu6_row_offset_s8();
+    test_sigmoid_row_offset_s8();
+    test_tanh_row_offset_s8();
     test_add_row_offset_s8();
+    test_mul_row_offset_s8();
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);

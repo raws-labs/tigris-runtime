@@ -1014,6 +1014,7 @@ static int kern_sigmoid_s8(
     }
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++) {
         Y[i] = lut[(uint8_t)X[i]];
     }
@@ -1049,6 +1050,7 @@ static int kern_tanh_s8(
     }
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++) {
         Y[i] = lut[(uint8_t)X[i]];
     }

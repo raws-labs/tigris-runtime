@@ -34,6 +34,13 @@
 
 #define TILE_ALIGN_UP(x) (((x) + (TIGRIS_TENSOR_ALIGN - 1u)) & ~(TIGRIS_TENSOR_ALIGN - 1u))
 
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+/* Test-only: geometry of the most recently executed chain, so a test can
+ * assert tile-0 / interior / partial-last coverage. Never in shipping builds. */
+int32_t g_tigris_chain_tile_h = 0;
+int32_t g_tigris_chain_num_tiles = 0;
+#endif
+
 typedef struct {
     int32_t full_in_h;
     int32_t full_in_w;
@@ -68,6 +75,10 @@ typedef struct {
     int32_t *sp_tile_out_h;
     int32_t *sp_tile_pt;
     int32_t *sp_tile_pb;
+    int32_t *sp_tile_out_gs;   /* this tile: spatial-op output global row start */
+    int32_t *sp_tile_out_ge;   /* this tile: spatial-op output global row end */
+    int32_t *roll_prev_gs;     /* per op-output tensor: previous tile out start */
+    int32_t *roll_prev_ge;     /* per op-output tensor: previous tile out end */
     uint16_t *last_use_op;
     uint16_t *last_consumer;
     uint16_t tensor_capacity;
@@ -191,11 +202,15 @@ static size_t workspace_bytes_for_limits(
     if (total > SIZE_MAX - (TIGRIS_EXECUTOR_INT32_ALIGNMENT - 1u))
         return 0;
     total += TIGRIS_EXECUTOR_INT32_ALIGNMENT - 1u;
-    count = 14u + 11u * (size_t)limits->spatial_ops;
+    count = 14u + 13u * (size_t)limits->spatial_ops;
     if (limits->chain_stages != 0 &&
         count > SIZE_MAX / limits->chain_stages)
         return 0;
     count *= limits->chain_stages;
+    /* Plus two int32 line-buffer arrays indexed by op-output tensor. */
+    if (2u * (size_t)limits->tensors > SIZE_MAX - count)
+        return 0;
+    count += 2u * (size_t)limits->tensors;
     if (count > (SIZE_MAX - total) / sizeof(int32_t))
         return 0;
     total += count * sizeof(int32_t);
@@ -264,7 +279,19 @@ static int workspace_layout(
     TIGRIS_LAYOUT_SPATIAL_FIELD(sp_tile_out_h);
     TIGRIS_LAYOUT_SPATIAL_FIELD(sp_tile_pt);
     TIGRIS_LAYOUT_SPATIAL_FIELD(sp_tile_pb);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_tile_out_gs);
+    TIGRIS_LAYOUT_SPATIAL_FIELD(sp_tile_out_ge);
 #undef TIGRIS_LAYOUT_SPATIAL_FIELD
+
+    /* Line-buffer roll bookkeeping, indexed by op-output tensor. */
+#define TIGRIS_LAYOUT_TENSOR_I32_FIELD(field)                                  \
+    do {                                                                       \
+        workspace->field = (int32_t *)cursor;                                 \
+        cursor += (size_t)limits->tensors * sizeof(int32_t);                   \
+    } while (0)
+    TIGRIS_LAYOUT_TENSOR_I32_FIELD(roll_prev_gs);
+    TIGRIS_LAYOUT_TENSOR_I32_FIELD(roll_prev_ge);
+#undef TIGRIS_LAYOUT_TENSOR_I32_FIELD
 
     cursor = align_address(cursor, TIGRIS_EXECUTOR_UINT16_ALIGNMENT);
     workspace->last_use_op = (uint16_t *)cursor;
@@ -1184,11 +1211,21 @@ static tigris_exec_error_t exec_chain_tiled(
         in_slow_bases[i] = mem->tensor_ptrs[first_sin[i]];
 
     /* Line-buffered chain flag from the compiler (recomputing chain head).
-     * Read only for now: the roll that skips halo recompute using this
-     * flag is a later change, so this must not affect execution. */
+     * When set, each interior tile ROLLS every intermediate stage's overlap
+     * output rows to the front of a persistent buffer and computes only the
+     * new rows, instead of recomputing the full back-propagated range per tile.
+     * Gated so an unflagged chain runs the exact recompute path byte-for-byte.
+     *
+     * Preconditions the roll relies on (documented, not just asserted):
+     *  - chain_tile_h is constant across the run (a single value below);
+     *  - the fast arena is single-owner across the TIGRIS_PLATFORM_FEED_WDT()
+     *    yield between tiles, because the roll now depends on the persistent
+     *    buffers' BYTES surviving from one tile to the next, not merely on the
+     *    bump allocator handing back the same address;
+     *  - backend weight-decompression scratch is carved once, before the loop.
+     * Roll is only applied to rank-4, batch-1 op outputs (height tiling). */
     int line_buffered =
         (first_stage->_reserved1 & TIGRIS_STAGE_FLAG_LINE_BUFFERED) != 0;
-    (void)line_buffered;
 
     /* 3. Get chain tile height - use validated override (accounts for
      *    decompressed weights reducing available fast space) */
@@ -1197,6 +1234,95 @@ static tigris_exec_error_t exec_chain_tiled(
 
     int32_t num_tiles = (last_full_out_h + chain_tile_h - 1) / chain_tile_h;
     int32_t out_row_cursor = 0;
+
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+    g_tigris_chain_tile_h = chain_tile_h;
+    g_tigris_chain_num_tiles = num_tiles;
+#endif
+
+    /* Persistent fast bases for the last stage's spilled outputs. The spill
+     * repoints those tensors at slow each tile; the roll re-establishes them
+     * here so the next tile's kernels write back into the persistent buffer. */
+    void *roll_last_fast[TIGRIS_MAX_STAGE_OUTPUTS];
+
+    /* 3b. Line-buffered pre-allocation: allocate every chain op-output buffer
+     *     ONCE at its maximum (interior) tile height, so the buffers keep fixed
+     *     addresses and surviving content across tiles. The first-input load
+     *     and last-output spill continue to cycle above these persistent
+     *     buffers. Sizes mirror the budget-validation forward pass exactly, so
+     *     the reserved footprint equals the already-validated tile working set. */
+    if (line_buffered) {
+        if (last_stage->outputs_count > TIGRIS_MAX_STAGE_OUTPUTS)
+            return TIGRIS_EXEC_ERR_WORKSPACE;
+
+        /* Interior (unclamped) back-propagated heights for chain_tile_h. */
+        int32_t *s_out = workspace->s_out;
+        int32_t *s_in = workspace->s_in;
+        s_out[num_chain - 1] = chain_tile_h;
+        for (int c = num_chain - 1; c >= 0; c--) {
+            if (c < num_chain - 1)
+                s_out[c] = s_in[c + 1];
+            int32_t overlap = info[c].eff_kh - info[c].stride_h;
+            s_in[c] = s_out[c] * info[c].stride_h +
+                      (overlap > 0 ? overlap : 0);
+        }
+
+        for (uint16_t c = 0; c < num_chain; c++) {
+            int32_t cur_h = s_in[c];
+            int sp_j = 0;
+            const uint16_t *sops = tigris_stage_ops(plan, stages[c]);
+            for (uint16_t j = 0; j < stages[c]->ops_count; j++) {
+                const tigris_op_t *op = &plan->ops[sops[j]];
+                uint8_t ot = op->op_type;
+                if (is_height_spatial_op(ot) && sp_j < info[c].sp_count) {
+                    size_t spi = spatial_index(workspace, c, (uint16_t)sp_j);
+                    int32_t ekh = workspace->sp_eff_khs[spi];
+                    int32_t sh  = workspace->sp_strides[spi];
+                    int32_t pt  = workspace->sp_pad_tops[spi];
+                    cur_h = (cur_h + pt - ekh) / sh + 1;
+                    sp_j++;
+                }
+                const uint16_t *outs = tigris_op_outputs(plan, op);
+                for (uint8_t k = 0; k < op->num_outputs; k++) {
+                    uint16_t tidx = outs[k];
+                    const tigris_tensor_t *t = &plan->tensors[tidx];
+                    uint32_t bytes;
+                    if (t->ndim == 4) {
+                        const int32_t *sh = tigris_tensor_shape(plan, t);
+                        uint32_t numel = (uint32_t)sh[0] * (uint32_t)sh[1] *
+                                         (uint32_t)sh[2] * (uint32_t)sh[3];
+                        uint32_t elem = t->size_bytes / numel;
+                        bytes = (uint32_t)sh[0] * (uint32_t)cur_h *
+                                (uint32_t)sh[2] * (uint32_t)sh[3] * elem;
+                    } else {
+                        bytes = t->size_bytes;
+                    }
+                    tigris_mem_error_t merr =
+                        tigris_mem_alloc_fast(mem, tidx, bytes);
+                    if (merr != TIGRIS_MEM_OK) {
+                        TIGRIS_PLATFORM_DBG("MEM@%d f=%lu/%lu s=%lu/%lu\n",
+                            __LINE__,
+                            (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
+                            (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
+                        return TIGRIS_EXEC_ERR_MEM;
+                    }
+                }
+            }
+        }
+
+        /* Record last-stage output persistent bases for the post-spill restore. */
+        for (uint16_t oi = 0; oi < last_stage->outputs_count; oi++)
+            roll_last_fast[oi] = mem->tensor_ptrs[last_sout[oi]];
+
+        /* These buffers must survive tigris_mem_reset_fast between tiles. */
+        mem->fast_reserved = mem->fast_used;
+
+        /* Nothing rolled yet: clear the previous-tile bookkeeping. */
+        for (uint16_t i = 0; i < mem->num_tensors; i++) {
+            workspace->roll_prev_gs[i] = 0;
+            workspace->roll_prev_ge[i] = 0;
+        }
+    }
 
     /* 4. Tile loop - iterate over last stage's output tiles */
     for (int32_t tile = 0; tile < num_tiles; tile++) {
@@ -1227,6 +1353,11 @@ static tigris_exec_error_t exec_chain_tiled(
                     size_t spi = spatial_index(
                         workspace, (uint16_t)c, (uint16_t)j);
                     workspace->sp_tile_out_h[spi] = cur_oe - cur_os;
+                    /* Global output row range of this spatial op, before it is
+                     * back-propagated to the input range below. Consumed by the
+                     * line-buffer roll to size the per-op overlap. */
+                    workspace->sp_tile_out_gs[spi] = cur_os;
+                    workspace->sp_tile_out_ge[spi] = cur_oe;
 
                     int32_t sh  = workspace->sp_strides[spi];
                     int32_t ekh = workspace->sp_eff_khs[spi];
@@ -1312,6 +1443,40 @@ static tigris_exec_error_t exec_chain_tiled(
             int32_t cur_data_h = tile_in_h;
             int sp_j = 0;  /* next spatial op index within this stage */
 
+            /* Line-buffer roll gating for this stage on this tile. A stage may
+             * roll only on interior tiles where no spatial op was boundary
+             * clamped (top pad exists only in tile 0's head, bottom pad only in
+             * the last tile's tail) and where it contains no Concat (Concat does
+             * not honor the new-row offset contract). Otherwise every op in the
+             * stage full-computes, which also re-establishes its boundary rows. */
+            int stage_rollable = 0;
+            if (line_buffered && tile > 0) {
+                stage_rollable = 1;
+                for (int spx = 0; spx < info[c].sp_count; spx++) {
+                    size_t spi2 = spatial_index(workspace, c, (uint16_t)spx);
+                    if (workspace->sp_tile_pt[spi2] != 0 ||
+                        workspace->sp_tile_pb[spi2] != 0) {
+                        stage_rollable = 0;
+                        break;
+                    }
+                }
+                if (stage_rollable) {
+                    const uint16_t *csops = tigris_stage_ops(plan, st);
+                    for (uint16_t jj = 0; jj < st->ops_count; jj++) {
+                        if (plan->ops[csops[jj]].op_type == TIGRIS_OP_CONCAT) {
+                            stage_rollable = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            /* Global row range of the tensor currently flowing through the
+             * stage: the stage input range before the first spatial op, then
+             * each spatial op's output range. Drives the per-op roll overlap. */
+            int32_t run_gs = in_starts[c];
+            int32_t run_ge = in_ends[c];
+
             /* Alloc tile-sized op outputs in fast, run kernels */
             const uint16_t *sops = tigris_stage_ops(cplan, st);
             for (uint16_t j = 0; j < st->ops_count; j++) {
@@ -1337,9 +1502,11 @@ static tigris_exec_error_t exec_chain_tiled(
                 int32_t alloc_h = is_spatial
                     ? workspace->sp_tile_out_h[spi] : cur_data_h;
 
-                /* Allocate op output at correct tile height */
+                /* Allocate op output at correct tile height. Line-buffered
+                 * chains pre-allocated every op-output buffer once (persistent
+                 * across tiles), so skip the per-tile alloc and reuse those. */
                 const uint16_t *outs = tigris_op_outputs(cplan, op);
-                for (uint8_t k = 0; k < op->num_outputs; k++) {
+                for (uint8_t k = 0; !line_buffered && k < op->num_outputs; k++) {
                     uint16_t tidx = outs[k];
                     const tigris_tensor_t *t = &cplan->tensors[tidx];
                     if (t->ndim == 4) {
@@ -1372,17 +1539,87 @@ static tigris_exec_error_t exec_chain_tiled(
                     }
                 }
 
+                /* Line-buffer roll: this op's output global row range. Spatial
+                 * ops take their back-propagated output range; pointwise ops
+                 * preserve the range currently flowing through the stage. */
+                int32_t op_gs = is_spatial
+                    ? workspace->sp_tile_out_gs[spi] : run_gs;
+                int32_t op_ge = is_spatial
+                    ? workspace->sp_tile_out_ge[spi] : run_ge;
+
+                /* Full row count this op would compute without rolling; restored
+                 * after the kernel so a rolled op does not leak its narrowed
+                 * out_h into the next (e.g. a following pointwise op). */
+                int32_t op_full_out_h = mem->tile.out_h;
+
+                /* Default: full compute (offsets 0, byte-identical to the
+                 * recompute path). Roll only a rank-4, batch-1, single-output
+                 * op whose reconstructed height matches the tile context, so a
+                 * mismatch (e.g. a pointwise op ahead of the spatial op) safely
+                 * falls back to full compute. */
+                mem->tile.out_row_start = 0;
+                mem->tile.in_row_start  = 0;
+                if (line_buffered && stage_rollable && op->num_outputs == 1) {
+                    uint16_t otid = outs[0];
+                    const tigris_tensor_t *ot = &cplan->tensors[otid];
+                    int32_t existing_out_h = op_full_out_h;
+                    int32_t this_h = op_ge - op_gs;
+                    const int32_t *osh = tigris_tensor_shape(cplan, ot);
+                    if (ot->ndim == 4 && osh[0] == 1 && this_h == existing_out_h) {
+                        int32_t prev_gs = workspace->roll_prev_gs[otid];
+                        int32_t prev_ge = workspace->roll_prev_ge[otid];
+                        int32_t prev_h  = prev_ge - prev_gs;
+                        int32_t overlap = prev_ge - op_gs;
+                        if (overlap < 0) overlap = 0;
+                        if (overlap > this_h) overlap = this_h;
+                        if (overlap > prev_h) overlap = prev_h;
+                        if (overlap > 0) {
+                            /* Per-row byte stride is width*channels*elem, i.e.
+                             * size_bytes / (N*H); independent of tile height. */
+                            uint32_t row_bytes = ot->size_bytes /
+                                ((uint32_t)osh[0] * (uint32_t)osh[1]);
+                            int32_t src_row = op_gs - prev_gs; /* = prev_h - overlap */
+                            uint8_t *base = (uint8_t *)mem->tensor_ptrs[otid];
+                            /* Carry the overlap rows to the front, then compute
+                             * only the new rows after them. */
+                            memmove(base,
+                                    base + (size_t)src_row * row_bytes,
+                                    (size_t)overlap * row_bytes);
+                            mem->tile.out_row_start = overlap;
+                            mem->tile.in_row_start  = 0;
+                            mem->tile.out_h = existing_out_h - overlap;
+                        }
+                    }
+                }
+
+                /* Record this op's output range for the next tile's roll.
+                 * Done every op, every tile (including full-computed ops), so
+                 * the buffer always describes its current-tile content. */
+                if (op->num_outputs == 1) {
+                    workspace->roll_prev_gs[outs[0]] = op_gs;
+                    workspace->roll_prev_ge[outs[0]] = op_ge;
+                }
+
                 int kret = kernel(cplan, op, op_idx, mem, user_ctx);
                 if (kret != 0)
                     return TIGRIS_EXEC_ERR_KERNEL;
 
-                /* After spatial op: advance to next, update data height
-                 * and tile context for pointwise followers. */
+                /* Undo any roll narrowing so the next op sees this op's full
+                 * height and offsets 0 (a following pointwise op inherits this
+                 * out_h; a following spatial op overwrites it below). */
+                mem->tile.out_h        = op_full_out_h;
+                mem->tile.out_row_start = 0;
+                mem->tile.in_row_start  = 0;
+
+                /* After spatial op: advance to next, update data height,
+                 * running range, and tile context for pointwise followers. */
                 if (sp_j < info[c].sp_count &&
                     (int32_t)op_idx == workspace->sp_op_indices[spi]) {
                     cur_data_h = workspace->sp_tile_out_h[spi];
                     mem->tile.in_h = cur_data_h;
                     mem->tile.in_w = workspace->sp_full_out_ws[spi];
+                    run_gs = workspace->sp_tile_out_gs[spi];
+                    run_ge = workspace->sp_tile_out_ge[spi];
                     sp_j++;
                     /* Pre-set pad for next spatial op (if any) */
                     if (sp_j < info[c].sp_count) {
@@ -1408,6 +1645,12 @@ static tigris_exec_error_t exec_chain_tiled(
                     (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
                 return TIGRIS_EXEC_ERR_MEM;
             }
+            /* spill_tile repointed this tensor at slow; for a line-buffered
+             * chain, restore its persistent fast base so the next tile's last
+             * stage writes back into the surviving buffer. After the final
+             * tile leave it at slow, where the model output lives. */
+            if (line_buffered && tile + 1 < num_tiles)
+                mem->tensor_ptrs[tidx] = roll_last_fast[oi];
         }
 
         out_row_cursor += out_ends[num_chain - 1] - out_starts[num_chain - 1];

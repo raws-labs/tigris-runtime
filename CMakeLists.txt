@@ -125,6 +125,16 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(test_executor test/test_executor.c)
     target_link_libraries(test_executor tigris_runtime)
 
+    # Instrumented twin: same executor tests, but the runtime sources are
+    # compiled with TIGRIS_COUNT_KERNEL_ROWS so the line-buffered roll test can
+    # compare kernel output-row counts. Compiling the sources directly (rather
+    # than linking tigris_runtime) keeps the shipping library free of the
+    # test-only counter.
+    add_executable(test_executor_rows test/test_executor.c ${TIGRIS_RUNTIME_SRCS})
+    target_include_directories(test_executor_rows PRIVATE include)
+    target_compile_definitions(test_executor_rows PRIVATE TIGRIS_COUNT_KERNEL_ROWS)
+    target_link_libraries(test_executor_rows m)
+
     # This executable references only the explicit executor API. The legacy
     # wrapper lives in a separate archive member and must not add its second
     # workspace to the linked BSS.
@@ -216,6 +226,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     # contain the generated .tgrs model fixtures they require.
     add_test(NAME loader COMMAND test_loader)
     add_test(NAME executor COMMAND test_executor)
+    add_test(NAME executor_rows COMMAND test_executor_rows)
     add_test(NAME explicit_workspace_link COMMAND explicit_workspace_link_smoke)
     add_test(NAME kernels_f32 COMMAND test_kernels)
     add_test(NAME kernels_s8 COMMAND test_kernels_s8)

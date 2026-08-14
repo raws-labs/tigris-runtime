@@ -221,6 +221,20 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(tigris_contract_runner test/contract_runner.c)
     target_link_libraries(tigris_contract_runner tigris_runtime)
 
+    # Rows-instrumented twin of the contract runner: same source, but the
+    # runtime sources are compiled with TIGRIS_COUNT_KERNEL_ROWS so the gate can
+    # read kernel output-row counts and prove the line-buffered roll computes
+    # fewer rows than the recompute path. Compiling the sources directly (rather
+    # than linking tigris_runtime) keeps the shipping library and the default
+    # tigris_contract_runner free of the test-only counter. Also not a CTest
+    # case, for the same reason as the default runner.
+    add_executable(tigris_contract_runner_rows
+        test/contract_runner.c ${TIGRIS_RUNTIME_SRCS})
+    target_include_directories(tigris_contract_runner_rows PRIVATE include)
+    target_compile_definitions(tigris_contract_runner_rows PRIVATE
+        TIGRIS_COUNT_KERNEL_ROWS)
+    target_link_libraries(tigris_contract_runner_rows m)
+
     # Self-contained unit tests.  Fixture-driven executables are built above,
     # but are not registered here because a clean runtime checkout does not
     # contain the generated .tgrs model fixtures they require.

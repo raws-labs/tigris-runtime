@@ -16,6 +16,7 @@
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "tigris_executor.h"
+#include "tigris_kernels.h"
 
 /* Alignment helper */
 
@@ -577,6 +578,205 @@ static uint32_t total_tensor_bytes(const tigris_plan_t *plan)
     return total;
 }
 
+/*
+ * A minimal 2-stage streaming chain plan: AveragePool 3x3 stride 2 into
+ * MaxPool 3x3 stride 2, float32, input [1,1,64,64]. Compiled with the
+ * sibling compiler (feature/linebuffer-chains) at a 4K budget, which is
+ * small enough that detect_and_solve_chains() forms a real recomputing
+ * chain and sets STAGE_FLAG_LINE_BUFFERED on the head stage (stage 0).
+ * Used to exercise exec_chain_tiled's real execution path, not just
+ * workspace sizing. Regenerate with (from ../tigris, same branch):
+ *
+ *   python3 -c "
+ *   import sys; sys.path.insert(0, 'scripts')
+ *   from crossrepo_contract import _tiled_pool_chain_case
+ *   from tigris.cli import _run_pipeline
+ *   from tigris.emitters.binary.writer import emit_binary
+ *   import tempfile, onnx, os
+ *   case = _tiled_pool_chain_case()
+ *   with tempfile.TemporaryDirectory() as d:
+ *       p = os.path.join(d, 'm.onnx')
+ *       onnx.save(case.compile_model, p)
+ *       ag, _ = _run_pipeline(p, (case.mem_budget,))
+ *       emit_binary(ag, 'pool_chain.tgrs')
+ *   "
+ */
+static const uint8_t k_line_buffered_chain_plan[] = {
+    0x54, 0x47, 0x52, 0x53, 0x05, 0x00, 0x00, 0x00, 0xaf, 0x01, 0x00, 0x00,
+    0x30, 0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0xa0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x30, 0x01, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+    0x30, 0x01, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x50, 0x01, 0x00, 0x00,
+    0x07, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00,
+    0x00, 0x00, 0x04, 0x01, 0x02, 0xff, 0xff, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x00, 0x04, 0x00, 0x00, 0x04, 0x00, 0x04, 0x01, 0x04, 0xff, 0xff, 0x00,
+    0x0f, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x08, 0x00, 0x04, 0x01,
+    0x00, 0xff, 0xff, 0x00, 0x17, 0x00, 0x00, 0x00, 0x06, 0x01, 0x01, 0x00,
+    0x02, 0x00, 0x03, 0x00, 0x03, 0x03, 0x02, 0x02, 0x01, 0x00, 0x01, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0xff, 0xff,
+    0xff, 0xff, 0x00, 0x80, 0x7f, 0x00, 0x25, 0x00, 0x00, 0x00, 0x05, 0x01,
+    0x01, 0x01, 0x04, 0x00, 0x05, 0x00, 0x03, 0x03, 0x02, 0x02, 0x01, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x80, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x50, 0x00, 0x00, 0x06, 0x00, 0x01, 0x00, 0x07, 0x00, 0x01, 0x00,
+    0x08, 0x00, 0x01, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+    0x02, 0x00, 0x01, 0x00, 0x00, 0x14, 0x00, 0x00, 0x09, 0x00, 0x01, 0x00,
+    0x0a, 0x00, 0x01, 0x00, 0x0b, 0x00, 0x01, 0x00, 0xff, 0xff, 0x00, 0x00,
+    0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00,
+    0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00,
+    0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+    0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x6d, 0x00, 0x69, 0x6e, 0x70, 0x75, 0x74, 0x00, 0x6f, 0x75, 0x74, 0x70,
+    0x75, 0x74, 0x00, 0x61, 0x76, 0x65, 0x72, 0x61, 0x67, 0x65, 0x00, 0x41,
+    0x76, 0x65, 0x72, 0x61, 0x67, 0x65, 0x50, 0x6f, 0x6f, 0x6c, 0x5f, 0x30,
+    0x00, 0x4d, 0x61, 0x78, 0x50, 0x6f, 0x6f, 0x6c, 0x5f, 0x31, 0x00,
+};
+
+/**
+ * Run a loaded plan to completion with the real float32 reference kernels,
+ * filling model inputs with a deterministic non-constant pattern, and
+ * return a newly malloc'd copy of the concatenated model-output bytes
+ * (caller frees). On any failure, records a failed assertion and returns
+ * NULL with *out_len set to 0.
+ */
+static uint8_t *run_plan_capture_output(const tigris_plan_t *plan, uint32_t *out_len)
+{
+    *out_len = 0;
+
+    uint16_t nt = plan->header->num_tensors;
+    void **ptrs = (void **)calloc(nt, sizeof(void *));
+
+    uint32_t fast_size = plan->header->budget;
+    fast_size += tigris_weight_decompression_overhead(plan);
+    uint8_t *fast_buf = (uint8_t *)malloc(fast_size);
+
+    uint32_t slow_size = total_tensor_bytes(plan) * 2;
+    uint8_t *slow_buf = (uint8_t *)malloc(slow_size);
+
+    tigris_mem_t mem;
+    tigris_mem_error_t merr = tigris_mem_init(&mem, ptrs, nt,
+                                              fast_buf, fast_size,
+                                              slow_buf, slow_size);
+    TEST_ASSERT_EQ(merr, TIGRIS_MEM_OK, "run_plan_capture_output: mem init");
+
+    for (uint8_t i = 0; i < plan->header->num_model_inputs; i++) {
+        uint16_t tidx = plan->model_inputs[i];
+        merr = tigris_mem_alloc_slow(&mem, tidx, plan->tensors[tidx].size_bytes);
+        TEST_ASSERT_EQ(merr, TIGRIS_MEM_OK, "run_plan_capture_output: alloc input");
+
+        uint32_t num_floats = plan->tensors[tidx].size_bytes / sizeof(float);
+        float *data = (float *)ptrs[tidx];
+        for (uint32_t j = 0; j < num_floats; j++)
+            data[j] = ((float)(j % 17) - 8.0f) * 0.25f;
+    }
+
+    tigris_executor_workspace_t workspace;
+    tigris_exec_error_t eerr = tigris_run_with_workspace(
+        plan, &mem, tigris_dispatch_kernel, NULL, NULL, &workspace);
+    TEST_ASSERT_EQ(eerr, TIGRIS_EXEC_OK, "run_plan_capture_output: inference completed");
+
+    uint8_t *out = NULL;
+    if (eerr == TIGRIS_EXEC_OK) {
+        uint32_t total = 0;
+        for (uint8_t i = 0; i < plan->header->num_model_outputs; i++)
+            total += plan->tensors[plan->model_outputs[i]].size_bytes;
+        out = (uint8_t *)malloc(total);
+        uint32_t off = 0;
+        for (uint8_t i = 0; i < plan->header->num_model_outputs; i++) {
+            uint16_t tidx = plan->model_outputs[i];
+            memcpy(out + off, ptrs[tidx], plan->tensors[tidx].size_bytes);
+            off += plan->tensors[tidx].size_bytes;
+        }
+        *out_len = total;
+    }
+
+    free(ptrs);
+    free(fast_buf);
+    free(slow_buf);
+    return out;
+}
+
+/**
+ * Regression guard for the actual read site: run the SAME streaming chain
+ * plan bytes through exec_chain_tiled (via tigris_run_with_workspace) twice,
+ * once with the compiler-emitted line-buffered flag on the head stage and
+ * once with that single bit cleared, and assert the model output is
+ * byte-for-byte identical. This is what a future change that starts
+ * branching on `line_buffered` inside exec_chain_tiled without also
+ * updating this test would break - unlike
+ * test_exec_line_buffered_flag_is_noop_for_sizing() (workspace sizing
+ * only), this exercises the real tiled execution path the flag was read
+ * for.
+ */
+static void test_exec_chain_tiled_line_buffered_flag_is_noop(void)
+{
+    printf("  test_exec_chain_tiled_line_buffered_flag_is_noop...\n");
+
+    const size_t plan_len = sizeof(k_line_buffered_chain_plan);
+    uint8_t *buf_flagged = (uint8_t *)malloc(plan_len);
+    uint8_t *buf_cleared = (uint8_t *)malloc(plan_len);
+    memcpy(buf_flagged, k_line_buffered_chain_plan, plan_len);
+    memcpy(buf_cleared, k_line_buffered_chain_plan, plan_len);
+
+    tigris_plan_t plan_flagged;
+    tigris_error_t lerr = tigris_plan_load(buf_flagged, (uint32_t)plan_len, &plan_flagged);
+    TEST_ASSERT_EQ(lerr, TIGRIS_OK, "load flagged plan");
+    if (lerr != TIGRIS_OK) { free(buf_flagged); free(buf_cleared); return; }
+
+    TEST_ASSERT(plan_flagged.header->num_stages >= 2, "chain fixture has >=2 stages");
+    TEST_ASSERT_EQ(plan_flagged.stages[0].chain_len, 2, "chain length is 2");
+    TEST_ASSERT_EQ(plan_flagged.stages[0].chain_id, 0, "stage 0 is the chain head");
+    TEST_ASSERT((plan_flagged.stages[0]._reserved1 & TIGRIS_STAGE_FLAG_LINE_BUFFERED) != 0,
+                "fixture head stage carries the line-buffered flag as compiled");
+
+    /* Loader is zero-copy: plan.stages points directly into the loaded
+     * buffer, so this offset locates the exact byte to flip in the second
+     * copy. */
+    size_t reserved1_off =
+        (size_t)((const uint8_t *)&plan_flagged.stages[0]._reserved1 - buf_flagged);
+    TEST_ASSERT(reserved1_off + sizeof(uint16_t) <= plan_len, "reserved1 offset in bounds");
+    buf_cleared[reserved1_off] = (uint8_t)(buf_cleared[reserved1_off] &
+        ~(uint8_t)(TIGRIS_STAGE_FLAG_LINE_BUFFERED & 0xFFu));
+
+    tigris_plan_t plan_cleared;
+    lerr = tigris_plan_load(buf_cleared, (uint32_t)plan_len, &plan_cleared);
+    TEST_ASSERT_EQ(lerr, TIGRIS_OK, "load cleared plan");
+    if (lerr != TIGRIS_OK) { free(buf_flagged); free(buf_cleared); return; }
+    TEST_ASSERT_EQ(plan_cleared.stages[0]._reserved1 & TIGRIS_STAGE_FLAG_LINE_BUFFERED, 0,
+                   "flag bit cleared in second copy");
+
+    int diffs = 0;
+    for (size_t i = 0; i < plan_len; i++)
+        if (buf_flagged[i] != buf_cleared[i]) diffs++;
+    TEST_ASSERT_EQ(diffs, 1, "the two plan buffers differ in exactly one byte (the flag)");
+
+    uint32_t out_len_flagged = 0, out_len_cleared = 0;
+    uint8_t *out_flagged = run_plan_capture_output(&plan_flagged, &out_len_flagged);
+    uint8_t *out_cleared = run_plan_capture_output(&plan_cleared, &out_len_cleared);
+
+    TEST_ASSERT(out_flagged != NULL && out_cleared != NULL,
+                "both flagged and cleared runs produced output");
+    if (out_flagged && out_cleared) {
+        TEST_ASSERT_EQ(out_len_flagged, out_len_cleared, "output length matches");
+        TEST_ASSERT(out_len_flagged == out_len_cleared &&
+                    memcmp(out_flagged, out_cleared, out_len_flagged) == 0,
+                    "output bytes are identical with the flag set vs cleared");
+    }
+
+    free(out_flagged);
+    free(out_cleared);
+    free(buf_flagged);
+    free(buf_cleared);
+}
+
 /**
  * Run executor on a fixture: allocate model inputs in slow, fill with 0xAA,
  * run with stub kernel (fills outputs with 0x01), verify output is in slow.
@@ -1012,6 +1212,7 @@ int main(int argc, char *argv[])
     test_exec_workspace_contract();
     test_exec_workspace_chain_sizing();
     test_exec_line_buffered_flag_is_noop_for_sizing();
+    test_exec_chain_tiled_line_buffered_flag_is_noop();
     test_exec_height_tiling_contract();
     test_exec_compaction_preserves_data();
     test_exec_error_strings();

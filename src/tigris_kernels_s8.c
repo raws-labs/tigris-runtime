@@ -1185,6 +1185,12 @@ int tigris_dispatch_kernel_s8(
 {
     (void)user_ctx;
 
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+    extern unsigned long g_tigris_kernel_rows;
+    if (mem->tile.active)
+        g_tigris_kernel_rows += (unsigned long)mem->tile.out_h;
+#endif
+
     switch ((tigris_op_type_t)op->op_type) {
     case TIGRIS_OP_CONV:        return kern_conv2d_s8(plan, op, mem);
     case TIGRIS_OP_DEPTHWISE:   return kern_depthwise_conv2d_s8(plan, op, mem);

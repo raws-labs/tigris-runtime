@@ -12,6 +12,14 @@
 #include <math.h>
 #include <string.h>
 
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+/* Test-only instrumentation: total output rows computed across all kernel
+ * dispatches. Incremented by mem->tile.out_h per tiled dispatch so a test can
+ * compare the line-buffered roll (new rows only) against the recompute path
+ * (full back-propagated range every tile). Never compiled into shipping code. */
+unsigned long g_tigris_kernel_rows = 0;
+#endif
+
 /* Helpers */
 
 /** Total number of elements in a tensor. */
@@ -881,6 +889,11 @@ int tigris_dispatch_kernel(
     void                *user_ctx)
 {
     (void)user_ctx;
+
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+    if (mem->tile.active)
+        g_tigris_kernel_rows += (unsigned long)mem->tile.out_h;
+#endif
 
     switch ((tigris_op_type_t)op->op_type) {
     case TIGRIS_OP_CONV:        return kern_conv2d(plan, op, mem);

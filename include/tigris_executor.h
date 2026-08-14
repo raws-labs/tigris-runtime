@@ -100,8 +100,9 @@ typedef struct {
      ((size_t)(inputs) + (size_t)(outputs) +                                   \
       2u * (size_t)(chain_stages)) * sizeof(void *) +                          \
      (TIGRIS_EXECUTOR_INT32_ALIGNMENT - 1u) +                                  \
-     (size_t)(chain_stages) *                                                  \
-         (14u + 11u * (size_t)(spatial_ops)) * sizeof(int32_t) +               \
+     ((size_t)(chain_stages) *                                                 \
+          (14u + 13u * (size_t)(spatial_ops)) +                                \
+      2u * (size_t)(tensors)) * sizeof(int32_t) +                              \
      (TIGRIS_EXECUTOR_UINT16_ALIGNMENT - 1u) +                                 \
      2u * (size_t)(tensors) * sizeof(uint16_t))
 
@@ -114,10 +115,11 @@ typedef struct {
 #define TIGRIS_EXECUTOR_WORKSPACE_BYTES (                                      \
     64u +                                                                      \
     2u * TIGRIS_MAX_TENSORS * sizeof(uint16_t) +                               \
+    2u * TIGRIS_MAX_TENSORS * sizeof(int32_t) +                                \
     (TIGRIS_MAX_STAGE_INPUTS + TIGRIS_MAX_STAGE_OUTPUTS) * sizeof(void *) +     \
     TIGRIS_MAX_CHAIN_STAGES * (                                                \
         2u * sizeof(void *) +                                                  \
-        (14u + 11u * TIGRIS_MAX_SPATIAL_OPS_PER_STAGE) * sizeof(int32_t)))
+        (14u + 13u * TIGRIS_MAX_SPATIAL_OPS_PER_STAGE) * sizeof(int32_t)))
 #endif
 
 /** Caller-owned, naturally aligned executor working storage. */

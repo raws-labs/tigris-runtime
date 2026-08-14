@@ -503,6 +503,69 @@ static void test_exec_workspace_chain_sizing(void)
         "query includes pool in actual chain spatial capacity");
 }
 
+/**
+ * The compiler sets TIGRIS_STAGE_FLAG_LINE_BUFFERED on a recomputing chain's
+ * head stage. The runtime reads it in exec_chain_tiled but does not act on
+ * it yet (the roll is a later change). Confirm that setting the bit on the
+ * head stage's _reserved1 does not perturb workspace sizing, i.e. it is
+ * safely ignored by everything that currently looks at chain stages.
+ */
+static void test_exec_line_buffered_flag_is_noop_for_sizing(void)
+{
+    printf("  test_exec_line_buffered_flag_is_noop_for_sizing...\n");
+    tigris_file_header_t header;
+    tigris_op_t ops[3];
+    tigris_stage_t stages[2];
+    tigris_plan_t plan;
+    const uint16_t indices[] = {
+        0, 1,       /* stage 0 ops */
+        0, 1,       /* stage 0 inputs */
+        2,          /* stage 0 output */
+        2,          /* stage 1 op */
+        2,          /* stage 1 input */
+        2, 3, 4,    /* stage 1 outputs */
+    };
+
+    memset(&header, 0, sizeof(header));
+    memset(ops, 0, sizeof(ops));
+    memset(stages, 0, sizeof(stages));
+    memset(&plan, 0, sizeof(plan));
+    header.num_tensors = 5;
+    header.num_ops = 3;
+    header.num_stages = 2;
+    ops[0].op_type = TIGRIS_OP_CONV;
+    ops[1].op_type = TIGRIS_OP_AVG_POOL;
+    ops[2].op_type = TIGRIS_OP_CONV;
+    stages[0].ops_off = 0;
+    stages[0].ops_count = 2;
+    stages[0].inputs_off = 2;
+    stages[0].inputs_count = 2;
+    stages[0].outputs_off = 4;
+    stages[0].outputs_count = 1;
+    stages[0].chain_id = 0;
+    stages[0].chain_len = 2;
+    stages[1].ops_off = 5;
+    stages[1].ops_count = 1;
+    stages[1].inputs_off = 6;
+    stages[1].inputs_count = 1;
+    stages[1].outputs_off = 7;
+    stages[1].outputs_count = 3;
+    stages[1].chain_id = 0;
+    stages[1].chain_len = 2;
+    plan.header = &header;
+    plan.ops = ops;
+    plan.stages = stages;
+    plan.index_pool = indices;
+
+    uint32_t required_unset = tigris_executor_workspace_required(&plan);
+
+    stages[0]._reserved1 = TIGRIS_STAGE_FLAG_LINE_BUFFERED;
+    uint32_t required_set = tigris_executor_workspace_required(&plan);
+
+    TEST_ASSERT_EQ(required_set, required_unset,
+                   "line-buffered flag on head stage does not change workspace sizing");
+}
+
 /** Helper: compute sum of all non-constant tensor sizes for slow buffer sizing. */
 static uint32_t total_tensor_bytes(const tigris_plan_t *plan)
 {
@@ -948,6 +1011,7 @@ int main(int argc, char *argv[])
     test_exec_null_args();
     test_exec_workspace_contract();
     test_exec_workspace_chain_sizing();
+    test_exec_line_buffered_flag_is_noop_for_sizing();
     test_exec_height_tiling_contract();
     test_exec_compaction_preserves_data();
     test_exec_error_strings();

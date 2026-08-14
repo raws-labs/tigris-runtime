@@ -148,6 +148,13 @@ typedef enum {
 /* Sentinel: chain_id == 0xFFFF means stage is not part of a chain */
 #define TIGRIS_NO_CHAIN         0xFFFF
 
+/* Stage flags packed into the chain head stage's _reserved1 field.
+ * Set by the compiler when a recomputing chain's shared boundary rows
+ * are eligible to be kept in a line buffer instead of recomputed per
+ * tile. The runtime currently only reads this bit; the roll itself is
+ * a later change. */
+#define TIGRIS_STAGE_FLAG_LINE_BUFFERED 0x0001u
+
 /* Packed struct definitions */
 
 #pragma pack(push, 1)

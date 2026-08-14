@@ -1183,6 +1183,13 @@ static tigris_exec_error_t exec_chain_tiled(
     for (uint16_t i = 0; i < first_stage->inputs_count; i++)
         in_slow_bases[i] = mem->tensor_ptrs[first_sin[i]];
 
+    /* Line-buffered chain flag from the compiler (recomputing chain head).
+     * Read only for now: the roll that skips halo recompute using this
+     * flag is a later change, so this must not affect execution. */
+    int line_buffered =
+        (first_stage->_reserved1 & TIGRIS_STAGE_FLAG_LINE_BUFFERED) != 0;
+    (void)line_buffered;
+
     /* 3. Get chain tile height - use validated override (accounts for
      *    decompressed weights reducing available fast space) */
     int32_t chain_tile_h = chain_tile_h_override;

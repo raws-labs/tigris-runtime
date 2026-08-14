@@ -39,6 +39,11 @@
  * assert tile-0 / interior / partial-last coverage. Never in shipping builds. */
 int32_t g_tigris_chain_tile_h = 0;
 int32_t g_tigris_chain_num_tiles = 0;
+/* Test-only: number of (interior tile, stage) pairs where a stage that could
+ * otherwise roll was forced to full-compute by a per-stage boundary clamp
+ * (sp_tile_pt/pb != 0) while the tile is neither tile 0 nor the last tile. A
+ * nonzero value proves the interior-clamp fallback path was exercised. */
+int32_t g_tigris_interior_clamps = 0;
 #endif
 
 typedef struct {
@@ -1238,6 +1243,7 @@ static tigris_exec_error_t exec_chain_tiled(
 #ifdef TIGRIS_COUNT_KERNEL_ROWS
     g_tigris_chain_tile_h = chain_tile_h;
     g_tigris_chain_num_tiles = num_tiles;
+    g_tigris_interior_clamps = 0;
 #endif
 
     /* Persistent fast bases for the last stage's spilled outputs. The spill
@@ -1252,6 +1258,9 @@ static tigris_exec_error_t exec_chain_tiled(
      *     buffers. Sizes mirror the budget-validation forward pass exactly, so
      *     the reserved footprint equals the already-validated tile working set. */
     if (line_buffered) {
+        /* Load-bearing bound: roll_last_fast is sized TIGRIS_MAX_STAGE_OUTPUTS
+         * and later indexed by [0, last_stage->outputs_count), so reject a plan
+         * whose last stage has more outputs before recording any base below. */
         if (last_stage->outputs_count > TIGRIS_MAX_STAGE_OUTPUTS)
             return TIGRIS_EXEC_ERR_WORKSPACE;
 
@@ -1457,6 +1466,13 @@ static tigris_exec_error_t exec_chain_tiled(
                     if (workspace->sp_tile_pt[spi2] != 0 ||
                         workspace->sp_tile_pb[spi2] != 0) {
                         stage_rollable = 0;
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+                        /* Count clamps on genuinely interior tiles (not tile 0,
+                         * not the last tile) so a test can assert the mixed
+                         * roll/full-compute fallback actually ran. */
+                        if (tile + 1 < num_tiles)
+                            g_tigris_interior_clamps++;
+#endif
                         break;
                     }
                 }
@@ -1586,7 +1602,14 @@ static tigris_exec_error_t exec_chain_tiled(
                                     base + (size_t)src_row * row_bytes,
                                     (size_t)overlap * row_bytes);
                             mem->tile.out_row_start = overlap;
-                            mem->tile.in_row_start  = 0;
+                            /* Spatial kernels reconstruct the global input row
+                             * from the output row, so they read the full input
+                             * buffer at offset 0. Height-preserving ops compute
+                             * Y[i] = f(X[i]) over the literal offsets, and their
+                             * input shares the same global base row as their
+                             * output, so their input must skip the same overlap
+                             * the output does. */
+                            mem->tile.in_row_start  = is_spatial ? 0 : overlap;
                             mem->tile.out_h = existing_out_h - overlap;
                         }
                     }
@@ -1594,8 +1617,10 @@ static tigris_exec_error_t exec_chain_tiled(
 
                 /* Record this op's output range for the next tile's roll.
                  * Done every op, every tile (including full-computed ops), so
-                 * the buffer always describes its current-tile content. */
-                if (op->num_outputs == 1) {
+                 * the buffer always describes its current-tile content. These
+                 * ranges are read only on the line-buffered roll path, so skip
+                 * the writes entirely on the hot unflagged path. */
+                if (line_buffered && op->num_outputs == 1) {
                     workspace->roll_prev_gs[outs[0]] = op_gs;
                     workspace->roll_prev_ge[outs[0]] = op_ge;
                 }

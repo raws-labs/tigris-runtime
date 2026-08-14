@@ -24,6 +24,19 @@
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+/* Test-only kernel row counters, defined in the runtime sources when they are
+ * compiled with TIGRIS_COUNT_KERNEL_ROWS. The shipping library and the default
+ * contract runner are built without this flag, so these are never linked there.
+ * The rows-instrumented runner uses them to report how many kernel output rows
+ * an execution computed, which the cross-repo gate diffs between the
+ * line-buffered roll and the recompute path. */
+extern unsigned long g_tigris_kernel_rows;
+extern int32_t g_tigris_chain_tile_h;
+extern int32_t g_tigris_chain_num_tiles;
+extern int32_t g_tigris_interior_clamps;
+#endif
+
 static int load_file_aligned(
     const char *path, uint8_t **out_data, uint32_t *out_size)
 {
@@ -203,15 +216,36 @@ int main(int argc, char **argv)
     tigris_mem_t mem;
     tigris_kernel_fn dispatch = NULL;
     int result = 1;
+    int no_linebuffer = 0;
+    char *pos_argv[5];
+    int pos_argc = 1;
+    int arg_index;
 
-    if (argc != 4 && argc != 5) {
+    /* Separate the optional --no-linebuffer switch from the positional
+     * arguments so it may appear anywhere on the command line. Everything
+     * else keeps its existing positional meaning, so a call without the
+     * switch behaves exactly as before. */
+    pos_argv[0] = argv[0];
+    for (arg_index = 1; arg_index < argc; ++arg_index) {
+        if (strcmp(argv[arg_index], "--no-linebuffer") == 0) {
+            no_linebuffer = 1;
+        } else if (pos_argc < (int)(sizeof(pos_argv) / sizeof(pos_argv[0]))) {
+            pos_argv[pos_argc++] = argv[arg_index];
+        } else {
+            fprintf(stderr, "too many arguments\n");
+            return 2;
+        }
+    }
+
+    if (pos_argc != 4 && pos_argc != 5) {
         fprintf(stderr,
-                "usage: %s plan.tgrs inputs.bin outputs.bin [activation-limit]\n",
-                argv[0]);
+                "usage: %s plan.tgrs inputs.bin outputs.bin [activation-limit] "
+                "[--no-linebuffer]\n",
+                pos_argv[0]);
         return 2;
     }
-    if (load_file_aligned(argv[1], &plan_data, &plan_size) != 0) {
-        fprintf(stderr, "could not read plan: %s\n", argv[1]);
+    if (load_file_aligned(pos_argv[1], &plan_data, &plan_size) != 0) {
+        fprintf(stderr, "could not read plan: %s\n", pos_argv[1]);
         goto cleanup;
     }
     {
@@ -234,12 +268,12 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     activation_limit = plan.header->budget;
-    if (argc == 5) {
+    if (pos_argc == 5) {
         char *end = NULL;
-        unsigned long parsed = strtoul(argv[4], &end, 10);
-        if (!argv[4][0] || !end || *end != '\0' || parsed == 0 ||
+        unsigned long parsed = strtoul(pos_argv[4], &end, 10);
+        if (!pos_argv[4][0] || !end || *end != '\0' || parsed == 0 ||
             parsed > plan.header->budget || parsed > UINT32_MAX) {
-            fprintf(stderr, "invalid activation limit: %s\n", argv[4]);
+            fprintf(stderr, "invalid activation limit: %s\n", pos_argv[4]);
             goto cleanup;
         }
         activation_limit = (uint32_t)parsed;
@@ -262,10 +296,28 @@ int main(int argc, char **argv)
         fprintf(stderr, "memory initialization failed\n");
         goto cleanup;
     }
-    if (load_inputs(argv[2], &plan, &mem) != 0) {
+    if (load_inputs(pos_argv[2], &plan, &mem) != 0) {
         fprintf(stderr, "input layout does not match plan model inputs\n");
         goto cleanup;
     }
+    if (no_linebuffer) {
+        /* Force the recompute path: clear the line-buffered flag on every
+         * loaded stage. The loader is zero-copy, so plan.stages aliases the
+         * loaded buffer; locate each _reserved1 byte inside plan_data and
+         * clear the flag bit in place, exactly as the executor line-buffer
+         * ctest does. A chain without the flag executes the unchanged
+         * recompute path, which is what the gate measures against. */
+        for (uint16_t s = 0; s < plan.header->num_stages; ++s) {
+            const uint8_t *field = (const uint8_t *)&plan.stages[s]._reserved1;
+            size_t off = (size_t)(field - plan_data);
+            if (off + sizeof(uint16_t) <= plan_size)
+                plan_data[off] = (uint8_t)(plan_data[off] &
+                    ~(uint8_t)(TIGRIS_STAGE_FLAG_LINE_BUFFERED & 0xFFu));
+        }
+    }
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+    g_tigris_kernel_rows = 0;
+#endif
     {
         tigris_exec_error_t error =
             tigris_run(&plan, &mem, dispatch, NULL, NULL);
@@ -275,7 +327,7 @@ int main(int argc, char **argv)
             goto cleanup;
         }
     }
-    if (write_outputs(argv[3], &plan, &mem) != 0) {
+    if (write_outputs(pos_argv[3], &plan, &mem) != 0) {
         fprintf(stderr, "could not write model outputs\n");
         goto cleanup;
     }
@@ -285,6 +337,13 @@ int main(int argc, char **argv)
         " peak=%" PRIu32 "\n",
         plan.header->budget, activation_limit, overhead, required_size,
         fast_size, mem.fast_peak);
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+    printf(
+        "TIGRIS_CONTRACT_ROWS kernel_rows=%lu chain_tiles=%" PRId32
+        " chain_tile_h=%" PRId32 " interior_clamps=%" PRId32 "\n",
+        g_tigris_kernel_rows, g_tigris_chain_num_tiles,
+        g_tigris_chain_tile_h, g_tigris_interior_clamps);
+#endif
     result = 0;
 
 cleanup:

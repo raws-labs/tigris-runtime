@@ -1369,14 +1369,18 @@ int tigris_accel_try_s8_ref(
         return -1;
 
     /* Line-buffered chains roll overlap rows across tiles by setting
-     * mem->tile.out_row_start / in_row_start (see exec_chain_tiled). Only the
-     * reference and s8 kernels honor that offset contract; the ESP-NN
-     * Conv/Depthwise adapters ignore it and would write the new rows at the
-     * wrong position. Route just the rolled ops to s8_ref so a flagged chain
-     * stays bit-exact on every backend, while non-rolled tiles (tile 0,
-     * standalone tiles, last-tile full compute) keep the vendor path. */
+     * mem->tile.out_row_start / in_row_start (see exec_chain_tiled). 2D tiles
+     * carry mem->tile.width_tiled and partition width via pad_left/tile-in_w
+     * as well as height (see exec_stage_tiled_2d). Only the reference and s8
+     * kernels honor those offset and width contracts; the ESP-NN/CMSIS-NN
+     * Conv/Depthwise adapters ignore them and would write rows or columns at
+     * the wrong position. Route rolled or 2D-tiled ops to s8_ref so a
+     * flagged chain or tile stays bit-exact on every backend, while
+     * non-rolled, non-2D tiles (tile 0, standalone height tiles, last-tile
+     * full compute) keep the vendor path. */
     if (mem->tile.active &&
-        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0)) {
+        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0 ||
+         mem->tile.width_tiled)) {
         *handled = 1;
         return tigris_dispatch_kernel_s8(
             plan, op, op_index, mem, user_ctx);

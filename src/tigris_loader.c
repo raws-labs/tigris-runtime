@@ -407,8 +407,15 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             uint64_t weight_bytes = weight_elements *
                 (dtype == 1 ? sizeof(float) : sizeof(int8_t));
             uint64_t bias_bytes = (uint64_t)output_channels * sizeof(int32_t);
+            /* kern_conv_transpose_s8 indexes the output quant param by oc
+             * for every oc in [0, output_channels) once num_channels > 1, so
+             * a per-channel quant param must cover exactly output_channels
+             * entries (or be per-tensor with num_channels == 1); otherwise
+             * the kernel reads past the validated quant-data region. Same
+             * guard as the CONV case above. */
             if (!weight_size_is(plan, op->weight_idx, weight_bytes) ||
-                !optional_bias_size_is(plan, op->bias_idx, bias_bytes))
+                !optional_bias_size_is(plan, op->bias_idx, bias_bytes) ||
+                !quant_channels_fit(plan, output, output_channels))
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
         }

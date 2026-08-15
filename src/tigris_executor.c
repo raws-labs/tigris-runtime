@@ -934,6 +934,347 @@ static tigris_exec_error_t exec_stage_tiled(
     return TIGRIS_EXEC_OK;
 }
 
+/* 2D (HW axis) standalone tiled execution */
+
+/**
+ * Aligned fast-arena byte cost of one packed [N, h_extent, w_extent, C] tile
+ * of a rank-4 NHWC tensor, matching tigris_mem_alloc_fast's per-allocation
+ * alignment. Returns 0 on malformed metadata.
+ */
+static int tile2d_allocation_bytes(
+    const tigris_plan_t *plan, uint16_t tensor_idx,
+    int32_t h_extent, int32_t w_extent, uint32_t *bytes)
+{
+    const tigris_tensor_t *tensor = &plan->tensors[tensor_idx];
+    const int32_t *shape = tigris_tensor_shape(plan, tensor);
+    if (!bytes || tensor->ndim != 4 ||
+        shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0 || shape[3] <= 0 ||
+        h_extent <= 0 || w_extent <= 0)
+        return 0;
+
+    uint64_t elems = (uint64_t)shape[0] * (uint32_t)shape[1] *
+                     (uint32_t)shape[2] * (uint32_t)shape[3];
+    if (elems == 0)
+        return 0;
+    uint32_t elem_size = tensor->size_bytes / (uint32_t)elems;
+
+    uint64_t raw = (uint64_t)shape[0] * (uint32_t)h_extent *
+                   (uint32_t)w_extent * (uint32_t)shape[3] * elem_size;
+    uint64_t aligned =
+        (raw + (TIGRIS_TENSOR_ALIGN - 1u)) &
+        ~(uint64_t)(TIGRIS_TENSOR_ALIGN - 1u);
+    if (aligned > UINT32_MAX)
+        return 0;
+    *bytes = (uint32_t)aligned;
+    return 1;
+}
+
+/**
+ * Largest fast working set a single 2D (HW) tile can require: one packed input
+ * tile per stage input plus every op's packed output tile, all resident at
+ * once (the arena is reset only between tiles). Extents use the interior
+ * (full out_tile_h x out_tile_w) tile, which back-computes the widest input
+ * halo, so the total upper-bounds every partial edge and corner tile.
+ */
+static int stage_2d_fast_bytes(
+    const tigris_plan_t *plan, const tigris_stage_t *stage,
+    int sp_op_idx, int32_t out_tile_h, int32_t out_tile_w,
+    int32_t stride_h, int32_t stride_w, int32_t eff_kh, int32_t eff_kw,
+    int32_t full_in_h, int32_t full_in_w, uint32_t *required)
+{
+    const uint16_t *stage_inputs = tigris_stage_inputs(plan, stage);
+    const uint16_t *stage_ops = tigris_stage_ops(plan, stage);
+
+    int32_t in_tile_h = sp_op_idx >= 0
+        ? (out_tile_h - 1) * stride_h + eff_kh : out_tile_h;
+    int32_t in_tile_w = sp_op_idx >= 0
+        ? (out_tile_w - 1) * stride_w + eff_kw : out_tile_w;
+    if (in_tile_h <= 0 || in_tile_w <= 0)
+        return 0;
+    if (in_tile_h > full_in_h) in_tile_h = full_in_h;
+    if (in_tile_w > full_in_w) in_tile_w = full_in_w;
+
+    uint64_t total = 0;
+    for (uint16_t i = 0; i < stage->inputs_count; i++) {
+        uint32_t b;
+        if (!tile2d_allocation_bytes(plan, stage_inputs[i],
+                                     in_tile_h, in_tile_w, &b))
+            return 0;
+        total += b;
+    }
+
+    int32_t cur_h = in_tile_h;
+    int32_t cur_w = in_tile_w;
+    for (uint16_t j = 0; j < stage->ops_count; j++) {
+        uint16_t op_idx = stage_ops[j];
+        const tigris_op_t *op = &plan->ops[op_idx];
+        int is_spatial = ((int)op_idx == sp_op_idx);
+        int32_t ah = is_spatial ? out_tile_h : cur_h;
+        int32_t aw = is_spatial ? out_tile_w : cur_w;
+        const uint16_t *outputs = tigris_op_outputs(plan, op);
+        for (uint8_t k = 0; k < op->num_outputs; k++) {
+            uint32_t b;
+            if (!tile2d_allocation_bytes(plan, outputs[k], ah, aw, &b))
+                return 0;
+            total += b;
+        }
+        if (is_spatial) {
+            cur_h = out_tile_h;
+            cur_w = out_tile_w;
+        }
+    }
+
+    if (total > UINT32_MAX)
+        return 0;
+    *required = (uint32_t)total;
+    return 1;
+}
+
+/**
+ * Execute a standalone rank-4 stage tiled along both height and width.
+ *
+ * Drives an (tile_row, tile_col) grid over the output, back-computing each
+ * tile's input rectangle and effective four-sided padding, then reusing the
+ * Task 5 strided load/spill primitives and the Task 6 width-aware kernels. The
+ * full output tensor is assembled in slow, byte-identical to the whole-op
+ * result. Marked TIGRIS_NOINLINE to keep the inlined dispatcher within its
+ * per-frame stack budget.
+ */
+static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_2d(
+    const tigris_plan_t      *plan,
+    const tigris_stage_t     *stage,
+    tigris_mem_t             *mem,
+    tigris_kernel_fn          kernel,
+    void                     *user_ctx,
+    executor_workspace_impl_t *workspace)
+{
+    const uint16_t *sout = tigris_stage_outputs(plan, stage);
+    const uint16_t *sin  = tigris_stage_inputs(plan, stage);
+    const uint16_t *sops = tigris_stage_ops(plan, stage);
+    void **out_slow_bases = workspace->output_ptrs;
+    void **in_slow_bases  = workspace->input_ptrs;
+
+    if (stage->inputs_count == 0 || stage->outputs_count == 0)
+        return TIGRIS_EXEC_ERR_TILE;
+
+    /* 2D tiling is NHWC-only; the width axis has no meaning at rank 3. */
+    if (plan->tensors[sin[0]].ndim != 4 || plan->tensors[sout[0]].ndim != 4)
+        return TIGRIS_EXEC_ERR_TILE;
+
+    /* Spatial op + image geometry (height and width). */
+    int sp_op_idx = find_spatial_op(plan, stage);
+    const tigris_spatial_attrs_t *sp =
+        (sp_op_idx >= 0) ? &plan->ops[sp_op_idx].spatial : NULL;
+
+    const int32_t *in_shape = tigris_tensor_shape(plan, &plan->tensors[sin[0]]);
+    const int32_t *out_shape = tigris_tensor_shape(plan, &plan->tensors[sout[0]]);
+    int32_t IH = in_shape[1];
+    int32_t IW = in_shape[2];
+    int32_t OH = out_shape[1];
+    int32_t OW = out_shape[2];
+
+    int32_t SH = sp ? sp->stride_h : 1;
+    int32_t SW = sp ? sp->stride_w : 1;
+    int32_t PT = sp ? sp->pad_top : 0;
+    int32_t PL = sp ? sp->pad_left : 0;
+    int32_t dh = (sp && sp->dilation_h) ? sp->dilation_h : 1;
+    int32_t dw = (sp && sp->dilation_w) ? sp->dilation_w : 1;
+    int32_t eff_kh = sp ? ((sp->kernel_h - 1) * dh + 1) : 1;
+    int32_t eff_kw = sp ? ((sp->kernel_w - 1) * dw + 1) : 1;
+
+    /* Tile geometry: tile_height is a named field; the compiler packs
+     * tile_width into the low 16 bits of the tile plan's reserved word. */
+    const tigris_tile_plan_t *tp = tigris_stage_tile_plan(plan, stage);
+    if (!tp)
+        return TIGRIS_EXEC_ERR_TILE;
+    int32_t th = (int32_t)tp->tile_height;
+    int32_t tw = (int32_t)(tp->_reserved & 0xFFFFu);
+    if (th <= 0 || tw <= 0 || OH <= 0 || OW <= 0)
+        return TIGRIS_EXEC_ERR_TILE;
+
+    /* Shape validation (fail-closed): the emitted (th, tw) working set must
+     * fit the real fast arena. The 2D solver models only a proportional
+     * activation peak and ignores resident scratch/weight bytes, so the
+     * runtime is the authority on whether the shape actually fits. */
+    int32_t val_out_h = th < OH ? th : OH;
+    int32_t val_out_w = tw < OW ? tw : OW;
+    uint32_t required = 0;
+    if (!stage_2d_fast_bytes(plan, stage, sp_op_idx, val_out_h, val_out_w,
+                             SH, SW, eff_kh, eff_kw, IH, IW, &required))
+        return TIGRIS_EXEC_ERR_TILE;
+    if (mem->fast_reserved > mem->fast_size ||
+        required > mem->fast_size - mem->fast_reserved)
+        return TIGRIS_EXEC_ERR_TILE;
+
+    /* Pre-allocate full output tensors in slow. */
+    for (uint16_t i = 0; i < stage->outputs_count; i++) {
+        uint16_t tidx = sout[i];
+        tigris_mem_error_t merr = tigris_mem_alloc_slow(
+            mem, tidx, plan->tensors[tidx].size_bytes);
+        if (merr != TIGRIS_MEM_OK)
+            return TIGRIS_EXEC_ERR_MEM;
+        out_slow_bases[i] = mem->tensor_ptrs[tidx];
+    }
+
+    /* Save slow ptrs for stage inputs. */
+    for (uint16_t i = 0; i < stage->inputs_count; i++)
+        in_slow_bases[i] = mem->tensor_ptrs[sin[i]];
+
+    int32_t num_tiles_h = 1 + (OH - 1) / th;
+    int32_t num_tiles_w = 1 + (OW - 1) / tw;
+
+    /* Tile grid: iterate output (row, col) blocks. */
+    for (int32_t tr = 0; tr < num_tiles_h; tr++) {
+        for (int32_t tc = 0; tc < num_tiles_w; tc++) {
+            int32_t oh0 = tr * th;
+            int32_t oh1 = oh0 + th; if (oh1 > OH) oh1 = OH;
+            int32_t ow0 = tc * tw;
+            int32_t ow1 = ow0 + tw; if (ow1 > OW) ow1 = OW;
+            int32_t tile_out_h = oh1 - oh0;
+            int32_t tile_out_w = ow1 - ow0;
+
+            /* Back-compute the input rectangle and effective four-sided pads.
+             * pad_bottom/pad_right are set for completeness; the kernels read
+             * the bottom/right edges implicitly via the ih<IH / iw<IW bound
+             * checks, exactly as the height path leaves pad_bottom implicit. */
+            int32_t ih0, ih1, iw0, iw1;
+            int32_t pt = 0, pb = 0, pl = 0, pr = 0;
+            if (sp) {
+                ih0 = oh0 * SH - PT;
+                ih1 = (oh1 - 1) * SH - PT + eff_kh;
+                iw0 = ow0 * SW - PL;
+                iw1 = (ow1 - 1) * SW - PL + eff_kw;
+                if (ih0 < 0) { pt = -ih0; ih0 = 0; }
+                if (ih1 > IH) { pb = ih1 - IH; ih1 = IH; }
+                if (iw0 < 0) { pl = -iw0; iw0 = 0; }
+                if (iw1 > IW) { pr = iw1 - IW; iw1 = IW; }
+            } else {
+                ih0 = oh0; ih1 = oh1; iw0 = ow0; iw1 = ow1;
+            }
+            if (ih1 <= ih0 || iw1 <= iw0)
+                return TIGRIS_EXEC_ERR_TILE;
+            int32_t tile_in_h = ih1 - ih0;
+            int32_t tile_in_w = iw1 - iw0;
+
+            /* Activate a 2D (HW) tile. */
+            mem->tile.active = 1;
+            mem->tile.width_tiled = 1;
+            mem->tile.out_row_start = 0;
+            mem->tile.in_row_start = 0;
+
+            /* LOAD: pack the input sub-rectangle for each stage input. */
+            for (uint16_t i = 0; i < stage->inputs_count; i++) {
+                uint16_t tidx = sin[i];
+                mem->tensor_ptrs[tidx] = in_slow_bases[i]; /* restore before load */
+                tigris_mem_error_t merr = tigris_mem_load_tile_2d(
+                    mem, plan, tidx, ih0, ih1, iw0, iw1);
+                if (merr != TIGRIS_MEM_OK)
+                    return TIGRIS_EXEC_ERR_MEM;
+            }
+
+            /* EXECUTE: track the tile's height/width through the op sequence.
+             * It starts at the input tile size; the single spatial op reduces
+             * it to the output tile size; pointwise ops preserve it. */
+            int32_t cur_h = tile_in_h;
+            int32_t cur_w = tile_in_w;
+            for (uint16_t j = 0; j < stage->ops_count; j++) {
+                uint16_t op_idx = sops[j];
+                const tigris_op_t *op = &plan->ops[op_idx];
+                int is_spatial = ((int)op_idx == sp_op_idx);
+
+                if (is_spatial) {
+                    mem->tile.in_h       = cur_h;
+                    mem->tile.out_h      = tile_out_h;
+                    mem->tile.in_w       = cur_w;
+                    mem->tile.out_w      = tile_out_w;
+                    mem->tile.pad_top    = (uint16_t)pt;
+                    mem->tile.pad_bottom = (uint16_t)pb;
+                    mem->tile.pad_left   = (uint16_t)pl;
+                    mem->tile.pad_right  = (uint16_t)pr;
+                } else {
+                    /* Pointwise op: height/width preserved, no padding. */
+                    mem->tile.in_h       = cur_h;
+                    mem->tile.out_h      = cur_h;
+                    mem->tile.in_w       = cur_w;
+                    mem->tile.out_w      = cur_w;
+                    mem->tile.pad_top    = 0;
+                    mem->tile.pad_bottom = 0;
+                    mem->tile.pad_left   = 0;
+                    mem->tile.pad_right  = 0;
+                }
+
+                int32_t alloc_h = is_spatial ? tile_out_h : cur_h;
+                int32_t alloc_w = is_spatial ? tile_out_w : cur_w;
+
+                /* Alloc tile-sized outputs in fast (NHWC, alloc_h x alloc_w). */
+                const uint16_t *outs = tigris_op_outputs(plan, op);
+                for (uint8_t k = 0; k < op->num_outputs; k++) {
+                    uint16_t tidx = outs[k];
+                    const tigris_tensor_t *t = &plan->tensors[tidx];
+                    const int32_t *shape = tigris_tensor_shape(plan, t);
+                    uint32_t full_w = t->ndim == 4 ? (uint32_t)shape[2] : 1u;
+                    uint32_t channels = (uint32_t)shape[t->ndim - 1];
+                    uint32_t elem_size = t->size_bytes /
+                        ((uint32_t)shape[0] * (uint32_t)shape[1] *
+                         full_w * channels);
+                    uint32_t tile_bytes = (uint32_t)shape[0] * (uint32_t)alloc_h *
+                        (uint32_t)alloc_w * channels * elem_size;
+                    tigris_mem_error_t merr = tigris_mem_alloc_fast(
+                        mem, tidx, tile_bytes);
+                    if (merr != TIGRIS_MEM_OK)
+                        return TIGRIS_EXEC_ERR_MEM;
+                }
+
+                int kret = kernel(plan, op, op_idx, mem, user_ctx);
+                if (kret != 0)
+                    return TIGRIS_EXEC_ERR_KERNEL;
+
+                if (is_spatial) {
+                    cur_h = tile_out_h;
+                    cur_w = tile_out_w;
+                }
+            }
+
+            /* SPILL: write each packed output core back to its slow rectangle. */
+            for (uint16_t i = 0; i < stage->outputs_count; i++) {
+                uint16_t tidx = sout[i];
+                tigris_mem_error_t merr = tigris_mem_spill_tile_2d(
+                    mem, plan, tidx, out_slow_bases[i], oh0, oh1, ow0, ow1);
+                if (merr != TIGRIS_MEM_OK)
+                    return TIGRIS_EXEC_ERR_MEM;
+            }
+
+            /* Reset fast arena for next tile. */
+            tigris_mem_reset_fast(mem);
+
+            TIGRIS_PLATFORM_FEED_WDT();
+        }
+    }
+
+    /* Clear tile context, restore input ptrs to slow, and NULL intermediate op
+     * outputs so compact_fast won't find stale fast-arena pointers with
+     * full-size metadata. Stage outputs already point to slow via spill. */
+    memset(&mem->tile, 0, sizeof(mem->tile));
+    for (uint16_t i = 0; i < stage->inputs_count; i++)
+        mem->tensor_ptrs[sin[i]] = in_slow_bases[i];
+
+    for (uint16_t j = 0; j < stage->ops_count; j++) {
+        const tigris_op_t *op = &plan->ops[sops[j]];
+        const uint16_t *outs = tigris_op_outputs(plan, op);
+        for (uint8_t k = 0; k < op->num_outputs; k++) {
+            uint16_t tidx = outs[k];
+            int is_stage_out = 0;
+            for (uint16_t s = 0; s < stage->outputs_count; s++) {
+                if (tidx == sout[s]) { is_stage_out = 1; break; }
+            }
+            if (!is_stage_out)
+                mem->tensor_ptrs[tidx] = NULL;
+        }
+    }
+
+    return TIGRIS_EXEC_OK;
+}
+
 /* Weight block helpers */
 
 static int align_tensor_size(uint32_t value, uint32_t *aligned)
@@ -1901,12 +2242,21 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
                 common_tile_rank &&
                 total_io > (mem->fast_size - mem->fast_reserved);
 
+            /* Schema-v5 stages may serialize the height/length axis (1D) or the
+             * combined HW axis (2D). Both are accepted here; WIDTH and any other
+             * value remain fail-closed. */
+            int is_hw_axis =
+                run_plan->header->version >=
+                    TIGRIS_SCHEMA_VERSION_TILE_AXIS &&
+                tile_axis == TIGRIS_TILE_AXIS_HW;
+
             if (needs_tiling &&
                 stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
                 (stage->tile_plan_idx >= run_plan->header->num_tile_plans ||
                  !run_plan->tile_plans ||
                  !run_plan->tile_plans[stage->tile_plan_idx].tileable ||
-                 tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH ||
+                 (tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH &&
+                  tile_axis != TIGRIS_TILE_AXIS_HW) ||
                  !axis1_tileable)) {
                 result = TIGRIS_EXEC_ERR_TILE;
                 goto restore_fast_arena;
@@ -1916,6 +2266,11 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
              * height path even when they carry no standalone tile record.
              * Rank-3 length tiling is schema-v5-only and requires the explicit
              * axis promise. */
+            /* Standalone 2D (HW) tiling. Checked before the height-only path
+             * because a rank-4 stage otherwise satisfies may_tile and would be
+             * misrouted to exec_stage_tiled. */
+            int may_tile_2d = needs_tiling && is_hw_axis && axis1_tileable;
+
             int may_tile =
                 axis1_tileable &&
                 (rank == 4 ||
@@ -1923,7 +2278,19 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
                       TIGRIS_SCHEMA_VERSION_TILE_AXIS &&
                   tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH));
 
-            if (needs_tiling && may_tile) {
+            if (may_tile_2d) {
+                tigris_exec_error_t err = exec_stage_tiled_2d(
+                    run_plan, stage, mem, kernel, user_ctx, workspace);
+                if (err != TIGRIS_EXEC_OK) {
+                    TIGRIS_PLATFORM_DBG("S%u tiled2d ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
+                        s, (int)err, (unsigned long)total_io,
+                        (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
+                        (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
+                    result = err;
+                    goto restore_fast_arena;
+                }
+                if (stats) stats->stages_tiled++;
+            } else if (needs_tiling && may_tile) {
                 tigris_exec_error_t err = exec_stage_tiled(
                     run_plan, stage, mem, kernel, user_ctx,
                     last_consumer, s, workspace);

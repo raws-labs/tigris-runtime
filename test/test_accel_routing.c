@@ -185,6 +185,21 @@ static int run_pre_route_rolled(const route_fixture_t *fx,
         backend, &fx->plan, &fx->op, 0, &mem, NULL, handled);
 }
 
+/* Route a 2D (width) tiled op. Only width_tiled is set here; row offsets stay
+ * zero so the test isolates the width_tiled branch of the guard. */
+static int run_pre_route_width_tiled(const route_fixture_t *fx,
+                                     tigris_accel_backend_t backend,
+                                     int8_t *output, int width_tiled,
+                                     int *handled)
+{
+    tigris_mem_t mem;
+    void *ptrs[2];
+    init_mem(&mem, ptrs, output, fx, 1);
+    mem.tile.width_tiled = (uint8_t)width_tiled;
+    return tigris_accel_try_s8_ref(
+        backend, &fx->plan, &fx->op, 0, &mem, NULL, handled);
+}
+
 static void assert_array_eq(const int8_t *actual, const int8_t *expected,
                             const char *message)
 {
@@ -412,6 +427,37 @@ static void test_rolled_tile_routes_reference(void)
                    "rolled conv routes CMSIS to s8_ref");
 }
 
+/* A 2D-tiled op sets mem->tile.width_tiled on tiles that partition width as
+ * well as height. The ESP-NN/CMSIS-NN Conv/Depthwise adapters do not honor
+ * width_tiled/pad_left/tile-in_w, so a 2D-tiled op must fall back to s8_ref,
+ * same reasoning as the line-buffer roll guard above. */
+static void test_width_tiled_routes_reference(void)
+{
+    printf("  test_width_tiled_routes_reference...\n");
+    route_fixture_t fx;
+    build_fixture(&fx, TIGRIS_OP_CONV, 0);
+    fx.op.spatial.dilation_h = 1;
+    fx.op.spatial.dilation_w = 1;
+
+    int handled;
+    int8_t out[8];
+
+    /* width_tiled tile: guard fires for both backends. */
+    memset(out, 0, sizeof(out));
+    run_pre_route_width_tiled(&fx, TIGRIS_ACCEL_ESP_NN, out, 1, &handled);
+    TEST_ASSERT_EQ(handled, 1, "2D tile routes ESP to s8_ref");
+
+    memset(out, 0, sizeof(out));
+    run_pre_route_width_tiled(&fx, TIGRIS_ACCEL_CMSIS_NN, out, 1, &handled);
+    TEST_ASSERT_EQ(handled, 1, "2D tile routes CMSIS to s8_ref");
+
+    /* non-2D tiled conv still uses the adapter on ESP (guard not
+     * over-firing). */
+    memset(out, 0, sizeof(out));
+    run_pre_route_width_tiled(&fx, TIGRIS_ACCEL_ESP_NN, out, 0, &handled);
+    TEST_ASSERT_EQ(handled, 0, "non-2D tiled conv stays on ESP adapter");
+}
+
 int main(void)
 {
     printf("TiGrIS Accelerator Routing Tests\n\n");
@@ -420,6 +466,7 @@ int main(void)
     test_cmsis_dilation_and_tile_routes();
     test_unit_dilation_keeps_esp_adapter();
     test_rolled_tile_routes_reference();
+    test_width_tiled_routes_reference();
     test_esp_asymmetric_pad_workspace_policy();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

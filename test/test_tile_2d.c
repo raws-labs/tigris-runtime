@@ -19,6 +19,18 @@
  *        executor path will call. These tests exercise the mem-level
  *        primitives directly, independent of a loaded plan file, using a
  *        minimal in-memory tensor descriptor and shape pool.
+ *
+ * Task 6: per-tile in_w and left/right pad overrides in kern_conv2d and
+ *        kern_avg_pool (reference float32 and int8). Each test builds one
+ *        op describing the full untiled tensor, runs it once with
+ *        mem->tile inactive (the golden full-canvas output), then runs the
+ *        SAME op again against a packed 2D tile loaded with
+ *        tigris_mem_load_tile_2d and mem->tile.width_tiled set, and asserts
+ *        the packed core is byte-identical to the matching sub-block of the
+ *        golden output. Before Task 6, PL stayed at the op's global
+ *        pad_left even for a width-tiled call, so an interior tile (whose
+ *        effective pad_left is 0) still shifted every column by the
+ *        model's global pad_left.
  */
 
 #include <stdio.h>
@@ -28,6 +40,8 @@
 #include "tigris.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
+#include "tigris_kernels.h"
+#include "tigris_kernels_s8.h"
 
 /* Test infrastructure */
 
@@ -301,6 +315,666 @@ static void test_load_tile_2d_rejects_bad_bounds(void)
     TEST_ASSERT_EQ(e, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range w1 rejected");
 }
 
+/* Task 6: per-tile in_w / left-right pad overrides */
+
+/* Shared geometry: a 3x3 stride-1 pad-1 spatial op over a 6x6 canvas keeps
+ * the output the same size as the input, so a golden run and a tiled run
+ * can share one op/weight setup and only the tile bounds differ. */
+#define TC_H  6
+#define TC_W  6
+#define TC_C  2
+#define TC_OC 2
+#define TC_K  3
+#define TS_C  1   /* s8 tests use a single channel to keep quant math trivial */
+
+static void tc_fill_input_f32(float *x)
+{
+    for (int h = 0; h < TC_H; h++)
+        for (int w = 0; w < TC_W; w++)
+            for (int c = 0; c < TC_C; c++)
+                x[(h * TC_W + w) * TC_C + c] = (float)(h * 100 + w * 10 + c);
+}
+
+static void tc_fill_weight_f32(float *w)
+{
+    for (int oc = 0; oc < TC_OC; oc++)
+        for (int kh = 0; kh < TC_K; kh++)
+            for (int kw = 0; kw < TC_K; kw++)
+                for (int ic = 0; ic < TC_C; ic++)
+                    w[((oc * TC_K + kh) * TC_K + kw) * TC_C + ic] =
+                        (float)(oc * 1000 + kh * 100 + kw * 10 + ic) * 0.01f;
+}
+
+static void ts_fill_input_s8(int8_t *x)
+{
+    for (int h = 0; h < TC_H; h++)
+        for (int w = 0; w < TC_W; w++)
+            x[h * TC_W + w] = (int8_t)(h * TC_W + w);
+}
+
+/* Column-difference kernel: distinct per (kh,kw) so a left/right indexing
+ * bug shows up as a wrong value, not an accidental match. */
+static const int8_t ts_weight[TC_K * TC_K] = {
+    1, 0, -1,
+    1, 0, -1,
+    1, 0, -1
+};
+
+static void tc_build_conv_plan_f32(
+    tigris_tensor_t *tensors, int32_t *shape_pool, uint16_t *index_pool,
+    tigris_weight_entry_t *weights, float *weight_blob,
+    tigris_file_header_t *header, tigris_op_t *op, tigris_plan_t *plan,
+    const float *W, uint32_t w_bytes, const float *B, uint32_t b_bytes)
+{
+    int32_t x_shape[4] = {1, TC_H, TC_W, TC_C};
+    int32_t y_shape[4] = {1, TC_H, TC_W, TC_OC};
+    memcpy(shape_pool, x_shape, sizeof(x_shape));
+    memcpy(shape_pool + 4, y_shape, sizeof(y_shape));
+
+    memset(tensors, 0, sizeof(*tensors) * 2);
+    tensors[0].shape_off = 0; tensors[0].ndim = 4; tensors[0].dtype = 1;
+    tensors[0].size_bytes = (uint32_t)(TC_H * TC_W * TC_C) * (uint32_t)sizeof(float);
+    tensors[0].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    tensors[1].shape_off = 4; tensors[1].ndim = 4; tensors[1].dtype = 1;
+    tensors[1].size_bytes = (uint32_t)(TC_H * TC_W * TC_OC) * (uint32_t)sizeof(float);
+    tensors[1].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+
+    index_pool[0] = 0; index_pool[1] = 1;
+
+    /* weight_blob is declared float[] by the caller (not uint8_t[]) so the
+     * f32 kernels' direct B[oc] dereference stays naturally aligned, the
+     * same convention test_kernels.c uses. */
+    weights[0].name_str = 0; weights[0].offset = 0; weights[0].size_bytes = w_bytes;
+    weights[1].name_str = 0; weights[1].offset = w_bytes; weights[1].size_bytes = b_bytes;
+    memcpy(weight_blob, W, w_bytes);
+    memcpy((uint8_t *)weight_blob + w_bytes, B, b_bytes);
+
+    memset(op, 0, sizeof(*op));
+    op->op_type = TIGRIS_OP_CONV;
+    op->num_inputs = 1; op->num_outputs = 1;
+    op->inputs_off = 0; op->outputs_off = 1;
+    op->spatial.kernel_h = TC_K; op->spatial.kernel_w = TC_K;
+    op->spatial.stride_h = 1; op->spatial.stride_w = 1;
+    op->spatial.dilation_h = 1; op->spatial.dilation_w = 1;
+    op->spatial.pad_top = 1; op->spatial.pad_bottom = 1;
+    op->spatial.pad_left = 1; op->spatial.pad_right = 1;
+    op->spatial.group = 1;
+    op->weight_idx = 0; op->bias_idx = 1;
+    op->fused_act = TIGRIS_ACT_NONE;
+
+    memset(header, 0, sizeof(*header));
+    header->num_tensors = 2; header->num_ops = 1; header->num_weights = 2;
+
+    memset(plan, 0, sizeof(*plan));
+    plan->header = header;
+    plan->tensors = tensors;
+    plan->ops = op;
+    plan->index_pool = index_pool;
+    plan->shape_pool = shape_pool;
+    plan->strings = "";
+    plan->weight_entries = weights;
+    plan->weight_blob = (const uint8_t *)weight_blob;
+}
+
+static void tc_build_conv_plan_s8(
+    tigris_tensor_t *tensors, int32_t *shape_pool, uint16_t *index_pool,
+    tigris_weight_entry_t *weights, uint8_t *weight_blob,
+    tigris_quant_param_t *qp, int32_t *qd,
+    tigris_file_header_t *header, tigris_op_t *op, tigris_plan_t *plan)
+{
+    int32_t x_shape[4] = {1, TC_H, TC_W, TS_C};
+    int32_t y_shape[4] = {1, TC_H, TC_W, TS_C};
+    memcpy(shape_pool, x_shape, sizeof(x_shape));
+    memcpy(shape_pool + 4, y_shape, sizeof(y_shape));
+
+    /* Output quant: identity requant (multiplier=2^30, shift=1), the same
+     * per-tensor convention test_conv2d_s8_per_tensor uses in
+     * test_kernels_s8.c, so the int8 output equals the raw accumulator. */
+    memset(qp, 0, sizeof(*qp) * 2);
+    qp[0].scale = 1.0f; qp[0].zero_point = 0; qp[0].num_channels = 1;
+    qp[1].scale = 1.0f; qp[1].zero_point = 0; qp[1].num_channels = 1;
+    qp[1].multiplier_off = 0; qp[1].shift_off = 1;
+    qd[0] = 1073741824; /* 2^30 */
+    qd[1] = 1;
+
+    memset(tensors, 0, sizeof(*tensors) * 2);
+    tensors[0].shape_off = 0; tensors[0].ndim = 4; tensors[0].dtype = 3;
+    tensors[0].size_bytes = (uint32_t)(TC_H * TC_W * TS_C);
+    tensors[0].quant_param_idx = 0;
+    tensors[1].shape_off = 4; tensors[1].ndim = 4; tensors[1].dtype = 3;
+    tensors[1].size_bytes = (uint32_t)(TC_H * TC_W * TS_C);
+    tensors[1].quant_param_idx = 1;
+
+    index_pool[0] = 0; index_pool[1] = 1;
+
+    static const int32_t bias[1] = {0};
+    weights[0].name_str = 0; weights[0].offset = 0;
+    weights[0].size_bytes = sizeof(ts_weight);
+    weights[1].name_str = 0; weights[1].offset = sizeof(ts_weight);
+    weights[1].size_bytes = sizeof(bias);
+    memcpy(weight_blob, ts_weight, sizeof(ts_weight));
+    memcpy(weight_blob + sizeof(ts_weight), bias, sizeof(bias));
+
+    memset(op, 0, sizeof(*op));
+    op->op_type = TIGRIS_OP_CONV;
+    op->num_inputs = 1; op->num_outputs = 1;
+    op->inputs_off = 0; op->outputs_off = 1;
+    op->spatial.kernel_h = TC_K; op->spatial.kernel_w = TC_K;
+    op->spatial.stride_h = 1; op->spatial.stride_w = 1;
+    op->spatial.dilation_h = 1; op->spatial.dilation_w = 1;
+    op->spatial.pad_top = 1; op->spatial.pad_bottom = 1;
+    op->spatial.pad_left = 1; op->spatial.pad_right = 1;
+    op->spatial.group = 1;
+    op->weight_idx = 0; op->bias_idx = 1;
+    op->act_min = -128; op->act_max = 127;
+
+    memset(header, 0, sizeof(*header));
+    header->num_tensors = 2; header->num_ops = 1; header->num_weights = 2;
+
+    memset(plan, 0, sizeof(*plan));
+    plan->header = header;
+    plan->tensors = tensors;
+    plan->ops = op;
+    plan->index_pool = index_pool;
+    plan->shape_pool = shape_pool;
+    plan->strings = "";
+    plan->weight_entries = weights;
+    plan->weight_blob = weight_blob;
+    plan->quant_params = qp;
+    plan->quant_data = qd;
+    plan->num_quant_params = 2;
+}
+
+static void tc_build_avgpool_plan_f32(
+    tigris_tensor_t *tensors, int32_t *shape_pool, uint16_t *index_pool,
+    tigris_file_header_t *header, tigris_op_t *op, tigris_plan_t *plan)
+{
+    int32_t x_shape[4] = {1, TC_H, TC_W, TC_C};
+    int32_t y_shape[4] = {1, TC_H, TC_W, TC_C};
+    memcpy(shape_pool, x_shape, sizeof(x_shape));
+    memcpy(shape_pool + 4, y_shape, sizeof(y_shape));
+
+    memset(tensors, 0, sizeof(*tensors) * 2);
+    tensors[0].shape_off = 0; tensors[0].ndim = 4; tensors[0].dtype = 1;
+    tensors[0].size_bytes = (uint32_t)(TC_H * TC_W * TC_C) * (uint32_t)sizeof(float);
+    tensors[0].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    tensors[1].shape_off = 4; tensors[1].ndim = 4; tensors[1].dtype = 1;
+    tensors[1].size_bytes = (uint32_t)(TC_H * TC_W * TC_C) * (uint32_t)sizeof(float);
+    tensors[1].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+
+    index_pool[0] = 0; index_pool[1] = 1;
+
+    memset(op, 0, sizeof(*op));
+    op->op_type = TIGRIS_OP_AVG_POOL;
+    op->num_inputs = 1; op->num_outputs = 1;
+    op->inputs_off = 0; op->outputs_off = 1;
+    op->spatial.kernel_h = TC_K; op->spatial.kernel_w = TC_K;
+    op->spatial.stride_h = 1; op->spatial.stride_w = 1;
+    op->spatial.pad_top = 1; op->spatial.pad_bottom = 1;
+    op->spatial.pad_left = 1; op->spatial.pad_right = 1;
+    op->weight_idx = TIGRIS_NO_WEIGHT; op->bias_idx = TIGRIS_NO_WEIGHT;
+
+    memset(header, 0, sizeof(*header));
+    header->num_tensors = 2; header->num_ops = 1;
+
+    memset(plan, 0, sizeof(*plan));
+    plan->header = header;
+    plan->tensors = tensors;
+    plan->ops = op;
+    plan->index_pool = index_pool;
+    plan->shape_pool = shape_pool;
+    plan->strings = "";
+}
+
+static void tc_build_avgpool_plan_s8(
+    tigris_tensor_t *tensors, int32_t *shape_pool, uint16_t *index_pool,
+    tigris_file_header_t *header, tigris_op_t *op, tigris_plan_t *plan)
+{
+    int32_t x_shape[4] = {1, TC_H, TC_W, TS_C};
+    int32_t y_shape[4] = {1, TC_H, TC_W, TS_C};
+    memcpy(shape_pool, x_shape, sizeof(x_shape));
+    memcpy(shape_pool + 4, y_shape, sizeof(y_shape));
+
+    memset(tensors, 0, sizeof(*tensors) * 2);
+    tensors[0].shape_off = 0; tensors[0].ndim = 4; tensors[0].dtype = 3;
+    tensors[0].size_bytes = (uint32_t)(TC_H * TC_W * TS_C);
+    tensors[0].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    tensors[1].shape_off = 4; tensors[1].ndim = 4; tensors[1].dtype = 3;
+    tensors[1].size_bytes = (uint32_t)(TC_H * TC_W * TS_C);
+    tensors[1].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+
+    index_pool[0] = 0; index_pool[1] = 1;
+
+    memset(op, 0, sizeof(*op));
+    op->op_type = TIGRIS_OP_AVG_POOL;
+    op->num_inputs = 1; op->num_outputs = 1;
+    op->inputs_off = 0; op->outputs_off = 1;
+    op->spatial.kernel_h = TC_K; op->spatial.kernel_w = TC_K;
+    op->spatial.stride_h = 1; op->spatial.stride_w = 1;
+    op->spatial.pad_top = 1; op->spatial.pad_bottom = 1;
+    op->spatial.pad_left = 1; op->spatial.pad_right = 1;
+    op->weight_idx = TIGRIS_NO_WEIGHT; op->bias_idx = TIGRIS_NO_WEIGHT;
+    op->act_min = -128; op->act_max = 127;
+
+    memset(header, 0, sizeof(*header));
+    header->num_tensors = 2; header->num_ops = 1;
+
+    memset(plan, 0, sizeof(*plan));
+    plan->header = header;
+    plan->tensors = tensors;
+    plan->ops = op;
+    plan->index_pool = index_pool;
+    plan->shape_pool = shape_pool;
+    plan->strings = "";
+}
+
+/* Compare a packed [2,2,channels] tile core against the sub-block of the
+ * golden full output starting at (oh0, ow0). golden_w is the golden
+ * tensor's full output width (row-major NHWC indexing). */
+static void tc_compare_f32(
+    const char *name, const float *tile, const float *golden_full,
+    int golden_w, int channels, int oh0, int ow0)
+{
+    for (int oh = 0; oh < 2; oh++) {
+        for (int ow = 0; ow < 2; ow++) {
+            int gh = oh0 + oh, gw = ow0 + ow;
+            for (int c = 0; c < channels; c++) {
+                float got  = tile[(oh * 2 + ow) * channels + c];
+                float want = golden_full[(gh * golden_w + gw) * channels + c];
+                tests_run++;
+                if (got != want) {
+                    tests_failed++;
+                    fprintf(stderr,
+                        "  FAIL: %s: tile[%d,%d,%d]=%.6f != golden[%d,%d,%d]=%.6f\n",
+                        name, oh, ow, c, (double)got, gh, gw, c, (double)want);
+                } else {
+                    tests_passed++;
+                }
+            }
+        }
+    }
+}
+
+static void tc_compare_s8(
+    const char *name, const int8_t *tile, const int8_t *golden_full,
+    int golden_w, int channels, int oh0, int ow0)
+{
+    for (int oh = 0; oh < 2; oh++) {
+        for (int ow = 0; ow < 2; ow++) {
+            int gh = oh0 + oh, gw = ow0 + ow;
+            for (int c = 0; c < channels; c++) {
+                int8_t got  = tile[(oh * 2 + ow) * channels + c];
+                int8_t want = golden_full[(gh * golden_w + gw) * channels + c];
+                tests_run++;
+                if (got != want) {
+                    tests_failed++;
+                    fprintf(stderr,
+                        "  FAIL: %s: tile[%d,%d,%d]=%d != golden[%d,%d,%d]=%d\n",
+                        name, oh, ow, c, (int)got, gh, gw, c, (int)want);
+                } else {
+                    tests_passed++;
+                }
+            }
+        }
+    }
+}
+
+/* Pack input[h0:h1, w0:w1, :] via tigris_mem_load_tile_2d, set a 2D tile
+ * context with the given effective top/left pads and zero row-start
+ * offsets (2D tiles have no line-buffered halo), and dispatch the op. */
+static void tc_run_tile_f32(
+    int (*dispatch)(const tigris_plan_t *, const tigris_op_t *, uint16_t,
+                     tigris_mem_t *, void *),
+    const tigris_plan_t *plan, const tigris_op_t *op, const float *X_full,
+    int32_t h0, int32_t h1, int32_t w0, int32_t w1,
+    uint16_t pad_top, uint16_t pad_left, float *out_tile)
+{
+    uint8_t fast_buf[512];
+    uint8_t slow_buf[16];
+    void *tile_ptrs[2] = { NULL, NULL };
+    tigris_mem_t tile_mem;
+    tigris_mem_error_t merr = tigris_mem_init(&tile_mem, tile_ptrs, 2,
+                                               fast_buf, sizeof(fast_buf),
+                                               slow_buf, sizeof(slow_buf));
+    TEST_ASSERT_EQ(merr, TIGRIS_MEM_OK, "tile mem init ok");
+
+    tile_mem.tensor_ptrs[0] = (void *)X_full;
+    tigris_mem_error_t lerr = tigris_mem_load_tile_2d(&tile_mem, plan, 0, h0, h1, w0, w1);
+    TEST_ASSERT_EQ(lerr, TIGRIS_MEM_OK, "2D tile load ok");
+
+    tile_mem.tensor_ptrs[1] = out_tile;
+
+    tile_mem.tile.active = 1;
+    tile_mem.tile.width_tiled = 1;
+    tile_mem.tile.in_h = h1 - h0;
+    tile_mem.tile.out_h = 2;
+    tile_mem.tile.in_w = w1 - w0;
+    tile_mem.tile.out_w = 2;
+    tile_mem.tile.pad_top = pad_top;
+    tile_mem.tile.pad_bottom = 0;
+    tile_mem.tile.pad_left = pad_left;
+    tile_mem.tile.pad_right = 0;
+    tile_mem.tile.out_row_start = 0;
+    tile_mem.tile.in_row_start = 0;
+
+    int ret = dispatch(plan, op, 0, &tile_mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "tiled dispatch ok");
+}
+
+static void tc_run_tile_s8(
+    int (*dispatch)(const tigris_plan_t *, const tigris_op_t *, uint16_t,
+                     tigris_mem_t *, void *),
+    const tigris_plan_t *plan, const tigris_op_t *op, const int8_t *X_full,
+    int32_t h0, int32_t h1, int32_t w0, int32_t w1,
+    uint16_t pad_top, uint16_t pad_left, int8_t *out_tile)
+{
+    uint8_t fast_buf[256];
+    uint8_t slow_buf[16];
+    void *tile_ptrs[2] = { NULL, NULL };
+    tigris_mem_t tile_mem;
+    tigris_mem_error_t merr = tigris_mem_init(&tile_mem, tile_ptrs, 2,
+                                               fast_buf, sizeof(fast_buf),
+                                               slow_buf, sizeof(slow_buf));
+    TEST_ASSERT_EQ(merr, TIGRIS_MEM_OK, "tile mem init ok");
+
+    tile_mem.tensor_ptrs[0] = (void *)X_full;
+    tigris_mem_error_t lerr = tigris_mem_load_tile_2d(&tile_mem, plan, 0, h0, h1, w0, w1);
+    TEST_ASSERT_EQ(lerr, TIGRIS_MEM_OK, "2D tile load ok");
+
+    tile_mem.tensor_ptrs[1] = out_tile;
+
+    tile_mem.tile.active = 1;
+    tile_mem.tile.width_tiled = 1;
+    tile_mem.tile.in_h = h1 - h0;
+    tile_mem.tile.out_h = 2;
+    tile_mem.tile.in_w = w1 - w0;
+    tile_mem.tile.out_w = 2;
+    tile_mem.tile.pad_top = pad_top;
+    tile_mem.tile.pad_bottom = 0;
+    tile_mem.tile.pad_left = pad_left;
+    tile_mem.tile.pad_right = 0;
+    tile_mem.tile.out_row_start = 0;
+    tile_mem.tile.in_row_start = 0;
+
+    int ret = dispatch(plan, op, 0, &tile_mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "tiled dispatch ok");
+}
+
+/* Conv2D: interior tile (all effective pads 0) and top-left edge tile
+ * (effective pad_top = pad_left = 1, the tensor boundary). f32 and s8. */
+
+static void test_conv_2d_tile_matches_subregion_f32(void)
+{
+    printf("  test_conv_2d_tile_matches_subregion_f32...\n");
+
+    float X[TC_H * TC_W * TC_C];
+    tc_fill_input_f32(X);
+    float W[TC_OC * TC_K * TC_K * TC_C];
+    tc_fill_weight_f32(W);
+    float B[TC_OC] = {0.5f, -0.25f};
+
+    tigris_tensor_t tensors[2];
+    int32_t shape_pool[8];
+    uint16_t index_pool[2];
+    tigris_weight_entry_t weights[2];
+    float weight_blob[TC_OC * TC_K * TC_K * TC_C + TC_OC];
+    tigris_file_header_t header;
+    tigris_op_t op;
+    tigris_plan_t plan;
+    tc_build_conv_plan_f32(tensors, shape_pool, index_pool, weights,
+                            weight_blob, &header, &op, &plan,
+                            W, sizeof(W), B, sizeof(B));
+
+    float Y_full[TC_H * TC_W * TC_OC];
+    void *golden_ptrs[2] = { X, Y_full };
+    tigris_mem_t golden_mem;
+    memset(&golden_mem, 0, sizeof(golden_mem));
+    golden_mem.tensor_ptrs = golden_ptrs;
+    golden_mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &golden_mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "golden conv dispatch ok");
+
+    /* Interior: input[1:5,1:5,:] packed as in_h=in_w=4, core [2:4,2:4]. */
+    float Y_tile[2 * 2 * TC_OC];
+    tc_run_tile_f32(tigris_dispatch_kernel, &plan, &op, X, 1, 5, 1, 5, 0, 0, Y_tile);
+    tc_compare_f32(__func__, Y_tile, Y_full, TC_W, TC_OC, 2, 2);
+}
+
+static void test_conv_2d_tile_edge_f32(void)
+{
+    printf("  test_conv_2d_tile_edge_f32...\n");
+
+    float X[TC_H * TC_W * TC_C];
+    tc_fill_input_f32(X);
+    float W[TC_OC * TC_K * TC_K * TC_C];
+    tc_fill_weight_f32(W);
+    float B[TC_OC] = {0.5f, -0.25f};
+
+    tigris_tensor_t tensors[2];
+    int32_t shape_pool[8];
+    uint16_t index_pool[2];
+    tigris_weight_entry_t weights[2];
+    float weight_blob[TC_OC * TC_K * TC_K * TC_C + TC_OC];
+    tigris_file_header_t header;
+    tigris_op_t op;
+    tigris_plan_t plan;
+    tc_build_conv_plan_f32(tensors, shape_pool, index_pool, weights,
+                            weight_blob, &header, &op, &plan,
+                            W, sizeof(W), B, sizeof(B));
+
+    float Y_full[TC_H * TC_W * TC_OC];
+    void *golden_ptrs[2] = { X, Y_full };
+    tigris_mem_t golden_mem;
+    memset(&golden_mem, 0, sizeof(golden_mem));
+    golden_mem.tensor_ptrs = golden_ptrs;
+    golden_mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &golden_mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "golden conv dispatch ok");
+
+    /* Top-left corner: input[0:3,0:3,:], effective pad_top=pad_left=1,
+     * core [0:2,0:2]. */
+    float Y_tile[2 * 2 * TC_OC];
+    tc_run_tile_f32(tigris_dispatch_kernel, &plan, &op, X, 0, 3, 0, 3, 1, 1, Y_tile);
+    tc_compare_f32(__func__, Y_tile, Y_full, TC_W, TC_OC, 0, 0);
+}
+
+static void test_conv_2d_tile_matches_subregion_s8(void)
+{
+    printf("  test_conv_2d_tile_matches_subregion_s8...\n");
+
+    int8_t X[TC_H * TC_W * TS_C];
+    ts_fill_input_s8(X);
+
+    tigris_tensor_t tensors[2];
+    int32_t shape_pool[8];
+    uint16_t index_pool[2];
+    tigris_weight_entry_t weights[2];
+    _Alignas(int32_t) uint8_t weight_blob[sizeof(ts_weight) + sizeof(int32_t)];
+    tigris_quant_param_t qp[2];
+    int32_t qd[2];
+    tigris_file_header_t header;
+    tigris_op_t op;
+    tigris_plan_t plan;
+    tc_build_conv_plan_s8(tensors, shape_pool, index_pool, weights, weight_blob,
+                           qp, qd, &header, &op, &plan);
+
+    int8_t Y_full[TC_H * TC_W * TS_C];
+    void *golden_ptrs[2] = { X, Y_full };
+    tigris_mem_t golden_mem;
+    memset(&golden_mem, 0, sizeof(golden_mem));
+    golden_mem.tensor_ptrs = golden_ptrs;
+    golden_mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &golden_mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "golden conv_s8 dispatch ok");
+
+    int8_t Y_tile[2 * 2 * TS_C];
+    tc_run_tile_s8(tigris_dispatch_kernel_s8, &plan, &op, X, 1, 5, 1, 5, 0, 0, Y_tile);
+    tc_compare_s8(__func__, Y_tile, Y_full, TC_W, TS_C, 2, 2);
+}
+
+static void test_conv_2d_tile_edge_s8(void)
+{
+    printf("  test_conv_2d_tile_edge_s8...\n");
+
+    int8_t X[TC_H * TC_W * TS_C];
+    ts_fill_input_s8(X);
+
+    tigris_tensor_t tensors[2];
+    int32_t shape_pool[8];
+    uint16_t index_pool[2];
+    tigris_weight_entry_t weights[2];
+    _Alignas(int32_t) uint8_t weight_blob[sizeof(ts_weight) + sizeof(int32_t)];
+    tigris_quant_param_t qp[2];
+    int32_t qd[2];
+    tigris_file_header_t header;
+    tigris_op_t op;
+    tigris_plan_t plan;
+    tc_build_conv_plan_s8(tensors, shape_pool, index_pool, weights, weight_blob,
+                           qp, qd, &header, &op, &plan);
+
+    int8_t Y_full[TC_H * TC_W * TS_C];
+    void *golden_ptrs[2] = { X, Y_full };
+    tigris_mem_t golden_mem;
+    memset(&golden_mem, 0, sizeof(golden_mem));
+    golden_mem.tensor_ptrs = golden_ptrs;
+    golden_mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &golden_mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "golden conv_s8 dispatch ok");
+
+    int8_t Y_tile[2 * 2 * TS_C];
+    tc_run_tile_s8(tigris_dispatch_kernel_s8, &plan, &op, X, 0, 3, 0, 3, 1, 1, Y_tile);
+    tc_compare_s8(__func__, Y_tile, Y_full, TC_W, TS_C, 0, 0);
+}
+
+/* AveragePool: the pool variant called for by the task brief. Its width
+ * bound is computed differently from conv/max_pool (a valid-sample window
+ * count, not a per-tap continue), so it exercises the PL fix on a distinct
+ * code path. Same interior/edge geometry as the conv tests above. */
+
+static void test_avg_pool_2d_tile_matches_subregion_f32(void)
+{
+    printf("  test_avg_pool_2d_tile_matches_subregion_f32...\n");
+
+    float X[TC_H * TC_W * TC_C];
+    tc_fill_input_f32(X);
+
+    tigris_tensor_t tensors[2];
+    int32_t shape_pool[8];
+    uint16_t index_pool[2];
+    tigris_file_header_t header;
+    tigris_op_t op;
+    tigris_plan_t plan;
+    tc_build_avgpool_plan_f32(tensors, shape_pool, index_pool, &header, &op, &plan);
+
+    float Y_full[TC_H * TC_W * TC_C];
+    void *golden_ptrs[2] = { X, Y_full };
+    tigris_mem_t golden_mem;
+    memset(&golden_mem, 0, sizeof(golden_mem));
+    golden_mem.tensor_ptrs = golden_ptrs;
+    golden_mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &golden_mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "golden avg_pool dispatch ok");
+
+    float Y_tile[2 * 2 * TC_C];
+    tc_run_tile_f32(tigris_dispatch_kernel, &plan, &op, X, 1, 5, 1, 5, 0, 0, Y_tile);
+    tc_compare_f32(__func__, Y_tile, Y_full, TC_W, TC_C, 2, 2);
+}
+
+static void test_avg_pool_2d_tile_edge_f32(void)
+{
+    printf("  test_avg_pool_2d_tile_edge_f32...\n");
+
+    float X[TC_H * TC_W * TC_C];
+    tc_fill_input_f32(X);
+
+    tigris_tensor_t tensors[2];
+    int32_t shape_pool[8];
+    uint16_t index_pool[2];
+    tigris_file_header_t header;
+    tigris_op_t op;
+    tigris_plan_t plan;
+    tc_build_avgpool_plan_f32(tensors, shape_pool, index_pool, &header, &op, &plan);
+
+    float Y_full[TC_H * TC_W * TC_C];
+    void *golden_ptrs[2] = { X, Y_full };
+    tigris_mem_t golden_mem;
+    memset(&golden_mem, 0, sizeof(golden_mem));
+    golden_mem.tensor_ptrs = golden_ptrs;
+    golden_mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &golden_mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "golden avg_pool dispatch ok");
+
+    float Y_tile[2 * 2 * TC_C];
+    tc_run_tile_f32(tigris_dispatch_kernel, &plan, &op, X, 0, 3, 0, 3, 1, 1, Y_tile);
+    tc_compare_f32(__func__, Y_tile, Y_full, TC_W, TC_C, 0, 0);
+}
+
+static void test_avg_pool_2d_tile_matches_subregion_s8(void)
+{
+    printf("  test_avg_pool_2d_tile_matches_subregion_s8...\n");
+
+    int8_t X[TC_H * TC_W * TS_C];
+    ts_fill_input_s8(X);
+
+    tigris_tensor_t tensors[2];
+    int32_t shape_pool[8];
+    uint16_t index_pool[2];
+    tigris_file_header_t header;
+    tigris_op_t op;
+    tigris_plan_t plan;
+    tc_build_avgpool_plan_s8(tensors, shape_pool, index_pool, &header, &op, &plan);
+
+    int8_t Y_full[TC_H * TC_W * TS_C];
+    void *golden_ptrs[2] = { X, Y_full };
+    tigris_mem_t golden_mem;
+    memset(&golden_mem, 0, sizeof(golden_mem));
+    golden_mem.tensor_ptrs = golden_ptrs;
+    golden_mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &golden_mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "golden avg_pool_s8 dispatch ok");
+
+    int8_t Y_tile[2 * 2 * TS_C];
+    tc_run_tile_s8(tigris_dispatch_kernel_s8, &plan, &op, X, 1, 5, 1, 5, 0, 0, Y_tile);
+    tc_compare_s8(__func__, Y_tile, Y_full, TC_W, TS_C, 2, 2);
+}
+
+static void test_avg_pool_2d_tile_edge_s8(void)
+{
+    printf("  test_avg_pool_2d_tile_edge_s8...\n");
+
+    int8_t X[TC_H * TC_W * TS_C];
+    ts_fill_input_s8(X);
+
+    tigris_tensor_t tensors[2];
+    int32_t shape_pool[8];
+    uint16_t index_pool[2];
+    tigris_file_header_t header;
+    tigris_op_t op;
+    tigris_plan_t plan;
+    tc_build_avgpool_plan_s8(tensors, shape_pool, index_pool, &header, &op, &plan);
+
+    int8_t Y_full[TC_H * TC_W * TS_C];
+    void *golden_ptrs[2] = { X, Y_full };
+    tigris_mem_t golden_mem;
+    memset(&golden_mem, 0, sizeof(golden_mem));
+    golden_mem.tensor_ptrs = golden_ptrs;
+    golden_mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &op, 0, &golden_mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "golden avg_pool_s8 dispatch ok");
+
+    int8_t Y_tile[2 * 2 * TS_C];
+    tc_run_tile_s8(tigris_dispatch_kernel_s8, &plan, &op, X, 0, 3, 0, 3, 1, 1, Y_tile);
+    tc_compare_s8(__func__, Y_tile, Y_full, TC_W, TS_C, 0, 0);
+}
+
 /* Main */
 
 int main(void)
@@ -312,6 +986,15 @@ int main(void)
     test_load_tile_2d_roundtrip();
     test_spill_tile_2d_roundtrip();
     test_load_tile_2d_rejects_bad_bounds();
+
+    test_conv_2d_tile_matches_subregion_f32();
+    test_conv_2d_tile_edge_f32();
+    test_conv_2d_tile_matches_subregion_s8();
+    test_conv_2d_tile_edge_s8();
+    test_avg_pool_2d_tile_matches_subregion_f32();
+    test_avg_pool_2d_tile_edge_f32();
+    test_avg_pool_2d_tile_matches_subregion_s8();
+    test_avg_pool_2d_tile_edge_s8();
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);

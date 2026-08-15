@@ -143,7 +143,8 @@ typedef enum {
 /* Serialized activation axes used by schema-v5 tile plans. */
 #define TIGRIS_TILE_AXIS_NONE             0
 #define TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH 1
-#define TIGRIS_TILE_AXIS_WIDTH            2
+#define TIGRIS_TILE_AXIS_WIDTH            2  /* reserved, not accepted */
+#define TIGRIS_TILE_AXIS_HW               3
 
 /* Sentinel: chain_id == 0xFFFF means stage is not part of a chain */
 #define TIGRIS_NO_CHAIN         0xFFFF

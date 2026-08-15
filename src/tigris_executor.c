@@ -32,6 +32,18 @@
 #  endif
 #endif
 
+/* The stage executors (normal / standalone-tiled / chained) are mutually
+ * exclusive per stage. Keeping the chained executor out of line stops the
+ * compiler from folding its locals into the dispatcher frame alongside the
+ * other executors, so each execution path stays within the per-frame stack
+ * budget. It runs once per chain (the tile loop is inside it), so the extra
+ * call is negligible. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define TIGRIS_NOINLINE __attribute__((noinline))
+#else
+#  define TIGRIS_NOINLINE
+#endif
+
 #define TILE_ALIGN_UP(x) (((x) + (TIGRIS_TENSOR_ALIGN - 1u)) & ~(TIGRIS_TENSOR_ALIGN - 1u))
 
 #ifdef TIGRIS_COUNT_KERNEL_ROWS
@@ -960,7 +972,7 @@ static const tigris_weight_block_t *find_weight_block(
  * @param kernel     Kernel dispatch function.
  * @param user_ctx   User context for kernels.
  */
-static tigris_exec_error_t exec_chain_tiled(
+static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
     const tigris_plan_t *plan,
     uint16_t             first_idx,
     uint16_t             num_chain,

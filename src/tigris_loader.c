@@ -357,6 +357,37 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             break;
         }
 
+        case TIGRIS_OP_CONV_TRANSPOSE: {
+            /* Untiled gather kernel (kern_conv_transpose / kern_conv_transpose_s8
+             * in tigris_kernels.c / tigris_kernels_s8.c). group == 1 is the only
+             * supported configuration in scope. Unlike TIGRIS_OP_CONV,
+             * output_padding is absorbed into the emitted output shape at
+             * compile time, so the shrink-formula output_dim_is_valid (derived
+             * for the forward strided-conv relation) does not apply here; the
+             * gather loop bounds itself against the allocated output extent
+             * instead. Validate structure only, mirroring the CONV case above
+             * minus the output-shape derivation and weight-size check.
+             *
+             * The gather kernels invert the forward stride relation with
+             * num_h % stride_h and num_h / stride_h (same for width). A zero
+             * stride divides by zero at execution time, and the kernels do
+             * not guard against it themselves, so the loader must reject it
+             * here. */
+            if (op->num_inputs != 1 || op->num_outputs != 1 ||
+                op->weight_idx == TIGRIS_NO_WEIGHT ||
+                input->ndim != 4 || output->ndim != 4)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            if (op->spatial.group != 1)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            if (op->spatial.stride_h == 0 || op->spatial.stride_w == 0)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *in_shape = tigris_tensor_shape(plan, input);
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            if (in_shape[0] != out_shape[0])
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
+
         case TIGRIS_OP_RESIZE: {
             if (!op_has_plain_io(op, 1, 1) ||
                 input->ndim != 4 || output->ndim != 4 ||

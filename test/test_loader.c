@@ -1289,6 +1289,142 @@ static void test_convolution_semantic_guards(void)
                    TIGRIS_ERR_BAD_OPERATOR, "operator stage mismatch rejected");
 }
 
+/* Compact one-op plan for exercising ConvTranspose loader acceptance.
+ * Two tensors (input, output) plus a one-element weight, mirroring the
+ * weight_idx convention kern_conv_transpose[_s8] actually reads (num_inputs
+ * stays 1; the weight is addressed through op->weight_idx like Conv, not
+ * appended to the input list). */
+#define CONVT_PLAN_SIZE    276u
+#define CONVT_TENSORS_OFF  112u
+#define CONVT_OPS_OFF      144u
+#define CONVT_STAGES_OFF   184u
+#define CONVT_INDEX_OFF    212u
+#define CONVT_SHAPES_OFF   224u
+#define CONVT_STRINGS_OFF  256u
+#define CONVT_WEIGHTS_OFF  260u
+
+static void build_conv_transpose_plan(uint8_t *buf)
+{
+    memset(buf, 0, CONVT_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = CONVT_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 2;
+    hdr->num_ops = 1;
+    hdr->num_stages = 1;
+    hdr->num_weights = 1;
+    hdr->model_io_off = 2;
+    hdr->num_model_inputs = 1;
+    hdr->num_model_outputs = 1;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, CONVT_TENSORS_OFF};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, CONVT_OPS_OFF};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, CONVT_STAGES_OFF};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, CONVT_INDEX_OFF};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, CONVT_SHAPES_OFF};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, CONVT_STRINGS_OFF};
+    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHTS, CONVT_WEIGHTS_OFF};
+
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + CONVT_TENSORS_OFF);
+    int32_t *shapes = (int32_t *)(buf + CONVT_SHAPES_OFF);
+
+    /* Tensor 0: input, NHWC 1x2x2x1 */
+    tensors[0].shape_off = 0;
+    tensors[0].ndim = 4;
+    tensors[0].dtype = 1;
+    tensors[0].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    tensors[0].size_bytes = 4 * sizeof(float);
+    shapes[0] = 1; shapes[1] = 2; shapes[2] = 2; shapes[3] = 1;
+
+    /* Tensor 1: output, NHWC 1x2x2x1. output_padding/spatial derivation is
+     * out of scope for this loader case, so the shape need only be rank-4
+     * with a matching batch dimension. */
+    tensors[1].shape_off = 4;
+    tensors[1].ndim = 4;
+    tensors[1].dtype = 1;
+    tensors[1].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    tensors[1].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+    tensors[1].size_bytes = 4 * sizeof(float);
+    shapes[4] = 1; shapes[5] = 2; shapes[6] = 2; shapes[7] = 1;
+
+    tigris_weight_entry_t *weight =
+        (tigris_weight_entry_t *)(buf + CONVT_WEIGHTS_OFF);
+    weight->name_str = 0;
+    weight->offset = 0;
+    weight->size_bytes = sizeof(float);
+
+    tigris_op_t *op = (tigris_op_t *)(buf + CONVT_OPS_OFF);
+    op->op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    op->num_inputs = 1;
+    op->num_outputs = 1;
+    op->stage = 0;
+    op->inputs_off = 0;
+    op->outputs_off = 1;
+    op->spatial.kernel_h = 1;
+    op->spatial.kernel_w = 1;
+    op->spatial.stride_h = 1;
+    op->spatial.stride_w = 1;
+    op->spatial.dilation_h = 1;
+    op->spatial.dilation_w = 1;
+    op->spatial.group = 1;
+    op->weight_idx = 0;
+    op->bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + CONVT_STAGES_OFF);
+    stage->ops_off = 4;
+    stage->ops_count = 1;
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    uint16_t *indices = (uint16_t *)(buf + CONVT_INDEX_OFF);
+    indices[0] = 0;   /* op input: tensor 0 */
+    indices[1] = 1;   /* op output: tensor 1 */
+    indices[2] = 0;   /* model input: tensor 0 */
+    indices[3] = 1;   /* model output: tensor 1 */
+    indices[4] = 0;   /* stage op list: op 0 */
+
+    buf[CONVT_STRINGS_OFF] = '\0';
+}
+
+static void test_conv_transpose_semantic_guards(void)
+{
+    printf("  test_conv_transpose_semantic_guards...\n");
+    _Alignas(4) uint8_t buf[CONVT_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_op_t *op;
+
+    build_conv_transpose_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid ConvTranspose loads");
+
+    build_conv_transpose_plan(buf);
+    op = (tigris_op_t *)(buf + CONVT_OPS_OFF);
+    op->spatial.stride_h = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "zero ConvTranspose stride_h rejected");
+
+    build_conv_transpose_plan(buf);
+    op = (tigris_op_t *)(buf + CONVT_OPS_OFF);
+    op->spatial.stride_w = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "zero ConvTranspose stride_w rejected");
+
+    build_conv_transpose_plan(buf);
+    op = (tigris_op_t *)(buf + CONVT_OPS_OFF);
+    op->spatial.group = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "unsupported ConvTranspose group rejected");
+}
+
 /* Struct size validation */
 
 static void test_struct_sizes(void)
@@ -1594,6 +1730,7 @@ int main(int argc, char *argv[])
     test_operator_semantic_guards();
     test_nonweighted_operator_semantics();
     test_convolution_semantic_guards();
+    test_conv_transpose_semantic_guards();
 
     printf("\nSchema compatibility fixtures:\n");
     test_schema_compatibility_fixtures();

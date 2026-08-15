@@ -223,6 +223,49 @@ tigris_mem_error_t tigris_mem_spill_tile(
     uint16_t tensor_idx, void *slow_base, int32_t h_start, int32_t h_end);
 
 /**
+ * Load a 2D [h0:h1, w0:w1, :] sub-rectangle of an NHWC tensor from slow to
+ * fast. Allocates N*(h1-h0)*(w1-w0)*C*elem in fast, packed with no gaps
+ * between rows, and copies the strided source rectangle row by row.
+ *
+ * @param mem   Memory manager.
+ * @param plan  Loaded plan (for tensor shape lookup).
+ * @param tidx  Tensor index to load a tile from. Must be rank 4 (NHWC).
+ * @param h0    First row (inclusive) of the height range. Must satisfy
+ *              0 <= h0 < h1 <= H.
+ * @param h1    Last row (exclusive) of the height range.
+ * @param w0    First column (inclusive) of the width range. Must satisfy
+ *              0 <= w0 < w1 <= W.
+ * @param w1    Last column (exclusive) of the width range.
+ * @return TIGRIS_MEM_OK on success, negative error code on failure.
+ */
+tigris_mem_error_t tigris_mem_load_tile_2d(
+    tigris_mem_t *mem, const tigris_plan_t *plan,
+    uint16_t tidx, int32_t h0, int32_t h1, int32_t w0, int32_t w1);
+
+/**
+ * Spill a packed 2D [oh, ow, C] core from fast to the strided
+ * [h0:h1, w0:w1, :] rectangle of the full NHWC tensor at slow_base, then
+ * restore tensor_ptrs[tidx]. 2D output tiles have no halo, so the entire
+ * packed core is written back.
+ *
+ * @param mem       Memory manager.
+ * @param plan      Loaded plan (for tensor shape lookup).
+ * @param tidx      Tensor index to spill a tile for.
+ * @param slow_base Destination buffer in slow memory for the full tensor.
+ * @param h0        First row (inclusive) of the height range. Must satisfy
+ *                  0 <= h0 < h1 <= H.
+ * @param h1        Last row (exclusive) of the height range.
+ * @param w0        First column (inclusive) of the width range. Must
+ *                  satisfy 0 <= w0 < w1 <= W.
+ * @param w1        Last column (exclusive) of the width range.
+ * @return TIGRIS_MEM_OK on success, negative error code on failure.
+ */
+tigris_mem_error_t tigris_mem_spill_tile_2d(
+    tigris_mem_t *mem, const tigris_plan_t *plan,
+    uint16_t tidx, void *slow_base,
+    int32_t h0, int32_t h1, int32_t w0, int32_t w1);
+
+/**
  * Return a human-readable string for a memory error code.
  *
  * @param err  Memory error code.

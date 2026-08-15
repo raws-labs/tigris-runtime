@@ -48,6 +48,12 @@ typedef struct {
      * recomputing already-rolled overlap rows. */
     int32_t  out_row_start; /* rows already written before this call */
     int32_t  in_row_start;  /* rows already consumed before this call */
+    /* 2D (HW axis) tile geometry. Consulted only when width_tiled == 1;
+     * default to 0 like every other field above, so 1D-height and
+     * non-tiled paths stay byte-identical. */
+    uint16_t pad_left;      /* effective left padding for this tile */
+    uint16_t pad_right;     /* effective right padding for this tile */
+    uint8_t  width_tiled;   /* 0=height-only tile, 1=2D (HW) tile active */
 } tigris_tile_ctx_t;
 
 /* Tensor alignment */

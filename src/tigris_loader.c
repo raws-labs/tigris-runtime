@@ -561,7 +561,8 @@ tigris_error_t tigris_plan_load(
                 return TIGRIS_ERR_BAD_SECTION;
             if (hdr->version >= TIGRIS_SCHEMA_VERSION_TILE_AXIS) {
                 if ((tile->tileable &&
-                     tile->axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) ||
+                     tile->axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH &&
+                     tile->axis != TIGRIS_TILE_AXIS_HW) ||
                     (!tile->tileable &&
                      tile->axis != TIGRIS_TILE_AXIS_NONE))
                     return TIGRIS_ERR_BAD_SECTION;

@@ -210,6 +210,82 @@ static int kern_conv2d(
     return 0;
 }
 
+/** ConvTranspose (transposed convolution) via input-gather.
+ * Untiled: runs as a whole standalone stage. group == 1 and dilation == 1
+ * are the only supported configuration in scope; output shape (including
+ * output_padding) is already resolved by the compiler into y_shape.
+ *
+ * For each output pixel, gather from the input positions that scattered
+ * into it under the forward strided-transpose relation
+ * (oh = ih*SH - PT + kh, ow = iw*SW - PL + kw), inverted to solve for
+ * ih/iw given oh/ow/kh/kw. A tap is skipped when it does not land on the
+ * stride lattice (num_h/num_w not divisible by SH/SW) or when the
+ * resulting ih/iw falls outside the input.
+ */
+static int kern_conv_transpose(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    const float *W = (const float *)tigris_op_weight(plan, op);
+    const float *B = (const float *)tigris_op_bias(plan, op);
+
+    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+
+    /* NHWC layout */
+    int N  = x_shape[0];
+    int IH = x_shape[1];
+    int IW = x_shape[2];
+    int IC = x_shape[3];
+    int OH = y_shape[1];
+    int OW = y_shape[2];
+    int OC = y_shape[3];
+    int KH = op->spatial.kernel_h;
+    int KW = op->spatial.kernel_w;
+    int SH = op->spatial.stride_h;
+    int SW = op->spatial.stride_w;
+    int PT = op->spatial.pad_top;
+    int PL = op->spatial.pad_left;
+
+    /* Weight layout: [OC, KH, KW, IC] (OHWI) */
+    for (int n = 0; n < N; n++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+                for (int oc = 0; oc < OC; oc++) {
+                    float sum = B ? B[oc] : 0.0f;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int num_h = oh + PT - kh;
+                        if (num_h % SH != 0)
+                            continue;
+                        int ih = num_h / SH;
+                        if (ih < 0 || ih >= IH)
+                            continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int num_w = ow + PL - kw;
+                            if (num_w % SW != 0)
+                                continue;
+                            int iw = num_w / SW;
+                            if (iw < 0 || iw >= IW)
+                                continue;
+                            for (int ic = 0; ic < IC; ic++) {
+                                float x_val = X[((n * IH + ih) * IW + iw) * IC + ic];
+                                float w_val = W[((oc * KH + kh) * KW + kw) * IC + ic];
+                                sum += x_val * w_val;
+                            }
+                        }
+                    }
+                    Y[((n * OH + oh) * OW + ow) * OC + oc] = apply_fused_act_f32(sum, op->fused_act);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static int kern_depthwise_conv2d(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -917,6 +993,7 @@ int tigris_dispatch_kernel(
 
     switch ((tigris_op_type_t)op->op_type) {
     case TIGRIS_OP_CONV:        return kern_conv2d(plan, op, mem);
+    case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose(plan, op, mem);
     case TIGRIS_OP_DEPTHWISE:   return kern_depthwise_conv2d(plan, op, mem);
     case TIGRIS_OP_RELU:        return kern_relu(plan, op, mem);
     case TIGRIS_OP_RELU6:       return kern_relu6(plan, op, mem);

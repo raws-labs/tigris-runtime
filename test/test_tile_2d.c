@@ -287,33 +287,186 @@ static void test_spill_tile_2d_roundtrip(void)
     TEST_ASSERT_EQ(restored, 1, "tensor_ptrs restored to slow_base");
 }
 
+#define T2D_NDIM_TIDX 1  /* second tensor: not rank 4, for ndim rejection */
+
+/* Two-tensor plan: index T2D_TIDX is the valid [T2D_N,T2D_H,T2D_W,T2D_C]
+ * rank-4 tensor from t2d_build_plan, index T2D_NDIM_TIDX is a rank-3 [N,L,C]
+ * tensor with no width axis, for exercising the ndim != 4 rejection path in
+ * both tigris_mem_load_tile_2d and tigris_mem_spill_tile_2d. Both tensors
+ * share one shape pool, the same convention t2d_build_plan uses. */
+static void t2d_build_plan_with_bad_ndim(tigris_tensor_t *tensors, int32_t *shape,
+                                          tigris_plan_t *plan)
+{
+    shape[0] = T2D_N;
+    shape[1] = T2D_H;
+    shape[2] = T2D_W;
+    shape[3] = T2D_C;
+    shape[4] = T2D_N;
+    shape[5] = T2D_H;
+    shape[6] = T2D_C;
+
+    memset(&tensors[T2D_TIDX], 0, sizeof(tensors[T2D_TIDX]));
+    tensors[T2D_TIDX].ndim = 4;
+    tensors[T2D_TIDX].shape_off = 0;
+    tensors[T2D_TIDX].size_bytes =
+        (uint32_t)(T2D_N * T2D_H * T2D_W * T2D_C) * (uint32_t)sizeof(int8_t);
+    tensors[T2D_TIDX].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+
+    memset(&tensors[T2D_NDIM_TIDX], 0, sizeof(tensors[T2D_NDIM_TIDX]));
+    tensors[T2D_NDIM_TIDX].ndim = 3;
+    tensors[T2D_NDIM_TIDX].shape_off = 4;
+    tensors[T2D_NDIM_TIDX].size_bytes =
+        (uint32_t)(T2D_N * T2D_H * T2D_C) * (uint32_t)sizeof(int8_t);
+    tensors[T2D_NDIM_TIDX].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+
+    memset(plan, 0, sizeof(*plan));
+    plan->tensors = tensors;
+    plan->shape_pool = shape;
+}
+
 static void test_load_tile_2d_rejects_bad_bounds(void)
 {
     printf("  test_load_tile_2d_rejects_bad_bounds...\n");
 
-    tigris_tensor_t tensor;
-    int32_t shape[4];
+    tigris_tensor_t tensors[2];
+    int32_t shape[7];
     tigris_plan_t plan;
-    t2d_build_plan(&tensor, shape, &plan);
+    t2d_build_plan_with_bad_ndim(tensors, shape, &plan);
 
     int8_t slow_buf[T2D_N * T2D_H * T2D_W * T2D_C];
     t2d_fill_source(slow_buf);
 
     uint8_t fast_buf[128];
     uint8_t slow_arena[128];
-    void *tensor_ptrs[1] = { NULL };
+    void *tensor_ptrs[2] = { NULL, NULL };
 
     tigris_mem_t mem;
-    tigris_mem_error_t merr = tigris_mem_init(&mem, tensor_ptrs, 1,
+    tigris_mem_error_t merr = tigris_mem_init(&mem, tensor_ptrs, 2,
                                                fast_buf, sizeof(fast_buf),
                                                slow_arena, sizeof(slow_arena));
     TEST_ASSERT_EQ(merr, TIGRIS_MEM_OK, "mem init ok");
     mem.tensor_ptrs[T2D_TIDX] = slow_buf;
 
+    /* tidx >= num_tensors must be rejected before any tensor lookup. */
+    tigris_mem_error_t e_tidx = tigris_mem_load_tile_2d(&mem, &plan, 2, 0, 1, 0, 1);
+    TEST_ASSERT_EQ(e_tidx, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range tidx rejected");
+
+    /* ndim != 4 must be rejected before any bounds check. */
+    tigris_mem_error_t e_ndim = tigris_mem_load_tile_2d(&mem, &plan, T2D_NDIM_TIDX,
+                                                          0, 1, 0, 1);
+    TEST_ASSERT_EQ(e_ndim, TIGRIS_MEM_ERR_BAD_INDEX, "non-4D tensor rejected");
+
+    /* h0 < 0 */
+    tigris_mem_error_t e_h0_neg = tigris_mem_load_tile_2d(&mem, &plan, T2D_TIDX,
+                                                            -1, 6, 3, 7);
+    TEST_ASSERT_EQ(e_h0_neg, TIGRIS_MEM_ERR_BAD_INDEX, "negative h0 rejected");
+
+    /* h1 <= h0, tested at equality */
+    tigris_mem_error_t e_h1_eq = tigris_mem_load_tile_2d(&mem, &plan, T2D_TIDX,
+                                                           3, 3, 3, 7);
+    TEST_ASSERT_EQ(e_h1_eq, TIGRIS_MEM_ERR_BAD_INDEX, "h1 == h0 rejected");
+
+    /* h1 > H */
+    tigris_mem_error_t e_h1_over = tigris_mem_load_tile_2d(&mem, &plan, T2D_TIDX,
+                                                             2, T2D_H + 1, 3, 7);
+    TEST_ASSERT_EQ(e_h1_over, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range h1 rejected");
+
+    /* w0 < 0 */
+    tigris_mem_error_t e_w0_neg = tigris_mem_load_tile_2d(&mem, &plan, T2D_TIDX,
+                                                            2, 6, -1, 7);
+    TEST_ASSERT_EQ(e_w0_neg, TIGRIS_MEM_ERR_BAD_INDEX, "negative w0 rejected");
+
+    /* w1 <= w0, tested at equality */
+    tigris_mem_error_t e_w1_eq = tigris_mem_load_tile_2d(&mem, &plan, T2D_TIDX,
+                                                           2, 6, 4, 4);
+    TEST_ASSERT_EQ(e_w1_eq, TIGRIS_MEM_ERR_BAD_INDEX, "w1 == w0 rejected");
+
     /* w1 > W must be rejected before any bytes move. */
-    tigris_mem_error_t e = tigris_mem_load_tile_2d(&mem, &plan, T2D_TIDX,
-                                                     2, 6, 3, T2D_W + 1);
-    TEST_ASSERT_EQ(e, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range w1 rejected");
+    tigris_mem_error_t e_w1_over = tigris_mem_load_tile_2d(&mem, &plan, T2D_TIDX,
+                                                             2, 6, 3, T2D_W + 1);
+    TEST_ASSERT_EQ(e_w1_over, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range w1 rejected");
+}
+
+static void test_spill_tile_2d_rejects_bad_bounds(void)
+{
+    printf("  test_spill_tile_2d_rejects_bad_bounds...\n");
+
+    tigris_tensor_t tensors[2];
+    int32_t shape[7];
+    tigris_plan_t plan;
+    t2d_build_plan_with_bad_ndim(tensors, shape, &plan);
+
+    int8_t core[4 * 4 * 2];
+    memset(core, 0, sizeof(core));
+
+    int8_t slow_buf[T2D_N * T2D_H * T2D_W * T2D_C];
+    memset(slow_buf, 0xFF, sizeof(slow_buf));
+
+    uint8_t fast_buf[128];
+    uint8_t slow_arena[128];
+    void *tensor_ptrs[2] = { NULL, NULL };
+
+    tigris_mem_t mem;
+    tigris_mem_error_t merr = tigris_mem_init(&mem, tensor_ptrs, 2,
+                                               fast_buf, sizeof(fast_buf),
+                                               slow_arena, sizeof(slow_arena));
+    TEST_ASSERT_EQ(merr, TIGRIS_MEM_OK, "mem init ok");
+    mem.tensor_ptrs[T2D_TIDX] = core;
+
+    /* tidx >= num_tensors must be rejected before any tensor lookup. */
+    tigris_mem_error_t e_tidx = tigris_mem_spill_tile_2d(&mem, &plan, 2, slow_buf,
+                                                           0, 1, 0, 1);
+    TEST_ASSERT_EQ(e_tidx, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range tidx rejected");
+
+    /* ndim != 4 must be rejected before any bounds check. */
+    tigris_mem_error_t e_ndim = tigris_mem_spill_tile_2d(&mem, &plan, T2D_NDIM_TIDX,
+                                                           slow_buf, 0, 1, 0, 1);
+    TEST_ASSERT_EQ(e_ndim, TIGRIS_MEM_ERR_BAD_INDEX, "non-4D tensor rejected");
+
+    /* h0 < 0 */
+    tigris_mem_error_t e_h0_neg = tigris_mem_spill_tile_2d(&mem, &plan, T2D_TIDX,
+                                                             slow_buf, -1, 6, 3, 7);
+    TEST_ASSERT_EQ(e_h0_neg, TIGRIS_MEM_ERR_BAD_INDEX, "negative h0 rejected");
+
+    /* h1 <= h0, tested at equality */
+    tigris_mem_error_t e_h1_eq = tigris_mem_spill_tile_2d(&mem, &plan, T2D_TIDX,
+                                                            slow_buf, 3, 3, 3, 7);
+    TEST_ASSERT_EQ(e_h1_eq, TIGRIS_MEM_ERR_BAD_INDEX, "h1 == h0 rejected");
+
+    /* h1 > H */
+    tigris_mem_error_t e_h1_over = tigris_mem_spill_tile_2d(&mem, &plan, T2D_TIDX,
+                                                              slow_buf, 2, T2D_H + 1, 3, 7);
+    TEST_ASSERT_EQ(e_h1_over, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range h1 rejected");
+
+    /* w0 < 0 */
+    tigris_mem_error_t e_w0_neg = tigris_mem_spill_tile_2d(&mem, &plan, T2D_TIDX,
+                                                             slow_buf, 2, 6, -1, 7);
+    TEST_ASSERT_EQ(e_w0_neg, TIGRIS_MEM_ERR_BAD_INDEX, "negative w0 rejected");
+
+    /* w1 <= w0, tested at equality */
+    tigris_mem_error_t e_w1_eq = tigris_mem_spill_tile_2d(&mem, &plan, T2D_TIDX,
+                                                            slow_buf, 2, 6, 4, 4);
+    TEST_ASSERT_EQ(e_w1_eq, TIGRIS_MEM_ERR_BAD_INDEX, "w1 == w0 rejected");
+
+    /* w1 > W must be rejected before any bytes move. */
+    tigris_mem_error_t e_w1_over = tigris_mem_spill_tile_2d(&mem, &plan, T2D_TIDX,
+                                                              slow_buf, 2, 6, 3, T2D_W + 1);
+    TEST_ASSERT_EQ(e_w1_over, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range w1 rejected");
+
+    /* Nothing in slow_buf should have moved: every rejected call must fail
+     * before the copy loop runs. */
+    for (size_t i = 0; i < sizeof(slow_buf); i++) {
+        tests_run++;
+        if (slow_buf[i] != (int8_t)-1) {
+            tests_failed++;
+            fprintf(stderr,
+                    "  FAIL: %s (byte %zu): slow_buf untouched by rejected spills "
+                    "(got %d, expected -1)\n",
+                    __func__, i, (int)slow_buf[i]);
+        } else {
+            tests_passed++;
+        }
+    }
 }
 
 /* Task 6: per-tile in_w / left-right pad overrides */
@@ -1412,6 +1565,7 @@ int main(void)
     test_load_tile_2d_roundtrip();
     test_spill_tile_2d_roundtrip();
     test_load_tile_2d_rejects_bad_bounds();
+    test_spill_tile_2d_rejects_bad_bounds();
 
     test_conv_2d_tile_matches_subregion_f32();
     test_conv_2d_tile_edge_f32();

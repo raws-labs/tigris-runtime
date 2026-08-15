@@ -359,14 +359,17 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 
         case TIGRIS_OP_CONV_TRANSPOSE: {
             /* Untiled gather kernel (kern_conv_transpose / kern_conv_transpose_s8
-             * in tigris_kernels.c / tigris_kernels_s8.c). group == 1 is the only
-             * supported configuration in scope. Unlike TIGRIS_OP_CONV,
-             * output_padding is absorbed into the emitted output shape at
-             * compile time, so the shrink-formula output_dim_is_valid (derived
-             * for the forward strided-conv relation) does not apply here; the
-             * gather loop bounds itself against the allocated output extent
-             * instead. Validate structure only, mirroring the CONV case above
-             * minus the output-shape derivation and weight-size check.
+             * in tigris_kernels.c / tigris_kernels_s8.c). group == 1 and
+             * dilation == 1 are the only supported configuration in scope: the
+             * gather kernels never read dilation_h/dilation_w, so a plan with
+             * dilation != 1 would silently produce wrong output instead of
+             * failing loudly. Unlike TIGRIS_OP_CONV, output_padding is
+             * absorbed into the emitted output shape at compile time, so the
+             * shrink-formula output_dim_is_valid (derived for the forward
+             * strided-conv relation) does not apply here; the gather loop
+             * bounds itself against the allocated output extent instead.
+             * Validate structure only, mirroring the CONV case above minus
+             * the output-shape derivation.
              *
              * The gather kernels invert the forward stride relation with
              * num_h % stride_h and num_h / stride_h (same for width). A zero
@@ -381,9 +384,31 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 return TIGRIS_ERR_BAD_OPERATOR;
             if (op->spatial.stride_h == 0 || op->spatial.stride_w == 0)
                 return TIGRIS_ERR_BAD_OPERATOR;
+            /* dilation 0 encodes "1" (unset) in this codebase, same
+             * convention the CONV case's output_dim_is_valid call relies on. */
+            uint16_t dilation_h =
+                op->spatial.dilation_h ? op->spatial.dilation_h : 1;
+            uint16_t dilation_w =
+                op->spatial.dilation_w ? op->spatial.dilation_w : 1;
+            if (dilation_h != 1 || dilation_w != 1)
+                return TIGRIS_ERR_BAD_OPERATOR;
             const int32_t *in_shape = tigris_tensor_shape(plan, input);
             const int32_t *out_shape = tigris_tensor_shape(plan, output);
             if (in_shape[0] != out_shape[0])
+                return TIGRIS_ERR_BAD_OPERATOR;
+            /* Weight is OHWI [OC, KH, KW, IC], same element count as the
+             * CONV case's [OC, KH, KW, IC]-order weight, just not
+             * transposed the way regular Conv weights are; bias is OC
+             * int32, same as CONV. */
+            uint32_t input_channels = (uint32_t)in_shape[3];
+            uint32_t output_channels = (uint32_t)out_shape[3];
+            uint64_t weight_elements = (uint64_t)output_channels *
+                op->spatial.kernel_h * op->spatial.kernel_w * input_channels;
+            uint64_t weight_bytes = weight_elements *
+                (dtype == 1 ? sizeof(float) : sizeof(int8_t));
+            uint64_t bias_bytes = (uint64_t)output_channels * sizeof(int32_t);
+            if (!weight_size_is(plan, op->weight_idx, weight_bytes) ||
+                !optional_bias_size_is(plan, op->bias_idx, bias_bytes))
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
         }

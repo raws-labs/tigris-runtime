@@ -1398,6 +1398,7 @@ static void test_conv_transpose_semantic_guards(void)
     _Alignas(4) uint8_t buf[CONVT_PLAN_SIZE];
     tigris_plan_t plan;
     tigris_op_t *op;
+    tigris_weight_entry_t *weight;
 
     build_conv_transpose_plan(buf);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
@@ -1423,6 +1424,20 @@ static void test_conv_transpose_semantic_guards(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_OPERATOR,
                    "unsupported ConvTranspose group rejected");
+
+    build_conv_transpose_plan(buf);
+    op = (tigris_op_t *)(buf + CONVT_OPS_OFF);
+    op->spatial.dilation_h = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "dilated ConvTranspose rejected");
+
+    build_conv_transpose_plan(buf);
+    weight = (tigris_weight_entry_t *)(buf + CONVT_WEIGHTS_OFF);
+    weight->size_bytes = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "undersized ConvTranspose weight rejected");
 }
 
 /* Struct size validation */

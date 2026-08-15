@@ -173,6 +173,11 @@ static int kern_conv2d(
         IW = mem->tile.in_w;
         OW = mem->tile.out_w;
         PT = mem->tile.pad_top;
+        /* Left pad only applies to a packed 2D (HW) tile; the right edge is
+         * already implicit in the IW bound check below, the same way the
+         * bottom edge is implicit in IH without a PB local. */
+        if (mem->tile.width_tiled)
+            PL = mem->tile.pad_left;
         out_row_start = mem->tile.out_row_start;
         in_row_start  = mem->tile.in_row_start;
     }
@@ -244,6 +249,11 @@ static int kern_depthwise_conv2d(
         IW = mem->tile.in_w;
         OW = mem->tile.out_w;
         PT = mem->tile.pad_top;
+        /* Left pad only applies to a packed 2D (HW) tile; the right edge is
+         * already implicit in the IW bound check below, the same way the
+         * bottom edge is implicit in IH without a PB local. */
+        if (mem->tile.width_tiled)
+            PL = mem->tile.pad_left;
         out_row_start = mem->tile.out_row_start;
         in_row_start  = mem->tile.in_row_start;
     }
@@ -644,6 +654,11 @@ static int kern_max_pool(
         IW = mem->tile.in_w;
         OW = mem->tile.out_w;
         PT = mem->tile.pad_top;
+        /* Left pad only applies to a packed 2D (HW) tile; the right edge is
+         * already implicit in the IW bound check below, the same way the
+         * bottom edge is implicit in IH without a PB local. */
+        if (mem->tile.width_tiled)
+            PL = mem->tile.pad_left;
         out_row_start = mem->tile.out_row_start;
         in_row_start  = mem->tile.in_row_start;
     }
@@ -709,6 +724,11 @@ static int kern_avg_pool(
         IW = mem->tile.in_w;
         OW = mem->tile.out_w;
         PT = mem->tile.pad_top;
+        /* Left pad only applies to a packed 2D (HW) tile; the right edge is
+         * already implicit in the IW bound check below, the same way the
+         * bottom edge is implicit in IH without a PB local. */
+        if (mem->tile.width_tiled)
+            PL = mem->tile.pad_left;
         out_row_start = mem->tile.out_row_start;
         in_row_start  = mem->tile.in_row_start;
     }

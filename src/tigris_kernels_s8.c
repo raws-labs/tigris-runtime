@@ -321,6 +321,95 @@ static int kern_conv2d_s8(
     return 0;
 }
 
+/** ConvTranspose (transposed convolution) via input-gather, int8.
+ * Same transpose-gather index relation as kern_conv_transpose (f32,
+ * tigris_kernels.c): for each output pixel, gather from the input
+ * positions that scattered into it under the forward strided-transpose
+ * relation (oh = ih*SH - PT + kh, ow = iw*SW - PL + kw), inverted to solve
+ * for ih/iw given oh/ow/kh/kw. A tap is skipped when it does not land on
+ * the stride lattice (num_h/num_w not divisible by SH/SW) or when the
+ * resulting ih/iw falls outside the input. group == 1 and dilation == 1
+ * are the only supported configuration in scope.
+ * Accumulation in int32 with per-channel requantization, matching
+ * kern_conv2d_s8.
+ */
+static int kern_conv_transpose_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+
+    const int8_t  *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t        *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
+    const uint8_t *B = (const uint8_t *)tigris_op_bias(plan, op);
+
+    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+
+    /* Input quant param for zero point */
+    const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    int32_t input_zp = in_qp ? in_qp->zero_point : 0;
+
+    /* Output quant param for requantization */
+    const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+
+    /* NHWC layout */
+    int N  = x_shape[0];
+    int IH = x_shape[1];
+    int IW = x_shape[2];
+    int IC = x_shape[3];
+    int OH = y_shape[1];
+    int OW = y_shape[2];
+    int OC = y_shape[3];
+    int KH = op->spatial.kernel_h;
+    int KW = op->spatial.kernel_w;
+    int SH = op->spatial.stride_h;
+    int SW = op->spatial.stride_w;
+    int PT = op->spatial.pad_top;
+    int PL = op->spatial.pad_left;
+
+    /* Weight layout: [OC, KH, KW, IC] (OHWI) */
+    for (int n = 0; n < N; n++) {
+        for (int oh = 0; oh < OH; oh++) {
+            for (int ow = 0; ow < OW; ow++) {
+                for (int oc = 0; oc < OC; oc++) {
+                    int32_t acc = B ? load_bias_s32(B, (uint32_t)oc) : 0;
+                    for (int kh = 0; kh < KH; kh++) {
+                        int num_h = oh + PT - kh;
+                        if (num_h % SH != 0)
+                            continue;
+                        int ih = num_h / SH;
+                        if (ih < 0 || ih >= IH)
+                            continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            int num_w = ow + PL - kw;
+                            if (num_w % SW != 0)
+                                continue;
+                            int iw = num_w / SW;
+                            if (iw < 0 || iw >= IW)
+                                continue;
+                            for (int ic = 0; ic < IC; ic++) {
+                                int32_t x_val = (int32_t)X[((n*IH+ih)*IW+iw)*IC+ic] - input_zp;
+                                int32_t w_val = (int32_t)W[((oc*KH+kh)*KW+kw)*IC+ic];
+                                acc += x_val * w_val;
+                            }
+                        }
+                    }
+                    /* Requantize: per-channel uses oc, per-tensor uses 0 */
+                    int ch = (out_qp && out_qp->num_channels > 1) ? oc : 0;
+                    int32_t m = out_qp ? get_multiplier(plan, out_qp, ch) : 1;
+                    int32_t s = out_qp ? get_shift(plan, out_qp, ch) : 0;
+                    int32_t scaled = multiply_by_quantized_multiplier(acc, m, s);
+                    Y[((n*OH+oh)*OW+ow)*OC+oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 /* INT8 1D convolution. NLC activation layout, weights [OC, K, IC], per-channel
  * requant - the int8 analogue of kern_conv1d (float) / kern_conv2d_s8. */
 static int kern_conv1d_s8(
@@ -1230,6 +1319,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_SOFTMAX:     return kern_softmax_s8(plan, op, mem);
     case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
+    case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose_s8(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */

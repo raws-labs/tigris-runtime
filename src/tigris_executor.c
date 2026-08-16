@@ -126,6 +126,15 @@ static uintptr_t align_address(uintptr_t address, size_t alignment)
     return (address + alignment - 1u) & ~(uintptr_t)(alignment - 1u);
 }
 
+/* Floor division for signed numerators (b > 0). Bare C `/` truncates toward
+ * zero, which rounds negative numerators the wrong way; the ConvTranspose
+ * inverse-rectangle back-computation needs a true floor for negative
+ * numerators, so it must go through this helper, never `/`. */
+static int32_t floor_div(int32_t a, int32_t b)
+{
+    return (a >= 0) ? (a / b) : -(((-a) + b - 1) / b);
+}
+
 static int is_height_spatial_op(uint8_t type)
 {
     return type == TIGRIS_OP_CONV ||
@@ -137,6 +146,7 @@ static int is_height_spatial_op(uint8_t type)
 static int is_height_tiling_op(uint8_t type)
 {
     return is_height_spatial_op(type) ||
+           type == TIGRIS_OP_CONV_TRANSPOSE ||
            type == TIGRIS_OP_RELU ||
            type == TIGRIS_OP_RELU6 ||
            type == TIGRIS_OP_SIGMOID ||
@@ -397,15 +407,18 @@ static void compact_slow(tigris_mem_t *mem, const tigris_plan_t *plan)
 /* Helpers */
 
 /**
- * Find the first axis-1 spatial op (Conv/DWConv/Pool/Conv1D) in a stage.
- * Returns its index in plan->ops, or -1 if none.
+ * Find the first axis-1 spatial op (Conv/DWConv/Pool/Conv1D/ConvTranspose) in a
+ * stage. Returns its index in plan->ops, or -1 if none. ConvTranspose is only
+ * located here so the 2D executor can invert its rectangle; the 1D executor
+ * fails closed on it (see exec_stage_tiled).
  */
 static int find_spatial_op(const tigris_plan_t *plan, const tigris_stage_t *stage)
 {
     const uint16_t *sops = tigris_stage_ops(plan, stage);
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         uint8_t t = plan->ops[sops[j]].op_type;
-        if (is_height_spatial_op(t) || t == TIGRIS_OP_CONV1D)
+        if (is_height_spatial_op(t) || t == TIGRIS_OP_CONV1D ||
+            t == TIGRIS_OP_CONV_TRANSPOSE)
             return (int)sops[j];
     }
     return -1;
@@ -450,7 +463,16 @@ static int stage_supports_axis1_tiling(
         uint8_t type = plan->ops[sops[j]].op_type;
         if (!is_height_tiling_op(type))
             return 0;
-        if (is_height_spatial_op(type))
+        /* ConvTranspose is counted as a spatial op here even though it is not
+         * in is_height_spatial_op: a stage is HW-tileable only when it holds a
+         * SINGLE spatial op. A mixed [Conv, ConvTranspose] stage would
+         * otherwise report spatial_count==1 (only the Conv counts), be routed
+         * to the 1D tiler, and misfind the leading Conv as the spatial op,
+         * sizing tiles from Conv geometry and OOMing on the expanding
+         * ConvTranspose output. Counting it here keeps mixed stages on the
+         * normal path; a pure ConvTranspose (optionally with pointwise) still
+         * has spatial_count==1 and takes the HW route. */
+        if (is_height_spatial_op(type) || type == TIGRIS_OP_CONV_TRANSPOSE)
             spatial_count++;
     }
     return spatial_count <= 1;
@@ -689,6 +711,15 @@ static tigris_exec_error_t exec_stage_tiled(
     int sp_op_idx = find_spatial_op(plan, stage);
     const tigris_spatial_attrs_t *sp_attrs =
         (sp_op_idx >= 0) ? &plan->ops[sp_op_idx].spatial : NULL;
+
+    /* Fail-closed: ConvTranspose expands its output, so the 1D shrink
+     * back-computation (in = out*stride - pad) below is invalid for it. Only
+     * the 2D executor (exec_stage_tiled_2d) inverts its rectangle. A plan that
+     * routes a ConvTranspose stage here (a 1D axis-1 tile plan) is malformed. */
+    if (sp_op_idx >= 0 &&
+        plan->ops[sp_op_idx].op_type == TIGRIS_OP_CONV_TRANSPOSE)
+        return TIGRIS_EXEC_ERR_TILE;
+
     uint8_t rank = plan->tensors[sin[0]].ndim;
     const int32_t *in_shape = tigris_tensor_shape(plan, &plan->tensors[sin[0]]);
     int32_t full_in_h = in_shape[1];
@@ -985,10 +1016,23 @@ static int stage_2d_fast_bytes(
     const uint16_t *stage_inputs = tigris_stage_inputs(plan, stage);
     const uint16_t *stage_ops = tigris_stage_ops(plan, stage);
 
-    int32_t in_tile_h = sp_op_idx >= 0
-        ? (out_tile_h - 1) * stride_h + eff_kh : out_tile_h;
-    int32_t in_tile_w = sp_op_idx >= 0
-        ? (out_tile_w - 1) * stride_w + eff_kw : out_tile_w;
+    int is_conv_transpose = sp_op_idx >= 0 &&
+        plan->ops[sp_op_idx].op_type == TIGRIS_OP_CONV_TRANSPOSE;
+    int32_t in_tile_h;
+    int32_t in_tile_w;
+    if (is_conv_transpose) {
+        /* ConvTranspose inverts to a SMALLER input tile. Proven upper bound on
+         * the widest realized input span: ceil((out_tile + eff_k)/stride) plus
+         * 2 rows/cols of slack. Keeps this pre-flight check a safe upper bound
+         * over every edge and corner tile. */
+        in_tile_h = (out_tile_h + eff_kh + stride_h - 1) / stride_h + 2;
+        in_tile_w = (out_tile_w + eff_kw + stride_w - 1) / stride_w + 2;
+    } else {
+        in_tile_h = sp_op_idx >= 0
+            ? (out_tile_h - 1) * stride_h + eff_kh : out_tile_h;
+        in_tile_w = sp_op_idx >= 0
+            ? (out_tile_w - 1) * stride_w + eff_kw : out_tile_w;
+    }
     if (in_tile_h <= 0 || in_tile_w <= 0)
         return 0;
     if (in_tile_h > full_in_h) in_tile_h = full_in_h;
@@ -1139,7 +1183,29 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_2d(
              * checks, exactly as the height path leaves pad_bottom implicit. */
             int32_t ih0, ih1, iw0, iw1;
             int32_t pt = 0, pb = 0, pl = 0, pr = 0;
-            if (sp) {
+            if (sp &&
+                plan->ops[sp_op_idx].op_type == TIGRIS_OP_CONV_TRANSPOSE) {
+                /* ConvTranspose expands: from an output tile back-compute the
+                 * SMALLER input rectangle via the gather relation
+                 * ih = floor((oh + PT - kh)/SH), and fold the tile's global
+                 * offset into effective pads so the kernel runs in local coords
+                 * (out_row_start/in_row_start stay 0, set above). floor_div is
+                 * mandatory: the numerators go negative near the top/left edge.
+                 * pad_bottom/pad_right are implicit via the ih<IH / iw<IW
+                 * clamps, matching the conv arm below. */
+                ih0 = floor_div(oh0 + PT - (eff_kh - 1), SH);
+                ih1 = floor_div(oh1 - 1 + PT, SH) + 1;
+                iw0 = floor_div(ow0 + PL - (eff_kw - 1), SW);
+                iw1 = floor_div(ow1 - 1 + PL, SW) + 1;
+                if (ih0 < 0) ih0 = 0;
+                if (ih1 > IH) ih1 = IH;
+                if (iw0 < 0) iw0 = 0;
+                if (iw1 > IW) iw1 = IW;
+                pt = oh0 + PT - ih0 * SH;   /* PT_eff, in [0, SH+eff_kh-2] */
+                pl = ow0 + PL - iw0 * SW;   /* PL_eff */
+                pb = 0;
+                pr = 0;
+            } else if (sp) {
                 ih0 = oh0 * SH - PT;
                 ih1 = (oh1 - 1) * SH - PT + eff_kh;
                 iw0 = ow0 * SW - PL;
@@ -1352,6 +1418,19 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
         for (uint16_t j = 0; j < stages[c]->ops_count; j++) {
             uint8_t t = plan->ops[sops[j]].op_type;
             if (!is_height_tiling_op(t))
+                return TIGRIS_EXEC_ERR_TILE;
+            /* Fail closed on a chained ConvTranspose. is_height_tiling_op now
+             * admits it (the standalone 2D route needs that), but the chain
+             * composer only models shrinking spatial ops via
+             * is_height_spatial_op; a ConvTranspose would be skipped and run
+             * with shape-preserving pointwise geometry, producing wrong output
+             * or an OOB write instead of expanding. This mirrors the 1D guard
+             * in exec_stage_tiled. The guard sits in the pre-execution
+             * enumeration pass, so it covers every op across all chained stages
+             * before any tile geometry is composed or executed. The compiler
+             * never chains an (untileable) ConvTranspose; this defends against
+             * forged or malformed plans. */
+            if (t == TIGRIS_OP_CONV_TRANSPOSE)
                 return TIGRIS_EXEC_ERR_TILE;
             if (is_height_spatial_op(t)) {
                 const tigris_spatial_attrs_t *sp = &plan->ops[sops[j]].spatial;

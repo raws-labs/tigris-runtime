@@ -251,6 +251,22 @@ static int kern_conv_transpose(
     int PT = op->spatial.pad_top;
     int PL = op->spatial.pad_left;
 
+    /* Tile override. Structurally identical to kern_conv2d: the tile's
+     * global offset is folded into the effective pads PT/PL by the executor
+     * (PT_eff = oh0 + PT - ih0*SH), so the gather below runs unchanged in
+     * local packed coordinates. Left pad only applies to a packed 2D (HW)
+     * tile, same as kern_conv2d. ConvTranspose never uses out_row_start /
+     * in_row_start (2D-only, no line-buffered chain). */
+    if (mem->tile.active) {
+        IH = mem->tile.in_h;
+        OH = mem->tile.out_h;
+        IW = mem->tile.in_w;
+        OW = mem->tile.out_w;
+        PT = mem->tile.pad_top;
+        if (mem->tile.width_tiled)
+            PL = mem->tile.pad_left;
+    }
+
     /* Weight layout: [OC, KH, KW, IC] (OHWI) */
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {

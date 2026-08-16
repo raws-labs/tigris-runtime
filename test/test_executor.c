@@ -1902,6 +1902,143 @@ static void test_exec_height_tiling_contract(void)
         3, TIGRIS_OP_CONCAT, rank3_shape, 64, TIGRIS_EXEC_ERR_TILE);
 }
 
+/* Build a single stride-2 ConvTranspose stage (8x8x4 in -> 16x16x4 out) with a
+ * serialized tile plan and run it through the executor. `axis` selects a 2D
+ * (HW) plan or a 1D (HEIGHT_OR_LENGTH) plan. total_io (256 + 1024) exceeds the
+ * fast budget, so the stage needs tiling: the HW plan must route to
+ * exec_stage_tiled_2d and succeed; the 1D plan must fail closed, because
+ * ConvTranspose expands its output and the 1D shrink back-computation is
+ * invalid for it. The probe kernel just records tile context, so no weights
+ * are needed - this covers ROUTING + FAIL-CLOSED, not numeric correctness
+ * (that is Task 5's cross-repo gate). */
+static void run_convtranspose_tiling_case(
+    uint8_t axis, tigris_exec_error_t expected)
+{
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[2];
+    tigris_op_t op;
+    tigris_stage_t stage;
+    tigris_tile_plan_t tile_plan;
+    const uint16_t indices[] = {
+        0, /* op input */
+        1, /* op output */
+        0, /* stage op */
+        0, /* stage input */
+        1, /* stage output */
+        0, /* model input */
+        1, /* model output */
+    };
+    int32_t shapes[] = {
+        1, 8, 8, 4,    /* input:  1x8x8x4 */
+        1, 16, 16, 4,  /* output: 1x16x16x4 (stride 2, kernel 2, pad 0) */
+    };
+    tigris_plan_t plan;
+    void *ptrs[2];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[1024];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[2048];
+    tigris_mem_t mem;
+    uint8_t workspace[
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(2, 1, 1, 0, 0)];
+    tigris_exec_stats_t stats;
+    tile_probe_ctx_t ctx = {0};
+
+    memset(&header, 0, sizeof(header));
+    memset(tensors, 0, sizeof(tensors));
+    memset(&op, 0, sizeof(op));
+    memset(&stage, 0, sizeof(stage));
+    memset(&tile_plan, 0, sizeof(tile_plan));
+    memset(&plan, 0, sizeof(plan));
+
+    header.version = TIGRIS_SCHEMA_VERSION;
+    header.num_tensors = 2;
+    header.num_ops = 1;
+    header.num_stages = 1;
+    header.num_tile_plans = 1;
+    header.num_model_inputs = 1;
+    header.num_model_outputs = 1;
+
+    tensors[0].size_bytes = 1u * 8u * 8u * 4u;    /* 256 */
+    tensors[0].shape_off = 0;
+    tensors[0].ndim = 4;
+    tensors[1].size_bytes = 1u * 16u * 16u * 4u;  /* 1024 */
+    tensors[1].shape_off = 4;
+    tensors[1].ndim = 4;
+
+    op.op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    op.num_inputs = 1;
+    op.num_outputs = 1;
+    op.inputs_off = 0;
+    op.outputs_off = 1;
+    op.spatial.kernel_h = 2;
+    op.spatial.kernel_w = 2;
+    op.spatial.stride_h = 2;
+    op.spatial.stride_w = 2;
+    op.spatial.dilation_h = 1;
+    op.spatial.dilation_w = 1;
+
+    stage.ops_off = 2;
+    stage.ops_count = 1;
+    stage.inputs_off = 3;
+    stage.inputs_count = 1;
+    stage.outputs_off = 4;
+    stage.outputs_count = 1;
+    stage.tile_plan_idx = 0;
+    stage.chain_id = TIGRIS_NO_CHAIN;
+
+    tile_plan.tileable = 1;
+    tile_plan.axis = axis;
+    tile_plan.tile_height = 8;
+    tile_plan.num_tiles = 4;
+    tile_plan.original_height = 16;
+    tile_plan._reserved = 8;  /* tile_width packed in low 16 bits (2D path) */
+
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.stages = &stage;
+    plan.tile_plans = &tile_plan;
+    plan.index_pool = indices;
+    plan.shape_pool = shapes;
+    plan.model_inputs = &indices[5];
+    plan.model_outputs = &indices[6];
+
+    TEST_ASSERT_EQ(
+        tigris_mem_init(
+            &mem, ptrs, 2, fast, 768u, slow, sizeof(slow)),
+        TIGRIS_MEM_OK, "convtranspose-tiling memory init");
+    TEST_ASSERT_EQ(
+        tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes),
+        TIGRIS_MEM_OK, "convtranspose-tiling input allocation");
+    memset(mem.tensor_ptrs[0], 0x11, tensors[0].size_bytes);
+
+    TEST_ASSERT_EQ(
+        tigris_run_with_workspace_buffer(
+            &plan, &mem, tile_probe_kernel, &ctx, &stats,
+            workspace, sizeof(workspace)),
+        expected, "convtranspose-tiling contract result");
+
+    if (expected == TIGRIS_EXEC_OK) {
+        TEST_ASSERT(ctx.calls > 1, "2D ConvTranspose executes multiple tiles");
+        TEST_ASSERT_EQ(ctx.tiled_calls, ctx.calls,
+                       "2D ConvTranspose kernel always receives tile context");
+        TEST_ASSERT_EQ(stats.stages_tiled, 1,
+                       "2D ConvTranspose stage counted as tiled");
+    } else {
+        TEST_ASSERT_EQ(ctx.calls, 0,
+                       "1D ConvTranspose rejected before kernel execution");
+    }
+}
+
+static void test_exec_convtranspose_2d_routing(void)
+{
+    printf("  test_exec_convtranspose_2d_routing...\n");
+    /* HW (2D) tile plan: accepted, routed to exec_stage_tiled_2d, runs OK. */
+    run_convtranspose_tiling_case(TIGRIS_TILE_AXIS_HW, TIGRIS_EXEC_OK);
+    /* HEIGHT_OR_LENGTH (1D) tile plan: fail-closed on the shrink-only path. */
+    run_convtranspose_tiling_case(
+        TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH, TIGRIS_EXEC_ERR_TILE);
+}
+
 typedef struct {
     int preserved;
 } compaction_ctx_t;
@@ -2049,6 +2186,7 @@ int main(int argc, char *argv[])
     test_exec_chain_tiled_line_buffered_rolls_pointwise();
     test_exec_chain_tiled_line_buffered_rolls_pointwise_s8();
     test_exec_height_tiling_contract();
+    test_exec_convtranspose_2d_routing();
     test_exec_compaction_preserves_data();
     test_exec_error_strings();
 

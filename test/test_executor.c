@@ -2173,6 +2173,146 @@ static void test_exec_mixed_conv_convtranspose_not_tiled(void)
     TEST_ASSERT_EQ(stats.stages_tiled, 0, "mixed stage not counted as tiled");
 }
 
+/* Fail-closed guard (final whole-branch review): is_height_tiling_op admits
+ * ConvTranspose (the standalone 2D route needs it), so a forged/malformed plan
+ * could place a ConvTranspose inside a tiled chain. exec_chain_tiled's composer
+ * only models shrinking spatial ops (is_height_spatial_op), so it would run the
+ * ConvTranspose with shape-preserving pointwise geometry - wrong output or an
+ * OOB write, not an error. The guard in the chain's pre-execution op
+ * enumeration must reject it with TIGRIS_EXEC_ERR_TILE. Here the ConvTranspose
+ * sits in the SECOND chained stage, proving the guard covers every op the chain
+ * would execute, not just the head stage's first op. Not reachable from the
+ * compiler today (untileable ConvTranspose is kept out of chains); this is
+ * defense-in-depth for the spec's first-class fail-closed invariant. */
+static void test_exec_chained_convtranspose_fails_closed(void)
+{
+    printf("  test_exec_chained_convtranspose_fails_closed...\n");
+
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[3];
+    tigris_op_t ops[2];
+    tigris_stage_t stages[2];
+    const uint16_t indices[] = {
+        0, /* 0:  op0 input  (t0) */
+        1, /* 1:  op0 output (t1) */
+        1, /* 2:  op1 input  (t1) */
+        2, /* 3:  op1 output (t2) */
+        0, /* 4:  stage0 op (op0) */
+        1, /* 5:  stage1 op (op1) */
+        0, /* 6:  stage0 input  (t0) */
+        1, /* 7:  stage0 output (t1) */
+        1, /* 8:  stage1 input  (t1) */
+        2, /* 9:  stage1 output (t2) */
+        0, /* 10: model input  (t0) */
+        2, /* 11: model output (t2) */
+    };
+    int32_t shapes[] = {
+        1, 8, 8, 4,   /* t0 */
+        1, 8, 8, 4,   /* t1 */
+        1, 8, 8, 4,   /* t2 */
+    };
+    tigris_plan_t plan;
+    void *ptrs[3];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[1024];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[2048];
+    tigris_mem_t mem;
+    uint8_t workspace[
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(5, 2, 3, 2, 2)];
+    tigris_exec_stats_t stats;
+    tile_probe_ctx_t ctx = {0};
+
+    memset(&header, 0, sizeof(header));
+    memset(tensors, 0, sizeof(tensors));
+    memset(ops, 0, sizeof(ops));
+    memset(stages, 0, sizeof(stages));
+    memset(&plan, 0, sizeof(plan));
+
+    header.version = TIGRIS_SCHEMA_VERSION;
+    header.num_tensors = 3;
+    header.num_ops = 2;
+    header.num_stages = 2;
+    header.num_tile_plans = 0;
+    header.num_model_inputs = 1;
+    header.num_model_outputs = 1;
+
+    tensors[0].size_bytes = 1u * 8u * 8u * 4u;
+    tensors[0].shape_off = 0;
+    tensors[0].ndim = 4;
+    tensors[1].size_bytes = 1u * 8u * 8u * 4u;
+    tensors[1].shape_off = 4;
+    tensors[1].ndim = 4;
+    tensors[2].size_bytes = 1u * 8u * 8u * 4u;
+    tensors[2].shape_off = 8;
+    tensors[2].ndim = 4;
+
+    /* Stage 0: a benign pointwise op so the chain composer passes it. */
+    ops[0].op_type = TIGRIS_OP_RELU;
+    ops[0].num_inputs = 1;
+    ops[0].num_outputs = 1;
+    ops[0].inputs_off = 0;
+    ops[0].outputs_off = 1;
+
+    /* Stage 1: the ConvTranspose that must be rejected fail-closed. */
+    ops[1].op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    ops[1].num_inputs = 1;
+    ops[1].num_outputs = 1;
+    ops[1].inputs_off = 2;
+    ops[1].outputs_off = 3;
+    ops[1].spatial.kernel_h = 2;
+    ops[1].spatial.kernel_w = 2;
+    ops[1].spatial.stride_h = 2;
+    ops[1].spatial.stride_w = 2;
+    ops[1].spatial.dilation_h = 1;
+    ops[1].spatial.dilation_w = 1;
+
+    stages[0].ops_off = 4;
+    stages[0].ops_count = 1;
+    stages[0].inputs_off = 6;
+    stages[0].inputs_count = 1;
+    stages[0].outputs_off = 7;
+    stages[0].outputs_count = 1;
+    stages[0].chain_id = 0;
+    stages[0].chain_len = 2;
+    stages[0].chain_tile_h = 4;
+
+    stages[1].ops_off = 5;
+    stages[1].ops_count = 1;
+    stages[1].inputs_off = 8;
+    stages[1].inputs_count = 1;
+    stages[1].outputs_off = 9;
+    stages[1].outputs_count = 1;
+    stages[1].chain_id = 0;
+    stages[1].chain_len = 2;
+
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = ops;
+    plan.stages = stages;
+    plan.tile_plans = NULL;
+    plan.index_pool = indices;
+    plan.shape_pool = shapes;
+    plan.model_inputs = &indices[10];
+    plan.model_outputs = &indices[11];
+
+    TEST_ASSERT_EQ(
+        tigris_mem_init(
+            &mem, ptrs, 3, fast, sizeof(fast), slow, sizeof(slow)),
+        TIGRIS_MEM_OK, "chained-convtranspose memory init");
+    TEST_ASSERT_EQ(
+        tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes),
+        TIGRIS_MEM_OK, "chained-convtranspose input allocation");
+    memset(mem.tensor_ptrs[0], 0x11, tensors[0].size_bytes);
+
+    TEST_ASSERT_EQ(
+        tigris_run_with_workspace_buffer(
+            &plan, &mem, tile_probe_kernel, &ctx, &stats,
+            workspace, sizeof(workspace)),
+        TIGRIS_EXEC_ERR_TILE,
+        "chained ConvTranspose is rejected fail-closed");
+    TEST_ASSERT_EQ(ctx.calls, 0,
+                   "chained ConvTranspose rejected before any kernel executes");
+}
+
 typedef struct {
     int preserved;
 } compaction_ctx_t;
@@ -2322,6 +2462,7 @@ int main(int argc, char *argv[])
     test_exec_height_tiling_contract();
     test_exec_convtranspose_2d_routing();
     test_exec_mixed_conv_convtranspose_not_tiled();
+    test_exec_chained_convtranspose_fails_closed();
     test_exec_compaction_preserves_data();
     test_exec_error_strings();
 

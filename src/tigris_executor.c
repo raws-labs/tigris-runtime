@@ -1419,6 +1419,19 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
             uint8_t t = plan->ops[sops[j]].op_type;
             if (!is_height_tiling_op(t))
                 return TIGRIS_EXEC_ERR_TILE;
+            /* Fail closed on a chained ConvTranspose. is_height_tiling_op now
+             * admits it (the standalone 2D route needs that), but the chain
+             * composer only models shrinking spatial ops via
+             * is_height_spatial_op; a ConvTranspose would be skipped and run
+             * with shape-preserving pointwise geometry, producing wrong output
+             * or an OOB write instead of expanding. This mirrors the 1D guard
+             * in exec_stage_tiled. The guard sits in the pre-execution
+             * enumeration pass, so it covers every op across all chained stages
+             * before any tile geometry is composed or executed. The compiler
+             * never chains an (untileable) ConvTranspose; this defends against
+             * forged or malformed plans. */
+            if (t == TIGRIS_OP_CONV_TRANSPOSE)
+                return TIGRIS_EXEC_ERR_TILE;
             if (is_height_spatial_op(t)) {
                 const tigris_spatial_attrs_t *sp = &plan->ops[sops[j]].spatial;
                 int32_t sh = sp->stride_h;

@@ -463,7 +463,16 @@ static int stage_supports_axis1_tiling(
         uint8_t type = plan->ops[sops[j]].op_type;
         if (!is_height_tiling_op(type))
             return 0;
-        if (is_height_spatial_op(type))
+        /* ConvTranspose is counted as a spatial op here even though it is not
+         * in is_height_spatial_op: a stage is HW-tileable only when it holds a
+         * SINGLE spatial op. A mixed [Conv, ConvTranspose] stage would
+         * otherwise report spatial_count==1 (only the Conv counts), be routed
+         * to the 1D tiler, and misfind the leading Conv as the spatial op,
+         * sizing tiles from Conv geometry and OOMing on the expanding
+         * ConvTranspose output. Counting it here keeps mixed stages on the
+         * normal path; a pure ConvTranspose (optionally with pointwise) still
+         * has spatial_count==1 and takes the HW route. */
+        if (is_height_spatial_op(type) || type == TIGRIS_OP_CONV_TRANSPOSE)
             spatial_count++;
     }
     return spatial_count <= 1;

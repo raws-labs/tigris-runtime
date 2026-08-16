@@ -2039,6 +2039,140 @@ static void test_exec_convtranspose_2d_routing(void)
         TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH, TIGRIS_EXEC_ERR_TILE);
 }
 
+/* Regression guard (Task 5 gate BUG A): a single stage that CONTAINS a
+ * ConvTranspose is HW-tileable only when ConvTranspose is its SOLE spatial op.
+ * A mixed [Conv, ConvTranspose] stage must fall back to exec_stage_normal, not
+ * be routed to the 1D tiler. The compiler never attaches a tile plan to such a
+ * stage, so it carries TIGRIS_NO_TILE_PLAN. total_io (256 + 1024) exceeds the
+ * fast budget (needs_tiling=1), which is exactly the condition that used to
+ * misroute it: find_spatial_op returned the LEADING Conv, the 1D tiler sized
+ * from Conv geometry, and the expanding ConvTranspose output OOMed. Post-fix
+ * the stage is not axis1_tileable (spatial_count==2) so it runs on the normal
+ * path (both ops execute, nothing tiled). */
+static void test_exec_mixed_conv_convtranspose_not_tiled(void)
+{
+    printf("  test_exec_mixed_conv_convtranspose_not_tiled...\n");
+
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[3];
+    tigris_op_t ops[2];
+    tigris_stage_t stage;
+    const uint16_t indices[] = {
+        0, /* 0: op0 input  (t0) */
+        1, /* 1: op0 output (t1) */
+        1, /* 2: op1 input  (t1) */
+        2, /* 3: op1 output (t2) */
+        0, /* 4: stage op0 */
+        1, /* 5: stage op1 */
+        0, /* 6: stage input  (t0) */
+        2, /* 7: stage output (t2) */
+        0, /* 8: model input  (t0) */
+        2, /* 9: model output (t2) */
+    };
+    int32_t shapes[] = {
+        1, 8, 8, 4,     /* t0: 1x8x8x4   (stage input)         */
+        1, 2, 2, 4,     /* t1: 1x2x2x4   (Conv output)         */
+        1, 16, 16, 4,   /* t2: 1x16x16x4 (ConvTranspose output) */
+    };
+    tigris_plan_t plan;
+    void *ptrs[3];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[2048];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[4096];
+    tigris_mem_t mem;
+    uint8_t workspace[
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+    tigris_exec_stats_t stats;
+    tile_probe_ctx_t ctx = {0};
+
+    memset(&header, 0, sizeof(header));
+    memset(tensors, 0, sizeof(tensors));
+    memset(ops, 0, sizeof(ops));
+    memset(&stage, 0, sizeof(stage));
+    memset(&plan, 0, sizeof(plan));
+
+    header.version = TIGRIS_SCHEMA_VERSION;
+    header.num_tensors = 3;
+    header.num_ops = 2;
+    header.num_stages = 1;
+    header.num_tile_plans = 0;
+    header.num_model_inputs = 1;
+    header.num_model_outputs = 1;
+
+    tensors[0].size_bytes = 1u * 8u * 8u * 4u;    /* 256  */
+    tensors[0].shape_off = 0;
+    tensors[0].ndim = 4;
+    tensors[1].size_bytes = 1u * 2u * 2u * 4u;    /* 64   */
+    tensors[1].shape_off = 4;
+    tensors[1].ndim = 4;
+    tensors[2].size_bytes = 1u * 16u * 16u * 4u;  /* 1024 */
+    tensors[2].shape_off = 8;
+    tensors[2].ndim = 4;
+
+    ops[0].op_type = TIGRIS_OP_CONV;
+    ops[0].num_inputs = 1;
+    ops[0].num_outputs = 1;
+    ops[0].inputs_off = 0;
+    ops[0].outputs_off = 1;
+    ops[0].spatial.kernel_h = 1;
+    ops[0].spatial.kernel_w = 1;
+    ops[0].spatial.stride_h = 4;
+    ops[0].spatial.stride_w = 4;
+    ops[0].spatial.dilation_h = 1;
+    ops[0].spatial.dilation_w = 1;
+
+    ops[1].op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    ops[1].num_inputs = 1;
+    ops[1].num_outputs = 1;
+    ops[1].inputs_off = 2;
+    ops[1].outputs_off = 3;
+    ops[1].spatial.kernel_h = 8;
+    ops[1].spatial.kernel_w = 8;
+    ops[1].spatial.stride_h = 8;
+    ops[1].spatial.stride_w = 8;
+    ops[1].spatial.dilation_h = 1;
+    ops[1].spatial.dilation_w = 1;
+
+    stage.ops_off = 4;
+    stage.ops_count = 2;
+    stage.inputs_off = 6;
+    stage.inputs_count = 1;
+    stage.outputs_off = 7;
+    stage.outputs_count = 1;
+    stage.tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage.chain_id = TIGRIS_NO_CHAIN;
+
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = ops;
+    plan.stages = &stage;
+    plan.tile_plans = NULL;
+    plan.index_pool = indices;
+    plan.shape_pool = shapes;
+    plan.model_inputs = &indices[8];
+    plan.model_outputs = &indices[9];
+
+    /* fast holds the whole stage working set after compaction (peak ~1088 B)
+     * but is smaller than total_io (1280 B), so needs_tiling is true - the
+     * routing decision is genuinely exercised, yet the stage must NOT tile. */
+    TEST_ASSERT_EQ(
+        tigris_mem_init(
+            &mem, ptrs, 3, fast, 1216u, slow, sizeof(slow)),
+        TIGRIS_MEM_OK, "mixed-stage memory init");
+    TEST_ASSERT_EQ(
+        tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes),
+        TIGRIS_MEM_OK, "mixed-stage input allocation");
+    memset(mem.tensor_ptrs[0], 0x11, tensors[0].size_bytes);
+
+    TEST_ASSERT_EQ(
+        tigris_run_with_workspace_buffer(
+            &plan, &mem, tile_probe_kernel, &ctx, &stats,
+            workspace, sizeof(workspace)),
+        TIGRIS_EXEC_OK, "mixed Conv+ConvTranspose runs on the normal path");
+    TEST_ASSERT_EQ(ctx.calls, 2, "both ops execute (Conv then ConvTranspose)");
+    TEST_ASSERT_EQ(ctx.tiled_calls, 0, "mixed stage is not tiled");
+    TEST_ASSERT_EQ(stats.stages_tiled, 0, "mixed stage not counted as tiled");
+}
+
 typedef struct {
     int preserved;
 } compaction_ctx_t;
@@ -2187,6 +2321,7 @@ int main(int argc, char *argv[])
     test_exec_chain_tiled_line_buffered_rolls_pointwise_s8();
     test_exec_height_tiling_contract();
     test_exec_convtranspose_2d_routing();
+    test_exec_mixed_conv_convtranspose_not_tiled();
     test_exec_compaction_preserves_data();
     test_exec_error_strings();
 

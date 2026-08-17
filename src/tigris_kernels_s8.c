@@ -1365,6 +1365,13 @@ static int cmsis_tiled_spatial_uses_reference(const tigris_op_t *op)
     switch ((tigris_op_type_t)op->op_type) {
     case TIGRIS_OP_CONV:
     case TIGRIS_OP_DEPTHWISE:
+        /* Plain-height tiles run on the CMSIS-NN adapter, which honors the tile
+         * context (in_h/out_h/pad_top/pad_bottom) like the ESP-NN adapter does.
+         * Dilated tiles still fall back to the reference kernel until native
+         * dilated-tile parity is covered; rolled and 2D-width tiles are already
+         * routed to reference by tigris_accel_try_s8_ref before this policy. */
+        return (effective_dilation(op->spatial.dilation_h) != 1u ||
+                effective_dilation(op->spatial.dilation_w) != 1u);
     case TIGRIS_OP_AVG_POOL:
     case TIGRIS_OP_GLOBAL_AVG:
     case TIGRIS_OP_MAX_POOL:

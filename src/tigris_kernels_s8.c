@@ -1482,10 +1482,12 @@ int tigris_accel_try_s8_ref(
         return -1;
 
     /* 2D tiles carry mem->tile.width_tiled and partition width via
-     * pad_left/tile-in_w as well as height (see exec_stage_tiled_2d). No vendor
-     * adapter honors the packed-width contract yet, so a 2D-tiled op routes to
-     * s8_ref on every backend. */
-    if (mem->tile.active && mem->tile.width_tiled) {
+     * pad_left/tile-in_w as well as height (see exec_stage_tiled_2d). The
+     * ESP-NN/CMSIS-NN Conv/Depthwise adapters honor the packed-width tile
+     * natively (in_w/out_w/pad_left, right pad implicit via IW clipping); every
+     * other op still routes to s8_ref. */
+    if (mem->tile.active && mem->tile.width_tiled &&
+        !is_conv_or_depthwise(op)) {
         *handled = 1;
         return tigris_dispatch_kernel_s8(
             plan, op, op_index, mem, user_ctx);

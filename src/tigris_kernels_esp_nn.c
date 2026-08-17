@@ -432,6 +432,10 @@ static int adapt_conv2d(
         OH = mem->tile.out_h;
         pt = mem->tile.pad_top;
         pb = mem->tile.pad_bottom;
+        if (mem->tile.width_tiled) {
+            IW = mem->tile.in_w;
+            OW = mem->tile.out_w;
+        }
     }
 
     /* Line-buffer roll: fold out_row_start into the output pointer and
@@ -449,8 +453,14 @@ static int adapt_conv2d(
 
     int32_t in_offset = in_qp ? -in_qp->zero_point : 0;
 
-    /* Handle asymmetric padding */
+    /* Handle asymmetric padding. A 2D (width_tiled) tile carries its own
+     * left/right pads; exec_stage_tiled_2d sets all four, so the bounce below
+     * pads the packed rectangle exactly as kern_conv2d_s8's IW/IH clipping. */
     int pl = op->spatial.pad_left,   pr = op->spatial.pad_right;
+    if (mem->tile.active && mem->tile.width_tiled) {
+        pl = mem->tile.pad_left;
+        pr = mem->tile.pad_right;
+    }
     int asymmetric = (pt != pb) || (pl != pr);
 
     const int8_t *conv_input = X;
@@ -543,6 +553,10 @@ static int adapt_depthwise_conv2d(
     if (mem->tile.active) {
         IH = mem->tile.in_h;
         OH = mem->tile.out_h;
+        if (mem->tile.width_tiled) {
+            IW = mem->tile.in_w;
+            OW = mem->tile.out_w;
+        }
     }
 
     /* Line-buffer roll: fold out_row_start into the output pointer and
@@ -577,7 +591,7 @@ static int adapt_depthwise_conv2d(
         .out_offset = out_offset,
         .ch_mult    = 1,
         .stride     = { .width = op->spatial.stride_w,  .height = op->spatial.stride_h },
-        .padding    = { .width = op->spatial.pad_left,   .height = mem->tile.active ? mem->tile.pad_top : op->spatial.pad_top },
+        .padding    = { .width = (mem->tile.active && mem->tile.width_tiled) ? mem->tile.pad_left : op->spatial.pad_left,   .height = mem->tile.active ? mem->tile.pad_top : op->spatial.pad_top },
         .dilation   = { .width = 0, .height = 0 },
         .activation = { .min = op->act_min, .max = op->act_max },
     };

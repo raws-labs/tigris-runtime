@@ -446,12 +446,13 @@ static void test_rolled_tile_routing(void)
 }
 
 /* A 2D-tiled op sets mem->tile.width_tiled on tiles that partition width as
- * well as height. The ESP-NN/CMSIS-NN Conv/Depthwise adapters do not honor
- * width_tiled/pad_left/tile-in_w, so a 2D-tiled op must fall back to s8_ref,
- * same reasoning as the line-buffer roll guard above. */
-static void test_width_tiled_routes_reference(void)
+ * well as height. 1.5c: the ESP-NN/CMSIS-NN Conv/Depthwise adapters now honor
+ * the packed-width tile (in_w/out_w/pad_left, right pad implicit), so a
+ * width-tiled conv/depthwise stays on the vendor path; every other op still
+ * routes to s8_ref. */
+static void test_width_tiled_routing(void)
 {
-    printf("  test_width_tiled_routes_reference...\n");
+    printf("  test_width_tiled_routing...\n");
     route_fixture_t fx;
     build_fixture(&fx, TIGRIS_OP_CONV, 0);
     fx.op.spatial.dilation_h = 1;
@@ -460,20 +461,39 @@ static void test_width_tiled_routes_reference(void)
     int handled;
     int8_t out[8];
 
-    /* width_tiled tile: guard fires for both backends. */
+    /* width_tiled conv/depthwise now runs on the adapter on both backends. */
     memset(out, 0, sizeof(out));
+    handled = 1;
     run_pre_route_width_tiled(&fx, TIGRIS_ACCEL_ESP_NN, out, 1, &handled);
-    TEST_ASSERT_EQ(handled, 1, "2D tile routes ESP to s8_ref");
+    TEST_ASSERT_EQ(handled, 0, "2D-tiled conv stays on the ESP adapter");
 
     memset(out, 0, sizeof(out));
+    handled = 1;
     run_pre_route_width_tiled(&fx, TIGRIS_ACCEL_CMSIS_NN, out, 1, &handled);
-    TEST_ASSERT_EQ(handled, 1, "2D tile routes CMSIS to s8_ref");
+    TEST_ASSERT_EQ(handled, 0, "2D-tiled conv stays on the CMSIS adapter");
 
-    /* non-2D tiled conv still uses the adapter on ESP (guard not
-     * over-firing). */
+    build_fixture(&fx, TIGRIS_OP_DEPTHWISE, 1);
+    fx.op.spatial.dilation_h = 1;
+    fx.op.spatial.dilation_w = 1;
     memset(out, 0, sizeof(out));
-    run_pre_route_width_tiled(&fx, TIGRIS_ACCEL_ESP_NN, out, 0, &handled);
-    TEST_ASSERT_EQ(handled, 0, "non-2D tiled conv stays on ESP adapter");
+    handled = 1;
+    run_pre_route_width_tiled(&fx, TIGRIS_ACCEL_CMSIS_NN, out, 1, &handled);
+    TEST_ASSERT_EQ(handled, 0, "2D-tiled depthwise stays on the CMSIS adapter");
+
+    /* A width-tiled NON-conv/depthwise op still routes to s8_ref. */
+    build_fixture(&fx, TIGRIS_OP_MAX_POOL, 0);
+    fx.op.spatial.dilation_h = 1;
+    fx.op.spatial.dilation_w = 1;
+    fx.op.spatial.kernel_h = 1;
+    fx.op.spatial.kernel_w = 1;
+    fx.op.spatial.pad_top = 0;
+    fx.op.spatial.pad_bottom = 0;
+    fx.op.spatial.pad_left = 0;
+    fx.op.spatial.pad_right = 0;
+    memset(out, 0, sizeof(out));
+    handled = 0;
+    run_pre_route_width_tiled(&fx, TIGRIS_ACCEL_ESP_NN, out, 1, &handled);
+    TEST_ASSERT_EQ(handled, 1, "2D-tiled max-pool still routes ESP to s8_ref");
 }
 
 /* 1.5a: a plain-height tile (tile.active, no roll offset, not width_tiled) with
@@ -528,7 +548,7 @@ int main(void)
     test_cmsis_plain_height_tile_routes_adapter();
     test_unit_dilation_keeps_esp_adapter();
     test_rolled_tile_routing();
-    test_width_tiled_routes_reference();
+    test_width_tiled_routing();
     test_esp_asymmetric_pad_workspace_policy();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

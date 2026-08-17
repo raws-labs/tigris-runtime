@@ -135,16 +135,22 @@ static int adapt_conv2d(
     int OH = y_shape[1], OW = y_shape[2], OC = y_shape[3];
     int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
     int pad_top = op->spatial.pad_top;
+    int pad_left = op->spatial.pad_left;
 
-    /* Plain-height tile: the loaded input tile holds tile.in_h rows and produces
-     * tile.out_h output rows, with tile.pad_top at the top. The bottom pad is
-     * implicit - CMSIS-NN clips input rows at or past IH to the input zero-point,
-     * so an asymmetric edge-tile pad needs no pre-pad. Width is never tiled here
-     * (2D width tiles route to s8_ref), so IW/OW/pad_left stay full-tensor. */
+    /* Height tile: tile.in_h rows produce tile.out_h output rows at tile.pad_top;
+     * the bottom pad is implicit (CMSIS-NN clips input rows at or past IH to the
+     * input zero-point), so an asymmetric edge-tile pad needs no pre-pad. A 2D
+     * (width_tiled) tile additionally packs tile.in_w columns into tile.out_w
+     * with tile.pad_left; the right pad is implicit the same way. */
     if (mem->tile.active) {
         IH = mem->tile.in_h;
         OH = mem->tile.out_h;
         pad_top = mem->tile.pad_top;
+        if (mem->tile.width_tiled) {
+            IW = mem->tile.in_w;
+            OW = mem->tile.out_w;
+            pad_left = mem->tile.pad_left;
+        }
     }
 
     /* Line-buffer roll: emit the tile.out_h new rows starting at output row
@@ -165,7 +171,7 @@ static int adapt_conv2d(
         .input_offset  = in_qp  ? -in_qp->zero_point  : 0,
         .output_offset = out_qp ? out_qp->zero_point : 0,
         .stride   = { .w = op->spatial.stride_w,  .h = op->spatial.stride_h },
-        .padding  = { .w = op->spatial.pad_left,   .h = pad_top },
+        .padding  = { .w = pad_left,   .h = pad_top },
         .dilation = { .w = op->spatial.dilation_w ? op->spatial.dilation_w : 1,
                       .h = op->spatial.dilation_h ? op->spatial.dilation_h : 1 },
         .activation = { .min = op->act_min, .max = op->act_max },
@@ -227,14 +233,21 @@ static int adapt_depthwise_conv2d(
     int OH = y_shape[1], OW = y_shape[2];
     int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
     int pad_top = op->spatial.pad_top;
+    int pad_left = op->spatial.pad_left;
 
-    /* Plain-height tile: same contract as adapt_conv2d - tile.in_h input rows
-     * produce tile.out_h output rows at tile.pad_top; the bottom pad is implicit
-     * via IH clipping. Width is never tiled here. */
+    /* Same contract as adapt_conv2d - tile.in_h input rows produce tile.out_h
+     * output rows at tile.pad_top (bottom pad implicit via IH clipping); a 2D
+     * (width_tiled) tile also packs tile.in_w columns into tile.out_w with
+     * tile.pad_left (right pad implicit via IW clipping). */
     if (mem->tile.active) {
         IH = mem->tile.in_h;
         OH = mem->tile.out_h;
         pad_top = mem->tile.pad_top;
+        if (mem->tile.width_tiled) {
+            IW = mem->tile.in_w;
+            OW = mem->tile.out_w;
+            pad_left = mem->tile.pad_left;
+        }
     }
 
     /* Line-buffer roll folds out_row_start into the output pointer and
@@ -257,7 +270,7 @@ static int adapt_depthwise_conv2d(
         .output_offset = out_qp ? out_qp->zero_point : 0,
         .ch_mult = 1,
         .stride   = { .w = op->spatial.stride_w,  .h = op->spatial.stride_h },
-        .padding  = { .w = op->spatial.pad_left,   .h = pad_top },
+        .padding  = { .w = pad_left,   .h = pad_top },
         .dilation = { .w = op->spatial.dilation_w ? op->spatial.dilation_w : 1,
                       .h = op->spatial.dilation_h ? op->spatial.dilation_h : 1 },
         .activation = { .min = op->act_min, .max = op->act_max },

@@ -155,6 +155,14 @@ tigris_mem_error_t tigris_mem_load_tile(
     int32_t W = t->ndim == 4 ? shape[2] : 1;
     int32_t C = shape[t->ndim - 1];
 
+    /* Fail closed on an out-of-range row window rather than reading past the
+     * source tensor. A correct tile plan always requests rows within [0, H]; a
+     * malformed or mis-tiled plan (e.g. a strided stage that loaded a
+     * post-spatial output-resolution operand at input rows) must not OOB-read.
+     * Mirrors the bounds guard in tigris_mem_load_tile_2d. */
+    if (h_start < 0 || h_end <= h_start || h_end > H)
+        return TIGRIS_MEM_ERR_BAD_INDEX;
+
     int32_t tile_h = h_end - h_start;
     uint32_t elem_size = t->size_bytes / (uint32_t)(N * H * W * C);
     uint32_t row_bytes = (uint32_t)W * (uint32_t)C * elem_size;

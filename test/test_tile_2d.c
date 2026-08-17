@@ -387,6 +387,56 @@ static void test_load_tile_2d_rejects_bad_bounds(void)
     TEST_ASSERT_EQ(e_w1_over, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range w1 rejected");
 }
 
+/* The 1D load primitive (tigris_mem_load_tile) must fail closed on an
+ * out-of-range height window exactly as the 2D primitive does, so a mis-tiled
+ * plan -- e.g. a strided stage that loads a post-spatial output-resolution
+ * operand at the spatial op's input rows -- returns an error instead of reading
+ * past the source tensor. */
+static void test_load_tile_1d_rejects_bad_bounds(void)
+{
+    printf("  test_load_tile_1d_rejects_bad_bounds...\n");
+
+    tigris_tensor_t tensor;
+    int32_t shape[4];
+    tigris_plan_t plan;
+    t2d_build_plan(&tensor, shape, &plan);
+
+    int8_t slow_buf[T2D_N * T2D_H * T2D_W * T2D_C];
+    t2d_fill_source(slow_buf);
+
+    uint8_t fast_buf[256];
+    uint8_t slow_arena[128];
+    void *tensor_ptrs[1] = { NULL };
+
+    tigris_mem_t mem;
+    tigris_mem_error_t merr = tigris_mem_init(&mem, tensor_ptrs, 1,
+                                               fast_buf, sizeof(fast_buf),
+                                               slow_arena, sizeof(slow_arena));
+    TEST_ASSERT_EQ(merr, TIGRIS_MEM_OK, "mem init ok");
+    mem.tensor_ptrs[T2D_TIDX] = slow_buf;
+
+    /* A valid window ending exactly at H (the last-tile case) still loads: the
+     * guard must reject h_end > H, not h_end == H. */
+    tigris_mem_error_t e_ok = tigris_mem_load_tile(&mem, &plan, T2D_TIDX, 4, T2D_H);
+    TEST_ASSERT_EQ(e_ok, TIGRIS_MEM_OK, "in-range 1D window (h_end == H) loads");
+    mem.tensor_ptrs[T2D_TIDX] = slow_buf; /* restore slow base after the load */
+
+    /* h_start < 0 */
+    tigris_mem_error_t e_neg = tigris_mem_load_tile(&mem, &plan, T2D_TIDX, -1, 6);
+    TEST_ASSERT_EQ(e_neg, TIGRIS_MEM_ERR_BAD_INDEX, "negative h_start rejected");
+    mem.tensor_ptrs[T2D_TIDX] = slow_buf;
+
+    /* h_end <= h_start, tested at equality */
+    tigris_mem_error_t e_eq = tigris_mem_load_tile(&mem, &plan, T2D_TIDX, 3, 3);
+    TEST_ASSERT_EQ(e_eq, TIGRIS_MEM_ERR_BAD_INDEX, "h_end == h_start rejected");
+    mem.tensor_ptrs[T2D_TIDX] = slow_buf;
+
+    /* h_end > H: the post-spatial strided-skip mis-tile requests rows past the
+     * source tensor's height; must fail closed instead of reading OOB. */
+    tigris_mem_error_t e_over = tigris_mem_load_tile(&mem, &plan, T2D_TIDX, 4, T2D_H + 4);
+    TEST_ASSERT_EQ(e_over, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range h_end rejected");
+}
+
 static void test_spill_tile_2d_rejects_bad_bounds(void)
 {
     printf("  test_spill_tile_2d_rejects_bad_bounds...\n");
@@ -1565,6 +1615,7 @@ int main(void)
     test_load_tile_2d_roundtrip();
     test_spill_tile_2d_roundtrip();
     test_load_tile_2d_rejects_bad_bounds();
+    test_load_tile_1d_rejects_bad_bounds();
     test_spill_tile_2d_rejects_bad_bounds();
 
     test_conv_2d_tile_matches_subregion_f32();

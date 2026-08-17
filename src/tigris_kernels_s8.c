@@ -1481,19 +1481,26 @@ int tigris_accel_try_s8_ref(
     if (!plan || !op || !mem || !handled)
         return -1;
 
+    /* 2D tiles carry mem->tile.width_tiled and partition width via
+     * pad_left/tile-in_w as well as height (see exec_stage_tiled_2d). No vendor
+     * adapter honors the packed-width contract yet, so a 2D-tiled op routes to
+     * s8_ref on every backend. */
+    if (mem->tile.active && mem->tile.width_tiled) {
+        *handled = 1;
+        return tigris_dispatch_kernel_s8(
+            plan, op, op_index, mem, user_ctx);
+    }
+
     /* Line-buffered chains roll overlap rows across tiles by setting
-     * mem->tile.out_row_start / in_row_start (see exec_chain_tiled). 2D tiles
-     * carry mem->tile.width_tiled and partition width via pad_left/tile-in_w
-     * as well as height (see exec_stage_tiled_2d). Only the reference and s8
-     * kernels honor those offset and width contracts; the ESP-NN/CMSIS-NN
-     * Conv/Depthwise adapters ignore them and would write rows or columns at
-     * the wrong position. Route rolled or 2D-tiled ops to s8_ref so a
-     * flagged chain or tile stays bit-exact on every backend, while
-     * non-rolled, non-2D tiles (tile 0, standalone height tiles, last-tile
-     * full compute) keep the vendor path. */
+     * mem->tile.out_row_start / in_row_start (see exec_chain_tiled). The
+     * ESP-NN/CMSIS-NN Conv/Depthwise adapters honor the roll natively - they
+     * fold out_row_start into the output pointer and (out_row_start*stride -
+     * in_row_start) into the input pointer, matching the s8 kernel's index math.
+     * Every other op ignores the offsets and would write rows at the wrong
+     * position, so a rolled non-conv/depthwise op still routes to s8_ref. */
     if (mem->tile.active &&
-        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0 ||
-         mem->tile.width_tiled)) {
+        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0) &&
+        !is_conv_or_depthwise(op)) {
         *handled = 1;
         return tigris_dispatch_kernel_s8(
             plan, op, op_index, mem, user_ctx);

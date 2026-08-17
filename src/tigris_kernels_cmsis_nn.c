@@ -147,6 +147,20 @@ static int adapt_conv2d(
         pad_top = mem->tile.pad_top;
     }
 
+    /* Line-buffer roll: emit the tile.out_h new rows starting at output row
+     * out_row_start, and fold (out_row_start*stride - in_row_start) into the
+     * input pointer - zero when in_row_start == out_row_start*stride (the common
+     * line-buffer case, where the roll is a pure output offset). Mirrors the
+     * oh_g / ih index math in kern_conv2d_s8. */
+    if (mem->tile.active &&
+        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0)) {
+        int delta = mem->tile.out_row_start * op->spatial.stride_h
+                  - mem->tile.in_row_start;
+        X  += delta * IW * IC;
+        Y  += mem->tile.out_row_start * OW * OC;
+        IH -= delta;
+    }
+
     cmsis_nn_conv_params conv_params = {
         .input_offset  = in_qp  ? -in_qp->zero_point  : 0,
         .output_offset = out_qp ? out_qp->zero_point : 0,
@@ -221,6 +235,18 @@ static int adapt_depthwise_conv2d(
         IH = mem->tile.in_h;
         OH = mem->tile.out_h;
         pad_top = mem->tile.pad_top;
+    }
+
+    /* Line-buffer roll folds out_row_start into the output pointer and
+     * (out_row_start*stride - in_row_start) into the input pointer, as in
+     * adapt_conv2d. Runs after the tile-context block so IH is the tile height. */
+    if (mem->tile.active &&
+        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0)) {
+        int delta = mem->tile.out_row_start * op->spatial.stride_h
+                  - mem->tile.in_row_start;
+        X  += delta * IW * C;
+        Y  += mem->tile.out_row_start * OW * C;
+        IH -= delta;
     }
 
     /* Weight layout: [KH, KW, C] (HWC) from compiler.

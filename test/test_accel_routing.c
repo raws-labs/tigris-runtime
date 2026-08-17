@@ -370,18 +370,18 @@ static void test_esp_asymmetric_pad_workspace_policy(void)
 }
 
 /* A line-buffered chain sets mem->tile.out_row_start / in_row_start on rolled
- * interior tiles. The ESP-NN Conv/Depthwise adapters ignore those offsets, so
- * a rolled op must fall back to s8_ref. pre_route cannot see the offsets (it
- * only takes tile_active), so the guard lives in tigris_accel_try_s8_ref and
- * fires only on rolled tiles, leaving non-rolled tiles on the vendor path. */
-static void test_rolled_tile_routes_reference(void)
+ * interior tiles. 1.5b: the ESP-NN/CMSIS-NN Conv/Depthwise adapters now honor
+ * those offsets natively, so a rolled conv/depthwise stays on the vendor path;
+ * every other op still falls back to s8_ref. pre_route cannot see the offsets
+ * (it only takes tile_active), so the roll routing lives in
+ * tigris_accel_try_s8_ref. */
+static void test_rolled_tile_routing(void)
 {
-    printf("  test_rolled_tile_routes_reference...\n");
+    printf("  test_rolled_tile_routing...\n");
     route_fixture_t fx;
     build_fixture(&fx, TIGRIS_OP_CONV, 0);
 
-    /* Non-dilated 1x1 height-preserving conv: an ESP adapter op absent a roll,
-     * and s8_ref execution stays trivially in bounds when the guard fires. */
+    /* Non-dilated 1x1 height-preserving conv. */
     fx.op.spatial.dilation_h = 1;
     fx.op.spatial.dilation_w = 1;
     fx.op.spatial.kernel_h = 1;
@@ -391,8 +391,6 @@ static void test_rolled_tile_routes_reference(void)
     fx.op.spatial.pad_left = 0;
     fx.op.spatial.pad_right = 0;
 
-    /* pre_route sees only tile_active, so it keeps this on the ESP adapter even
-     * when tiled: the roll-awareness must come from the try_s8_ref guard. */
     TEST_ASSERT_EQ(tigris_accel_pre_route(
                        TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 1),
                    TIGRIS_ACCEL_ROUTE_ADAPTER,
@@ -403,28 +401,48 @@ static void test_rolled_tile_routes_reference(void)
 
     /* Non-rolled tiled: guard must not over-fire; ESP keeps its adapter. */
     memset(out, 0, sizeof(out));
+    handled = 1;
     run_pre_route_rolled(&fx, TIGRIS_ACCEL_ESP_NN, out, 0, 0, 3, &handled);
     TEST_ASSERT_EQ(handled, 0,
                    "non-rolled tiled conv stays on the ESP adapter");
 
-    /* Rolled via out_row_start: ESP falls back to s8_ref. */
+    /* 1.5b: a rolled conv now runs on the vendor adapter (it folds the roll
+     * offsets into the input/output pointers), on both backends. */
     memset(out, 0, sizeof(out));
+    handled = 1;
+    run_pre_route_rolled(&fx, TIGRIS_ACCEL_ESP_NN, out, 2, 0, 3, &handled);
+    TEST_ASSERT_EQ(handled, 0,
+                   "rolled conv (out_row_start) stays on the ESP adapter");
+
+    memset(out, 0, sizeof(out));
+    handled = 1;
+    run_pre_route_rolled(&fx, TIGRIS_ACCEL_ESP_NN, out, 0, 2, 3, &handled);
+    TEST_ASSERT_EQ(handled, 0,
+                   "rolled conv (in_row_start) stays on the ESP adapter");
+
+    memset(out, 0, sizeof(out));
+    handled = 1;
+    run_pre_route_rolled(&fx, TIGRIS_ACCEL_CMSIS_NN, out, 2, 0, 3, &handled);
+    TEST_ASSERT_EQ(handled, 0,
+                   "rolled conv stays on the CMSIS adapter");
+
+    /* A rolled NON-conv/depthwise op still routes to s8_ref: only conv/depthwise
+     * fold the roll offsets natively. Max-pool honors the roll in s8_ref, so the
+     * fallback execution stays in bounds. */
+    build_fixture(&fx, TIGRIS_OP_MAX_POOL, 0);
+    fx.op.spatial.dilation_h = 1;
+    fx.op.spatial.dilation_w = 1;
+    fx.op.spatial.kernel_h = 1;
+    fx.op.spatial.kernel_w = 1;
+    fx.op.spatial.pad_top = 0;
+    fx.op.spatial.pad_bottom = 0;
+    fx.op.spatial.pad_left = 0;
+    fx.op.spatial.pad_right = 0;
+    memset(out, 0, sizeof(out));
+    handled = 0;
     run_pre_route_rolled(&fx, TIGRIS_ACCEL_ESP_NN, out, 2, 0, 3, &handled);
     TEST_ASSERT_EQ(handled, 1,
-                   "rolled conv (out_row_start) routes ESP to s8_ref");
-
-    /* Rolled via in_row_start alone also triggers the guard. */
-    memset(out, 0, sizeof(out));
-    run_pre_route_rolled(&fx, TIGRIS_ACCEL_ESP_NN, out, 0, 2, 3, &handled);
-    TEST_ASSERT_EQ(handled, 1,
-                   "rolled conv (in_row_start) routes ESP to s8_ref");
-
-    /* CMSIS: rolled ops also route to s8_ref (it already routes all tiled
-     * spatial ops there, so this stays correct as well). */
-    memset(out, 0, sizeof(out));
-    run_pre_route_rolled(&fx, TIGRIS_ACCEL_CMSIS_NN, out, 2, 0, 3, &handled);
-    TEST_ASSERT_EQ(handled, 1,
-                   "rolled conv routes CMSIS to s8_ref");
+                   "rolled max-pool still routes ESP to s8_ref");
 }
 
 /* A 2D-tiled op sets mem->tile.width_tiled on tiles that partition width as
@@ -509,7 +527,7 @@ int main(void)
     test_cmsis_dilation_and_tile_routes();
     test_cmsis_plain_height_tile_routes_adapter();
     test_unit_dilation_keeps_esp_adapter();
-    test_rolled_tile_routes_reference();
+    test_rolled_tile_routing();
     test_width_tiled_routes_reference();
     test_esp_asymmetric_pad_workspace_policy();
 

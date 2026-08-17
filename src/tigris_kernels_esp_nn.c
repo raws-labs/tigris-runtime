@@ -434,6 +434,19 @@ static int adapt_conv2d(
         pb = mem->tile.pad_bottom;
     }
 
+    /* Line-buffer roll: fold out_row_start into the output pointer and
+     * (out_row_start*stride - in_row_start) into the input pointer, matching
+     * kern_conv2d_s8 and the CMSIS-NN adapter. Rolled tiles are interior
+     * (pt==pb==0), so the asymmetric-pad path below is not taken. */
+    if (mem->tile.active &&
+        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0)) {
+        int delta = mem->tile.out_row_start * op->spatial.stride_h
+                  - mem->tile.in_row_start;
+        X  += delta * IW * IC;
+        Y  += mem->tile.out_row_start * OW * OC;
+        IH -= delta;
+    }
+
     int32_t in_offset = in_qp ? -in_qp->zero_point : 0;
 
     /* Handle asymmetric padding */
@@ -530,6 +543,18 @@ static int adapt_depthwise_conv2d(
     if (mem->tile.active) {
         IH = mem->tile.in_h;
         OH = mem->tile.out_h;
+    }
+
+    /* Line-buffer roll: fold out_row_start into the output pointer and
+     * (out_row_start*stride - in_row_start) into the input pointer, matching
+     * kern_conv2d_s8 and the CMSIS-NN adapter. */
+    if (mem->tile.active &&
+        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0)) {
+        int delta = mem->tile.out_row_start * op->spatial.stride_h
+                  - mem->tile.in_row_start;
+        X  += delta * IW * C;
+        Y  += mem->tile.out_row_start * OW * C;
+        IH -= delta;
     }
 
     data_dims_t input_dims  = { .width = IW, .height = IH, .channels = C, .extra = 1 };

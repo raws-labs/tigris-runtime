@@ -134,12 +134,24 @@ static int adapt_conv2d(
     int IH = x_shape[1], IW = x_shape[2], IC = x_shape[3];
     int OH = y_shape[1], OW = y_shape[2], OC = y_shape[3];
     int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
+    int pad_top = op->spatial.pad_top;
+
+    /* Plain-height tile: the loaded input tile holds tile.in_h rows and produces
+     * tile.out_h output rows, with tile.pad_top at the top. The bottom pad is
+     * implicit - CMSIS-NN clips input rows at or past IH to the input zero-point,
+     * so an asymmetric edge-tile pad needs no pre-pad. Width is never tiled here
+     * (2D width tiles route to s8_ref), so IW/OW/pad_left stay full-tensor. */
+    if (mem->tile.active) {
+        IH = mem->tile.in_h;
+        OH = mem->tile.out_h;
+        pad_top = mem->tile.pad_top;
+    }
 
     cmsis_nn_conv_params conv_params = {
         .input_offset  = in_qp  ? -in_qp->zero_point  : 0,
         .output_offset = out_qp ? out_qp->zero_point : 0,
         .stride   = { .w = op->spatial.stride_w,  .h = op->spatial.stride_h },
-        .padding  = { .w = op->spatial.pad_left,   .h = op->spatial.pad_top },
+        .padding  = { .w = op->spatial.pad_left,   .h = pad_top },
         .dilation = { .w = op->spatial.dilation_w ? op->spatial.dilation_w : 1,
                       .h = op->spatial.dilation_h ? op->spatial.dilation_h : 1 },
         .activation = { .min = op->act_min, .max = op->act_max },
@@ -200,6 +212,16 @@ static int adapt_depthwise_conv2d(
     int IH = x_shape[1], IW = x_shape[2], C = x_shape[3];
     int OH = y_shape[1], OW = y_shape[2];
     int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
+    int pad_top = op->spatial.pad_top;
+
+    /* Plain-height tile: same contract as adapt_conv2d - tile.in_h input rows
+     * produce tile.out_h output rows at tile.pad_top; the bottom pad is implicit
+     * via IH clipping. Width is never tiled here. */
+    if (mem->tile.active) {
+        IH = mem->tile.in_h;
+        OH = mem->tile.out_h;
+        pad_top = mem->tile.pad_top;
+    }
 
     /* Weight layout: [KH, KW, C] (HWC) from compiler.
      * CMSIS-NN expects [1, KH, KW, C] via filter_dims.n=1 - same data. */
@@ -209,7 +231,7 @@ static int adapt_depthwise_conv2d(
         .output_offset = out_qp ? out_qp->zero_point : 0,
         .ch_mult = 1,
         .stride   = { .w = op->spatial.stride_w,  .h = op->spatial.stride_h },
-        .padding  = { .w = op->spatial.pad_left,   .h = op->spatial.pad_top },
+        .padding  = { .w = op->spatial.pad_left,   .h = pad_top },
         .dilation = { .w = op->spatial.dilation_w ? op->spatial.dilation_w : 1,
                       .h = op->spatial.dilation_h ? op->spatial.dilation_h : 1 },
         .activation = { .min = op->act_min, .max = op->act_max },

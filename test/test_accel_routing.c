@@ -458,12 +458,56 @@ static void test_width_tiled_routes_reference(void)
     TEST_ASSERT_EQ(handled, 0, "non-2D tiled conv stays on ESP adapter");
 }
 
+/* 1.5a: a plain-height tile (tile.active, no roll offset, not width_tiled) with
+ * unit dilation now runs on the CMSIS-NN Conv/Depthwise adapter, matching what
+ * the ESP-NN adapter already does. Dilated, rolled, and 2D-width tiles still
+ * route to s8_ref. */
+static void test_cmsis_plain_height_tile_routes_adapter(void)
+{
+    printf("  test_cmsis_plain_height_tile_routes_adapter...\n");
+    route_fixture_t fx;
+    int handled;
+    int8_t out[8];
+
+    /* unit-dilation plain-height Conv tile -> CMSIS adapter */
+    build_fixture(&fx, TIGRIS_OP_CONV, 0);
+    fx.op.spatial.dilation_h = 1;
+    fx.op.spatial.dilation_w = 1;
+    TEST_ASSERT_EQ(tigris_accel_pre_route(
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 1),
+                   TIGRIS_ACCEL_ROUTE_ADAPTER,
+                   "CMSIS-NN plain-height tiled Conv routes to the adapter");
+    memset(out, 0, sizeof(out));
+    handled = 1;
+    run_pre_route(&fx, TIGRIS_ACCEL_CMSIS_NN, out, 1, &handled);
+    TEST_ASSERT_EQ(handled, 0,
+                   "plain-height tiled Conv selects the CMSIS adapter");
+
+    /* unit-dilation plain-height Depthwise tile -> CMSIS adapter */
+    build_fixture(&fx, TIGRIS_OP_DEPTHWISE, 1);
+    fx.op.spatial.dilation_h = 1;
+    fx.op.spatial.dilation_w = 1;
+    TEST_ASSERT_EQ(tigris_accel_pre_route(
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 1),
+                   TIGRIS_ACCEL_ROUTE_ADAPTER,
+                   "CMSIS-NN plain-height tiled Depthwise routes to the adapter");
+
+    /* a dilated plain-height tile still routes to reference: native
+     * dilated-tile parity is out of scope for this step. */
+    build_fixture(&fx, TIGRIS_OP_CONV, 0);  /* fixture dilation_h = 2 */
+    TEST_ASSERT_EQ(tigris_accel_pre_route(
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 1),
+                   TIGRIS_ACCEL_ROUTE_S8_REF,
+                   "CMSIS-NN dilated tiled Conv still routes to s8_ref");
+}
+
 int main(void)
 {
     printf("TiGrIS Accelerator Routing Tests\n\n");
     test_esp_dilated_conv_routes_reference();
     test_esp_dilated_depthwise_routes_reference();
     test_cmsis_dilation_and_tile_routes();
+    test_cmsis_plain_height_tile_routes_adapter();
     test_unit_dilation_keeps_esp_adapter();
     test_rolled_tile_routes_reference();
     test_width_tiled_routes_reference();

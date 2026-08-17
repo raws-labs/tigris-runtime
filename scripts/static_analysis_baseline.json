@@ -18,10 +18,10 @@
     "counts": {}
   },
   "misra": {
-    "total": 2778,
-    "misra_total": 2751,
+    "total": 2780,
+    "misra_total": 2753,
     "config_errors": 2,
-    "fingerprint_sha256": "6f2784b2cc87208b4caaebc5c429a2bf11fdb359cc9d843c3cff3f808c9f509f",
+    "fingerprint_sha256": "2066a0b3b407170247a40b2aa29f1d66598c0c3a4e294685df0b307b58aa53a4",
     "counts": {
       "include/tigris.h": {
         "misra-c2012-10.4": 4,
@@ -104,11 +104,11 @@
         "misra-c2012-10.8": 11,
         "misra-c2012-11.5": 48,
         "misra-c2012-11.9": 41,
-        "misra-c2012-12.1": 160,
+        "misra-c2012-12.1": 161,
         "misra-c2012-12.2": 5,
         "misra-c2012-12.3": 5,
         "misra-c2012-14.4": 19,
-        "misra-c2012-15.5": 64,
+        "misra-c2012-15.5": 65,
         "misra-c2012-15.6": 76,
         "misra-c2012-17.3": 1,
         "misra-c2012-17.7": 4,

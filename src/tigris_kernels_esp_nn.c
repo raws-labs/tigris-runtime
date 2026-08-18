@@ -145,6 +145,65 @@ void tigris_esp_nn_deinit(void)
 #endif
 }
 
+/* Max conv input rect (IH, IW) an op sees at inference. For an op in a tiled
+ * stage this is the tile's input rect (bounded by the tile plan); otherwise the
+ * full tensor. Tiling produces asymmetric EDGE tiles (a top tile pads only the
+ * top, a left width tile only the left) even when the full op is symmetric, so
+ * the ESP-NN asymmetric-pad bounce buffer must be sized for THIS rect - not the
+ * full op, which would reserve a full-tensor pad buffer for a small tile. */
+static void esp_conv_tile_input_dims(
+    const tigris_plan_t *plan, uint16_t op_idx,
+    int IH, int IW, int SH, int SW, int eff_kh, int eff_kw,
+    int *tile_IH, int *tile_IW)
+{
+    *tile_IH = IH;
+    *tile_IW = IW;
+    for (uint16_t s = 0; s < plan->header->num_stages; s++) {
+        const tigris_stage_t *st = &plan->stages[s];
+        const uint16_t *sops = tigris_stage_ops(plan, st);
+        int in_stage = 0;
+        for (uint16_t j = 0; j < st->ops_count; j++) {
+            if (sops[j] == op_idx) {
+                in_stage = 1;
+                break;
+            }
+        }
+        if (!in_stage)
+            continue;
+
+        int32_t th;
+        int32_t tw = (int32_t)IW;   /* width is tiled only on the 2D path */
+        if (st->chain_len > 0) {
+            /* A chain back-propagates the halo, so an earlier stage's tile is
+             * taller than the head's chain_tile_h; bound it by adding one halo
+             * per chain member (a safe over-estimate). */
+            th = (int32_t)plan->stages[st->chain_id].chain_tile_h +
+                 (int32_t)(eff_kh - 1) * (int32_t)st->chain_len;
+        } else {
+            const tigris_tile_plan_t *tp = tigris_stage_tile_plan(plan, st);
+            if (!tp || !tp->tileable)
+                return;             /* untiled stage: keep full dims */
+            th = (int32_t)tp->tile_height;
+            if (tp->axis == TIGRIS_TILE_AXIS_HW)   /* 2D: width also tiled */
+                tw = (int32_t)(tp->_reserved & 0xFFFFu);
+        }
+        if (th <= 0)
+            th = (int32_t)IH;
+        if (tw <= 0)
+            tw = (int32_t)IW;
+
+        int32_t cih = (th - 1) * (int32_t)SH + (int32_t)eff_kh;
+        int32_t ciw = (tw - 1) * (int32_t)SW + (int32_t)eff_kw;
+        if (cih < 1) cih = 1;
+        if (ciw < 1) ciw = 1;
+        if (cih > (int32_t)IH) cih = (int32_t)IH;
+        if (ciw > (int32_t)IW) ciw = (int32_t)IW;
+        *tile_IH = (int)cih;
+        *tile_IW = (int)ciw;
+        return;
+    }
+}
+
 /* tigris_esp_nn_prepare */
 
 int tigris_esp_nn_prepare(
@@ -203,6 +262,27 @@ int tigris_esp_nn_prepare(
                 conv_IW = PW;
                 pad_h = 0;
                 pad_w = 0;
+            }
+
+            /* Tile-aware pad-bounce sizing: an edge tile is asymmetric even when
+             * the full op is symmetric, so size the bounce for the tile's input
+             * rect. Dilated convs are already routed to s8_ref above, so the
+             * effective kernel equals the kernel here. */
+            {
+                int SH = op->spatial.stride_h ? op->spatial.stride_h : 1;
+                int SW = op->spatial.stride_w ? op->spatial.stride_w : 1;
+                int tIH, tIW;
+                esp_conv_tile_input_dims(plan, i, IH, IW, SH, SW, KH, KW,
+                                         &tIH, &tIW);
+                if (tIH != IH || tIW != IW) {
+                    uint32_t req;
+                    if (!tigris_accel_esp_pad_workspace_fits(
+                            tIH, tIW, IC, (uint16_t)pt, (uint16_t)pb,
+                            (uint16_t)pl, (uint16_t)pr, UINT32_MAX, &req) ||
+                        req > (uint32_t)(INT_MAX - 15))
+                        return -1;
+                    max_pad = MAX(max_pad, (int)req);
+                }
             }
 
             data_dims_t id = { .width = conv_IW, .height = conv_IH,

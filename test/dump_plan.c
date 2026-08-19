@@ -33,13 +33,35 @@ static const char *op_type_name(uint8_t t)
     switch (t) {
     case 1: return "CONV";
     case 2: return "DEPTHWISE";
-    case 3: return "FULLY_CONN";
-    case 4: return "RELU";
-    case 5: return "RELU6";
-    case 6: return "ADD";
-    case 7: return "GLOBAL_AVG";
-    case 8: return "RESHAPE";
-    case 9: return "FLATTEN";
+    case 3: return "RELU";
+    case 4: return "RELU6";
+    case 5: return "MAX_POOL";
+    case 6: return "AVG_POOL";
+    case 7: return "ADD";
+    case 8: return "MUL";
+    case 9: return "FULLY_CONN";
+    case 10: return "SOFTMAX";
+    case 11: return "CLIP";
+    case 12: return "SIGMOID";
+    case 13: return "CONCAT";
+    case 14: return "PAD";
+    case 15: return "GLOBAL_AVG";
+    case 16: return "FLATTEN";
+    case 17: return "RESHAPE";
+    case 18: return "SUB";
+    case 19: return "DIV";
+    case 20: return "TANH";
+    case 21: return "LEAKY_RELU";
+    case 22: return "BATCH_NORM";
+    case 23: return "INST_NORM";
+    case 24: return "CONV_TRANSPOSE";
+    case 25: return "MATMUL";
+    case 26: return "REDUCE_MEAN";
+    case 27: return "SQUEEZE";
+    case 28: return "UNSQUEEZE";
+    case 29: return "TRANSPOSE";
+    case 30: return "RESIZE";
+    case 31: return "GLOBAL_MAX";
     default: return "???";
     }
 }

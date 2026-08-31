@@ -122,6 +122,29 @@ See [examples/posix/main.c](examples/posix/main.c) for checked loader, arena,
 input, execution, and output handling. Production integrations normally use
 the harness emitted by `tigris codegen`.
 
+### Local gate checks before pushing
+
+CI enforces three gates that `ctest` does not: stack-frame budgets, the MISRA
+static-analysis baseline, and per-file coverage floors. Run them locally the
+same way CI does, so a tiling or roll change fails on your machine instead of
+only after a push:
+
+```bash
+scripts/local_ci.sh                 # run every gate the local toolchain allows
+scripts/local_ci.sh --strict        # count a skipped gate as a failure
+scripts/local_ci.sh --build-cppcheck # build+cache the pinned Cppcheck, then run
+```
+
+Static analysis needs Cppcheck 2.21.1 and coverage needs `gcc-13`/`gcov-13`,
+the exact tools the baseline and floors are calibrated against; a gate is
+skipped (reported, not silently passed) when its tool is missing. Point
+`TIGRIS_CPPCHECK` at an existing 2.21.1 binary to skip the source build. Wire
+it into git from the repo root with:
+
+```bash
+ln -s ../../scripts/local_ci.sh .git/hooks/pre-push
+```
+
 ## Install for CMake consumers
 
 Install the runtime to a prefix:

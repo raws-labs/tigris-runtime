@@ -33,4 +33,5 @@ files:
     - "test/**/*"
     - "docs/**/*"
     - ".github/**/*"
+    - "PUBLISHING.md"
     - "**/*.tgrs"

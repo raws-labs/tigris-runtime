@@ -1,0 +1,36 @@
+# ESP Component Registry manifest. The runtime's root CMakeLists is dual-mode:
+# under ESP-IDF the `if(COMMAND idf_component_register)` block registers this
+# repository as an ESP-IDF component, so the repo itself is the component.
+# Published as raws-labs/tigris-runtime. Publish from the git tag that matches
+# `version` below so the registry version and the code agree.
+version: "0.6.0"
+description: "Portable C99 runtime that executes TiGrIS-compiled inference plans (.tgrs) on ESP-IDF targets, with the ESP-NN accelerated kernels and no dynamic allocation during inference."
+url: "https://tigris-ml.dev/"
+documentation: "https://tigris-ml.dev/docs"
+repository: "https://github.com/raws-labs/tigris-runtime.git"
+issues: "https://github.com/raws-labs/tigris-runtime/issues"
+license: "Apache-2.0"
+maintainers:
+  - "RAWS Labs <contact@raws.at>"
+tags:
+  - tigris
+  - inference
+  - embedded-ml
+  - tinyml
+  - esp-nn
+targets:
+  - esp32
+  - esp32s3
+  - esp32c3
+dependencies:
+  idf: ">=5.0"
+  espressif/esp-nn: ">=1.1.0"
+files:
+  use_gitignore: true
+  exclude:
+    - "build/**/*"
+    - "examples/**/*"
+    - "test/**/*"
+    - "docs/**/*"
+    - ".github/**/*"
+    - "**/*.tgrs"

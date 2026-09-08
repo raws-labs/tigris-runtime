@@ -1,0 +1,32 @@
+name: Publish ESP component
+
+# Publishes raws-labs/tigris-runtime to the ESP Component Registry
+# (components.espressif.com) on each version tag. The runtime's dual-mode root
+# CMakeLists makes the repository itself the component.
+#
+# Auth: the IDF_COMPONENT_API_TOKEN repository secret. (OIDC is an alternative
+# that avoids a stored secret but must be trusted by the registry; to use it,
+# drop api_token and add a `permissions: id-token: write` block.)
+#
+# Version comes from the tag (github.ref_name). Keep idf_component.yml's version
+# field in step with the tag you push.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  upload:
+    if: github.repository == 'raws-labs/tigris-runtime'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Upload to ESP Component Registry
+        uses: espressif/upload-components-ci-action@v2
+        with:
+          namespace: "raws-labs"
+          components: "tigris-runtime:."
+          version: ${{ github.ref_name }}
+          skip_pre_release: "true"
+          api_token: ${{ secrets.IDF_COMPONENT_API_TOKEN }}

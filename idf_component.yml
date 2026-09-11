@@ -6,7 +6,7 @@
 version: "0.6.0"
 description: "Portable C99 runtime that executes TiGrIS-compiled inference plans (.tgrs) on ESP-IDF targets, with the ESP-NN accelerated kernels and no dynamic allocation during inference."
 url: "https://tigris-ml.dev/"
-documentation: "https://tigris-ml.dev/docs"
+documentation: "https://tigris-ml.dev/getting-started/quickstart/"
 repository: "https://github.com/raws-labs/tigris-runtime.git"
 issues: "https://github.com/raws-labs/tigris-runtime/issues"
 license: "Apache-2.0"

@@ -1,7 +1,7 @@
 # TiGrIS Runtime
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/docs)
+[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/getting-started/quickstart/)
 
 Portable C runtime for [TiGrIS](https://github.com/raws-labs/tigris). It
 loads compatible `.tgrs` plans and executes them against caller-owned memory
@@ -66,7 +66,7 @@ caller-owned bytes to `tigris_run_with_workspace_buffer()`. The fixed
 for source compatibility. `tigris_run()` uses one process-global fixed
 workspace and is not safe for concurrent inference. Arena sizing, stack
 provisioning, and re-entrant execution are documented in the
-[runtime integration guide](https://tigris-ml.dev/docs/runtime/integration/).
+[runtime integration guide](https://tigris-ml.dev/runtime/integration/).
 
 The plan's `budget` is the modeled activation requirement. For an arena whose
 base satisfies `TIGRIS_TENSOR_ALIGN`, `tigris_fast_arena_required()` returns
@@ -188,8 +188,8 @@ using ESP-NN, call `tigris_esp_nn_prepare()` and check its return value before
 
 ## Further reading
 
-- [Getting started](https://tigris-ml.dev/docs)
+- [Getting started](https://tigris-ml.dev/getting-started/quickstart/)
 - [Compiler and plan compatibility data](https://github.com/raws-labs/tigris/blob/main/compatibility.json)
-- [Runtime integration](https://tigris-ml.dev/docs/runtime/integration)
-- [Runtime API](https://tigris-ml.dev/docs/runtime/api-reference)
-- [Memory model](https://tigris-ml.dev/docs/architecture/memory-model)
+- [Runtime integration](https://tigris-ml.dev/runtime/integration)
+- [Runtime API](https://tigris-ml.dev/runtime/api-reference)
+- [Memory model](https://tigris-ml.dev/architecture/memory-model)

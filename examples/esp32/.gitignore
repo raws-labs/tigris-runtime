@@ -1,6 +1,0 @@
-build/
-sdkconfig
-sdkconfig.old
-*.o
-*.a
-*.d

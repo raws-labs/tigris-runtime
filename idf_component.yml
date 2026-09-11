@@ -25,16 +25,19 @@ targets:
 dependencies:
   idf: ">=5.0"
   espressif/esp-nn: ">=1.1.0"
+# The example to expose via `idf.py create-project-from-example
+# "raws-labs/tigris-runtime:getting-started"`. The path is explicit because the
+# example is nested under examples/esp32/ (the ESP32 examples bucket).
+examples:
+  - path: examples/esp32/getting-started
 files:
   use_gitignore: true
-  # Ship the getting-started example (and its embedded plan/reference) so
-  # `idf.py create-project-from-example "raws-labs/tigris-runtime:getting-started"`
-  # works. `include` overrides the excludes below (incl. the *.tgrs rule).
+  # Ship the nested getting-started example (and its embedded plan/reference).
+  # `include` overrides the excludes below (incl. the *.tgrs rule).
   include:
-    - "examples/getting-started/**/*"
+    - "examples/esp32/getting-started/**/*"
   exclude:
     - "build/**/*"
-    - "examples/esp32/**/*"
     - "examples/posix/**/*"
     - "test/**/*"
     - "docs/**/*"

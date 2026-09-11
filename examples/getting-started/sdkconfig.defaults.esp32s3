@@ -1,0 +1,10 @@
+# ESP32-S3 with PSRAM (developed on an ESP32-S3-DevKitC-1 N16R8: 16 MB flash,
+# 8 MB octal PSRAM). The U-Net spills its long-lived skip tensors to PSRAM, so
+# PSRAM is required. On a QUAD-PSRAM board, use CONFIG_SPIRAM_MODE_QUAD instead;
+# on 8 MB flash, shrink the factory partition in partitions.csv.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y

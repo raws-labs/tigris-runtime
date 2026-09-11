@@ -2,7 +2,7 @@
 
 ESP-IDF example app for running [TiGrIS](https://github.com/raws-labs/tigris) inference plans on ESP32 hardware.
 
-**[Documentation](https://tigris-ml.dev/docs)**
+**[Documentation](https://tigris-ml.dev/getting-started/quickstart/)**
 
 ## Prerequisites
 

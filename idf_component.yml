@@ -3,7 +3,7 @@
 # repository as an ESP-IDF component, so the repo itself is the component.
 # Published as raws-labs/tigris-runtime. Publish from the git tag that matches
 # `version` below so the registry version and the code agree.
-version: "0.6.0"
+version: "0.6.1"
 description: "Portable C99 runtime that executes TiGrIS-compiled inference plans (.tgrs) on ESP-IDF targets, with the ESP-NN accelerated kernels and no dynamic allocation during inference."
 url: "https://tigris-ml.dev/"
 documentation: "https://tigris-ml.dev/getting-started/quickstart/"
@@ -25,11 +25,20 @@ targets:
 dependencies:
   idf: ">=5.0"
   espressif/esp-nn: ">=1.1.0"
+# The example to expose via `idf.py create-project-from-example
+# "raws-labs/tigris-runtime:getting-started"`. The path is explicit because the
+# example is nested under examples/esp32/ (the ESP32 examples bucket).
+examples:
+  - path: examples/esp32/getting-started
 files:
   use_gitignore: true
+  # Ship the nested getting-started example (and its embedded plan/reference).
+  # `include` overrides the excludes below (incl. the *.tgrs rule).
+  include:
+    - "examples/esp32/getting-started/**/*"
   exclude:
     - "build/**/*"
-    - "examples/**/*"
+    - "examples/posix/**/*"
     - "test/**/*"
     - "docs/**/*"
     - "scripts/**/*"

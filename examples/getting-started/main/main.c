@@ -163,27 +163,25 @@ void app_main(void) {
     printf("Fast (SRAM): %.0f KiB   Slow (PSRAM): %.0f KiB   Workspace: %u B\n\n",
            mem.fast_size / 1024.0f, slow_size / 1024.0f, (unsigned)ws_size);
 
-    /* 3. Run once (warm), then a timed run. Input = int8 1 (the value the
-     *    reference was generated with). */
+    /* 3. Reset the arena (esp_nn_prepare reduced mem.fast_size in place), fill
+     *    the input (int8 1 — the value the reference was generated with), and
+     *    run once. The s8_ref decoder stages make this take ~30 s. */
+    tigris_mem_init(&mem, mem.tensor_ptrs, mem.num_tensors,
+                    mem.fast_base, mem.fast_size, mem.slow_base, mem.slow_size);
+    for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {
+        uint16_t t = plan.model_inputs[i];
+        tigris_mem_alloc_slow(&mem, t, plan.tensors[t].size_bytes);
+        memset(mem.tensor_ptrs[t], is_quant ? 1 : 0, plan.tensors[t].size_bytes);
+    }
+    printf("Running inference (the s8_ref decoder takes ~30 s)...\n\n");
     tigris_exec_stats_t stats = {0};
-    int64_t latency_us = -1;
-    for (int run = 0; run < 2; run++) {
-        tigris_mem_init(&mem, tensor_ptrs, plan.header->num_tensors,
-                        fast_buf, fast_size, slow_buf, slow_size);
-        for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {
-            uint16_t t = plan.model_inputs[i];
-            tigris_mem_alloc_slow(&mem, t, plan.tensors[t].size_bytes);
-            memset(mem.tensor_ptrs[t], is_quant ? 1 : 0, plan.tensors[t].size_bytes);
-        }
-        int64_t t0 = esp_timer_get_time();
-        tigris_exec_error_t err = tigris_run_with_workspace_buffer(
-            &plan, &mem, dispatch, NULL, &stats, ws, ws_size);
-        int64_t t1 = esp_timer_get_time();
-        if (err != TIGRIS_EXEC_OK) {
-            ESP_LOGE(TAG, "inference failed: %s", tigris_exec_error_str(err));
-            return;
-        }
-        if (run == 1) latency_us = t1 - t0;
+    int64_t t0 = esp_timer_get_time();
+    tigris_exec_error_t err = tigris_run_with_workspace_buffer(
+        &plan, &mem, dispatch, NULL, &stats, ws, ws_size);
+    int64_t latency_us = esp_timer_get_time() - t0;
+    if (err != TIGRIS_EXEC_OK) {
+        ESP_LOGE(TAG, "inference failed: %s", tigris_exec_error_str(err));
+        return;
     }
 
     /* 4. Self-check the int8 output against the embedded golden reference. */

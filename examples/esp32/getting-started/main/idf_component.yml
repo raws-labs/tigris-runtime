@@ -6,5 +6,5 @@
 dependencies:
   idf: ">=5.0"
   raws-labs/tigris-runtime:
-    version: "^0.6.1"
+    version: "^0.7.0"
     override_path: "../../../../"

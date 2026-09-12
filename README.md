@@ -1,7 +1,7 @@
 # TiGrIS Runtime
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/docs)
+[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/getting-started/quickstart/)
 
 Portable C runtime for [TiGrIS](https://github.com/raws-labs/tigris). It
 loads compatible `.tgrs` plans and executes them against caller-owned memory
@@ -66,7 +66,7 @@ caller-owned bytes to `tigris_run_with_workspace_buffer()`. The fixed
 for source compatibility. `tigris_run()` uses one process-global fixed
 workspace and is not safe for concurrent inference. Arena sizing, stack
 provisioning, and re-entrant execution are documented in the
-[runtime integration guide](https://tigris-ml.dev/docs/runtime/integration/).
+[runtime integration guide](https://tigris-ml.dev/runtime/integration/).
 
 The plan's `budget` is the modeled activation requirement. For an arena whose
 base satisfies `TIGRIS_TENSOR_ALIGN`, `tigris_fast_arena_required()` returns
@@ -122,6 +122,29 @@ See [examples/posix/main.c](examples/posix/main.c) for checked loader, arena,
 input, execution, and output handling. Production integrations normally use
 the harness emitted by `tigris codegen`.
 
+### Local gate checks before pushing
+
+CI enforces three gates that `ctest` does not: stack-frame budgets, the MISRA
+static-analysis baseline, and per-file coverage floors. Run them locally the
+same way CI does, so a tiling or roll change fails on your machine instead of
+only after a push:
+
+```bash
+scripts/local_ci.sh                 # run every gate the local toolchain allows
+scripts/local_ci.sh --strict        # count a skipped gate as a failure
+scripts/local_ci.sh --build-cppcheck # build+cache the pinned Cppcheck, then run
+```
+
+Static analysis needs Cppcheck 2.21.1 and coverage needs `gcc-13`/`gcov-13`,
+the exact tools the baseline and floors are calibrated against; a gate is
+skipped (reported, not silently passed) when its tool is missing. Point
+`TIGRIS_CPPCHECK` at an existing 2.21.1 binary to skip the source build. Wire
+it into git from the repo root with:
+
+```bash
+ln -s ../../scripts/local_ci.sh .git/hooks/pre-push
+```
+
 ## Install for CMake consumers
 
 Install the runtime to a prefix:
@@ -165,8 +188,8 @@ using ESP-NN, call `tigris_esp_nn_prepare()` and check its return value before
 
 ## Further reading
 
-- [Getting started](https://tigris-ml.dev/docs)
+- [Getting started](https://tigris-ml.dev/getting-started/quickstart/)
 - [Compiler and plan compatibility data](https://github.com/raws-labs/tigris/blob/main/compatibility.json)
-- [Runtime integration](https://tigris-ml.dev/docs/runtime/integration)
-- [Runtime API](https://tigris-ml.dev/docs/runtime/api-reference)
-- [Memory model](https://tigris-ml.dev/docs/architecture/memory-model)
+- [Runtime integration](https://tigris-ml.dev/runtime/integration)
+- [Runtime API](https://tigris-ml.dev/runtime/api-reference)
+- [Memory model](https://tigris-ml.dev/architecture/memory-model)

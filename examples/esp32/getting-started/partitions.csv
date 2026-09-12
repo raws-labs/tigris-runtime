@@ -1,0 +1,7 @@
+# Partition table. No "plan" partition: the compiled plan and its golden output
+# are embedded in the app image, so the factory app partition is sized to hold
+# them (~0.66 MB of data on top of the code). Offsets assume 16 MB flash.
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  0x300000,

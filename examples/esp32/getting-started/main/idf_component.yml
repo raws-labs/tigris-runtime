@@ -1,0 +1,10 @@
+## Dependencies of the getting-started example.
+##
+## `override_path` points at the parent runtime so the example builds against
+## the local checkout during development. `idf.py create-project-from-example`
+## drops the override and resolves raws-labs/tigris-runtime from the registry.
+dependencies:
+  idf: ">=5.0"
+  raws-labs/tigris-runtime:
+    version: "^0.7.0"
+    override_path: "../../../../"

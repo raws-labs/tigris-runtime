@@ -165,6 +165,490 @@ static void test_conv2d(void)
         TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "conv2d output");
 }
 
+/* ConvTranspose tests */
+
+static void test_conv_transpose_stride2(void)
+{
+    printf("  test_conv_transpose_stride2...\n");
+
+    /* NHWC: 1x2x2x1 input, kernel 2x2, stride=2, pad=0 -> 1x4x4x1 output.
+     * With stride == kernel and no pad, each input pixel maps to a
+     * disjoint 2x2 output block:
+     *   out[2*ih+kh, 2*iw+kw] = X[ih,iw] * W[kh,kw]
+     * Hand-verified per input pixel:
+     *   ih=0,iw=0 (X=1): out[0,0]=10 out[0,1]=20 out[1,0]=30 out[1,1]=40
+     *   ih=0,iw=1 (X=2): out[0,2]=20 out[0,3]=40 out[1,2]=60 out[1,3]=80
+     *   ih=1,iw=0 (X=3): out[2,0]=30 out[2,1]=60 out[3,0]=90 out[3,1]=120
+     *   ih=1,iw=1 (X=4): out[2,2]=40 out[2,3]=80 out[3,2]=120 out[3,3]=160
+     */
+    int32_t x_shape[] = {1, 2, 2, 1};
+    int32_t y_shape[] = {1, 4, 4, 1};
+
+    float X[4] = {1, 2,
+                  3, 4};
+    /* Weight [OC=1, KH=2, KW=2, IC=1] (OHWI layout) */
+    float W[4] = {10, 20,
+                  30, 40};
+    float B[1] = {0.0f};
+
+    float expected[16] = {
+        10,  20,  20,  40,
+        30,  40,  60,  80,
+        30,  60,  40,  80,
+        90, 120, 120, 160,
+    };
+
+    /* Build plan */
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 1;
+    tensors[1].shape_off = 4; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(expected); tensors[1].dtype = 1;
+
+    int32_t shape_pool[8];
+    memcpy(shape_pool, x_shape, sizeof(x_shape));
+    memcpy(shape_pool + 4, y_shape, sizeof(y_shape));
+
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_weight_entry_t weights[2];
+    weights[0].name_str = 0; weights[0].offset = 0;
+    weights[0].size_bytes = sizeof(W);
+    weights[1].name_str = 0;
+    weights[1].offset = sizeof(W);
+    weights[1].size_bytes = sizeof(B);
+
+    float weight_blob[5];
+    memcpy(weight_blob, W, sizeof(W));
+    memcpy((char *)weight_blob + sizeof(W), B, sizeof(B));
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.spatial.kernel_h = 2; op.spatial.kernel_w = 2;
+    op.spatial.stride_h = 2; op.spatial.stride_w = 2;
+    op.spatial.dilation_h = 1; op.spatial.dilation_w = 1;
+    op.spatial.group = 1;
+    op.weight_idx = 0; op.bias_idx = 1;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    header.num_weights = 2;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+    plan.weight_entries = weights;
+    plan.weight_blob = (const uint8_t *)weight_blob;
+
+    void *ptrs[2] = {NULL, NULL};
+    float out_buf[16];
+    memset(out_buf, 0, sizeof(out_buf));
+    ptrs[0] = X;
+    ptrs[1] = out_buf;
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "dispatch returns 0");
+    for (int i = 0; i < 16; i++)
+        TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "conv_transpose stride2 output");
+}
+
+static void test_conv_transpose_pad_stride_skip(void)
+{
+    printf("  test_conv_transpose_pad_stride_skip...\n");
+
+    /* NHWC: 1x2x2x1 input, kernel 3x3, stride=2, pad=1 -> 1x3x3x1 output.
+     * This case exercises the skip branches in the gather loop:
+     *   - num_h/num_w % stride != 0 (some kh/kw taps land off the stride
+     *     lattice and must be skipped)
+     *   - ih/iw < 0 or >= input extent (pad pushes the tap out of range)
+     *
+     * Scatter-form cross-check (oh = ih*SH - PT + kh, same for w) gives the
+     * same result as the gather form used by the kernel; both were computed
+     * by hand and agree (see task-1-report.md for the full derivation).
+     *
+     * Weight [OC=1, KH=3, KW=3, IC=1] (OHWI), row-major kh,kw = 1..9:
+     *   W = [[1,2,3],[4,5,6],[7,8,9]]
+     * Input X[ih,iw] = [[1,2],[3,4]]
+     *
+     * Valid (ih,kh,oh) triples (num_h % 2 == 0 and 0<=ih<2):
+     *   oh=0: (ih=0,kh=1)
+     *   oh=1: (ih=1,kh=0), (ih=0,kh=2)
+     *   oh=2: (ih=1,kh=1)
+     * Same structure for (iw,kw,ow). Expected (row-major oh,ow):
+     *   Y[0,0]=5   Y[0,1]=14  Y[0,2]=10
+     *   Y[1,0]=14  Y[1,1]=36  Y[1,2]=24
+     *   Y[2,0]=15  Y[2,1]=34  Y[2,2]=20
+     */
+    int32_t x_shape[] = {1, 2, 2, 1};
+    int32_t y_shape[] = {1, 3, 3, 1};
+
+    float X[4] = {1, 2,
+                  3, 4};
+    float W[9] = {1, 2, 3,
+                  4, 5, 6,
+                  7, 8, 9};
+    float B[1] = {0.0f};
+
+    float expected[9] = {
+         5, 14, 10,
+        14, 36, 24,
+        15, 34, 20,
+    };
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 1;
+    tensors[1].shape_off = 4; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(expected); tensors[1].dtype = 1;
+
+    int32_t shape_pool[8];
+    memcpy(shape_pool, x_shape, sizeof(x_shape));
+    memcpy(shape_pool + 4, y_shape, sizeof(y_shape));
+
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_weight_entry_t weights[2];
+    weights[0].name_str = 0; weights[0].offset = 0;
+    weights[0].size_bytes = sizeof(W);
+    weights[1].name_str = 0;
+    weights[1].offset = sizeof(W);
+    weights[1].size_bytes = sizeof(B);
+
+    float weight_blob[10];
+    memcpy(weight_blob, W, sizeof(W));
+    memcpy((char *)weight_blob + sizeof(W), B, sizeof(B));
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.spatial.kernel_h = 3; op.spatial.kernel_w = 3;
+    op.spatial.stride_h = 2; op.spatial.stride_w = 2;
+    op.spatial.pad_top = 1; op.spatial.pad_bottom = 1;
+    op.spatial.pad_left = 1; op.spatial.pad_right = 1;
+    op.spatial.dilation_h = 1; op.spatial.dilation_w = 1;
+    op.spatial.group = 1;
+    op.weight_idx = 0; op.bias_idx = 1;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    header.num_weights = 2;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+    plan.weight_entries = weights;
+    plan.weight_blob = (const uint8_t *)weight_blob;
+
+    void *ptrs[2] = {NULL, NULL};
+    float out_buf[9];
+    memset(out_buf, 0, sizeof(out_buf));
+    ptrs[0] = X;
+    ptrs[1] = out_buf;
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "dispatch returns 0");
+    for (int i = 0; i < 9; i++)
+        TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "conv_transpose pad/stride-skip output");
+}
+
+static void test_conv_transpose_out_of_range_skip(void)
+{
+    printf("  test_conv_transpose_out_of_range_skip...\n");
+
+    /* NHWC: 1x2x2x1 input, kernel 3x3, stride=1, pad=2 -> 1x3x3x1 output.
+     * stride_h=stride_w=1 means num_h % SH and num_w % SW are always 0, so
+     * every kh/kw tap passes the modulo check in kern_conv_transpose and the
+     * only thing that can skip a tap is the ih/iw bounds check itself
+     * (tigris_kernels.c:265,272). This isolates that branch from the
+     * modulo-skip branch, which the earlier stride2/pad-stride-skip tests
+     * exercise instead (see test_conv_transpose_pad_stride_skip; every
+     * non-divisible num_h/num_w there is caught by the modulo check before
+     * the bounds check line is ever reached).
+     *
+     * Gather-form derivation, ih = oh + PT - kh (PT=2, SH=1):
+     *   oh=0: kh=0 -> ih=2 (>=IH=2, skip -- the bounds branch, hit
+     *                directly, not via modulo); kh=1 -> ih=1 (valid);
+     *                kh=2 -> ih=0 (valid).
+     *   oh=1: kh=0 -> ih=3 (skip, bounds); kh=1 -> ih=2 (skip, bounds);
+     *                kh=2 -> ih=1 (valid).
+     *   oh=2: kh=0 -> ih=4 (skip, bounds); kh=1 -> ih=3 (skip, bounds);
+     *                kh=2 -> ih=2 (skip, bounds). All three kh taps skip,
+     *                so this row's sum never leaves the initial bias.
+     * Width is the same structure (IW=2, PL=2, KW=3, SW=1), so ow=2 is
+     * also an all-skip column. Cross-checked against the scatter-form
+     * relation oh = ih*SH - PT + kh (ih in {0,1}, kh in {0,1,2}), which
+     * gives the same three valid (ih,kh,oh) triples: (0,2,0), (1,1,0),
+     * (1,2,1); same for w. Full expected grid (row-major oh,ow), bias=7,
+     * X[ih,iw] = {1,2,3,4}, W[kh,kw] = {1..9} row-major:
+     *   Y[0,0] = 7 + X[0,0]*W[2,2] + X[0,1]*W[2,1]
+     *              + X[1,0]*W[1,2] + X[1,1]*W[1,1]
+     *          = 7 + 1*9 + 2*8 + 3*6 + 4*5 = 7 + 9+16+18+20 = 70
+     *   Y[0,1] = 7 + X[0,1]*W[2,2] + X[1,1]*W[1,2] = 7 + 2*9 + 4*6 = 49
+     *   Y[0,2] = 7                                  (w-side all-skip)
+     *   Y[1,0] = 7 + X[1,0]*W[2,2] + X[1,1]*W[2,1] = 7 + 3*9 + 4*8 = 66
+     *   Y[1,1] = 7 + X[1,1]*W[2,2]                 = 7 + 4*9        = 43
+     *   Y[1,2] = 7                                  (w-side all-skip)
+     *   Y[2,*] = 7                                  (h-side all-skip)
+     */
+    int32_t x_shape[] = {1, 2, 2, 1};
+    int32_t y_shape[] = {1, 3, 3, 1};
+
+    float X[4] = {1, 2,
+                  3, 4};
+    float W[9] = {1, 2, 3,
+                  4, 5, 6,
+                  7, 8, 9};
+    float B[1] = {7.0f};
+
+    float expected[9] = {
+        70, 49, 7,
+        66, 43, 7,
+         7,  7, 7,
+    };
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 1;
+    tensors[1].shape_off = 4; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(expected); tensors[1].dtype = 1;
+
+    int32_t shape_pool[8];
+    memcpy(shape_pool, x_shape, sizeof(x_shape));
+    memcpy(shape_pool + 4, y_shape, sizeof(y_shape));
+
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_weight_entry_t weights[2];
+    weights[0].name_str = 0; weights[0].offset = 0;
+    weights[0].size_bytes = sizeof(W);
+    weights[1].name_str = 0;
+    weights[1].offset = sizeof(W);
+    weights[1].size_bytes = sizeof(B);
+
+    float weight_blob[10];
+    memcpy(weight_blob, W, sizeof(W));
+    memcpy((char *)weight_blob + sizeof(W), B, sizeof(B));
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.spatial.kernel_h = 3; op.spatial.kernel_w = 3;
+    op.spatial.stride_h = 1; op.spatial.stride_w = 1;
+    op.spatial.pad_top = 2; op.spatial.pad_bottom = 2;
+    op.spatial.pad_left = 2; op.spatial.pad_right = 2;
+    op.spatial.dilation_h = 1; op.spatial.dilation_w = 1;
+    op.spatial.group = 1;
+    op.weight_idx = 0; op.bias_idx = 1;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    header.num_weights = 2;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+    plan.weight_entries = weights;
+    plan.weight_blob = (const uint8_t *)weight_blob;
+
+    void *ptrs[2] = {NULL, NULL};
+    float out_buf[9];
+    memset(out_buf, 0, sizeof(out_buf));
+    ptrs[0] = X;
+    ptrs[1] = out_buf;
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "dispatch returns 0");
+    for (int i = 0; i < 9; i++)
+        TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "conv_transpose out-of-range-skip output");
+}
+
+static void test_conv_transpose_tile_2d(void)
+{
+    printf("  test_conv_transpose_tile_2d...\n");
+
+    /* NHWC: 1x4x4x1 input, kernel 2x2, stride=2, pad=0 -> 1x8x8x1 output.
+     * Run the op WHOLE (tile inactive) to get Y_full, the oracle. Then run
+     * it TILED for one interior 2D output tile and assert byte-equality
+     * with the whole-op sub-region. No expected values are hardcoded.
+     *
+     * Interior 2D output tile [oh0..oh1) x [ow0..ow1) = [4..6) x [2..6):
+     *   ih_lo = floor_div(oh0 + PT - (KH-1), SH) = floor_div(4+0-1, 2) = 1
+     *   ih_hi = floor_div(oh1-1 + PT, SH)        = floor_div(5+0, 2)   = 2
+     *   iw_lo = floor_div(ow0 + PL - (KW-1), SW) = floor_div(2+0-1, 2) = 0
+     *   iw_hi = floor_div(ow1-1 + PL, SW)        = floor_div(5+0, 2)   = 2
+     * loaded input rect: rows [1,3) cols [0,3)  -> in_h=2, in_w=3, ih0=1, iw0=0
+     * effective pads:  PT_eff = oh0 + PT - ih0*SH = 4 - 2 = 2
+     *                  PL_eff = ow0 + PL - iw0*SW = 2 - 0 = 2
+     */
+    int32_t x_shape[] = {1, 4, 4, 1};
+    int32_t y_shape[] = {1, 8, 8, 1};
+
+    float X_full[16] = {
+         1,  2,  3,  4,
+         5,  6,  7,  8,
+         9, 10, 11, 12,
+        13, 14, 15, 16,
+    };
+    /* Weight [OC=1, KH=2, KW=2, IC=1] (OHWI layout) */
+    float W[4] = {1, 2,
+                  3, 4};
+    float B[1] = {0.5f};
+
+    /* Build plan (shared by both the whole and the tiled dispatch: only
+     * N/IC/OC are read from x_shape/y_shape once the tile override is
+     * active, so the same "full" shape metadata is valid for both calls). */
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(X_full); tensors[0].dtype = 1;
+    tensors[1].shape_off = 4; tensors[1].ndim = 4;
+    tensors[1].size_bytes = 8 * 8 * sizeof(float); tensors[1].dtype = 1;
+
+    int32_t shape_pool[8];
+    memcpy(shape_pool, x_shape, sizeof(x_shape));
+    memcpy(shape_pool + 4, y_shape, sizeof(y_shape));
+
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_weight_entry_t weights[2];
+    weights[0].name_str = 0; weights[0].offset = 0;
+    weights[0].size_bytes = sizeof(W);
+    weights[1].name_str = 0;
+    weights[1].offset = sizeof(W);
+    weights[1].size_bytes = sizeof(B);
+
+    float weight_blob[5];
+    memcpy(weight_blob, W, sizeof(W));
+    memcpy((char *)weight_blob + sizeof(W), B, sizeof(B));
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.spatial.kernel_h = 2; op.spatial.kernel_w = 2;
+    op.spatial.stride_h = 2; op.spatial.stride_w = 2;
+    op.spatial.dilation_h = 1; op.spatial.dilation_w = 1;
+    op.spatial.group = 1;
+    op.weight_idx = 0; op.bias_idx = 1;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    header.num_weights = 2;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+    plan.weight_entries = weights;
+    plan.weight_blob = (const uint8_t *)weight_blob;
+
+    /* 1) Run WHOLE: X[1,4,4,1], W OHWI [1,2,2,1] -> Y_full[1,8,8,1]. */
+    void *ptrs_full[2] = {NULL, NULL};
+    float Y_full[64];
+    memset(Y_full, 0, sizeof(Y_full));
+    ptrs_full[0] = X_full;
+    ptrs_full[1] = Y_full;
+
+    tigris_mem_t mem_full;
+    memset(&mem_full, 0, sizeof(mem_full));
+    mem_full.tensor_ptrs = ptrs_full;
+    mem_full.num_tensors = 2;
+
+    int ret_full = tigris_dispatch_kernel(&plan, &op, 0, &mem_full, NULL);
+    TEST_ASSERT(ret_full == 0, "dispatch (whole) returns 0");
+
+    /* 2) Build packed X_tile = X_full[1:3, 0:3] (in_h=2, in_w=3, IC=1). */
+    float X_tile[6];
+    for (int r = 0; r < 2; r++)
+        for (int c = 0; c < 3; c++)
+            X_tile[r * 3 + c] = X_full[(1 + r) * 4 + (0 + c)];
+
+    /* 3) Run TILED for output tile [4..6) x [2..6): set mem.tile active=1,
+     * width_tiled=1, out_h=2, out_w=4, in_h=2, in_w=3, pad_top=2,
+     * pad_left=2, pad_bottom=0, pad_right=0, out_row_start=0,
+     * in_row_start=0; point tensor_ptrs at X_tile / Y_tile[2*4]. */
+    void *ptrs_tile[2] = {NULL, NULL};
+    float Y_tile[2 * 4];
+    memset(Y_tile, 0, sizeof(Y_tile));
+    ptrs_tile[0] = X_tile;
+    ptrs_tile[1] = Y_tile;
+
+    tigris_mem_t mem_tile;
+    memset(&mem_tile, 0, sizeof(mem_tile));
+    mem_tile.tensor_ptrs = ptrs_tile;
+    mem_tile.num_tensors = 2;
+    mem_tile.tile.active = 1;
+    mem_tile.tile.width_tiled = 1;
+    mem_tile.tile.in_h = 2;
+    mem_tile.tile.out_h = 2;
+    mem_tile.tile.in_w = 3;
+    mem_tile.tile.out_w = 4;
+    mem_tile.tile.pad_top = 2;
+    mem_tile.tile.pad_left = 2;
+    mem_tile.tile.pad_bottom = 0;
+    mem_tile.tile.pad_right = 0;
+    mem_tile.tile.out_row_start = 0;
+    mem_tile.tile.in_row_start = 0;
+
+    /* 4) dispatch kern_conv_transpose, then: tiled == whole[4:6, 2:6]. */
+    int ret_tile = tigris_dispatch_kernel(&plan, &op, 0, &mem_tile, NULL);
+    TEST_ASSERT(ret_tile == 0, "dispatch (tile) returns 0");
+
+    for (int r = 0; r < 2; r++)
+        for (int c = 0; c < 4; c++)
+            TEST_ASSERT_NEAR(Y_tile[r * 4 + c], Y_full[(4 + r) * 8 + (2 + c)], EPS,
+                             "conv_transpose 2D tile == whole sub-region");
+}
+
 /* DepthwiseConv2D test */
 
 static void test_depthwise_conv2d(void)
@@ -1391,6 +1875,10 @@ int main(void)
     printf("TiGrIS Kernel Tests\n\n");
 
     test_conv2d();
+    test_conv_transpose_stride2();
+    test_conv_transpose_pad_stride_skip();
+    test_conv_transpose_out_of_range_skip();
+    test_conv_transpose_tile_2d();
     test_depthwise_conv2d();
     test_relu();
     test_relu6();

@@ -39,6 +39,21 @@ typedef struct {
     int32_t  out_h;        /* tile output H (core) */
     int32_t  in_w;         /* input W (same as full, for convenience) */
     int32_t  out_w;        /* output W */
+    /* New-row offsets for line-buffered chains: a kernel computes exactly
+     * out_h output rows, writing them starting at out_row_start in the
+     * (possibly larger, persistent) output buffer, and reading input rows
+     * starting at in_row_start in the input buffer handed to it. Both
+     * default to 0, which reduces every existing full-tile kernel call to
+     * today's behavior byte-for-byte. Set by the roll loop to skip
+     * recomputing already-rolled overlap rows. */
+    int32_t  out_row_start; /* rows already written before this call */
+    int32_t  in_row_start;  /* rows already consumed before this call */
+    /* 2D (HW axis) tile geometry. Consulted only when width_tiled == 1;
+     * default to 0 like every other field above, so 1D-height and
+     * non-tiled paths stay byte-identical. */
+    uint16_t pad_left;      /* effective left padding for this tile */
+    uint16_t pad_right;     /* effective right padding for this tile */
+    uint8_t  width_tiled;   /* 0=height-only tile, 1=2D (HW) tile active */
 } tigris_tile_ctx_t;
 
 /* Tensor alignment */
@@ -206,6 +221,49 @@ tigris_mem_error_t tigris_mem_load_tile(
 tigris_mem_error_t tigris_mem_spill_tile(
     tigris_mem_t *mem, const tigris_plan_t *plan,
     uint16_t tensor_idx, void *slow_base, int32_t h_start, int32_t h_end);
+
+/**
+ * Load a 2D [h0:h1, w0:w1, :] sub-rectangle of an NHWC tensor from slow to
+ * fast. Allocates N*(h1-h0)*(w1-w0)*C*elem in fast, packed with no gaps
+ * between rows, and copies the strided source rectangle row by row.
+ *
+ * @param mem   Memory manager.
+ * @param plan  Loaded plan (for tensor shape lookup).
+ * @param tidx  Tensor index to load a tile from. Must be rank 4 (NHWC).
+ * @param h0    First row (inclusive) of the height range. Must satisfy
+ *              0 <= h0 < h1 <= H.
+ * @param h1    Last row (exclusive) of the height range.
+ * @param w0    First column (inclusive) of the width range. Must satisfy
+ *              0 <= w0 < w1 <= W.
+ * @param w1    Last column (exclusive) of the width range.
+ * @return TIGRIS_MEM_OK on success, negative error code on failure.
+ */
+tigris_mem_error_t tigris_mem_load_tile_2d(
+    tigris_mem_t *mem, const tigris_plan_t *plan,
+    uint16_t tidx, int32_t h0, int32_t h1, int32_t w0, int32_t w1);
+
+/**
+ * Spill a packed 2D [oh, ow, C] core from fast to the strided
+ * [h0:h1, w0:w1, :] rectangle of the full NHWC tensor at slow_base, then
+ * restore tensor_ptrs[tidx]. 2D output tiles have no halo, so the entire
+ * packed core is written back.
+ *
+ * @param mem       Memory manager.
+ * @param plan      Loaded plan (for tensor shape lookup).
+ * @param tidx      Tensor index to spill a tile for.
+ * @param slow_base Destination buffer in slow memory for the full tensor.
+ * @param h0        First row (inclusive) of the height range. Must satisfy
+ *                  0 <= h0 < h1 <= H.
+ * @param h1        Last row (exclusive) of the height range.
+ * @param w0        First column (inclusive) of the width range. Must
+ *                  satisfy 0 <= w0 < w1 <= W.
+ * @param w1        Last column (exclusive) of the width range.
+ * @return TIGRIS_MEM_OK on success, negative error code on failure.
+ */
+tigris_mem_error_t tigris_mem_spill_tile_2d(
+    tigris_mem_t *mem, const tigris_plan_t *plan,
+    uint16_t tidx, void *slow_base,
+    int32_t h0, int32_t h1, int32_t w0, int32_t w1);
 
 /**
  * Return a human-readable string for a memory error code.

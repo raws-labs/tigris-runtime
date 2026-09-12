@@ -1,0 +1,9 @@
+# Common defaults (all targets).
+# A big main-task stack + all watchdogs off: the s8_ref decoder stages are slow,
+# and the embedded plan/reference make the app image large.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=65536
+CONFIG_ESP_TASK_WDT_EN=n
+CONFIG_ESP_INT_WDT=n
+CONFIG_BOOTLOADER_WDT_ENABLE=n

@@ -125,6 +125,16 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(test_executor test/test_executor.c)
     target_link_libraries(test_executor tigris_runtime)
 
+    # Instrumented twin: same executor tests, but the runtime sources are
+    # compiled with TIGRIS_COUNT_KERNEL_ROWS so the line-buffered roll test can
+    # compare kernel output-row counts. Compiling the sources directly (rather
+    # than linking tigris_runtime) keeps the shipping library free of the
+    # test-only counter.
+    add_executable(test_executor_rows test/test_executor.c ${TIGRIS_RUNTIME_SRCS})
+    target_include_directories(test_executor_rows PRIVATE include)
+    target_compile_definitions(test_executor_rows PRIVATE TIGRIS_COUNT_KERNEL_ROWS)
+    target_link_libraries(test_executor_rows m)
+
     # This executable references only the explicit executor API. The legacy
     # wrapper lives in a separate archive member and must not add its second
     # workspace to the linked BSS.
@@ -149,6 +159,14 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
 
     add_executable(test_tile_padding test/test_tile_padding.c)
     target_link_libraries(test_tile_padding tigris_runtime)
+
+    add_executable(test_row_offset test/test_row_offset.c)
+    target_link_libraries(test_row_offset tigris_runtime)
+
+    add_executable(test_tile_2d test/test_tile_2d.c)
+    target_compile_definitions(test_tile_2d PRIVATE
+        TIGRIS_TILE2D_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/tile2d_fixtures")
+    target_link_libraries(test_tile_2d tigris_runtime)
 
     add_executable(test_accel_routing test/test_accel_routing.c)
     target_include_directories(test_accel_routing PRIVATE src)
@@ -208,17 +226,34 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(tigris_contract_runner test/contract_runner.c)
     target_link_libraries(tigris_contract_runner tigris_runtime)
 
+    # Rows-instrumented twin of the contract runner: same source, but the
+    # runtime sources are compiled with TIGRIS_COUNT_KERNEL_ROWS so the gate can
+    # read kernel output-row counts and prove the line-buffered roll computes
+    # fewer rows than the recompute path. Compiling the sources directly (rather
+    # than linking tigris_runtime) keeps the shipping library and the default
+    # tigris_contract_runner free of the test-only counter. Also not a CTest
+    # case, for the same reason as the default runner.
+    add_executable(tigris_contract_runner_rows
+        test/contract_runner.c ${TIGRIS_RUNTIME_SRCS})
+    target_include_directories(tigris_contract_runner_rows PRIVATE include)
+    target_compile_definitions(tigris_contract_runner_rows PRIVATE
+        TIGRIS_COUNT_KERNEL_ROWS)
+    target_link_libraries(tigris_contract_runner_rows m)
+
     # Self-contained unit tests.  Fixture-driven executables are built above,
     # but are not registered here because a clean runtime checkout does not
     # contain the generated .tgrs model fixtures they require.
     add_test(NAME loader COMMAND test_loader)
     add_test(NAME executor COMMAND test_executor)
+    add_test(NAME executor_rows COMMAND test_executor_rows)
     add_test(NAME explicit_workspace_link COMMAND explicit_workspace_link_smoke)
     add_test(NAME kernels_f32 COMMAND test_kernels)
     add_test(NAME kernels_s8 COMMAND test_kernels_s8)
     add_test(NAME lz4 COMMAND test_lz4)
     add_test(NAME weight_arena COMMAND test_weight_arena)
     add_test(NAME tile_padding COMMAND test_tile_padding)
+    add_test(NAME row_offset COMMAND test_row_offset)
+    add_test(NAME tile_2d COMMAND test_tile_2d)
     add_test(NAME accel_routing COMMAND test_accel_routing)
     add_test(NAME cmsis_arena COMMAND test_cmsis_arena)
     add_test(NAME avg_pool_s8 COMMAND test_avg_pool_s8)

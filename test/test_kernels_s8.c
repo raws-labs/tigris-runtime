@@ -654,6 +654,383 @@ static void test_conv2d_s8_v2(void)
     TEST_ASSERT_EQ(out[7], 28, "y[0,1,1,1]=28");
 }
 
+/* ConvTranspose s8 tests */
+
+static void test_conv_transpose_s8_stride2(void)
+{
+    printf("  test_conv_transpose_s8_stride2...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+
+    /*
+     * Same no-overlap stride2 gather geometry as the f32
+     * test_conv_transpose_stride2 (kernel_h/kernel_w == stride_h/stride_w,
+     * no padding): each input pixel maps to a disjoint 2x2 output block,
+     * out[2*ih+kh, 2*iw+kw] = X[ih,iw] * W[kh,kw] + bias.
+     * Identity requant (multiplier=2^30, shift=1), zp=0, bias=1 (oc=0).
+     * X[ih,iw]: 1 2 / 3 4   W[kh,kw]: 1 2 / 3 4
+     * Hand-computed per input pixel (product + bias 1):
+     *   ih=0,iw=0 (X=1): out[0,0]=2 out[0,1]=3 out[1,0]=4 out[1,1]=5
+     *   ih=0,iw=1 (X=2): out[0,2]=3 out[0,3]=5 out[1,2]=7 out[1,3]=9
+     *   ih=1,iw=0 (X=3): out[2,0]=4 out[2,1]=7 out[3,0]=10 out[3,1]=13
+     *   ih=1,iw=1 (X=4): out[2,2]=5 out[2,3]=9 out[3,2]=13 out[3,3]=17
+     */
+    int32_t mults[] = {1073741824};
+    int32_t shifts[] = {1};
+    uint16_t in_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
+    uint16_t out_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
+
+    int32_t x_shape[] = {1, 2, 2, 1};
+    int32_t y_shape[] = {1, 4, 4, 1};
+    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
+    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 16, out_qp);
+
+    /* Weight [OC=1, KH=2, KW=2, IC=1] (OHWI) */
+    int8_t weight[] = {1, 2, 3, 4};
+    uint16_t w_idx = add_weight(weight, sizeof(weight), "w");
+
+    int32_t bias[] = {1};
+    uint16_t b_idx = add_weight(bias, sizeof(bias), "b");
+
+    test_ops[0].op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in};
+    uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = w_idx;
+    test_ops[0].bias_idx = b_idx;
+    test_ops[0].spatial.kernel_h = 2;
+    test_ops[0].spatial.kernel_w = 2;
+    test_ops[0].spatial.stride_h = 2;
+    test_ops[0].spatial.stride_w = 2;
+    test_ops[0].spatial.dilation_h = 1;
+    test_ops[0].spatial.dilation_w = 1;
+    test_ops[0].spatial.group = 1;
+    test_ops[0].act_min = -128;
+    test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[4096], slow_buf[4096];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
+
+    int8_t input_data[] = {1, 2, 3, 4};
+    tigris_mem_alloc_fast(&mem, t_in, 4);
+    memcpy(ptrs[t_in], input_data, 4);
+    tigris_mem_alloc_fast(&mem, t_out, 16);
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "conv_transpose_s8_stride2 returns 0");
+
+    int8_t *out = (int8_t *)ptrs[t_out];
+    int8_t expected[16] = {
+        2,  3,  3,  5,
+        4,  5,  7,  9,
+        4,  7,  5,  9,
+        10, 13, 13, 17,
+    };
+    for (int i = 0; i < 16; i++)
+        TEST_ASSERT_EQ(out[i], expected[i], "conv_transpose_s8 stride2 output");
+}
+
+static void test_conv_transpose_s8_pad_stride_skip(void)
+{
+    printf("  test_conv_transpose_s8_pad_stride_skip...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+
+    /*
+     * Same padded/indivisible-stride geometry as the f32
+     * test_conv_transpose_pad_stride_skip (kernel 3x3, stride 2, pad 1,
+     * 1x2x2x1 input -> 1x3x3x1 output): exercises the modulo-skip branch
+     * (num_h/num_w % stride != 0) in the s8 gather loop. Identity requant
+     * (multiplier=2^30, shift=1), zp=0, bias=0.
+     * X[ih,iw]: 1 2 / 3 4   W[kh,kw] row-major 1..9: 1 2 3 / 4 5 6 / 7 8 9
+     * Expected (same valid (ih,kh,oh)/(iw,kw,ow) triples as the f32 test):
+     *   Y[0,0]=5   Y[0,1]=14  Y[0,2]=10
+     *   Y[1,0]=14  Y[1,1]=36  Y[1,2]=24
+     *   Y[2,0]=15  Y[2,1]=34  Y[2,2]=20
+     */
+    int32_t mults[] = {1073741824};
+    int32_t shifts[] = {1};
+    uint16_t in_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
+    uint16_t out_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
+
+    int32_t x_shape[] = {1, 2, 2, 1};
+    int32_t y_shape[] = {1, 3, 3, 1};
+    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
+    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 9, out_qp);
+
+    int8_t weight[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    uint16_t w_idx = add_weight(weight, sizeof(weight), "w");
+
+    int32_t bias[] = {0};
+    uint16_t b_idx = add_weight(bias, sizeof(bias), "b");
+
+    test_ops[0].op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in};
+    uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = w_idx;
+    test_ops[0].bias_idx = b_idx;
+    test_ops[0].spatial.kernel_h = 3;
+    test_ops[0].spatial.kernel_w = 3;
+    test_ops[0].spatial.stride_h = 2;
+    test_ops[0].spatial.stride_w = 2;
+    test_ops[0].spatial.pad_top = 1;
+    test_ops[0].spatial.pad_bottom = 1;
+    test_ops[0].spatial.pad_left = 1;
+    test_ops[0].spatial.pad_right = 1;
+    test_ops[0].spatial.dilation_h = 1;
+    test_ops[0].spatial.dilation_w = 1;
+    test_ops[0].spatial.group = 1;
+    test_ops[0].act_min = -128;
+    test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[4096], slow_buf[4096];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
+
+    int8_t input_data[] = {1, 2, 3, 4};
+    tigris_mem_alloc_fast(&mem, t_in, 4);
+    memcpy(ptrs[t_in], input_data, 4);
+    tigris_mem_alloc_fast(&mem, t_out, 9);
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "conv_transpose_s8_pad_stride_skip returns 0");
+
+    int8_t *out = (int8_t *)ptrs[t_out];
+    int8_t expected[9] = {
+         5, 14, 10,
+        14, 36, 24,
+        15, 34, 20,
+    };
+    for (int i = 0; i < 9; i++)
+        TEST_ASSERT_EQ(out[i], expected[i], "conv_transpose_s8 pad/stride-skip output");
+}
+
+static void test_conv_transpose_s8_out_of_range_skip(void)
+{
+    printf("  test_conv_transpose_s8_out_of_range_skip...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+
+    /*
+     * Same geometry as the f32 test_conv_transpose_out_of_range_skip
+     * (kernel 3x3, stride 1, pad 2, 1x2x2x1 input -> 1x3x3x1 output):
+     * stride_h=stride_w=1 makes num_h % SH and num_w % SW always 0, so the
+     * only skip that can happen here is the ih/iw >= input-extent bounds
+     * check, isolating that branch in the s8 kernel from the modulo-skip
+     * branch already covered above. Identity requant (multiplier=2^30,
+     * shift=1), zp=0, bias=7.
+     * X[ih,iw]: 1 2 / 3 4   W[kh,kw] row-major 1..9: 1 2 3 / 4 5 6 / 7 8 9
+     * Expected (same derivation as the f32 test):
+     *   Y[0,0]=70  Y[0,1]=49  Y[0,2]=7
+     *   Y[1,0]=66  Y[1,1]=43  Y[1,2]=7
+     *   Y[2,0]=7   Y[2,1]=7   Y[2,2]=7
+     */
+    int32_t mults[] = {1073741824};
+    int32_t shifts[] = {1};
+    uint16_t in_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
+    uint16_t out_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
+
+    int32_t x_shape[] = {1, 2, 2, 1};
+    int32_t y_shape[] = {1, 3, 3, 1};
+    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
+    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 9, out_qp);
+
+    int8_t weight[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    uint16_t w_idx = add_weight(weight, sizeof(weight), "w");
+
+    int32_t bias[] = {7};
+    uint16_t b_idx = add_weight(bias, sizeof(bias), "b");
+
+    test_ops[0].op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in};
+    uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = w_idx;
+    test_ops[0].bias_idx = b_idx;
+    test_ops[0].spatial.kernel_h = 3;
+    test_ops[0].spatial.kernel_w = 3;
+    test_ops[0].spatial.stride_h = 1;
+    test_ops[0].spatial.stride_w = 1;
+    test_ops[0].spatial.pad_top = 2;
+    test_ops[0].spatial.pad_bottom = 2;
+    test_ops[0].spatial.pad_left = 2;
+    test_ops[0].spatial.pad_right = 2;
+    test_ops[0].spatial.dilation_h = 1;
+    test_ops[0].spatial.dilation_w = 1;
+    test_ops[0].spatial.group = 1;
+    test_ops[0].act_min = -128;
+    test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[4096], slow_buf[4096];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
+
+    int8_t input_data[] = {1, 2, 3, 4};
+    tigris_mem_alloc_fast(&mem, t_in, 4);
+    memcpy(ptrs[t_in], input_data, 4);
+    tigris_mem_alloc_fast(&mem, t_out, 9);
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "conv_transpose_s8_out_of_range_skip returns 0");
+
+    int8_t *out = (int8_t *)ptrs[t_out];
+    int8_t expected[9] = {
+        70, 49, 7,
+        66, 43, 7,
+         7,  7, 7,
+    };
+    for (int i = 0; i < 9; i++)
+        TEST_ASSERT_EQ(out[i], expected[i], "conv_transpose_s8 out-of-range-skip output");
+}
+
+static void test_conv_transpose_s8_tile_2d(void)
+{
+    printf("  test_conv_transpose_s8_tile_2d...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+
+    /*
+     * Same interior 2D output tile geometry as the f32 Task 1 test
+     * (test_conv_transpose_tile_2d): NHWC 1x4x4x1 input, kernel 2x2,
+     * stride=2, pad=0 -> 1x8x8x1 output. Interior output tile
+     * [oh0..oh1) x [ow0..ow1) = [4..6) x [2..6):
+     *   ih_lo = floor_div(oh0 + PT - (KH-1), SH) = floor_div(4+0-1, 2) = 1
+     *   ih_hi = floor_div(oh1-1 + PT, SH)        = floor_div(5+0, 2)   = 2
+     *   iw_lo = floor_div(ow0 + PL - (KW-1), SW) = floor_div(2+0-1, 2) = 0
+     *   iw_hi = floor_div(ow1-1 + PL, SW)        = floor_div(5+0, 2)   = 2
+     * loaded input rect: rows [1,3) cols [0,3) -> in_h=2, in_w=3, ih0=1, iw0=0
+     * effective pads: PT_eff = oh0 + PT - ih0*SH = 4 - 2 = 2
+     *                 PL_eff = ow0 + PL - iw0*SW = 2 - 0 = 2
+     * out_h=2, out_w=4.
+     * Identity requant (multiplier=2^30, shift=1), zp=0, bias=1 (oc=0), same
+     * scaffolding as test_conv_transpose_s8_stride2. Run the op WHOLE (tile
+     * inactive) to get Y_full, the oracle; no expected values are
+     * hardcoded. Then run it TILED for the interior tile and assert exact
+     * int8 equality against Y_full's sub-region.
+     */
+    int32_t mults[] = {1073741824};
+    int32_t shifts[] = {1};
+    uint16_t in_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
+    uint16_t out_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
+
+    int32_t x_shape[] = {1, 4, 4, 1};
+    int32_t y_shape[] = {1, 8, 8, 1};
+    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 16, in_qp);
+    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 64, out_qp);
+
+    /* Weight [OC=1, KH=2, KW=2, IC=1] (OHWI) */
+    int8_t weight[] = {1, 2, 3, 4};
+    uint16_t w_idx = add_weight(weight, sizeof(weight), "w");
+
+    int32_t bias[] = {1};
+    uint16_t b_idx = add_weight(bias, sizeof(bias), "b");
+
+    test_ops[0].op_type = TIGRIS_OP_CONV_TRANSPOSE;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in};
+    uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = w_idx;
+    test_ops[0].bias_idx = b_idx;
+    test_ops[0].spatial.kernel_h = 2;
+    test_ops[0].spatial.kernel_w = 2;
+    test_ops[0].spatial.stride_h = 2;
+    test_ops[0].spatial.stride_w = 2;
+    test_ops[0].spatial.dilation_h = 1;
+    test_ops[0].spatial.dilation_w = 1;
+    test_ops[0].spatial.group = 1;
+    test_ops[0].act_min = -128;
+    test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[4096], slow_buf[4096];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
+
+    int8_t input_data[16] = {
+         1,  2,  3,  4,
+         5,  6,  7,  8,
+         9, 10, 11, 12,
+        13, 14, 15, 16,
+    };
+    tigris_mem_alloc_fast(&mem, t_in, 16);
+    memcpy(ptrs[t_in], input_data, 16);
+    tigris_mem_alloc_fast(&mem, t_out, 64);
+
+    /* 1) Run WHOLE (tile inactive): Y_full is the oracle. */
+    int ret_full = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret_full, 0, "conv_transpose_s8_tile_2d whole dispatch returns 0");
+
+    int8_t Y_full[64];
+    memcpy(Y_full, ptrs[t_out], sizeof(Y_full));
+
+    /* 2) Build packed X_tile = X_full[1:3, 0:3] (in_h=2, in_w=3, IC=1). */
+    int8_t input_tile[6];
+    for (int r = 0; r < 2; r++)
+        for (int c = 0; c < 3; c++)
+            input_tile[r * 3 + c] = input_data[(1 + r) * 4 + (0 + c)];
+
+    /* 3) Run TILED for output tile [4..6) x [2..6). */
+    tigris_mem_reset_fast(&mem);
+    tigris_mem_alloc_fast(&mem, t_in, 6);
+    memcpy(ptrs[t_in], input_tile, 6);
+    tigris_mem_alloc_fast(&mem, t_out, 8);
+
+    mem.tile.active = 1;
+    mem.tile.width_tiled = 1;
+    mem.tile.in_h = 2;
+    mem.tile.out_h = 2;
+    mem.tile.in_w = 3;
+    mem.tile.out_w = 4;
+    mem.tile.pad_top = 2;
+    mem.tile.pad_left = 2;
+    mem.tile.pad_bottom = 0;
+    mem.tile.pad_right = 0;
+    mem.tile.out_row_start = 0;
+    mem.tile.in_row_start = 0;
+
+    int ret_tile = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret_tile, 0, "conv_transpose_s8_tile_2d tiled dispatch returns 0");
+
+    int8_t *out_tile = (int8_t *)ptrs[t_out];
+    for (int r = 0; r < 2; r++)
+        for (int c = 0; c < 4; c++)
+            TEST_ASSERT_EQ(out_tile[r * 4 + c], Y_full[(4 + r) * 8 + (2 + c)],
+                           "conv_transpose_s8 2D tile == whole sub-region");
+}
+
 static void test_fc_s8(void)
 {
     printf("  test_fc_s8...\n");
@@ -1058,6 +1435,10 @@ int main(void)
     test_reshape_s8();
     test_conv2d_s8_per_tensor();
     test_conv2d_s8_v2();
+    test_conv_transpose_s8_stride2();
+    test_conv_transpose_s8_pad_stride_skip();
+    test_conv_transpose_s8_out_of_range_skip();
+    test_conv_transpose_s8_tile_2d();
     test_fc_s8();
     test_global_avg_pool_s8();
     test_tanh_s8();

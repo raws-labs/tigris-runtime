@@ -155,6 +155,14 @@ tigris_mem_error_t tigris_mem_load_tile(
     int32_t W = t->ndim == 4 ? shape[2] : 1;
     int32_t C = shape[t->ndim - 1];
 
+    /* Fail closed on an out-of-range row window rather than reading past the
+     * source tensor. A correct tile plan always requests rows within [0, H]; a
+     * malformed or mis-tiled plan (e.g. a strided stage that loaded a
+     * post-spatial output-resolution operand at input rows) must not OOB-read.
+     * Mirrors the bounds guard in tigris_mem_load_tile_2d. */
+    if (h_start < 0 || h_end <= h_start || h_end > H)
+        return TIGRIS_MEM_ERR_BAD_INDEX;
+
     int32_t tile_h = h_end - h_start;
     uint32_t elem_size = t->size_bytes / (uint32_t)(N * H * W * C);
     uint32_t row_bytes = (uint32_t)W * (uint32_t)C * elem_size;
@@ -222,6 +230,114 @@ tigris_mem_error_t tigris_mem_spill_tile(
 
     /* Restore pointer to slow base */
     mem->tensor_ptrs[tensor_idx] = slow_base;
+    return TIGRIS_MEM_OK;
+}
+
+tigris_mem_error_t tigris_mem_load_tile_2d(
+    tigris_mem_t *mem, const tigris_plan_t *plan,
+    uint16_t tidx, int32_t h0, int32_t h1, int32_t w0, int32_t w1)
+{
+    if (!mem || !plan) return TIGRIS_MEM_ERR_NULL;
+    if (tidx >= mem->num_tensors) return TIGRIS_MEM_ERR_BAD_INDEX;
+
+    const tigris_tensor_t *t = &plan->tensors[tidx];
+    const int32_t *shape = tigris_tensor_shape(plan, t);
+
+    /* Only rank-4 NHWC tensors have a width axis to slice. */
+    if (t->ndim != 4)
+        return TIGRIS_MEM_ERR_BAD_INDEX;
+
+    int32_t N = shape[0];
+    int32_t H = shape[1];
+    int32_t W = shape[2];
+    int32_t C = shape[3];
+
+    if (h0 < 0 || h1 <= h0 || h1 > H || w0 < 0 || w1 <= w0 || w1 > W)
+        return TIGRIS_MEM_ERR_BAD_INDEX;
+
+    int32_t tile_h = h1 - h0;
+    int32_t tile_w = w1 - w0;
+    uint32_t elem_size = t->size_bytes / (uint32_t)(N * H * W * C);
+    uint32_t full_row_bytes = (uint32_t)W * (uint32_t)C * elem_size;      /* slow src stride */
+    uint32_t tile_row_bytes = (uint32_t)tile_w * (uint32_t)C * elem_size; /* packed dst row */
+    uint32_t tile_rows_bytes = (uint32_t)tile_h * tile_row_bytes;
+    uint32_t tile_bytes = (uint32_t)N * tile_rows_bytes;
+
+    /* Source is in slow, same resolution as the 1D load: tensor_ptrs[tidx]
+     * already holds the slow base for this tensor. */
+    uint8_t *slow_ptr = (uint8_t *)mem->tensor_ptrs[tidx];
+    if (!slow_ptr) return TIGRIS_MEM_ERR_NOT_SET;
+
+    /* Alloc the packed tile in fast, same allocation path as the 1D load. */
+    tigris_mem_error_t err = tigris_mem_alloc_fast(mem, tidx, tile_bytes);
+    if (err != TIGRIS_MEM_OK) return err;
+
+    uint8_t *fast_ptr = (uint8_t *)mem->tensor_ptrs[tidx];
+
+    uint32_t full_batch_bytes = (uint32_t)H * full_row_bytes;
+    uint32_t src_col_off = (uint32_t)w0 * (uint32_t)C * elem_size;
+
+    for (int32_t n = 0; n < N; n++) {
+        for (int32_t r = 0; r < tile_h; r++) {
+            memcpy(fast_ptr + (uint32_t)n * tile_rows_bytes + (uint32_t)r * tile_row_bytes,
+                   slow_ptr + (uint32_t)n * full_batch_bytes
+                            + (uint32_t)(h0 + r) * full_row_bytes
+                            + src_col_off,
+                   tile_row_bytes);
+        }
+    }
+
+    return TIGRIS_MEM_OK;
+}
+
+tigris_mem_error_t tigris_mem_spill_tile_2d(
+    tigris_mem_t *mem, const tigris_plan_t *plan,
+    uint16_t tidx, void *slow_base,
+    int32_t h0, int32_t h1, int32_t w0, int32_t w1)
+{
+    if (!mem || !plan || !slow_base) return TIGRIS_MEM_ERR_NULL;
+    if (tidx >= mem->num_tensors) return TIGRIS_MEM_ERR_BAD_INDEX;
+
+    const tigris_tensor_t *t = &plan->tensors[tidx];
+    const int32_t *shape = tigris_tensor_shape(plan, t);
+
+    if (t->ndim != 4)
+        return TIGRIS_MEM_ERR_BAD_INDEX;
+
+    int32_t N = shape[0];
+    int32_t H = shape[1];
+    int32_t W = shape[2];
+    int32_t C = shape[3];
+
+    if (h0 < 0 || h1 <= h0 || h1 > H || w0 < 0 || w1 <= w0 || w1 > W)
+        return TIGRIS_MEM_ERR_BAD_INDEX;
+
+    int32_t tile_h = h1 - h0;
+    int32_t tile_w = w1 - w0;
+    uint32_t elem_size = t->size_bytes / (uint32_t)(N * H * W * C);
+    uint32_t full_row_bytes = (uint32_t)W * (uint32_t)C * elem_size;      /* slow dst stride */
+    uint32_t tile_row_bytes = (uint32_t)tile_w * (uint32_t)C * elem_size; /* packed src row */
+    uint32_t tile_rows_bytes = (uint32_t)tile_h * tile_row_bytes;
+
+    uint8_t *fast_ptr = (uint8_t *)mem->tensor_ptrs[tidx];
+    if (!fast_ptr) return TIGRIS_MEM_ERR_NOT_SET;
+
+    uint8_t *slow_ptr = (uint8_t *)slow_base;
+    uint32_t full_batch_bytes = (uint32_t)H * full_row_bytes;
+    uint32_t dst_col_off = (uint32_t)w0 * (uint32_t)C * elem_size;
+
+    for (int32_t n = 0; n < N; n++) {
+        for (int32_t r = 0; r < tile_h; r++) {
+            memcpy(slow_ptr + (uint32_t)n * full_batch_bytes
+                             + (uint32_t)(h0 + r) * full_row_bytes
+                             + dst_col_off,
+                   fast_ptr + (uint32_t)n * tile_rows_bytes + (uint32_t)r * tile_row_bytes,
+                   tile_row_bytes);
+        }
+    }
+
+    /* Restore pointer to slow base */
+    mem->tensor_ptrs[tidx] = slow_base;
     return TIGRIS_MEM_OK;
 }
 

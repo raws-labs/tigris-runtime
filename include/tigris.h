@@ -143,10 +143,18 @@ typedef enum {
 /* Serialized activation axes used by schema-v5 tile plans. */
 #define TIGRIS_TILE_AXIS_NONE             0
 #define TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH 1
-#define TIGRIS_TILE_AXIS_WIDTH            2
+#define TIGRIS_TILE_AXIS_WIDTH            2  /* reserved, not accepted */
+#define TIGRIS_TILE_AXIS_HW               3
 
 /* Sentinel: chain_id == 0xFFFF means stage is not part of a chain */
 #define TIGRIS_NO_CHAIN         0xFFFF
+
+/* Stage flags packed into the chain head stage's _reserved1 field.
+ * Set by the compiler when a recomputing chain's shared boundary rows
+ * are eligible to be kept in a line buffer instead of recomputed per
+ * tile. The runtime currently only reads this bit; the roll itself is
+ * a later change. */
+#define TIGRIS_STAGE_FLAG_LINE_BUFFERED 0x0001u
 
 /* Packed struct definitions */
 

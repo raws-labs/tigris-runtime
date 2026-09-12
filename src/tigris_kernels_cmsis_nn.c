@@ -134,12 +134,44 @@ static int adapt_conv2d(
     int IH = x_shape[1], IW = x_shape[2], IC = x_shape[3];
     int OH = y_shape[1], OW = y_shape[2], OC = y_shape[3];
     int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
+    int pad_top = op->spatial.pad_top;
+    int pad_left = op->spatial.pad_left;
+
+    /* Height tile: tile.in_h rows produce tile.out_h output rows at tile.pad_top;
+     * the bottom pad is implicit (CMSIS-NN clips input rows at or past IH to the
+     * input zero-point), so an asymmetric edge-tile pad needs no pre-pad. A 2D
+     * (width_tiled) tile additionally packs tile.in_w columns into tile.out_w
+     * with tile.pad_left; the right pad is implicit the same way. */
+    if (mem->tile.active) {
+        IH = mem->tile.in_h;
+        OH = mem->tile.out_h;
+        pad_top = mem->tile.pad_top;
+        if (mem->tile.width_tiled) {
+            IW = mem->tile.in_w;
+            OW = mem->tile.out_w;
+            pad_left = mem->tile.pad_left;
+        }
+    }
+
+    /* Line-buffer roll: emit the tile.out_h new rows starting at output row
+     * out_row_start, and fold (out_row_start*stride - in_row_start) into the
+     * input pointer - zero when in_row_start == out_row_start*stride (the common
+     * line-buffer case, where the roll is a pure output offset). Mirrors the
+     * oh_g / ih index math in kern_conv2d_s8. */
+    if (mem->tile.active &&
+        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0)) {
+        int delta = mem->tile.out_row_start * op->spatial.stride_h
+                  - mem->tile.in_row_start;
+        X  += delta * IW * IC;
+        Y  += mem->tile.out_row_start * OW * OC;
+        IH -= delta;
+    }
 
     cmsis_nn_conv_params conv_params = {
         .input_offset  = in_qp  ? -in_qp->zero_point  : 0,
         .output_offset = out_qp ? out_qp->zero_point : 0,
         .stride   = { .w = op->spatial.stride_w,  .h = op->spatial.stride_h },
-        .padding  = { .w = op->spatial.pad_left,   .h = op->spatial.pad_top },
+        .padding  = { .w = pad_left,   .h = pad_top },
         .dilation = { .w = op->spatial.dilation_w ? op->spatial.dilation_w : 1,
                       .h = op->spatial.dilation_h ? op->spatial.dilation_h : 1 },
         .activation = { .min = op->act_min, .max = op->act_max },
@@ -200,6 +232,35 @@ static int adapt_depthwise_conv2d(
     int IH = x_shape[1], IW = x_shape[2], C = x_shape[3];
     int OH = y_shape[1], OW = y_shape[2];
     int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
+    int pad_top = op->spatial.pad_top;
+    int pad_left = op->spatial.pad_left;
+
+    /* Same contract as adapt_conv2d - tile.in_h input rows produce tile.out_h
+     * output rows at tile.pad_top (bottom pad implicit via IH clipping); a 2D
+     * (width_tiled) tile also packs tile.in_w columns into tile.out_w with
+     * tile.pad_left (right pad implicit via IW clipping). */
+    if (mem->tile.active) {
+        IH = mem->tile.in_h;
+        OH = mem->tile.out_h;
+        pad_top = mem->tile.pad_top;
+        if (mem->tile.width_tiled) {
+            IW = mem->tile.in_w;
+            OW = mem->tile.out_w;
+            pad_left = mem->tile.pad_left;
+        }
+    }
+
+    /* Line-buffer roll folds out_row_start into the output pointer and
+     * (out_row_start*stride - in_row_start) into the input pointer, as in
+     * adapt_conv2d. Runs after the tile-context block so IH is the tile height. */
+    if (mem->tile.active &&
+        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0)) {
+        int delta = mem->tile.out_row_start * op->spatial.stride_h
+                  - mem->tile.in_row_start;
+        X  += delta * IW * C;
+        Y  += mem->tile.out_row_start * OW * C;
+        IH -= delta;
+    }
 
     /* Weight layout: [KH, KW, C] (HWC) from compiler.
      * CMSIS-NN expects [1, KH, KW, C] via filter_dims.n=1 - same data. */
@@ -209,7 +270,7 @@ static int adapt_depthwise_conv2d(
         .output_offset = out_qp ? out_qp->zero_point : 0,
         .ch_mult = 1,
         .stride   = { .w = op->spatial.stride_w,  .h = op->spatial.stride_h },
-        .padding  = { .w = op->spatial.pad_left,   .h = op->spatial.pad_top },
+        .padding  = { .w = pad_left,   .h = pad_top },
         .dilation = { .w = op->spatial.dilation_w ? op->spatial.dilation_w : 1,
                       .h = op->spatial.dilation_h ? op->spatial.dilation_h : 1 },
         .activation = { .min = op->act_min, .max = op->act_max },

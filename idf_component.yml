@@ -45,5 +45,5 @@ files:
     - "cmake/**/*"
     - ".github/**/*"
     - ".git"
-    - "PUBLISHING.md"
+    - "CONTRIBUTING.md"
     - "**/*.tgrs"

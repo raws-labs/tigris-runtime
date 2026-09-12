@@ -1910,7 +1910,7 @@ static void test_exec_height_tiling_contract(void)
  * ConvTranspose expands its output and the 1D shrink back-computation is
  * invalid for it. The probe kernel just records tile context, so no weights
  * are needed - this covers ROUTING + FAIL-CLOSED, not numeric correctness
- * (that is Task 5's cross-repo gate). */
+ * (that is the cross-repo contract gate's job). */
 static void run_convtranspose_tiling_case(
     uint8_t axis, tigris_exec_error_t expected)
 {
@@ -2039,7 +2039,7 @@ static void test_exec_convtranspose_2d_routing(void)
         TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH, TIGRIS_EXEC_ERR_TILE);
 }
 
-/* Regression guard (Task 5 gate BUG A): a single stage that CONTAINS a
+/* Regression guard: a single stage that CONTAINS a
  * ConvTranspose is HW-tileable only when ConvTranspose is its SOLE spatial op.
  * A mixed [Conv, ConvTranspose] stage must fall back to exec_stage_normal, not
  * be routed to the 1D tiler. The compiler never attaches a tile plan to such a

@@ -1,6 +1,6 @@
 /**
  * @file test_tile_2d.c
- * @brief Runtime-side checks for Phase 1.3b (2D spatial tiling).
+ * @brief Runtime-side checks for 2D spatial tiling.
  *
  * Task 4: the TIGRIS_TILE_AXIS_HW constant, the width fields on
  *        tigris_tile_ctx_t, and the loader accepting a tileable tile plan

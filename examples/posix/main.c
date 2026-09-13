@@ -13,6 +13,7 @@
 
 #include "tigris.h"
 #include "tigris_executor.h"
+#include "tigris_iface.h"
 #include "tigris_kernels_s8.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
@@ -155,7 +156,9 @@ int main(int argc, char **argv)
                 &plan, &mem, tigris_dispatch_kernel_s8, NULL, &stats,
                 &executor_workspace);
             uint16_t out_idx;
-            const int8_t *output;
+            uint32_t out_bytes;
+            float *output = NULL;
+            uint32_t count;
             uint32_t show;
             uint32_t j;
 
@@ -165,21 +168,36 @@ int main(int argc, char **argv)
                 goto cleanup;
             }
 
+            /* Read the output in the dtype the model declares, which the
+             * runtime converts to from whatever the plan executes on. */
             out_idx = plan.model_outputs[0];
-            output = (const int8_t *)mem.tensor_ptrs[out_idx];
-            if (output == NULL || plan.tensors[out_idx].size_bytes == 0) {
+            out_bytes = tigris_iface_bytes(&plan, out_idx);
+            if (out_bytes == 0) {
                 fprintf(stderr, "inference produced no first output\n");
                 goto cleanup;
             }
+            output = (float *)malloc(out_bytes);
+            if (output == NULL) {
+                fprintf(stderr, "output allocation failed\n");
+                goto cleanup;
+            }
+            if (tigris_output_read(&plan, &mem, out_idx, output, out_bytes)
+                != TIGRIS_OK) {
+                fprintf(stderr, "output conversion failed\n");
+                free(output);
+                goto cleanup;
+            }
 
-            show = plan.tensors[out_idx].size_bytes;
+            count = out_bytes / (uint32_t)sizeof(float);
+            show = count;
             if (show > 5)
                 show = 5;
             printf("Output:");
             for (j = 0; j < show; ++j)
-                printf(" %d", (int)output[j]);
+                printf(" %.6g", (double)output[j]);
             printf("\nFast arena peak: %lu bytes\n",
                    (unsigned long)mem.fast_peak);
+            free(output);
         }
     }
 

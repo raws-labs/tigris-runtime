@@ -3,6 +3,7 @@
   "cppcheck_version": "2.21.1",
   "sources": [
     "src/tigris_loader.c",
+    "src/tigris_iface.c",
     "src/tigris_mem.c",
     "src/tigris_executor.c",
     "src/tigris_executor_compat.c",
@@ -18,10 +19,10 @@
     "counts": {}
   },
   "misra": {
-    "total": 2788,
-    "misra_total": 2761,
+    "total": 2858,
+    "misra_total": 2830,
     "config_errors": 2,
-    "fingerprint_sha256": "be0a8e540471cea632e2b09c162d6dd0168b61cba4c623b18cf11bdb4a15372b",
+    "fingerprint_sha256": "57f7f21f644fb418ef9a0166375171ca475d2cc9cd48be4d6019bb59e114cfdf",
     "counts": {
       "include/tigris.h": {
         "misra-c2012-10.4": 4,
@@ -78,6 +79,18 @@
         "misra-c2012-8.7": 1,
         "misra-c2012-8.9": 1
       },
+      "src/tigris_iface.c": {
+        "constParameterPointer": 1,
+        "misra-c2012-10.4": 4,
+        "misra-c2012-10.8": 1,
+        "misra-c2012-11.5": 4,
+        "misra-c2012-12.1": 6,
+        "misra-c2012-15.5": 20,
+        "misra-c2012-15.6": 20,
+        "misra-c2012-17.7": 2,
+        "misra-c2012-5.9": 1,
+        "misra-c2012-8.7": 3
+      },
       "src/tigris_kernels.c": {
         "constParameterPointer": 9,
         "misra-c2012-10.3": 3,
@@ -114,21 +127,21 @@
         "misra-c2012-17.7": 4,
         "misra-c2012-18.4": 19,
         "misra-c2012-21.15": 1,
-        "misra-c2012-5.9": 3,
+        "misra-c2012-5.9": 4,
         "misra-c2012-8.7": 2
       },
       "src/tigris_loader.c": {
         "constVariable": 1,
         "misra-c2012-10.3": 4,
-        "misra-c2012-10.4": 225,
+        "misra-c2012-10.4": 227,
         "misra-c2012-10.6": 1,
         "misra-c2012-11.3": 13,
-        "misra-c2012-12.1": 211,
+        "misra-c2012-12.1": 213,
         "misra-c2012-12.3": 3,
         "misra-c2012-13.3": 1,
         "misra-c2012-14.4": 10,
-        "misra-c2012-15.5": 165,
-        "misra-c2012-15.6": 158,
+        "misra-c2012-15.5": 167,
+        "misra-c2012-15.6": 159,
         "misra-c2012-15.7": 5,
         "misra-c2012-17.7": 13,
         "misra-c2012-18.4": 43,

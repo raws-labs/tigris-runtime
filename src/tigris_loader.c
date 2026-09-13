@@ -797,10 +797,20 @@ tigris_error_t tigris_plan_load(
         if ((tensor->flags & ~(TIGRIS_TENSOR_CONSTANT |
                                TIGRIS_TENSOR_MODEL_INPUT |
                                TIGRIS_TENSOR_MODEL_OUTPUT)) != 0 ||
-            tensor->_pad != 0 ||
             (tensor->dtype == 1 &&
              tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM))
             return TIGRIS_ERR_BAD_TENSOR;
+        /* The byte was reserved and written as zero before the interface dtype
+         * existed, so an older plan reads as "no declared interface". A
+         * declared interface belongs to a boundary tensor and says something
+         * only when it differs from what the plan stores. */
+        if (tensor->iface_dtype != 0) {
+            if (hdr->version < TIGRIS_SCHEMA_VERSION_INTERFACE_DTYPE ||
+                (tensor->flags & (TIGRIS_TENSOR_MODEL_INPUT |
+                                  TIGRIS_TENSOR_MODEL_OUTPUT)) == 0 ||
+                tensor->iface_dtype == tensor->dtype)
+                return TIGRIS_ERR_BAD_TENSOR;
+        }
         uint32_t elements = 1;
         for (uint8_t dim = 0; dim < tensor->ndim; dim++) {
             int32_t value = candidate.shape_pool[tensor->shape_off + dim];
@@ -1290,6 +1300,8 @@ const char *tigris_error_str(tigris_error_t err)
         case TIGRIS_ERR_PLAN_LIMITS:return "plan exceeds executor limits";
         case TIGRIS_ERR_BAD_TENSOR: return "tensor contract is not executable";
         case TIGRIS_ERR_BAD_OPERATOR:return "operator contract is not executable";
+        case TIGRIS_ERR_BAD_INTERFACE:
+            return "declared model interface is not convertible";
         default:                    return "unknown error";
     }
 }

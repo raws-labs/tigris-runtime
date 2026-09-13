@@ -29,8 +29,9 @@ extern "C" {
 
 #define TIGRIS_MAGIC           0x53524754  /* "TGRS" in little-endian */
 #define TIGRIS_MAGIC_BYTES     "TGRS"
+#define TIGRIS_SCHEMA_VERSION_V6 6
 #define TIGRIS_SCHEMA_VERSION_V5 5
-#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V5
+#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V6
 #define TIGRIS_SCHEMA_VERSION_V4 4
 #define TIGRIS_SCHEMA_VERSION_V3 3
 #define TIGRIS_SCHEMA_VERSION_V2 2
@@ -38,6 +39,10 @@ extern "C" {
 #define TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES TIGRIS_SCHEMA_VERSION_V4
 #define TIGRIS_SCHEMA_VERSION_TILE_AXIS TIGRIS_SCHEMA_VERSION_V5
 #define TIGRIS_SCHEMA_VERSION_STAGE_TABLE_AUTHORITY TIGRIS_SCHEMA_VERSION_V5
+/* A model input or output carries the dtype the model file declares for it,
+ * so the runtime can present the interface the model states rather than the
+ * encoding the plan executes on. */
+#define TIGRIS_SCHEMA_VERSION_INTERFACE_DTYPE TIGRIS_SCHEMA_VERSION_V6
 #define TIGRIS_QUANT_PAGE_ELEMS 65536u
 
 /* Section type IDs */
@@ -135,6 +140,7 @@ typedef enum {
     TIGRIS_ERR_PLAN_LIMITS  = -9,   /* Plan exceeds compiled executor limits */
     TIGRIS_ERR_BAD_TENSOR   = -10,  /* Tensor metadata is not executable */
     TIGRIS_ERR_BAD_OPERATOR = -11,  /* Operator contract is not executable */
+    TIGRIS_ERR_BAD_INTERFACE = -12, /* Declared model interface is not convertible */
 } tigris_error_t;
 
 /* Sentinel: tile_plan_idx == 0xFFFF means no tile plan for this stage */
@@ -203,7 +209,8 @@ typedef struct {
     uint8_t     dtype;              /* 11: ONNX TensorProto.DataType enum */
     uint8_t     flags;              /* 12: TIGRIS_TENSOR_* flags */
     uint16_t    quant_param_idx;    /* 13-14: index into quant_params, 0xFFFF=none */
-    uint8_t     _pad;               /* 15: reserved */
+    uint8_t     iface_dtype;        /* 15: ONNX dtype the model declares for this
+                                     *     model input/output, 0 = same as dtype */
 } tigris_tensor_t;                  /* 16 bytes total */
 
 /**

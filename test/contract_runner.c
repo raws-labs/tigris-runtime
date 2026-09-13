@@ -21,6 +21,7 @@
 #include "tigris_executor.h"
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
+#include "tigris_iface.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 
@@ -150,12 +151,27 @@ static int load_inputs(
     for (uint8_t i = 0; i < plan->header->num_model_inputs; ++i) {
         uint16_t index = plan->model_inputs[i];
         uint32_t size;
+        uint32_t iface_size;
+        void *staging;
         if (index >= plan->header->num_tensors)
             goto fail;
         size = plan->tensors[index].size_bytes;
-        if (tigris_mem_alloc_slow(mem, index, size) != TIGRIS_MEM_OK ||
-            fread(mem->tensor_ptrs[index], 1, size, file) != size)
+        /* The file holds the dtype the model declares, which is not always the
+         * dtype the plan executes on. */
+        iface_size = tigris_iface_bytes(plan, index);
+        if (iface_size == 0u ||
+            tigris_mem_alloc_slow(mem, index, size) != TIGRIS_MEM_OK)
             goto fail;
+        staging = malloc(iface_size);
+        if (!staging)
+            goto fail;
+        if (fread(staging, 1, iface_size, file) != iface_size ||
+            tigris_input_write(plan, mem, index, staging, iface_size) !=
+                TIGRIS_OK) {
+            free(staging);
+            goto fail;
+        }
+        free(staging);
     }
     trailing = fgetc(file);
     if (trailing != EOF)
@@ -182,14 +198,23 @@ static int write_outputs(
 
     for (uint8_t i = 0; i < plan->header->num_model_outputs; ++i) {
         uint16_t index = plan->model_outputs[i];
-        uint32_t size;
-        void *data;
+        uint32_t iface_size;
+        void *staging;
         if (index >= plan->header->num_tensors)
             goto fail;
-        size = plan->tensors[index].size_bytes;
-        data = tigris_mem_tensor_ptr(mem, index);
-        if (!data || fwrite(data, 1, size, file) != size)
+        iface_size = tigris_iface_bytes(plan, index);
+        if (iface_size == 0u)
             goto fail;
+        staging = malloc(iface_size);
+        if (!staging)
+            goto fail;
+        if (tigris_output_read(plan, mem, index, staging, iface_size) !=
+                TIGRIS_OK ||
+            fwrite(staging, 1, iface_size, file) != iface_size) {
+            free(staging);
+            goto fail;
+        }
+        free(staging);
     }
     if (fclose(file) != 0)
         return -1;

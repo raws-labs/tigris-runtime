@@ -143,11 +143,15 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         if (dtype == 3 && op->act_min > op->act_max)
             return TIGRIS_ERR_BAD_OPERATOR;
 
+        /* Add carries an activation because a quantizer writes the residual
+         * block's Relu after the sum, on the edge that the sum's own output
+         * requantization already covers. */
         int allows_fused_activation =
             op->op_type == TIGRIS_OP_CONV ||
             op->op_type == TIGRIS_OP_DEPTHWISE ||
             op->op_type == TIGRIS_OP_FULLY_CONN ||
-            op->op_type == TIGRIS_OP_CONV1D;
+            op->op_type == TIGRIS_OP_CONV1D ||
+            op->op_type == TIGRIS_OP_ADD;
         if (!allows_fused_activation && op->fused_act != TIGRIS_ACT_NONE)
             return TIGRIS_ERR_BAD_OPERATOR;
 

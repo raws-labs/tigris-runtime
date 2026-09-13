@@ -17,6 +17,7 @@ import xml.etree.ElementTree as ET
 CPPCHECK_VERSION = "2.21.1"
 SOURCES = (
     "src/tigris_loader.c",
+    "src/tigris_iface.c",
     "src/tigris_mem.c",
     "src/tigris_executor.c",
     "src/tigris_executor_compat.c",

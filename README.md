@@ -76,7 +76,7 @@ provision backend workspace separately.
 Optimized Cortex-M builds require the plan base and tensors to satisfy
 `TIGRIS_TENSOR_ALIGN` (16 bytes with DSP enabled).
 
-For CMSIS-NN, “separately” is enforceable rather than an estimate:
+For CMSIS-NN, "separately" is enforceable rather than an estimate:
 `tigris_cmsis_nn_scratch_required()` queries the linked vendor library and
 `tigris_cmsis_nn_fast_arena_required()` combines that result with the core
 requirement. Generated standalone CMSIS harnesses reserve 4 KiB by default,

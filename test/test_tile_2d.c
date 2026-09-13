@@ -1,33 +1,32 @@
 /**
  * @file test_tile_2d.c
- * @brief Runtime-side checks for Phase 1.3b (2D spatial tiling).
+ * @brief Runtime-side checks for 2D spatial tiling.
  *
- * Task 4: the TIGRIS_TILE_AXIS_HW constant, the width fields on
+ * Loader: the TIGRIS_TILE_AXIS_HW constant, the width fields on
  *        tigris_tile_ctx_t, and the loader accepting a tileable tile plan
  *        whose axis is HW instead of only HEIGHT_OR_LENGTH.
  *
  * The HW-axis fixture is a real plan emitted by the compiler's 2D tile
- * solver (feature/2d-tiling-core): a [1,16,16,16] float32 3x3 stride-1
- * pad-1 Conv compiled at a 2K fast-memory budget, small enough that even a
- * single-row height tile still overflows the budget, forcing the compiler
- * to fall back to a 2x2 HW (height+width) core tile. The executor does not
- * yet dispatch HW-axis tile plans (that lands in Task 7); the Task 4 test
- * only exercises the loader's acceptance of the axis value.
+ * solver: a [1,16,16,16] float32 3x3 stride-1 pad-1 Conv compiled at a 2K
+ * fast-memory budget, small enough that even a single-row height tile still
+ * overflows the budget, forcing the compiler to fall back to a 2x2 HW
+ * (height+width) core tile. The loader test only exercises acceptance of the
+ * axis value; the executor path is covered further down.
  *
- * Task 5: tigris_mem_load_tile_2d and tigris_mem_spill_tile_2d, the strided
- *        2D sub-rectangle load and spill primitives that Task 7's HW-axis
- *        executor path will call. These tests exercise the mem-level
+ * Primitives: tigris_mem_load_tile_2d and tigris_mem_spill_tile_2d, the
+ *        strided 2D sub-rectangle load and spill primitives the HW-axis
+ *        executor path calls. These tests exercise the mem-level
  *        primitives directly, independent of a loaded plan file, using a
  *        minimal in-memory tensor descriptor and shape pool.
  *
- * Task 6: per-tile in_w and left/right pad overrides in kern_conv2d and
+ * Kernels: per-tile in_w and left/right pad overrides in kern_conv2d and
  *        kern_avg_pool (reference float32 and int8). Each test builds one
  *        op describing the full untiled tensor, runs it once with
  *        mem->tile inactive (the golden full-canvas output), then runs the
  *        SAME op again against a packed 2D tile loaded with
  *        tigris_mem_load_tile_2d and mem->tile.width_tiled set, and asserts
  *        the packed core is byte-identical to the matching sub-block of the
- *        golden output. Before Task 6, PL stayed at the op's global
+ *        golden output. Before the override, PL stayed at the op's global
  *        pad_left even for a width-tiled call, so an interior tile (whose
  *        effective pad_left is 0) still shifted every column by the
  *        model's global pad_left.
@@ -145,7 +144,7 @@ static void test_tile_ctx_has_width_fields(void)
                    "width fields present");
 }
 
-/* Task 5: tigris_mem_load_tile_2d / tigris_mem_spill_tile_2d */
+/* Primitives: tigris_mem_load_tile_2d / tigris_mem_spill_tile_2d */
 
 #define T2D_N    1
 #define T2D_H    8
@@ -519,7 +518,7 @@ static void test_spill_tile_2d_rejects_bad_bounds(void)
     }
 }
 
-/* Task 6: per-tile in_w / left-right pad overrides */
+/* Kernels: per-tile in_w / left-right pad overrides */
 
 /* Shared geometry: a 3x3 stride-1 pad-1 spatial op over a 6x6 canvas keeps
  * the output the same size as the input, so a golden run and a tiled run
@@ -1179,7 +1178,7 @@ static void test_avg_pool_2d_tile_edge_s8(void)
     tc_compare_s8(__func__, Y_tile, Y_full, TC_W, TS_C, 0, 0);
 }
 
-/* Task 7: the 2D standalone-tiled executor path.
+/* Executor: the 2D standalone-tiled executor path.
  *
  * These tests drive a full single-stage Conv plan through the executor. The
  * same plan struct is run twice: once with a large fast arena (which keeps
@@ -1330,7 +1329,7 @@ static void te_build_conv_plan_f32(
 
 /* s8 counterpart: single channel, per-tensor identity requant (multiplier
  * 2^30, shift 1) so the int8 output equals the clamped accumulator, matching
- * the convention used by the Task 6 s8 tests above. */
+ * the convention used by the kernel s8 tests above. */
 static void te_build_conv_plan_s8(
     tigris_file_header_t *header, tigris_tensor_t *tensors,
     int32_t *shape_pool, uint16_t *index_pool, tigris_op_t *ops,

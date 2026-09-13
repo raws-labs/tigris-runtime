@@ -625,7 +625,8 @@ static int kern_binary_f32(
         float b = dynamic_b
             ? dynamic_b[i]
             : load_weight_f32(constant_b, constant_count == 1 ? 0 : i);
-        Y[i] = multiply ? A[i] * b : A[i] + b;
+        float v = multiply ? A[i] * b : A[i] + b;
+        Y[i] = apply_fused_act_f32(v, op->fused_act);
     }
     return 0;
 }

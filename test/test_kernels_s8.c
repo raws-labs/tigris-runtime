@@ -917,7 +917,7 @@ static void test_conv_transpose_s8_tile_2d(void)
     tigris_plan_t plan;
 
     /*
-     * Same interior 2D output tile geometry as the f32 Task 1 test
+     * Same interior 2D output tile geometry as the f32 test
      * (test_conv_transpose_tile_2d): NHWC 1x4x4x1 input, kernel 2x2,
      * stride=2, pad=0 -> 1x8x8x1 output. Interior output tile
      * [oh0..oh1) x [ow0..ow1) = [4..6) x [2..6):

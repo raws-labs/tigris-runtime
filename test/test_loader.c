@@ -1771,6 +1771,7 @@ static void test_schema_compatibility_fixtures(void)
      *   v3 QDQ Conv: tigris 0fe37d3a53292cf532ba8628d2284c00a896fbb2
      *   v4 Transpose:tigris 208b322cab7f97c9960c63a8075944374fdfff2c
      *   v5 Conv1D:   explicit serialized length axis
+     *   v6 QDQ Conv: a boundary tensor declaring its float model interface
      */
     static const struct {
         const char *filename;
@@ -1785,6 +1786,7 @@ static void test_schema_compatibility_fixtures(void)
         {"schema-v4-transpose.tgrs", TIGRIS_SCHEMA_VERSION_V4, 0, 1, 0, 0},
         {"schema-v5-conv1d-axis.tgrs", TIGRIS_SCHEMA_VERSION_V5, 0, 0, 1,
          TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH},
+        {"schema-v6-interface-dtype.tgrs", TIGRIS_SCHEMA_VERSION_V6, 3, 0, 0, 0},
     };
     const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
 
@@ -1825,6 +1827,17 @@ static void test_schema_compatibility_fixtures(void)
             TEST_ASSERT_EQ(plan.header->num_tile_plans,
                            fixtures[i].tile_plans,
                            "schema fixture has expected tile plans");
+            if (fixtures[i].version >= TIGRIS_SCHEMA_VERSION_INTERFACE_DTYPE) {
+                /* The quantized boundary states the float interface the model
+                 * declares, which is what schema 6 added. */
+                for (uint8_t m = 0; m < plan.header->num_model_inputs; m++) {
+                    const tigris_tensor_t *t =
+                        &plan.tensors[plan.model_inputs[m]];
+                    TEST_ASSERT_EQ(t->dtype, 3, "v6 boundary stores int8");
+                    TEST_ASSERT_EQ(t->iface_dtype, 1,
+                                   "v6 boundary declares float32");
+                }
+            }
             if (fixtures[i].tile_plans > 0) {
                 TEST_ASSERT_EQ(plan.tile_plans[0].axis,
                                fixtures[i].tile_axis,

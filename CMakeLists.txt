@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 set(TIGRIS_RUNTIME_SRCS
     src/tigris_loader.c
+    src/tigris_iface.c
     src/tigris_mem.c
     src/tigris_executor.c
     src/tigris_executor_compat.c
@@ -163,6 +164,11 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(test_row_offset test/test_row_offset.c)
     target_link_libraries(test_row_offset tigris_runtime)
 
+    add_executable(test_iface test/test_iface.c)
+    target_compile_definitions(test_iface PRIVATE
+        TIGRIS_SCHEMA_COMPAT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/schema_compat")
+    target_link_libraries(test_iface tigris_runtime)
+
     add_executable(test_tile_2d test/test_tile_2d.c)
     target_compile_definitions(test_tile_2d PRIVATE
         TIGRIS_TILE2D_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/tile2d_fixtures")
@@ -254,6 +260,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_test(NAME tile_padding COMMAND test_tile_padding)
     add_test(NAME row_offset COMMAND test_row_offset)
     add_test(NAME tile_2d COMMAND test_tile_2d)
+    add_test(NAME iface COMMAND test_iface)
     add_test(NAME accel_routing COMMAND test_accel_routing)
     add_test(NAME cmsis_arena COMMAND test_cmsis_arena)
     add_test(NAME avg_pool_s8 COMMAND test_avg_pool_s8)

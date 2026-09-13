@@ -725,7 +725,12 @@ static int kern_add_s8(
         int32_t scaled = multiply_by_quantized_multiplier(av, a_mult, a_shift)
                        + multiply_by_quantized_multiplier(bv, b_mult, b_shift);
         int32_t q = multiply_by_quantized_multiplier(scaled, y_mult, y_shift) + zy;
-        Y[i] = clamp_s8(q);
+        /* A fused activation is a clamp on the requantized result: the compiler
+         * derives the bounds from the output scale and zero point. Older plans
+         * carry no bounds for this op, so fall back to the plain int8 range. */
+        Y[i] = (op->fused_act == TIGRIS_ACT_NONE)
+             ? clamp_s8(q)
+             : clamp_act(q, op->act_min, op->act_max);
     }
     return 0;
 }

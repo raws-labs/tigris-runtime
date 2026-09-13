@@ -143,11 +143,15 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         if (dtype == 3 && op->act_min > op->act_max)
             return TIGRIS_ERR_BAD_OPERATOR;
 
+        /* Add carries an activation because a quantizer writes the residual
+         * block's Relu after the sum, on the edge that the sum's own output
+         * requantization already covers. */
         int allows_fused_activation =
             op->op_type == TIGRIS_OP_CONV ||
             op->op_type == TIGRIS_OP_DEPTHWISE ||
             op->op_type == TIGRIS_OP_FULLY_CONN ||
-            op->op_type == TIGRIS_OP_CONV1D;
+            op->op_type == TIGRIS_OP_CONV1D ||
+            op->op_type == TIGRIS_OP_ADD;
         if (!allows_fused_activation && op->fused_act != TIGRIS_ACT_NONE)
             return TIGRIS_ERR_BAD_OPERATOR;
 
@@ -793,10 +797,20 @@ tigris_error_t tigris_plan_load(
         if ((tensor->flags & ~(TIGRIS_TENSOR_CONSTANT |
                                TIGRIS_TENSOR_MODEL_INPUT |
                                TIGRIS_TENSOR_MODEL_OUTPUT)) != 0 ||
-            tensor->_pad != 0 ||
             (tensor->dtype == 1 &&
              tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM))
             return TIGRIS_ERR_BAD_TENSOR;
+        /* The byte was reserved and written as zero before the interface dtype
+         * existed, so an older plan reads as "no declared interface". A
+         * declared interface belongs to a boundary tensor and says something
+         * only when it differs from what the plan stores. */
+        if (tensor->iface_dtype != 0) {
+            if (hdr->version < TIGRIS_SCHEMA_VERSION_INTERFACE_DTYPE ||
+                (tensor->flags & (TIGRIS_TENSOR_MODEL_INPUT |
+                                  TIGRIS_TENSOR_MODEL_OUTPUT)) == 0 ||
+                tensor->iface_dtype == tensor->dtype)
+                return TIGRIS_ERR_BAD_TENSOR;
+        }
         uint32_t elements = 1;
         for (uint8_t dim = 0; dim < tensor->ndim; dim++) {
             int32_t value = candidate.shape_pool[tensor->shape_off + dim];
@@ -1286,6 +1300,8 @@ const char *tigris_error_str(tigris_error_t err)
         case TIGRIS_ERR_PLAN_LIMITS:return "plan exceeds executor limits";
         case TIGRIS_ERR_BAD_TENSOR: return "tensor contract is not executable";
         case TIGRIS_ERR_BAD_OPERATOR:return "operator contract is not executable";
+        case TIGRIS_ERR_BAD_INTERFACE:
+            return "declared model interface is not convertible";
         default:                    return "unknown error";
     }
 }

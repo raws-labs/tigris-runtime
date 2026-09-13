@@ -1079,7 +1079,7 @@ static int stage_2d_fast_bytes(
  *
  * Drives an (tile_row, tile_col) grid over the output, back-computing each
  * tile's input rectangle and effective four-sided padding, then reusing the
- * Task 5 strided load/spill primitives and the Task 6 width-aware kernels. The
+ * strided 2D load/spill primitives and the width-aware kernels. The
  * full output tensor is assembled in slow, byte-identical to the whole-op
  * result. Marked TIGRIS_NOINLINE to keep the inlined dispatcher within its
  * per-frame stack budget.

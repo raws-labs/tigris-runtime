@@ -17,6 +17,7 @@ from pathlib import Path
 # folded into these host-only numbers.
 MINIMUMS = {
     "tigris_loader.c": (82.0, 61.0),
+    "tigris_iface.c": (90.0, 70.0),
     "tigris_executor.c": (90.0, 69.0),
     "tigris_mem.c": (94.0, 71.0),
     "tigris_lz4.c": (85.0, 66.0),

@@ -28,11 +28,18 @@
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "tigris_executor.h"
+#include "tigris_iface.h"
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
 #ifdef TIGRIS_HAS_ESP_NN
 #include "tigris_kernels_esp_nn.h"
 #endif
+
+/* The model's input quantization is scale 0.04323326, zero point 6, so this
+ * float lands exactly on int8 code 1 - the value unet_ref.bin was generated
+ * with. Feeding the declared dtype keeps the golden comparison valid while the
+ * application stays free of the plan's quantization parameters. */
+#define INPUT_VALUE (-0.21616632f)
 
 static const char *TAG = "tigris-example";
 
@@ -83,7 +90,7 @@ static void wdt_killer_task(void *arg) {
 /* Called by the runtime between tiles/stages on long runs. */
 void tigris_feed_wdt(void) { feed_and_disable_all_wdts(); }
 
-/* Largest single activation in the plan — the tensor an arena runtime must hold
+/* Largest single activation in the plan: the tensor an arena runtime must hold
  * whole, and the reason TFLM OOMs where TiGrIS tiles. */
 static uint32_t largest_tensor_bytes(const tigris_plan_t *plan) {
     uint32_t mx = 0;
@@ -110,8 +117,6 @@ void app_main(void) {
 
     uint32_t budget      = plan.header->budget;
     uint32_t largest     = largest_tensor_bytes(&plan);
-    uint8_t  in_dtype    = plan.tensors[plan.model_inputs[0]].dtype;
-    int      is_quant    = (in_dtype == 3);
 
     printf("Model:            %s\n", tigris_model_name(&plan));
     printf("Ops / stages:     %u / %u\n", plan.header->num_ops,
@@ -131,8 +136,17 @@ void app_main(void) {
     uint32_t fast_size = budget + tigris_weight_decompression_overhead(&plan);
     void *fast_buf = heap_caps_malloc(fast_size,
                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    /* The caller's copy of the input, in the model's declared dtype, is four
+     * times the stored int8 tensor and has to come from the same PSRAM. Take it
+     * off the slow arena here: sizing the arena to the whole free block first
+     * leaves nothing for the conversion buffer. */
+    uint32_t iface_reserve = 0;
+    for (uint8_t i = 0; i < plan.header->num_model_inputs; i++)
+        iface_reserve += tigris_iface_bytes(&plan, plan.model_inputs[i]);
+
     uint32_t slow_size = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
     if (slow_size > 2 * 1024 * 1024) slow_size -= 2 * 1024 * 1024; /* ESP-NN scratch */
+    if (slow_size > iface_reserve) slow_size -= iface_reserve;
     void *slow_buf = heap_caps_malloc(slow_size, MALLOC_CAP_SPIRAM);
     void **tensor_ptrs = heap_caps_calloc(plan.header->num_tensors, sizeof(void *),
                                           MALLOC_CAP_SPIRAM);
@@ -163,15 +177,40 @@ void app_main(void) {
     printf("Fast (SRAM): %.0f KiB   Slow (PSRAM): %.0f KiB   Workspace: %u B\n\n",
            mem.fast_size / 1024.0f, slow_size / 1024.0f, (unsigned)ws_size);
 
-    /* 3. Reset the arena (esp_nn_prepare reduced mem.fast_size in place), fill
-     *    the input (int8 1 — the value the reference was generated with), and
-     *    run once. The s8_ref decoder stages make this take ~30 s. */
+    /* 3. Reset the arena (esp_nn_prepare reduced mem.fast_size in place) and
+     *    hand the input over in the dtype the MODEL declares, not the dtype the
+     *    plan stores. This U-Net states float32 at its boundary and quantizes
+     *    inside itself, so the application never touches a scale or a zero
+     *    point: tigris_input_write() applies them. INPUT_VALUE is the float
+     *    that lands on the int8 code the golden reference was generated with.
+     *    The s8_ref decoder stages make the run take ~30 s. */
     tigris_mem_init(&mem, mem.tensor_ptrs, mem.num_tensors,
                     mem.fast_base, mem.fast_size, mem.slow_base, mem.slow_size);
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {
         uint16_t t = plan.model_inputs[i];
         tigris_mem_alloc_slow(&mem, t, plan.tensors[t].size_bytes);
-        memset(mem.tensor_ptrs[t], is_quant ? 1 : 0, plan.tensors[t].size_bytes);
+
+        uint32_t want = tigris_iface_bytes(&plan, t);
+        if (want == 0) {
+            /* No declared interface: the plan stores what the caller supplies. */
+            memset(mem.tensor_ptrs[t], 1, plan.tensors[t].size_bytes);
+            continue;
+        }
+        float *feed = heap_caps_malloc(want, MALLOC_CAP_SPIRAM);
+        if (!feed) {
+            ESP_LOGE(TAG, "input buffer allocation failed (%u B)",
+                     (unsigned)want);
+            return;
+        }
+        for (uint32_t j = 0; j < want / sizeof(float); j++)
+            feed[j] = INPUT_VALUE;
+        tigris_error_t ierr = tigris_input_write(&plan, &mem, t, feed, want);
+        heap_caps_free(feed);
+        if (ierr != TIGRIS_OK) {
+            ESP_LOGE(TAG, "input conversion failed: %s",
+                     tigris_error_str(ierr));
+            return;
+        }
     }
     printf("Running inference (the s8_ref decoder takes ~30 s)...\n\n");
     tigris_exec_stats_t stats = {0};

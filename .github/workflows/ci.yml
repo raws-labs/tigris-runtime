@@ -51,6 +51,8 @@ jobs:
         compiler: [gcc, clang]
     steps:
       - uses: actions/checkout@v4
+      - name: Check the version sources agree
+        run: python3 scripts/check_version_sources.py
       - run: >-
           cmake -S . -B build-${{ matrix.compiler }}
           -DCMAKE_BUILD_TYPE=Release

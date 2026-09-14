@@ -8,8 +8,8 @@ name: Publish ESP component
 # that avoids a stored secret but must be trusted by the registry; to use it,
 # drop api_token and add a `permissions: id-token: write` block.)
 #
-# Version comes from the tag (github.ref_name). Keep idf_component.yml's version
-# field in step with the tag you push.
+# Version comes from the tag (github.ref_name), and the job refuses to upload
+# unless the in-tree version sources state the same number.
 
 on:
   push:
@@ -22,6 +22,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check the version sources state the tag
+        # The registry refuses a version it already holds, and a failed upload
+        # is fixed with a new patch release rather than a re-tag, so a stale
+        # manifest costs a version number. Fail here instead.
+        run: >-
+          python3 scripts/check_version_sources.py
+          --expect "${GITHUB_REF_NAME#v}"
       - name: Upload to ESP Component Registry
         uses: espressif/upload-components-ci-action@v2
         with:

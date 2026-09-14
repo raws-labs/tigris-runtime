@@ -440,8 +440,7 @@ static int kern_tanh(
 static int kern_softmax(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
-    if (!plan || !op || !mem || op->num_inputs != 1 || op->num_outputs != 1 ||
-        mem->tile.active)
+    if (!plan || !op || !mem || op->num_inputs != 1 || op->num_outputs != 1)
         return -1;
 
     const uint16_t *ins = tigris_op_inputs(plan, op);
@@ -454,7 +453,10 @@ static int kern_softmax(
 
     const int32_t *shape = tigris_tensor_shape(plan, x_tensor);
     const uint32_t classes = (uint32_t)shape[x_tensor->ndim - 1];
-    const uint32_t count = tensor_numel(plan, ins[0]);
+    /* Normalization runs along the final stored dimension while a tile cuts
+     * stored axis 1, so a tile always holds whole rows and needs nothing from
+     * its neighbours. tile_aware_numel counts in those same terms. */
+    const uint32_t count = tile_aware_numel(plan, ins[0], mem);
     if (classes == 0 || count % classes != 0)
         return -1;
 
@@ -462,6 +464,7 @@ static int kern_softmax(
     float *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
     if (!X || !Y)
         return -1;
+    apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
 
     for (uint32_t row = 0; row < count / classes; row++) {
         const float *x = X + (size_t)row * classes;

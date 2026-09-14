@@ -1266,8 +1266,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_tanh_s8(
 static TIGRIS_KERNEL_NOINLINE int kern_softmax_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
-    if (!plan || !op || !mem || op->num_inputs != 1 || op->num_outputs != 1 ||
-        mem->tile.active)
+    if (!plan || !op || !mem || op->num_inputs != 1 || op->num_outputs != 1)
         return -1;
 
     const uint16_t *ins = tigris_op_inputs(plan, op);
@@ -1284,22 +1283,29 @@ static TIGRIS_KERNEL_NOINLINE int kern_softmax_s8(
 
     const int32_t *x_shape = tigris_tensor_shape(plan, x_tensor);
     const int32_t *y_shape = tigris_tensor_shape(plan, y_tensor);
-    uint64_t count = 1;
+    uint64_t whole = 1;
     for (uint8_t i = 0; i < x_tensor->ndim; i++) {
         if (x_shape[i] <= 0 || x_shape[i] != y_shape[i])
             return -1;
-        count *= (uint32_t)x_shape[i];
-        if (count > UINT32_MAX)
+        whole *= (uint32_t)x_shape[i];
+        if (whole > UINT32_MAX)
             return -1;
     }
     const uint32_t classes = (uint32_t)x_shape[x_tensor->ndim - 1];
-    if (classes == 0 || count != x_tensor->size_bytes || count % classes != 0)
+    if (classes == 0 || whole != x_tensor->size_bytes)
+        return -1;
+    /* Normalization runs along the final stored dimension while a tile cuts
+     * stored axis 1, so a tile always holds whole rows and needs nothing from
+     * its neighbours. tile_aware_numel counts in those same terms. */
+    const uint32_t count = tile_aware_numel(plan, ins[0], mem);
+    if (count == 0 || count % classes != 0)
         return -1;
 
     const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
     if (!X || !Y)
         return -1;
+    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
 
     const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, x_tensor);
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, y_tensor);

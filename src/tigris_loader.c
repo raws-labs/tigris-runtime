@@ -105,10 +105,15 @@ static int op_has_plain_io(
 
 static int is_axis1_unary_pointwise_op(uint8_t type)
 {
+    /* Softmax is a reduction, but along the final stored dimension, which is
+     * the channel axis in both NLC and NHWC. The length axis a tile cuts is
+     * ahead of it, so a tile holds whole normalization rows and the operator
+     * behaves like the shape-preserving unary ones here. */
     return type == TIGRIS_OP_RELU ||
            type == TIGRIS_OP_RELU6 ||
            type == TIGRIS_OP_SIGMOID ||
-           type == TIGRIS_OP_TANH;
+           type == TIGRIS_OP_TANH ||
+           type == TIGRIS_OP_SOFTMAX;
 }
 
 static int is_axis1_binary_pointwise_op(uint8_t type)

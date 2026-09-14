@@ -931,6 +931,66 @@ static TIGRIS_KERNEL_NOINLINE int kern_avg_pool_s8(
     return 0;
 }
 
+/* Y = A * B with both operands activations. Neither is a weight entry, so
+ * both zero points come from the tensor table and the requantization uses the
+ * output's own multiplier, which the compiler derived from the product of the
+ * two input scales. Axes are the model's own: the trailing pair is the matrix
+ * and everything before it batches. */
+static TIGRIS_KERNEL_NOINLINE int kern_matmul_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const int8_t *A = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    const int8_t *B = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[1]);
+    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+
+    const tigris_tensor_t *a_tensor = &plan->tensors[ins[0]];
+    const tigris_tensor_t *b_tensor = &plan->tensors[ins[1]];
+    const int32_t *a_shape = tigris_tensor_shape(plan, a_tensor);
+    const int32_t *b_shape = tigris_tensor_shape(plan, b_tensor);
+
+    const tigris_quant_param_t *qp_a = tigris_tensor_quant(plan, a_tensor);
+    const tigris_quant_param_t *qp_b = tigris_tensor_quant(plan, b_tensor);
+    const tigris_quant_param_t *qp_y =
+        tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    int32_t a_zp = qp_a ? qp_a->zero_point : 0;
+    int32_t b_zp = qp_b ? qp_b->zero_point : 0;
+    int32_t y_zp = qp_y ? qp_y->zero_point : 0;
+    int32_t mult = qp_y ? get_multiplier(plan, qp_y, 0) : 1;
+    int32_t shift = qp_y ? get_shift(plan, qp_y, 0) : 0;
+
+    uint8_t last = (uint8_t)(a_tensor->ndim - 1u);
+    int M = a_shape[last - 1u];
+    int K = a_shape[last];
+    int N = b_shape[last];
+
+    int batches = 1;
+    for (uint8_t axis = 0; axis + 2u <= last; axis++)
+        batches *= a_shape[axis];
+
+    for (int b = 0; b < batches; b++) {
+        const int8_t *a = A + (size_t)b * (size_t)M * (size_t)K;
+        const int8_t *w = B + (size_t)b * (size_t)K * (size_t)N;
+        int8_t *y = Y + (size_t)b * (size_t)M * (size_t)N;
+        for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+                int32_t acc = 0;
+                for (int k = 0; k < K; k++) {
+                    int32_t av = (int32_t)a[m * K + k] - a_zp;
+                    int32_t bv = (int32_t)w[k * N + n] - b_zp;
+                    acc += av * bv;
+                }
+                int32_t scaled =
+                    multiply_by_quantized_multiplier(acc, mult, shift);
+                y[m * N + n] =
+                    clamp_act(scaled + y_zp, op->act_min, op->act_max);
+            }
+        }
+    }
+    return 0;
+}
+
 static TIGRIS_KERNEL_NOINLINE int kern_reshape_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1352,6 +1412,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
     case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose_s8(plan, op, mem);
+    case TIGRIS_OP_MATMUL:      return kern_matmul_s8(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */

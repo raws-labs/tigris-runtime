@@ -686,17 +686,73 @@ static int kern_fully_connected(
 
     const tigris_tensor_t *y_tensor = &plan->tensors[outs[0]];
     const int32_t *y_shape = tigris_tensor_shape(plan, y_tensor);
-    /* Gemm: Y = X * W^T + B. OC is the last dim of output. */
-    int OC = y_shape[y_tensor->ndim - 1];
+    /* Gemm: Y = X * W^T + B. Input [N, IC], weight [OC, IC], output [N, OC].
+     * N is 1 for a classifier head and the row count for a linear layer
+     * applied per sequence position, which is the same shape the int8 kernel
+     * has always accepted. */
+    int N, OC;
+    if (y_tensor->ndim >= 2) {
+        N  = y_shape[0];
+        OC = y_shape[1];
+    } else {
+        N  = 1;
+        OC = y_shape[y_tensor->ndim - 1];
+    }
     /* IC from weight: total weight elements / OC */
     const tigris_weight_entry_t *we = &plan->weight_entries[op->weight_idx];
     int IC = (int)(we->size_bytes / sizeof(float)) / OC;
 
-    for (int oc = 0; oc < OC; oc++) {
-        float sum = B ? B[oc] : 0.0f;
-        for (int ic = 0; ic < IC; ic++)
-            sum += W[oc * IC + ic] * X[ic];
-        Y[oc] = apply_fused_act_f32(sum, op->fused_act);
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            float sum = B ? B[oc] : 0.0f;
+            for (int ic = 0; ic < IC; ic++)
+                sum += W[oc * IC + ic] * X[n * IC + ic];
+            Y[n * OC + oc] = apply_fused_act_f32(sum, op->fused_act);
+        }
+    }
+    return 0;
+}
+
+/* Y = A * B with both operands activations. Axes are the model's own: the
+ * trailing pair is the matrix, everything before it batches. The loader has
+ * already checked that the batch extents agree and that the inner dimensions
+ * meet, so this only walks them. MatMul is not in the loader's fused-activation
+ * allow-list, so there is no activation to apply here. */
+static int kern_matmul(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *A = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    const float *B = (const float *)tigris_mem_tensor_ptr(mem, ins[1]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+
+    const tigris_tensor_t *a_tensor = &plan->tensors[ins[0]];
+    const tigris_tensor_t *b_tensor = &plan->tensors[ins[1]];
+    const int32_t *a_shape = tigris_tensor_shape(plan, a_tensor);
+    const int32_t *b_shape = tigris_tensor_shape(plan, b_tensor);
+
+    uint8_t last = (uint8_t)(a_tensor->ndim - 1u);
+    int M = a_shape[last - 1u];
+    int K = a_shape[last];
+    int N = b_shape[last];
+
+    int batches = 1;
+    for (uint8_t axis = 0; axis + 2u <= last; axis++)
+        batches *= a_shape[axis];
+
+    for (int b = 0; b < batches; b++) {
+        const float *a = A + (size_t)b * (size_t)M * (size_t)K;
+        const float *w = B + (size_t)b * (size_t)K * (size_t)N;
+        float *y = Y + (size_t)b * (size_t)M * (size_t)N;
+        for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; k++)
+                    sum += a[m * K + k] * w[k * N + n];
+                y[m * N + n] = sum;
+            }
+        }
     }
     return 0;
 }
@@ -1028,6 +1084,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_AVG_POOL:    return kern_avg_pool(plan, op, mem);
     case TIGRIS_OP_CONCAT:      return kern_concat(plan, op, mem);
     case TIGRIS_OP_RESIZE:      return kern_resize_nearest(plan, op, mem);
+    case TIGRIS_OP_MATMUL:      return kern_matmul(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */

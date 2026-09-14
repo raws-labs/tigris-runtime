@@ -17,6 +17,17 @@
 #include <math.h>
 #include <string.h>
 
+/* Each kernel stays out of line. Inlined, they share one register allocation
+ * and one stack frame across the whole dispatcher, so editing any kernel
+ * reallocates spill slots in every other one: a four-byte change to the Add
+ * kernel moved the frame from 204 to 212 bytes and cost 6.6% on a DS-CNN that
+ * contains no Add at all. The call happens once per operator, not per element. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define TIGRIS_KERNEL_NOINLINE __attribute__((noinline))
+#else
+#  define TIGRIS_KERNEL_NOINLINE
+#endif
+
 /* Helpers */
 
 /** Clamp an int32 to int8 range. */
@@ -228,7 +239,7 @@ static int binary_s8_io_is_valid(
 
 /* Int8 Kernels */
 
-static int kern_conv2d_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_conv2d_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -333,7 +344,7 @@ static int kern_conv2d_s8(
  * Accumulation in int32 with per-channel requantization, matching
  * kern_conv2d_s8.
  */
-static int kern_conv_transpose_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_conv_transpose_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -428,7 +439,7 @@ static int kern_conv_transpose_s8(
 
 /* INT8 1D convolution. NLC activation layout, weights [OC, K, IC], per-channel
  * requant - the int8 analogue of kern_conv1d (float) / kern_conv2d_s8. */
-static int kern_conv1d_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_conv1d_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -488,7 +499,7 @@ static int kern_conv1d_s8(
     return 0;
 }
 
-static int kern_depthwise_conv2d_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_depthwise_conv2d_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -569,7 +580,7 @@ static int kern_depthwise_conv2d_s8(
     return 0;
 }
 
-static int kern_fully_connected_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_fully_connected_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -619,7 +630,7 @@ static int kern_fully_connected_s8(
     return 0;
 }
 
-static int kern_relu_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_relu_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -640,7 +651,7 @@ static int kern_relu_s8(
     return 0;
 }
 
-static int kern_relu6_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_relu6_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -670,7 +681,7 @@ static int kern_relu6_s8(
     return 0;
 }
 
-static int kern_add_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_add_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     /* Constants are absent from the tensor/quant tables in the current wire
@@ -735,7 +746,7 @@ static int kern_add_s8(
     return 0;
 }
 
-static int kern_global_avg_pool_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -794,7 +805,7 @@ static int kern_global_avg_pool_s8(
     return 0;
 }
 
-static int kern_avg_pool_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_avg_pool_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -920,7 +931,7 @@ static int kern_avg_pool_s8(
     return 0;
 }
 
-static int kern_reshape_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_reshape_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -936,7 +947,7 @@ static int kern_reshape_s8(
     return 0;
 }
 
-static int kern_max_pool_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_max_pool_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -1006,7 +1017,7 @@ static int kern_max_pool_s8(
     return 0;
 }
 
-static int kern_concat_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_concat_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -1068,7 +1079,7 @@ static int kern_concat_s8(
     return 0;
 }
 
-static int kern_resize_nearest_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_resize_nearest_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -1114,7 +1125,7 @@ static int kern_resize_nearest_s8(
     return 0;
 }
 
-static int kern_sigmoid_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_sigmoid_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -1153,7 +1164,7 @@ static int kern_sigmoid_s8(
 
 /* Tanh via a 256-entry LUT, mirroring kern_sigmoid_s8 (tanh in place of the
  * logistic). int8 input -> int8 output with its own output quant. */
-static int kern_tanh_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_tanh_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -1192,7 +1203,7 @@ static int kern_tanh_s8(
  * use ONNX's default/final-axis form.  Keep this scalar reference path for
  * terminal classifiers (and as the accelerator fallback), where correctness
  * matters more than throughput. */
-static int kern_softmax_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_softmax_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     if (!plan || !op || !mem || op->num_inputs != 1 || op->num_outputs != 1 ||
@@ -1261,7 +1272,7 @@ static int kern_softmax_s8(
     return 0;
 }
 
-static int kern_mul_s8(
+static TIGRIS_KERNEL_NOINLINE int kern_mul_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     /* See kern_add_s8: constant quantization is not recoverable from weight_idx. */

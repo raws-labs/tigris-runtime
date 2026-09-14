@@ -686,17 +686,29 @@ static int kern_fully_connected(
 
     const tigris_tensor_t *y_tensor = &plan->tensors[outs[0]];
     const int32_t *y_shape = tigris_tensor_shape(plan, y_tensor);
-    /* Gemm: Y = X * W^T + B. OC is the last dim of output. */
-    int OC = y_shape[y_tensor->ndim - 1];
+    /* Gemm: Y = X * W^T + B. Input [N, IC], weight [OC, IC], output [N, OC].
+     * N is 1 for a classifier head and the row count for a linear layer
+     * applied per sequence position, which is the same shape the int8 kernel
+     * has always accepted. */
+    int N, OC;
+    if (y_tensor->ndim >= 2) {
+        N  = y_shape[0];
+        OC = y_shape[1];
+    } else {
+        N  = 1;
+        OC = y_shape[y_tensor->ndim - 1];
+    }
     /* IC from weight: total weight elements / OC */
     const tigris_weight_entry_t *we = &plan->weight_entries[op->weight_idx];
     int IC = (int)(we->size_bytes / sizeof(float)) / OC;
 
-    for (int oc = 0; oc < OC; oc++) {
-        float sum = B ? B[oc] : 0.0f;
-        for (int ic = 0; ic < IC; ic++)
-            sum += W[oc * IC + ic] * X[ic];
-        Y[oc] = apply_fused_act_f32(sum, op->fused_act);
+    for (int n = 0; n < N; n++) {
+        for (int oc = 0; oc < OC; oc++) {
+            float sum = B ? B[oc] : 0.0f;
+            for (int ic = 0; ic < IC; ic++)
+                sum += W[oc * IC + ic] * X[n * IC + ic];
+            Y[n * OC + oc] = apply_fused_act_f32(sum, op->fused_act);
+        }
     }
     return 0;
 }

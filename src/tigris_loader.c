@@ -235,12 +235,13 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             uint32_t input_elements = tensor_elements(input);
             uint32_t output_elements = tensor_elements(output);
             uint32_t batches = 1;
-            if (dtype == 3 && output->ndim == 2)
+            if (output->ndim == 2) {
                 batches = (uint32_t)out_shape[0];
-            if ((dtype == 1 && output_elements != output_channels) ||
-                (dtype == 3 &&
-                 (output->ndim > 2 || output_elements != batches * output_channels ||
-                  input_elements % batches != 0)))
+                output_channels = (uint32_t)out_shape[1];
+            }
+            if (output->ndim > 2 ||
+                output_elements != batches * output_channels ||
+                batches == 0u || input_elements % batches != 0u)
                 return TIGRIS_ERR_BAD_OPERATOR;
             uint32_t inputs_per_batch = input_elements / batches;
             uint64_t weight_bytes =

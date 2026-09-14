@@ -797,7 +797,8 @@ tigris_error_t tigris_plan_load(
             return TIGRIS_ERR_BAD_SECTION;
         if ((tensor->flags & ~(TIGRIS_TENSOR_CONSTANT |
                                TIGRIS_TENSOR_MODEL_INPUT |
-                               TIGRIS_TENSOR_MODEL_OUTPUT)) != 0 ||
+                               TIGRIS_TENSOR_MODEL_OUTPUT |
+                               TIGRIS_TENSOR_LINEAR)) != 0 ||
             (tensor->dtype == 1 &&
              tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM))
             return TIGRIS_ERR_BAD_TENSOR;

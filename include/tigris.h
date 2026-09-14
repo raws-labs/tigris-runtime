@@ -29,9 +29,10 @@ extern "C" {
 
 #define TIGRIS_MAGIC           0x53524754  /* "TGRS" in little-endian */
 #define TIGRIS_MAGIC_BYTES     "TGRS"
+#define TIGRIS_SCHEMA_VERSION_V7 7
 #define TIGRIS_SCHEMA_VERSION_V6 6
 #define TIGRIS_SCHEMA_VERSION_V5 5
-#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V6
+#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V7
 #define TIGRIS_SCHEMA_VERSION_V4 4
 #define TIGRIS_SCHEMA_VERSION_V3 3
 #define TIGRIS_SCHEMA_VERSION_V2 2
@@ -43,6 +44,10 @@ extern "C" {
  * so the runtime can present the interface the model states rather than the
  * encoding the plan executes on. */
 #define TIGRIS_SCHEMA_VERSION_INTERFACE_DTYPE TIGRIS_SCHEMA_VERSION_V6
+/* A tensor records whether its axes are stored in the model's own order, so a
+ * boundary's element order is recoverable from the plan rather than inferred
+ * from the shape of the graph that produced it. */
+#define TIGRIS_SCHEMA_VERSION_TENSOR_LAYOUT TIGRIS_SCHEMA_VERSION_V7
 #define TIGRIS_QUANT_PAGE_ELEMS 65536u
 
 /* Section type IDs */
@@ -123,6 +128,13 @@ typedef enum {
 #define TIGRIS_TENSOR_CONSTANT      0x01
 #define TIGRIS_TENSOR_MODEL_INPUT   0x02
 #define TIGRIS_TENSOR_MODEL_OUTPUT  0x04
+/* The tensor's axes are stored in the order the model states them, not
+ * channels-last. Read it on a model input or output to know which order the
+ * caller's data is in: without it, a boundary written by a terminal Transpose
+ * is indistinguishable from any other. Plans below schema 7 never set it, and
+ * their boundaries follow the older rule of channels-last unless the graph
+ * ends in a Transpose. */
+#define TIGRIS_TENSOR_LINEAR        0x08
 
 /* Error codes */
 

@@ -1772,6 +1772,7 @@ static void test_schema_compatibility_fixtures(void)
      *   v4 Transpose:tigris 208b322cab7f97c9960c63a8075944374fdfff2c
      *   v5 Conv1D:   explicit serialized length axis
      *   v6 QDQ Conv: a boundary tensor declaring its float model interface
+     *   v7 MatMul:   tensors recording whether they are stored in model order
      */
     static const struct {
         const char *filename;
@@ -1787,6 +1788,7 @@ static void test_schema_compatibility_fixtures(void)
         {"schema-v5-conv1d-axis.tgrs", TIGRIS_SCHEMA_VERSION_V5, 0, 0, 1,
          TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH},
         {"schema-v6-interface-dtype.tgrs", TIGRIS_SCHEMA_VERSION_V6, 3, 0, 0, 0},
+        {"schema-v7-tensor-layout.tgrs", TIGRIS_SCHEMA_VERSION_V7, 0, 2, 0, 0},
     };
     const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
 
@@ -1827,15 +1829,42 @@ static void test_schema_compatibility_fixtures(void)
             TEST_ASSERT_EQ(plan.header->num_tile_plans,
                            fixtures[i].tile_plans,
                            "schema fixture has expected tile plans");
-            if (fixtures[i].version >= TIGRIS_SCHEMA_VERSION_INTERFACE_DTYPE) {
+            if (fixtures[i].version == TIGRIS_SCHEMA_VERSION_INTERFACE_DTYPE) {
                 /* The quantized boundary states the float interface the model
-                 * declares, which is what schema 6 added. */
+                 * declares, which is what schema 6 added. Held to that one
+                 * fixture: a later schema's exemplar need not be quantized. */
                 for (uint8_t m = 0; m < plan.header->num_model_inputs; m++) {
                     const tigris_tensor_t *t =
                         &plan.tensors[plan.model_inputs[m]];
                     TEST_ASSERT_EQ(t->dtype, 3, "v6 boundary stores int8");
                     TEST_ASSERT_EQ(t->iface_dtype, 1,
                                    "v6 boundary declares float32");
+                }
+            }
+            if (fixtures[i].version == TIGRIS_SCHEMA_VERSION_TENSOR_LAYOUT) {
+                /* Schema 7 records whether a tensor is stored in the model's
+                 * own axis order. Internal tensors of this matrix product are;
+                 * its boundaries keep the channels-last convention callers
+                 * already rely on, which is the distinction the flag exists to
+                 * make readable. */
+                uint16_t linear = 0;
+                for (uint16_t t = 0; t < plan.header->num_tensors; t++) {
+                    if ((plan.tensors[t].flags & TIGRIS_TENSOR_LINEAR) != 0u)
+                        linear++;
+                }
+                TEST_ASSERT(linear > 0,
+                            "v7 fixture records linear tensors");
+                for (uint8_t m = 0; m < plan.header->num_model_inputs; m++) {
+                    TEST_ASSERT_EQ(
+                        plan.tensors[plan.model_inputs[m]].flags &
+                            TIGRIS_TENSOR_LINEAR,
+                        0, "v7 model input keeps the channels-last convention");
+                }
+                for (uint8_t m = 0; m < plan.header->num_model_outputs; m++) {
+                    TEST_ASSERT_EQ(
+                        plan.tensors[plan.model_outputs[m]].flags &
+                            TIGRIS_TENSOR_LINEAR,
+                        0, "v7 model output keeps the channels-last convention");
                 }
             }
             if (fixtures[i].tile_plans > 0) {

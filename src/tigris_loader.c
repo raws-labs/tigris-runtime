@@ -118,7 +118,8 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
 
 static int is_axis1_binary_pointwise_op(uint8_t type)
 {
-    return type == TIGRIS_OP_ADD || type == TIGRIS_OP_MUL;
+    return type == TIGRIS_OP_ADD || type == TIGRIS_OP_SUB ||
+           type == TIGRIS_OP_MUL;
 }
 
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
@@ -309,6 +310,16 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
         }
+
+        case TIGRIS_OP_SUB:
+            /* Sub does not commute, and the wire format records only that an
+             * operand is constant, not which side it was on. Two tensor
+             * operands are the only unambiguous form. */
+            if (!op_has_plain_io(op, 2, 1) ||
+                !tensor_shapes_equal(plan, input, output) ||
+                !tensor_shapes_equal(plan, input, &plan->tensors[inputs[1]]))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
 
         case TIGRIS_OP_ADD:
         case TIGRIS_OP_MUL:

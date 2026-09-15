@@ -681,8 +681,11 @@ static TIGRIS_KERNEL_NOINLINE int kern_relu6_s8(
     return 0;
 }
 
-static TIGRIS_KERNEL_NOINLINE int kern_add_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+/* Add and Sub differ only in the sign of the second scaled term; everything
+ * around it, including the requantization, is identical. */
+static TIGRIS_KERNEL_NOINLINE int kern_addsub_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem,
+    int subtract)
 {
     /* Constants are absent from the tensor/quant tables in the current wire
      * format. Without their scale and zero point, one-input + weight_idx Add
@@ -733,8 +736,9 @@ static TIGRIS_KERNEL_NOINLINE int kern_add_s8(
     for (uint32_t i = 0; i < n; i++) {
         int32_t av = ((int32_t)A[i] - za) * (1 << LEFT_SHIFT);
         int32_t bv = ((int32_t)B_ptr[i] - zb) * (1 << LEFT_SHIFT);
+        int32_t scaled_b = multiply_by_quantized_multiplier(bv, b_mult, b_shift);
         int32_t scaled = multiply_by_quantized_multiplier(av, a_mult, a_shift)
-                       + multiply_by_quantized_multiplier(bv, b_mult, b_shift);
+                       + (subtract ? -scaled_b : scaled_b);
         int32_t q = multiply_by_quantized_multiplier(scaled, y_mult, y_shift) + zy;
         /* A fused activation is a clamp on the requantized result: the compiler
          * derives the bounds from the output scale and zero point. Older plans
@@ -744,6 +748,18 @@ static TIGRIS_KERNEL_NOINLINE int kern_add_s8(
              : clamp_act(q, op->act_min, op->act_max);
     }
     return 0;
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_add_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    return kern_addsub_s8(plan, op, mem, 0);
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_sub_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    return kern_addsub_s8(plan, op, mem, 1);
 }
 
 static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
@@ -1418,6 +1434,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
     case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose_s8(plan, op, mem);
+    case TIGRIS_OP_SUB:         return kern_sub_s8(plan, op, mem);
     case TIGRIS_OP_MATMUL:      return kern_matmul_s8(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     default:

@@ -153,6 +153,7 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_TANH ||
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_ADD ||
+           type == TIGRIS_OP_SUB ||
            type == TIGRIS_OP_MUL ||
            type == TIGRIS_OP_CONCAT;
 }
@@ -172,7 +173,8 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
 
 static int is_axis1_binary_pointwise_op(uint8_t type)
 {
-    return type == TIGRIS_OP_ADD || type == TIGRIS_OP_MUL;
+    return type == TIGRIS_OP_ADD || type == TIGRIS_OP_SUB ||
+           type == TIGRIS_OP_MUL;
 }
 
 static int workspace_limits(

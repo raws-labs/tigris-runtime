@@ -1007,6 +1007,40 @@ static TIGRIS_KERNEL_NOINLINE int kern_matmul_s8(
     return 0;
 }
 
+/* GlobalMaxPool: the maximum over every spatial position, per channel. Like
+ * MaxPool it needs no requantization, because the result is one of the input
+ * values and so already sits in the input's scale and zero point. */
+static TIGRIS_KERNEL_NOINLINE int kern_global_max_pool_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (!X || !Y)
+        return -1;
+
+    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    int N = x_shape[0];
+    int H = x_shape[1];
+    int W = x_shape[2];
+    int C = x_shape[3];
+
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            int32_t best = -128;
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    int32_t v = (int32_t)X[((n * H + h) * W + w) * C + c];
+                    if (v > best) best = v;
+                }
+            }
+            Y[n * C + c] = clamp_act(best, op->act_min, op->act_max);
+        }
+    }
+    return 0;
+}
+
 static TIGRIS_KERNEL_NOINLINE int kern_reshape_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1435,6 +1469,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
     case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose_s8(plan, op, mem);
     case TIGRIS_OP_SUB:         return kern_sub_s8(plan, op, mem);
+    case TIGRIS_OP_GLOBAL_MAX:  return kern_global_max_pool_s8(plan, op, mem);
     case TIGRIS_OP_MATMUL:      return kern_matmul_s8(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     default:

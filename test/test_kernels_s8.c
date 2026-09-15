@@ -329,6 +329,17 @@ static void test_binary_s8_contract(void)
     TEST_ASSERT(memcmp(ptrs[t_y], add_expected, sizeof(add_expected)) == 0,
                 "two-dynamic-input Add output");
 
+    /* Sub shares Add's path and differs only in the sign of the second term,
+     * so the operand order is what this checks: a swap would negate it. */
+    test_ops[0].op_type = TIGRIS_OP_SUB;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(
+                       &plan, &test_ops[0], 0, &mem, NULL),
+                   0, "two-dynamic-input Sub is supported");
+    const int8_t sub_expected[] = {-1, 3, 0, 4};
+    TEST_ASSERT(memcmp(ptrs[t_y], sub_expected, sizeof(sub_expected)) == 0,
+                "two-dynamic-input Sub output");
+    test_ops[0].op_type = TIGRIS_OP_ADD;
+
     test_ops[0].op_type = TIGRIS_OP_MUL;
     TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(
                        &plan, &test_ops[0], 0, &mem, NULL),
@@ -1156,6 +1167,57 @@ static void test_global_avg_pool_s8(void)
     TEST_ASSERT_EQ(out[0], 5, "avg(2,4,6,8) = 5");
 }
 
+static void test_global_max_pool_s8(void)
+{
+    printf("  test_global_max_pool_s8...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+
+    /* A maximum is one of the input values, so it keeps the input's scale and
+     * zero point and needs no requantization. The negative rules out an
+     * unsigned read of the input. */
+    uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t out_qp_idx = add_quant_param(1.0f, 0, 1, NULL, NULL);
+
+    int32_t x_shape[] = {1, 2, 2, 1};
+    int32_t y_shape[] = {1, 1, 1, 1};
+    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
+    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 1, out_qp_idx);
+
+    test_ops[0].op_type = TIGRIS_OP_GLOBAL_MAX;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in};
+    uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].act_min = -128;
+    test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[4096], slow_buf[4096];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
+                    slow_buf, sizeof(slow_buf));
+
+    int8_t input_data[] = {-9, 4, 7, 3};
+    tigris_mem_alloc_fast(&mem, t_in, 4);
+    memcpy(ptrs[t_in], input_data, 4);
+    tigris_mem_alloc_fast(&mem, t_out, 1);
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "global_max_pool_s8 returns 0");
+
+    int8_t *out = (int8_t *)ptrs[t_out];
+    TEST_ASSERT_EQ(out[0], 7, "max(-9,4,7,3) = 7");
+}
+
 static void test_unsupported_op_s8(void)
 {
     printf("  test_unsupported_op_s8...\n");
@@ -1442,6 +1504,7 @@ int main(void)
     test_conv_transpose_s8_tile_2d();
     test_fc_s8();
     test_global_avg_pool_s8();
+    test_global_max_pool_s8();
     test_tanh_s8();
     test_softmax_s8();
     test_conv1d_s8();

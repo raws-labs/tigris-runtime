@@ -785,6 +785,40 @@ static int kern_matmul(
     return 0;
 }
 
+/* GlobalMaxPool: the maximum over every spatial position, per channel. The
+ * counterpart of GlobalAveragePool, and like MaxPool it needs no requantization
+ * because a maximum is one of the input values. */
+static int kern_global_max_pool(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (!X || !Y)
+        return -1;
+
+    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    int N = x_shape[0];
+    int H = x_shape[1];
+    int W = x_shape[2];
+    int C = x_shape[3];
+
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float best = X[(n * H * W) * C + c];
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    float v = X[((n * H + h) * W + w) * C + c];
+                    if (v > best) best = v;
+                }
+            }
+            Y[n * C + c] = best;
+        }
+    }
+    return 0;
+}
+
 static int kern_reshape(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1113,6 +1147,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_CONCAT:      return kern_concat(plan, op, mem);
     case TIGRIS_OP_RESIZE:      return kern_resize_nearest(plan, op, mem);
     case TIGRIS_OP_SUB:         return kern_sub(plan, op, mem);
+    case TIGRIS_OP_GLOBAL_MAX: return kern_global_max_pool(plan, op, mem);
     case TIGRIS_OP_MATMUL:      return kern_matmul(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     default:

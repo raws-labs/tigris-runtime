@@ -370,6 +370,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             break;
         }
 
+        case TIGRIS_OP_GLOBAL_MAX:
         case TIGRIS_OP_GLOBAL_AVG: {
             if (!op_has_plain_io(op, 1, 1) ||
                 input->ndim != 4 || output->ndim != 4)

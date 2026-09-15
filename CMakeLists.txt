@@ -95,7 +95,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     write_basic_package_version_file(
         "${CMAKE_CURRENT_BINARY_DIR}/tigris_runtimeConfigVersion.cmake"
         VERSION ${PROJECT_VERSION}
-        # TiGrIS is pre-1.0: keep compatibility within the 0.6.x release line.
+        # TiGrIS is pre-1.0: keep compatibility within one minor release line.
         COMPATIBILITY SameMinorVersion
     )
     install(FILES

@@ -37,6 +37,9 @@ CONSUMER = ("test/package_consumer/CMakeLists.txt",
 EXAMPLE = ("examples/esp32/getting-started/main/idf_component.yml",
            r'raws-labs/tigris-runtime:\s*\n\s*version:\s*"\^([0-9]+\.[0-9]+\.[0-9]+)"')
 
+# The README shows consumers the find_package call, so it states the floor too.
+README = ("README.md", r"find_package\(tigris_runtime ([0-9]+\.[0-9]+) REQUIRED")
+
 
 def _read(relative: str, pattern: str) -> tuple[str, str | None]:
     text = (ROOT / relative).read_text()
@@ -56,15 +59,16 @@ def main() -> int:
         errors.append("version sources disagree: " + ", ".join(
             f"{name}={version}" for name, version in sorted(versions.items())))
 
-    consumer_name, consumer_floor = _read(*CONSUMER)
-    if consumer_floor is None:
-        errors.append(f"{consumer_name}: no find_package version found")
-    elif distinct:
-        expected_floor = ".".join(next(iter(distinct)).split(".")[:2])
-        if consumer_floor != expected_floor:
-            errors.append(
-                f"{consumer_name}: asks for {consumer_floor}, "
-                f"this release is {expected_floor}")
+    for name, pattern in (CONSUMER, README):
+        found_name, floor = _read(name, pattern)
+        if floor is None:
+            errors.append(f"{found_name}: no find_package version found")
+        elif distinct:
+            expected_floor = ".".join(next(iter(distinct)).split(".")[:2])
+            if floor != expected_floor:
+                errors.append(
+                    f"{found_name}: asks for {floor}, "
+                    f"this release is {expected_floor}")
 
     example_name, example_version = _read(*EXAMPLE)
     if example_version is None:

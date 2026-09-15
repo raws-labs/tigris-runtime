@@ -31,6 +31,12 @@ SOURCES = (
 CONSUMER = ("test/package_consumer/CMakeLists.txt",
             r"find_package\(tigris_runtime ([0-9]+\.[0-9]+)")
 
+# The shipped example depends on this component by a caret constraint, so it
+# names the version too. It is inside the published component, which makes a
+# stale constraint there a released artifact pointing at an older self.
+EXAMPLE = ("examples/esp32/getting-started/main/idf_component.yml",
+           r'raws-labs/tigris-runtime:\s*\n\s*version:\s*"\^([0-9]+\.[0-9]+\.[0-9]+)"')
+
 
 def _read(relative: str, pattern: str) -> tuple[str, str | None]:
     text = (ROOT / relative).read_text()
@@ -59,6 +65,14 @@ def main() -> int:
             errors.append(
                 f"{consumer_name}: asks for {consumer_floor}, "
                 f"this release is {expected_floor}")
+
+    example_name, example_version = _read(*EXAMPLE)
+    if example_version is None:
+        errors.append(f"{example_name}: no component constraint found")
+    elif distinct and example_version != next(iter(distinct)):
+        errors.append(
+            f"{example_name}: depends on ^{example_version}, "
+            f"this release is {next(iter(distinct))}")
 
     if args.expect and distinct and args.expect not in distinct:
         errors.append(

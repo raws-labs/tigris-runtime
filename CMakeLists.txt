@@ -25,7 +25,7 @@ if(COMMAND idf_component_register)
     return()
 endif()
 
-project(tigris_runtime VERSION 0.9.0 LANGUAGES C)
+project(tigris_runtime VERSION 0.9.1 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wvla)

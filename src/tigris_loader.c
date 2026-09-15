@@ -105,10 +105,15 @@ static int op_has_plain_io(
 
 static int is_axis1_unary_pointwise_op(uint8_t type)
 {
+    /* Softmax is a reduction, but along the final stored dimension, which is
+     * the channel axis in both NLC and NHWC. The length axis a tile cuts is
+     * ahead of it, so a tile holds whole normalization rows and the operator
+     * behaves like the shape-preserving unary ones here. */
     return type == TIGRIS_OP_RELU ||
            type == TIGRIS_OP_RELU6 ||
            type == TIGRIS_OP_SIGMOID ||
-           type == TIGRIS_OP_TANH;
+           type == TIGRIS_OP_TANH ||
+           type == TIGRIS_OP_SOFTMAX;
 }
 
 static int is_axis1_binary_pointwise_op(uint8_t type)
@@ -235,12 +240,13 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             uint32_t input_elements = tensor_elements(input);
             uint32_t output_elements = tensor_elements(output);
             uint32_t batches = 1;
-            if (dtype == 3 && output->ndim == 2)
+            if (output->ndim == 2) {
                 batches = (uint32_t)out_shape[0];
-            if ((dtype == 1 && output_elements != output_channels) ||
-                (dtype == 3 &&
-                 (output->ndim > 2 || output_elements != batches * output_channels ||
-                  input_elements % batches != 0)))
+                output_channels = (uint32_t)out_shape[1];
+            }
+            if (output->ndim > 2 ||
+                output_elements != batches * output_channels ||
+                batches == 0u || input_elements % batches != 0u)
                 return TIGRIS_ERR_BAD_OPERATOR;
             uint32_t inputs_per_batch = input_elements / batches;
             uint64_t weight_bytes =
@@ -277,6 +283,32 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 input->size_bytes != output->size_bytes)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
+
+        case TIGRIS_OP_MATMUL: {
+            /* Both operands are activations, so neither is a weight entry.
+             * Axes are the model's own: the trailing pair is the matrix and
+             * everything before it batches, with no broadcasting. A plan that
+             * needs broadcast batches is rejected rather than guessed at. */
+            if (!op_has_plain_io(op, 2, 1) || input->ndim < 2)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const tigris_tensor_t *rhs = &plan->tensors[inputs[1]];
+            if (rhs->ndim != input->ndim || output->ndim != input->ndim)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *a_shape = tigris_tensor_shape(plan, input);
+            const int32_t *b_shape = tigris_tensor_shape(plan, rhs);
+            const int32_t *y_shape = tigris_tensor_shape(plan, output);
+            uint8_t last = (uint8_t)(input->ndim - 1u);
+            for (uint8_t axis = 0; axis + 2u <= last; axis++) {
+                if (a_shape[axis] != b_shape[axis] ||
+                    a_shape[axis] != y_shape[axis])
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
+            if (a_shape[last] != b_shape[last - 1u] ||
+                y_shape[last - 1u] != a_shape[last - 1u] ||
+                y_shape[last] != b_shape[last])
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
 
         case TIGRIS_OP_ADD:
         case TIGRIS_OP_MUL:
@@ -796,7 +828,8 @@ tigris_error_t tigris_plan_load(
             return TIGRIS_ERR_BAD_SECTION;
         if ((tensor->flags & ~(TIGRIS_TENSOR_CONSTANT |
                                TIGRIS_TENSOR_MODEL_INPUT |
-                               TIGRIS_TENSOR_MODEL_OUTPUT)) != 0 ||
+                               TIGRIS_TENSOR_MODEL_OUTPUT |
+                               TIGRIS_TENSOR_LINEAR)) != 0 ||
             (tensor->dtype == 1 &&
              tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM))
             return TIGRIS_ERR_BAD_TENSOR;

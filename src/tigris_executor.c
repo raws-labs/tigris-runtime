@@ -151,6 +151,7 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_RELU6 ||
            type == TIGRIS_OP_SIGMOID ||
            type == TIGRIS_OP_TANH ||
+           type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_ADD ||
            type == TIGRIS_OP_MUL ||
            type == TIGRIS_OP_CONCAT;
@@ -158,10 +159,15 @@ static int is_height_tiling_op(uint8_t type)
 
 static int is_axis1_unary_pointwise_op(uint8_t type)
 {
+    /* Softmax reduces along the final stored dimension, which is the channel
+     * axis in both NLC and NHWC. The axis a tile cuts is ahead of it, so a
+     * tile holds whole normalization rows and the operator is shape-preserving
+     * and halo-free like the unary ones beside it. */
     return type == TIGRIS_OP_RELU ||
            type == TIGRIS_OP_RELU6 ||
            type == TIGRIS_OP_SIGMOID ||
-           type == TIGRIS_OP_TANH;
+           type == TIGRIS_OP_TANH ||
+           type == TIGRIS_OP_SOFTMAX;
 }
 
 static int is_axis1_binary_pointwise_op(uint8_t type)

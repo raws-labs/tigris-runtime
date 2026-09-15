@@ -286,13 +286,14 @@ static void test_spill_tile_2d_roundtrip(void)
     TEST_ASSERT_EQ(restored, 1, "tensor_ptrs restored to slow_base");
 }
 
-#define T2D_NDIM_TIDX 1  /* second tensor: not rank 4, for ndim rejection */
+#define T2D_NDIM_TIDX 1  /* second tensor: rank 2, for ndim rejection */
 
 /* Two-tensor plan: index T2D_TIDX is the valid [T2D_N,T2D_H,T2D_W,T2D_C]
- * rank-4 tensor from t2d_build_plan, index T2D_NDIM_TIDX is a rank-3 [N,L,C]
- * tensor with no width axis, for exercising the ndim != 4 rejection path in
- * both tigris_mem_load_tile_2d and tigris_mem_spill_tile_2d. Both tensors
- * share one shape pool, the same convention t2d_build_plan uses. */
+ * rank-4 tensor from t2d_build_plan, index T2D_NDIM_TIDX is a rank-2 tensor,
+ * for exercising the rejection path in both tigris_mem_load_tile_2d and
+ * tigris_mem_spill_tile_2d. Rank 3 is accepted: it is the same memory as rank 4
+ * with a single channel, which is what a transposed spill writes into. Both
+ * tensors share one shape pool, the same convention t2d_build_plan uses. */
 static void t2d_build_plan_with_bad_ndim(tigris_tensor_t *tensors, int32_t *shape,
                                           tigris_plan_t *plan)
 {
@@ -312,15 +313,79 @@ static void t2d_build_plan_with_bad_ndim(tigris_tensor_t *tensors, int32_t *shap
     tensors[T2D_TIDX].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
 
     memset(&tensors[T2D_NDIM_TIDX], 0, sizeof(tensors[T2D_NDIM_TIDX]));
-    tensors[T2D_NDIM_TIDX].ndim = 3;
+    tensors[T2D_NDIM_TIDX].ndim = 2;
     tensors[T2D_NDIM_TIDX].shape_off = 4;
     tensors[T2D_NDIM_TIDX].size_bytes =
-        (uint32_t)(T2D_N * T2D_H * T2D_C) * (uint32_t)sizeof(int8_t);
+        (uint32_t)(T2D_N * T2D_H) * (uint32_t)sizeof(int8_t);
     tensors[T2D_NDIM_TIDX].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
 
     memset(plan, 0, sizeof(*plan));
     plan->tensors = tensors;
     plan->shape_pool = shape;
+}
+
+/* A rank-3 tensor takes a rectangle: [N, H, W] is the same memory as
+ * [N, H, W, 1]. A transposed spill writes a column stripe this way, so the
+ * round trip has to preserve every element at its own index. */
+static void test_tile_2d_rank3_rectangle_round_trip(void)
+{
+    printf("  test_tile_2d_rank3_rectangle_round_trip...\n");
+
+    enum { R3_N = 1, R3_H = 5, R3_W = 7 };
+    int32_t shape[3] = { R3_N, R3_H, R3_W };
+    tigris_tensor_t tensor;
+    memset(&tensor, 0, sizeof(tensor));
+    tensor.ndim = 3;
+    tensor.shape_off = 0;
+    tensor.size_bytes = (uint32_t)(R3_N * R3_H * R3_W) * (uint32_t)sizeof(int8_t);
+    tensor.quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.tensors = &tensor;
+    plan.shape_pool = shape;
+
+    int8_t slow[R3_N * R3_H * R3_W];
+    for (int i = 0; i < R3_N * R3_H * R3_W; i++)
+        slow[i] = (int8_t)(i + 1);
+
+    uint8_t fast[256];
+    uint8_t slow_arena[256];
+    void *ptrs[1];
+    tigris_mem_t mem;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 1, fast, sizeof(fast),
+                                   slow_arena, sizeof(slow_arena)),
+                   TIGRIS_MEM_OK, "mem init");
+    mem.tensor_ptrs[0] = slow;
+
+    /* Columns 2..5 of every row. */
+    const int32_t w0 = 2, w1 = 5;
+    TEST_ASSERT_EQ(tigris_mem_load_tile_2d(&mem, &plan, 0, 0, R3_H, w0, w1),
+                   TIGRIS_MEM_OK, "rank-3 rectangle loads");
+
+    const int8_t *tile = (const int8_t *)mem.tensor_ptrs[0];
+    int packed_ok = 1;
+    for (int32_t h = 0; h < R3_H; h++) {
+        for (int32_t w = w0; w < w1; w++) {
+            if (tile[h * (w1 - w0) + (w - w0)] != slow[h * R3_W + w])
+                packed_ok = 0;
+        }
+    }
+    TEST_ASSERT_EQ(packed_ok, 1, "rank-3 tile is packed from the right columns");
+
+    /* Write it back shifted by one column and check only that stripe moved. */
+    int8_t expected[R3_N * R3_H * R3_W];
+    memcpy(expected, slow, sizeof(expected));
+    for (int32_t h = 0; h < R3_H; h++) {
+        for (int32_t w = w0; w < w1; w++)
+            expected[h * R3_W + (w - 1)] = slow[h * R3_W + w];
+    }
+
+    TEST_ASSERT_EQ(tigris_mem_spill_tile_2d(&mem, &plan, 0, slow,
+                                            0, R3_H, w0 - 1, w1 - 1),
+                   TIGRIS_MEM_OK, "rank-3 rectangle spills");
+    TEST_ASSERT_EQ(memcmp(slow, expected, sizeof(expected)), 0,
+                   "only the addressed column stripe changed");
 }
 
 static void test_load_tile_2d_rejects_bad_bounds(void)
@@ -353,7 +418,7 @@ static void test_load_tile_2d_rejects_bad_bounds(void)
     /* ndim != 4 must be rejected before any bounds check. */
     tigris_mem_error_t e_ndim = tigris_mem_load_tile_2d(&mem, &plan, T2D_NDIM_TIDX,
                                                           0, 1, 0, 1);
-    TEST_ASSERT_EQ(e_ndim, TIGRIS_MEM_ERR_BAD_INDEX, "non-4D tensor rejected");
+    TEST_ASSERT_EQ(e_ndim, TIGRIS_MEM_ERR_BAD_INDEX, "rank-2 tensor rejected");
 
     /* h0 < 0 */
     tigris_mem_error_t e_h0_neg = tigris_mem_load_tile_2d(&mem, &plan, T2D_TIDX,
@@ -470,7 +535,7 @@ static void test_spill_tile_2d_rejects_bad_bounds(void)
     /* ndim != 4 must be rejected before any bounds check. */
     tigris_mem_error_t e_ndim = tigris_mem_spill_tile_2d(&mem, &plan, T2D_NDIM_TIDX,
                                                            slow_buf, 0, 1, 0, 1);
-    TEST_ASSERT_EQ(e_ndim, TIGRIS_MEM_ERR_BAD_INDEX, "non-4D tensor rejected");
+    TEST_ASSERT_EQ(e_ndim, TIGRIS_MEM_ERR_BAD_INDEX, "rank-2 tensor rejected");
 
     /* h0 < 0 */
     tigris_mem_error_t e_h0_neg = tigris_mem_spill_tile_2d(&mem, &plan, T2D_TIDX,
@@ -1616,6 +1681,7 @@ int main(void)
     test_load_tile_2d_rejects_bad_bounds();
     test_load_tile_1d_rejects_bad_bounds();
     test_spill_tile_2d_rejects_bad_bounds();
+    test_tile_2d_rank3_rectangle_round_trip();
 
     test_conv_2d_tile_matches_subregion_f32();
     test_conv_2d_tile_edge_f32();

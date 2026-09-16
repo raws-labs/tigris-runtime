@@ -1193,7 +1193,27 @@ tigris_error_t tigris_plan_load(
                  * with a strided Conv1D can expose different length
                  * resolutions. Rank-4 stages retain the existing audited
                  * height contract and are checked again by the executor. */
-                if (rank == 3) {
+                if (stage->ops_count == 1 &&
+                    candidate.ops[
+                        candidate.index_pool[stage->ops_off]
+                    ].op_type == TIGRIS_OP_TRANSPOSE) {
+                    /* A layout conversion is tiled along its output rows,
+                     * gathering the input columns each band transposes. Only
+                     * the rank-3 last-two-axis permutation is executable that
+                     * way, and only as the whole stage. */
+                    uint16_t conv_op = candidate.index_pool[stage->ops_off];
+                    uint8_t perm_rank = 0;
+                    const uint8_t *perm = tigris_op_attribute_data(
+                        &candidate, conv_op,
+                        TIGRIS_OP_ATTR_TRANSPOSE_PERM, &perm_rank);
+                    if (rank != 3 ||
+                        stage->inputs_count != 1 ||
+                        stage->outputs_count != 1 ||
+                        stage->chain_len != 0 ||
+                        !perm || perm_rank != 3u ||
+                        perm[0] != 0u || perm[1] != 2u || perm[2] != 1u)
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                } else if (rank == 3) {
                     uint16_t conv_count = 0;
                     uint16_t binary_count = 0;
                     if (hdr->version < TIGRIS_SCHEMA_VERSION_TILE_AXIS ||

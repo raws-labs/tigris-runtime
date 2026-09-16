@@ -64,6 +64,11 @@ typedef struct {
     void    *reduce_acc;
     uint8_t  reduce_first;
     uint8_t  reduce_last;
+    /* A layout conversion tiled along its output rows. The kernel is handed a
+     * packed [N, in_h, in_w] input gathered from a column range and writes a
+     * packed [N, out_h, out_w] output, so it walks the tile extents above
+     * rather than the tensor's own. Zero on every other path. */
+    uint8_t  transposed_tile;
 } tigris_tile_ctx_t;
 
 /* Tensor alignment */

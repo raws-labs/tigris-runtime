@@ -1104,6 +1104,29 @@ int tigris_transpose_execute(
         return -1;
     uint32_t element_size = input->size_bytes / elements;
 
+    /* A conversion stage tiled along its output rows hands this kernel a
+     * packed [N, in_h, in_w] slice of the input and expects a packed
+     * [N, out_h, out_w] slice of the output. The walk below then runs on the
+     * tile extents while the element size stays the tensor's. Only the rank-3
+     * last-two-axis case is routed here, so the extents are fixed. */
+    int32_t tiled_in[3];
+    int32_t tiled_out[3];
+    if (mem->tile.active && mem->tile.transposed_tile) {
+        if (rank != 3 || mem->tile.in_h <= 0 || mem->tile.in_w <= 0 ||
+            mem->tile.out_h <= 0 || mem->tile.out_w <= 0)
+            return -1;
+        tiled_in[0] = input_shape[0];
+        tiled_in[1] = mem->tile.in_h;
+        tiled_in[2] = mem->tile.in_w;
+        tiled_out[0] = output_shape[0];
+        tiled_out[1] = mem->tile.out_h;
+        tiled_out[2] = mem->tile.out_w;
+        input_shape = tiled_in;
+        output_shape = tiled_out;
+        elements = (uint32_t)tiled_out[0] * (uint32_t)tiled_out[1] *
+                   (uint32_t)tiled_out[2];
+    }
+
     for (uint32_t output_index = 0; output_index < elements; output_index++) {
         uint32_t remainder = output_index;
         uint32_t input_index = 0;

@@ -1371,6 +1371,189 @@ static const tigris_weight_block_t *find_weight_block(
     return NULL;
 }
 
+/* Input-driven tiled execution */
+
+/**
+ * Whether a stage is a standalone global reduction that the output-driven
+ * tile loop cannot serve.
+ *
+ * exec_stage_tiled sizes its tiles from the stage output height. A global
+ * reduction collapses that height to 1, so it yields one tile holding the
+ * whole input and tiles nothing. Such a stage is walked along its input
+ * instead, a band of rows at a time, with the kernel carrying a running
+ * partial between bands. Deliberately narrow: one op consuming the stage
+ * input and producing the stage output, so nothing else has to stay resident
+ * across bands.
+ */
+static int stage_is_input_driven_reduction(
+    const tigris_plan_t *plan, const tigris_stage_t *stage)
+{
+    if (stage->ops_count != 1 || stage->inputs_count != 1 ||
+        stage->outputs_count != 1)
+        return 0;
+
+    uint16_t op_idx = tigris_stage_ops(plan, stage)[0];
+    const tigris_op_t *op = &plan->ops[op_idx];
+    if (op->op_type != TIGRIS_OP_GLOBAL_AVG)
+        return 0;
+    if (op->num_inputs != 1 || op->num_outputs != 1)
+        return 0;
+
+    uint16_t in_idx = tigris_stage_inputs(plan, stage)[0];
+    uint16_t out_idx = tigris_stage_outputs(plan, stage)[0];
+    if (tigris_op_inputs(plan, op)[0] != in_idx ||
+        tigris_op_outputs(plan, op)[0] != out_idx)
+        return 0;
+
+    const tigris_tensor_t *in = &plan->tensors[in_idx];
+    const tigris_tensor_t *out = &plan->tensors[out_idx];
+    if (in->ndim != 4 || out->ndim != 4)
+        return 0;
+
+    const int32_t *in_shape = tigris_tensor_shape(plan, in);
+    const int32_t *out_shape = tigris_tensor_shape(plan, out);
+    return in_shape[0] > 0 && in_shape[1] > 1 &&
+           in_shape[2] > 0 && in_shape[3] > 0 &&
+           out_shape[0] == in_shape[0] && out_shape[1] == 1 &&
+           out_shape[2] == 1 && out_shape[3] == in_shape[3];
+}
+
+/**
+ * Execute a standalone global reduction by walking bands of its input.
+ *
+ * Each band loads a range of input rows into the fast arena and calls the
+ * kernel with a running accumulator, one value per (batch, channel), held
+ * below the arena's reset point so it survives between bands. The kernel
+ * writes the output tensor on the last band only, at which point the whole
+ * reduction has been folded in, so the result is the byte the untiled kernel
+ * produces. Marked TIGRIS_NOINLINE to keep the inlined dispatcher within its
+ * per-frame stack budget.
+ */
+static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_by_input(
+    const tigris_plan_t      *plan,
+    const tigris_stage_t     *stage,
+    tigris_mem_t             *mem,
+    tigris_kernel_fn          kernel,
+    void                     *user_ctx)
+{
+    uint16_t in_idx = tigris_stage_inputs(plan, stage)[0];
+    uint16_t out_idx = tigris_stage_outputs(plan, stage)[0];
+    uint16_t op_idx = tigris_stage_ops(plan, stage)[0];
+    const tigris_op_t *op = &plan->ops[op_idx];
+
+    const int32_t *in_shape =
+        tigris_tensor_shape(plan, &plan->tensors[in_idx]);
+    int32_t full_in_h = in_shape[1];
+    int32_t full_in_w = in_shape[2];
+
+    void *in_slow_base = mem->tensor_ptrs[in_idx];
+    if (!in_slow_base)
+        return TIGRIS_EXEC_ERR_MEM;
+
+    /* The assembled output lives in slow and is written on the last band. */
+    if (tigris_mem_alloc_slow(mem, out_idx,
+                              plan->tensors[out_idx].size_bytes)
+            != TIGRIS_MEM_OK)
+        return TIGRIS_EXEC_ERR_MEM;
+    void *out_slow_base = mem->tensor_ptrs[out_idx];
+
+    /* One partial per (batch, channel): int32 for the int8 kernels, float
+     * for the float32 ones, four bytes either way. Raising fast_reserved
+     * over it keeps the per-band reset from reclaiming it. */
+    uint64_t acc_elems = (uint64_t)in_shape[0] * (uint32_t)in_shape[3];
+    uint32_t acc_bytes;
+    if (acc_elems == 0 || acc_elems > UINT32_MAX / 4u ||
+        !align_tensor_size((uint32_t)acc_elems * 4u, &acc_bytes))
+        return TIGRIS_EXEC_ERR_TILE;
+    if (mem->fast_used > mem->fast_size ||
+        acc_bytes > mem->fast_size - mem->fast_used)
+        return TIGRIS_EXEC_ERR_MEM;
+
+    const uint32_t entry_reserved = mem->fast_reserved;
+    void *acc = mem->fast_base + mem->fast_used;
+    mem->fast_used += acc_bytes;
+    tigris_mem_note_fast_peak(mem);
+    mem->fast_reserved = mem->fast_used;
+
+    /* Largest band whose rows plus the output tensor fit what is left. */
+    uint32_t available = mem->fast_size - mem->fast_reserved;
+    uint32_t out_bytes;
+    int32_t band = 0;
+    if (tile2d_allocation_bytes(plan, out_idx, 1, 1, &out_bytes)) {
+        int32_t low = 1;
+        int32_t high = full_in_h;
+        while (low <= high) {
+            int32_t candidate = low + (high - low) / 2;
+            uint32_t in_bytes;
+            if (!tile2d_allocation_bytes(plan, in_idx, candidate,
+                                         full_in_w, &in_bytes)) {
+                band = 0;
+                break;
+            }
+            if ((uint64_t)in_bytes + out_bytes <= available) {
+                band = candidate;
+                low = candidate + 1;
+            } else {
+                high = candidate - 1;
+            }
+        }
+    }
+    if (band == 0) {
+        mem->fast_reserved = entry_reserved;
+        tigris_mem_reset_fast(mem);
+        return TIGRIS_EXEC_ERR_TILE;
+    }
+
+    tigris_exec_error_t result = TIGRIS_EXEC_OK;
+    for (int32_t start = 0; start < full_in_h; start += band) {
+        int32_t end = full_in_h - start < band ? full_in_h : start + band;
+
+        mem->tile.active = 1;
+        mem->tile.in_h = end - start;
+        mem->tile.out_h = 1;
+        mem->tile.in_w = full_in_w;
+        mem->tile.out_w = 1;
+        mem->tile.reduce_acc = acc;
+        mem->tile.reduce_first = (start == 0) ? 1u : 0u;
+        mem->tile.reduce_last = (end == full_in_h) ? 1u : 0u;
+
+        mem->tensor_ptrs[in_idx] = in_slow_base;
+        if (tigris_mem_load_tile(mem, plan, in_idx, start, end)
+                != TIGRIS_MEM_OK) {
+            result = TIGRIS_EXEC_ERR_MEM;
+            break;
+        }
+        if (tigris_mem_alloc_fast(mem, out_idx,
+                                  plan->tensors[out_idx].size_bytes)
+                != TIGRIS_MEM_OK) {
+            result = TIGRIS_EXEC_ERR_MEM;
+            break;
+        }
+
+        if (kernel(plan, op, op_idx, mem, user_ctx) != 0) {
+            result = TIGRIS_EXEC_ERR_KERNEL;
+            break;
+        }
+
+        if (mem->tile.reduce_last &&
+            tigris_mem_spill_tile(mem, plan, out_idx, out_slow_base, 0, 1)
+                != TIGRIS_MEM_OK) {
+            result = TIGRIS_EXEC_ERR_MEM;
+            break;
+        }
+
+        tigris_mem_reset_fast(mem);
+        TIGRIS_PLATFORM_FEED_WDT();
+    }
+
+    memset(&mem->tile, 0, sizeof(mem->tile));
+    mem->fast_reserved = entry_reserved;
+    tigris_mem_reset_fast(mem);
+    mem->tensor_ptrs[in_idx] = in_slow_base;
+    mem->tensor_ptrs[out_idx] = out_slow_base;
+    return result;
+}
+
 /* Chained tiled execution */
 
 /**
@@ -2322,9 +2505,16 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
              * a tile plan, unsupported stages retain ordinary full-tensor
              * execution and may use slow overflow. */
             uint8_t tile_axis = stage_tile_axis(run_plan, stage);
+            /* A global reduction has no output axis to tile, so it is walked
+             * along its input instead. Accepted here beside the stripe
+             * contract, not inside it: the stripe kernels propagate a height
+             * this stage collapses. */
+            int input_driven =
+                stage_is_input_driven_reduction(run_plan, stage);
             int axis1_tileable =
-                common_tile_rank &&
-                stage_supports_axis1_tiling(run_plan, stage, rank);
+                input_driven ||
+                (common_tile_rank &&
+                 stage_supports_axis1_tiling(run_plan, stage, rank));
             int needs_tiling =
                 common_tile_rank &&
                 total_io > (mem->fast_size - mem->fast_reserved);
@@ -2344,6 +2534,8 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
                  !run_plan->tile_plans[stage->tile_plan_idx].tileable ||
                  (tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH &&
                   tile_axis != TIGRIS_TILE_AXIS_HW) ||
+                 (input_driven &&
+                  tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) ||
                  !axis1_tileable)) {
                 result = TIGRIS_EXEC_ERR_TILE;
                 goto restore_fast_arena;
@@ -2356,16 +2548,32 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
             /* Standalone 2D (HW) tiling. Checked before the height-only path
              * because a rank-4 stage otherwise satisfies may_tile and would be
              * misrouted to exec_stage_tiled. */
-            int may_tile_2d = needs_tiling && is_hw_axis && axis1_tileable;
+            int may_tile_2d =
+                needs_tiling && is_hw_axis && axis1_tileable && !input_driven;
+            int may_tile_by_input =
+                needs_tiling && input_driven &&
+                tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
 
             int may_tile =
-                axis1_tileable &&
+                axis1_tileable && !input_driven &&
                 (rank == 4 ||
                  (run_plan->header->version >=
                       TIGRIS_SCHEMA_VERSION_TILE_AXIS &&
                   tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH));
 
-            if (may_tile_2d) {
+            if (may_tile_by_input) {
+                tigris_exec_error_t err = exec_stage_tiled_by_input(
+                    run_plan, stage, mem, kernel, user_ctx);
+                if (err != TIGRIS_EXEC_OK) {
+                    TIGRIS_PLATFORM_DBG("S%u reduce ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
+                        s, (int)err, (unsigned long)total_io,
+                        (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
+                        (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
+                    result = err;
+                    goto restore_fast_arena;
+                }
+                if (stats) stats->stages_tiled++;
+            } else if (may_tile_2d) {
                 tigris_exec_error_t err = exec_stage_tiled_2d(
                     run_plan, stage, mem, kernel, user_ctx, workspace);
                 if (err != TIGRIS_EXEC_OK) {

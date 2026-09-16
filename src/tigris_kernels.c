@@ -687,14 +687,26 @@ static int kern_global_avg_pool(
     int C  = x_shape[3];
     int HW = H * W;
 
+    /* A band of rows while the executor walks the input, the whole tensor
+     * otherwise. The divisor stays the full HW either way, and the band sums
+     * add into the accumulator in the same order as the single-pass loop, so
+     * both produce the same float. */
+    float *acc = (float *)mem->tile.reduce_acc;
+    int rows = (mem->tile.active && mem->tile.in_h > 0) ? mem->tile.in_h : H;
+
     /* Output: [N, 1, 1, C] in NHWC */
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
-            float sum = 0.0f;
-            for (int h = 0; h < H; h++) {
+            float sum = (acc && !mem->tile.reduce_first) ? acc[n * C + c] : 0.0f;
+            for (int h = 0; h < rows; h++) {
                 for (int w = 0; w < W; w++) {
-                    sum += X[((n * H + h) * W + w) * C + c];
+                    sum += X[((n * rows + h) * W + w) * C + c];
                 }
+            }
+            if (acc) {
+                acc[n * C + c] = sum;
+                if (!mem->tile.reduce_last)
+                    continue;
             }
             Y[n * C + c] = sum / (float)HW;
         }

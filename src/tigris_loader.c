@@ -1214,6 +1214,23 @@ tigris_error_t tigris_plan_load(
                     if (conv_count > 1 ||
                         (conv_count == 1 && binary_count > 0))
                         return TIGRIS_ERR_BAD_OPERATOR;
+                } else if (stage->ops_count == 1 &&
+                           candidate.ops[
+                               candidate.index_pool[stage->ops_off]
+                           ].op_type == TIGRIS_OP_GLOBAL_AVG) {
+                    /* A global reduction collapses the height the stripe
+                     * contract propagates, so the executor walks its input
+                     * instead. Permitted only as the whole stage and only
+                     * when the output really is collapsed: with anything
+                     * else present there would be a height to carry. */
+                    const int32_t *out_shape = tigris_tensor_shape(
+                        &candidate, &candidate.tensors[first_output]);
+                    if (stage->inputs_count != 1 ||
+                        stage->outputs_count != 1 ||
+                        stage->chain_len != 0 ||
+                        rank != 4 ||
+                        out_shape[1] != 1 || out_shape[2] != 1)
+                        return TIGRIS_ERR_BAD_OPERATOR;
                 } else {
                     uint16_t spatial_count = 0;
                     for (uint16_t j = 0; j < stage->ops_count; j++) {

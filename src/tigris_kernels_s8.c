@@ -803,15 +803,28 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
     compute_mean_quant_mult(
         (double)in_scale / (double)out_scale, HW, &mult, &shift0);
 
+    /* A band of rows while the executor walks the input, the whole tensor
+     * otherwise. Only the raw int32 sum is split: the zero-point subtraction
+     * and the requantization still run once over the full HW, so a banded
+     * reduction yields the same byte as a single pass. */
+    int32_t *acc = (int32_t *)mem->tile.reduce_acc;
+    int rows = (mem->tile.active && mem->tile.in_h > 0) ? mem->tile.in_h : H;
+    int band = rows * W;
+
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
             /* Walk the channel with a stride-C pointer - no per-element index
              * arithmetic. temp_sum = Σ raw x (TFLite subtracts the zp after). */
-            const int8_t *xp = X + (size_t)(n * HW) * C + c;
-            int32_t sum = 0;
-            for (int p = 0; p < HW; p++) {
+            const int8_t *xp = X + (size_t)(n * band) * C + c;
+            int32_t sum = (acc && !mem->tile.reduce_first) ? acc[n * C + c] : 0;
+            for (int p = 0; p < band; p++) {
                 sum += *xp;
                 xp += C;
+            }
+            if (acc) {
+                acc[n * C + c] = sum;
+                if (!mem->tile.reduce_last)
+                    continue;
             }
             int32_t shifted = sum - input_zp * HW;
             int32_t q = multiply_by_quantized_multiplier(shifted, mult, shift0) + output_zp;

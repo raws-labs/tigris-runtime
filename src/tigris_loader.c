@@ -1538,6 +1538,7 @@ tigris_error_t tigris_plan_load(
                                     * is_height_tiling_op. */
                                    type != TIGRIS_OP_SOFTMAX &&
                                    type != TIGRIS_OP_ADD &&
+                                   type != TIGRIS_OP_SUB &&
                                    type != TIGRIS_OP_MUL &&
                                    type != TIGRIS_OP_CONCAT) {
                             return TIGRIS_ERR_BAD_OPERATOR;

@@ -559,13 +559,20 @@ static int kern_softmax(
         for (uint32_t c = 1; c < classes; c++)
             if (x[c] > maximum) maximum = x[c];
 
+        /* Keep each exponential rather than evaluating it again to
+         * normalize. The value, the summation order and the division are
+         * unchanged; only the second call to expf goes. Writing into y as we
+         * read x is safe in place, since each index is read before it is
+         * written and the maximum is already known. */
         float sum = 0.0f;
-        for (uint32_t c = 0; c < classes; c++)
-            sum += expf(x[c] - maximum);
+        for (uint32_t c = 0; c < classes; c++) {
+            y[c] = expf(x[c] - maximum);
+            sum += y[c];
+        }
         if (sum == 0.0f)
             return -1;
         for (uint32_t c = 0; c < classes; c++)
-            y[c] = expf(x[c] - maximum) / sum;
+            y[c] = y[c] / sum;
     }
     return 0;
 }

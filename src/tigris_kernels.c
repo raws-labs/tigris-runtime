@@ -536,9 +536,18 @@ static int kern_conv1d(
     return 0;
 }
 
+/* Elementwise binary operations. Add and Mul commute, so a constant operand can
+ * be applied from either side; Sub and Div do not, and the wire format records
+ * only that an operand is constant, not which side it was on. Those two
+ * therefore take two tensor operands and fail closed on the constant form. */
+#define BINARY_ADD 0
+#define BINARY_MUL 1
+#define BINARY_SUB 2
+#define BINARY_DIV 3
+
 static int kern_binary_f32(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem,
-    int multiply)
+    int operation)
 {
     if (!plan || !op || !mem || !plan->header || !plan->tensors ||
         !plan->index_pool || !plan->shape_pool || !mem->tensor_ptrs ||
@@ -572,6 +581,10 @@ static int kern_binary_f32(
     const float *dynamic_b = NULL;
     const uint8_t *constant_b = NULL;
     uint32_t constant_count = 0;
+    const int commutes = (operation == BINARY_ADD || operation == BINARY_MUL);
+
+    if (op->num_inputs != 2 && !commutes)
+        return -1;
 
     if (op->num_inputs == 2) {
         /* Dynamic elementwise Add/Mul supports exact-shape operands only. */
@@ -628,7 +641,13 @@ static int kern_binary_f32(
         float b = dynamic_b
             ? dynamic_b[i]
             : load_weight_f32(constant_b, constant_count == 1 ? 0 : i);
-        float v = multiply ? A[i] * b : A[i] + b;
+        float v;
+        switch (operation) {
+        case BINARY_MUL: v = A[i] * b; break;
+        case BINARY_SUB: v = A[i] - b; break;
+        case BINARY_DIV: v = A[i] / b; break;
+        default:         v = A[i] + b; break;
+        }
         Y[i] = apply_fused_act_f32(v, op->fused_act);
     }
     return 0;
@@ -637,13 +656,19 @@ static int kern_binary_f32(
 static int kern_mul(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
-    return kern_binary_f32(plan, op, mem, 1);
+    return kern_binary_f32(plan, op, mem, BINARY_MUL);
 }
 
 static int kern_add(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
-    return kern_binary_f32(plan, op, mem, 0);
+    return kern_binary_f32(plan, op, mem, BINARY_ADD);
+}
+
+static int kern_sub(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    return kern_binary_f32(plan, op, mem, BINARY_SUB);
 }
 
 static int kern_global_avg_pool(
@@ -755,6 +780,40 @@ static int kern_matmul(
                     sum += a[m * K + k] * w[k * N + n];
                 y[m * N + n] = sum;
             }
+        }
+    }
+    return 0;
+}
+
+/* GlobalMaxPool: the maximum over every spatial position, per channel. The
+ * counterpart of GlobalAveragePool, and like MaxPool it needs no requantization
+ * because a maximum is one of the input values. */
+static int kern_global_max_pool(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (!X || !Y)
+        return -1;
+
+    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    int N = x_shape[0];
+    int H = x_shape[1];
+    int W = x_shape[2];
+    int C = x_shape[3];
+
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            float best = X[(n * H * W) * C + c];
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    float v = X[((n * H + h) * W + w) * C + c];
+                    if (v > best) best = v;
+                }
+            }
+            Y[n * C + c] = best;
         }
     }
     return 0;
@@ -1087,6 +1146,8 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_AVG_POOL:    return kern_avg_pool(plan, op, mem);
     case TIGRIS_OP_CONCAT:      return kern_concat(plan, op, mem);
     case TIGRIS_OP_RESIZE:      return kern_resize_nearest(plan, op, mem);
+    case TIGRIS_OP_SUB:         return kern_sub(plan, op, mem);
+    case TIGRIS_OP_GLOBAL_MAX: return kern_global_max_pool(plan, op, mem);
     case TIGRIS_OP_MATMUL:      return kern_matmul(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     default:

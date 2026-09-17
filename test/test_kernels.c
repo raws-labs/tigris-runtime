@@ -934,7 +934,139 @@ static void test_add(void)
         TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "add output");
 }
 
+static void test_sub(void)
+{
+    printf("  test_sub...\n");
+
+    /* Sub does not commute, so the operand order is what this checks: a
+     * swapped pair would give the negated result. */
+    float A[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float B[4] = {10.0f, 20.0f, 30.0f, 40.0f};
+    float expected[4] = {-9.0f, -18.0f, -27.0f, -36.0f};
+    int32_t shape[] = {1, 2, 2, 1};
+
+    tigris_tensor_t tensors[3];
+    memset(tensors, 0, sizeof(tensors));
+    for (int i = 0; i < 3; i++) {
+        tensors[i].shape_off = 0; tensors[i].ndim = 4;
+        tensors[i].size_bytes = sizeof(A); tensors[i].dtype = 1;
+    }
+
+    uint16_t index_pool[3] = {0, 1, 2};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_SUB;
+    op.num_inputs = 2; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 2;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 3; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape;
+    plan.strings = g_strings;
+
+    void *ptrs[3];
+    float out_buf[4];
+    ptrs[0] = A; ptrs[1] = B; ptrs[2] = out_buf;
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 3;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "dispatch returns 0");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "sub output");
+
+    /* The constant form carries no operand side, so it must fail closed. */
+    op.num_inputs = 1;
+    op.weight_idx = 0;
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0,
+                "constant-operand Sub is refused");
+}
+
 /* GlobalAvgPool test */
+
+static void test_global_max_pool(void)
+{
+    printf("  test_global_max_pool...\n");
+
+    /* NHWC: 1x3x3x2 -> 1x1x1x2, the same layout test_global_avg_pool uses.
+     * Channel 0 holds 1..9 and channel 1 holds 10..18, so the maxima are the
+     * last value of each channel and a per-channel mix-up would show. */
+    int32_t x_shape[] = {1, 3, 3, 2};
+    int32_t y_shape[] = {1, 1, 1, 2};
+
+    float X[18];
+    for (int h = 0; h < 3; h++) {
+        for (int w = 0; w < 3; w++) {
+            X[(h * 3 + w) * 2 + 0] = (float)(h * 3 + w + 1);
+            X[(h * 3 + w) * 2 + 1] = (float)(h * 3 + w + 10);
+        }
+    }
+    /* A negative in channel 0 must not become the maximum. */
+    X[0] = -42.0f;
+    float expected[2] = {9.0f, 18.0f};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4;
+    tensors[0].size_bytes = sizeof(X); tensors[0].dtype = 1;
+    tensors[1].shape_off = 4; tensors[1].ndim = 4;
+    tensors[1].size_bytes = sizeof(expected); tensors[1].dtype = 1;
+
+    int32_t shape_pool[8];
+    memcpy(shape_pool, x_shape, sizeof(x_shape));
+    memcpy(shape_pool + 4, y_shape, sizeof(y_shape));
+
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_GLOBAL_MAX;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+
+    void *ptrs[2];
+    float out_buf[2];
+    ptrs[0] = X; ptrs[1] = out_buf;
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    int ret = tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+    TEST_ASSERT(ret == 0, "dispatch returns 0");
+    for (int i = 0; i < 2; i++)
+        TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "global_max_pool output");
+}
 
 static void test_global_avg_pool(void)
 {
@@ -1883,7 +2015,9 @@ int main(void)
     test_relu();
     test_relu6();
     test_add();
+    test_sub();
     test_global_avg_pool();
+    test_global_max_pool();
     test_avg_pool();
     test_fully_connected();
     test_reshape();

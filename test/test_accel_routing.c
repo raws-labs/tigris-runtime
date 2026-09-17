@@ -185,6 +185,22 @@ static int run_pre_route_rolled(const route_fixture_t *fx,
         backend, &fx->plan, &fx->op, 0, &mem, NULL, handled);
 }
 
+/* Route a row-banded op. Only row_tiled is set, so the test isolates that
+ * branch of the guard. */
+static int run_pre_route_row_tiled(const route_fixture_t *fx,
+                                   tigris_accel_backend_t backend,
+                                   int8_t *output, int *handled)
+{
+    tigris_mem_t mem;
+    void *ptrs[2];
+    init_mem(&mem, ptrs, output, fx, 1);
+    mem.tile.row_tiled = 1;
+    mem.tile.out_h = 1;
+    mem.tile.in_h = 1;
+    return tigris_accel_try_s8_ref(
+        backend, &fx->plan, &fx->op, 0, &mem, NULL, handled);
+}
+
 /* Route a 2D (width) tiled op. Only width_tiled is set here; row offsets stay
  * zero so the test isolates the width_tiled branch of the guard. */
 static int run_pre_route_width_tiled(const route_fixture_t *fx,
@@ -496,6 +512,44 @@ static void test_width_tiled_routing(void)
     TEST_ASSERT_EQ(handled, 1, "2D-tiled max-pool still routes ESP to s8_ref");
 }
 
+/* A row band says how many rows the buffer holds in mem->tile, not in the
+ * tensor shape. The vendor FullyConnected kernels read the row count from the
+ * tensor, so they would read and write the whole matrix through a band-sized
+ * allocation. Every backend must route a row band to the reference kernel,
+ * which honors it. */
+static void test_row_banded_ops_route_to_reference(void)
+{
+    printf("  test_row_banded_ops_route_to_reference...\n");
+
+    route_fixture_t fx;
+    int8_t out[8];
+    int handled;
+
+    build_fixture(&fx, TIGRIS_OP_FULLY_CONN, 0);
+    memset(out, 0, sizeof(out));
+    handled = 0;
+    run_pre_route_row_tiled(&fx, TIGRIS_ACCEL_CMSIS_NN, out, &handled);
+    TEST_ASSERT_EQ(handled, 1,
+                   "a row-banded fully-connected routes CMSIS to s8_ref");
+
+    memset(out, 0, sizeof(out));
+    handled = 0;
+    run_pre_route_row_tiled(&fx, TIGRIS_ACCEL_ESP_NN, out, &handled);
+    TEST_ASSERT_EQ(handled, 1,
+                   "a row-banded fully-connected routes ESP to s8_ref");
+
+    /* Conv is not a row-banding operator, but the guard is on the tile mode
+     * rather than the operator, so it routes too rather than relying on the
+     * compiler never to emit it. */
+    build_fixture(&fx, TIGRIS_OP_CONV, 0);
+    fx.op.spatial.dilation_h = 1;
+    fx.op.spatial.dilation_w = 1;
+    memset(out, 0, sizeof(out));
+    handled = 0;
+    run_pre_route_row_tiled(&fx, TIGRIS_ACCEL_CMSIS_NN, out, &handled);
+    TEST_ASSERT_EQ(handled, 1, "a row band routes whatever the operator");
+}
+
 /* 1.5a: a plain-height tile (tile.active, no roll offset, not width_tiled) with
  * unit dilation now runs on the CMSIS-NN Conv/Depthwise adapter, matching what
  * the ESP-NN adapter already does. Dilated, rolled, and 2D-width tiles still
@@ -549,6 +603,7 @@ int main(void)
     test_unit_dilation_keeps_esp_adapter();
     test_rolled_tile_routing();
     test_width_tiled_routing();
+    test_row_banded_ops_route_to_reference();
     test_esp_asymmetric_pad_workspace_policy();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

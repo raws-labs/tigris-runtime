@@ -1770,6 +1770,17 @@ int tigris_accel_try_s8_ref(
             plan, op, op_index, mem, user_ctx);
     }
 
+    /* A row band hands the kernel a buffer holding only the band's rows, and
+     * says so in mem->tile.out_h rather than in the tensor shape. The vendor
+     * FullyConnected kernels take their row count from the output tensor, so
+     * they would read and write the whole matrix into a band-sized allocation.
+     * The s8 reference kernel honors the band, so route there. */
+    if (mem->tile.active && mem->tile.row_tiled) {
+        *handled = 1;
+        return tigris_dispatch_kernel_s8(
+            plan, op, op_index, mem, user_ctx);
+    }
+
     /* Line-buffered chains roll overlap rows across tiles by setting
      * mem->tile.out_row_start / in_row_start (see exec_chain_tiled). The
      * ESP-NN/CMSIS-NN Conv/Depthwise adapters honor the roll natively - they

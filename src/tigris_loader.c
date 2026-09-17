@@ -113,7 +113,9 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_RELU6 ||
            type == TIGRIS_OP_SIGMOID ||
            type == TIGRIS_OP_TANH ||
-           type == TIGRIS_OP_SOFTMAX;
+           type == TIGRIS_OP_SOFTMAX ||
+           type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_LAYER_NORM;
 }
 
 static int is_axis1_binary_pointwise_op(uint8_t type)
@@ -1423,6 +1425,11 @@ tigris_error_t tigris_plan_load(
                                    type != TIGRIS_OP_RELU6 &&
                                    type != TIGRIS_OP_SIGMOID &&
                                    type != TIGRIS_OP_TANH &&
+                                   /* Elementwise, and a normalization whose
+                                    * reduced axis both tile axes are ahead
+                                    * of: shape-preserving and halo-free. */
+                                   type != TIGRIS_OP_ERF &&
+                                   type != TIGRIS_OP_LAYER_NORM &&
                                    /* Softmax normalizes along the final
                                     * stored dimension, which a height stripe
                                     * never cuts, so it belongs beside the

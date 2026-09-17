@@ -29,10 +29,11 @@ extern "C" {
 
 #define TIGRIS_MAGIC           0x53524754  /* "TGRS" in little-endian */
 #define TIGRIS_MAGIC_BYTES     "TGRS"
+#define TIGRIS_SCHEMA_VERSION_V8 8
 #define TIGRIS_SCHEMA_VERSION_V7 7
 #define TIGRIS_SCHEMA_VERSION_V6 6
 #define TIGRIS_SCHEMA_VERSION_V5 5
-#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V7
+#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V8
 #define TIGRIS_SCHEMA_VERSION_V4 4
 #define TIGRIS_SCHEMA_VERSION_V3 3
 #define TIGRIS_SCHEMA_VERSION_V2 2
@@ -64,8 +65,17 @@ extern "C" {
 #define TIGRIS_SEC_OP_ATTRIBUTES  11
 #define TIGRIS_SEC_MAX            12  /* one past the last valid section */
 
-/* Typed payloads stored in TIGRIS_SEC_OP_ATTRIBUTES. */
-#define TIGRIS_OP_ATTR_TRANSPOSE_PERM 1
+/* Typed payloads stored in TIGRIS_SEC_OP_ATTRIBUTES. The loader refuses a kind
+ * it does not know, so the whole set is declared at the schema version that
+ * introduces the mechanism for them rather than one kind per version. Payloads
+ * are little-endian and their length is the record's data_len. */
+#define TIGRIS_OP_ATTR_TRANSPOSE_PERM 1  /* uint8[rank], axis permutation */
+#define TIGRIS_OP_ATTR_EPSILON        2  /* float32, variance floor */
+#define TIGRIS_OP_ATTR_ALPHA          3  /* float32, negative slope */
+#define TIGRIS_OP_ATTR_CLIP_BOUNDS    4  /* float32[2], lower then upper */
+#define TIGRIS_OP_ATTR_PADS           5  /* int32[2*rank], leading, trailing */
+#define TIGRIS_OP_ATTR_AXES           6  /* uint8[n], axes a reduction takes */
+#define TIGRIS_OP_ATTR_MAX            6
 
 /* Compression types */
 #define TIGRIS_COMPRESS_NONE  0
@@ -120,6 +130,8 @@ typedef enum {
     TIGRIS_OP_RESIZE            = 30,
     TIGRIS_OP_GLOBAL_MAX        = 31,
     TIGRIS_OP_CONV1D            = 32,
+    TIGRIS_OP_LAYER_NORM        = 33,
+    TIGRIS_OP_ERF               = 34,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

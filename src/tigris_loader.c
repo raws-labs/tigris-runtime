@@ -113,13 +113,35 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_RELU6 ||
            type == TIGRIS_OP_SIGMOID ||
            type == TIGRIS_OP_TANH ||
-           type == TIGRIS_OP_SOFTMAX;
+           type == TIGRIS_OP_SOFTMAX ||
+           type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_LAYER_NORM;
 }
 
 static int is_axis1_binary_pointwise_op(uint8_t type)
 {
     return type == TIGRIS_OP_ADD || type == TIGRIS_OP_SUB ||
            type == TIGRIS_OP_MUL;
+}
+
+/**
+ * Whether an attribute kind belongs to this operator.
+ *
+ * Schema 8 declares every kind at once so the operators behind them can land
+ * one at a time, and this is what keeps that from loosening the format: a
+ * payload is only accepted on the operator that will read it.
+ */
+static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
+{
+    switch (kind) {
+    case TIGRIS_OP_ATTR_TRANSPOSE_PERM: return op_type == TIGRIS_OP_TRANSPOSE;
+    case TIGRIS_OP_ATTR_EPSILON:        return op_type == TIGRIS_OP_LAYER_NORM;
+    case TIGRIS_OP_ATTR_ALPHA:          return op_type == TIGRIS_OP_LEAKY_RELU;
+    case TIGRIS_OP_ATTR_CLIP_BOUNDS:    return op_type == TIGRIS_OP_CLIP;
+    case TIGRIS_OP_ATTR_PADS:           return op_type == TIGRIS_OP_PAD;
+    case TIGRIS_OP_ATTR_AXES:           return op_type == TIGRIS_OP_REDUCE_MEAN;
+    default:                            return 0;
+    }
 }
 
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
@@ -284,6 +306,36 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 input->size_bytes != output->size_bytes)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
+
+        case TIGRIS_OP_ERF:
+            if (!op_has_plain_io(op, 1, 1) ||
+                input->ndim != output->ndim ||
+                input->size_bytes != output->size_bytes)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+
+        case TIGRIS_OP_LAYER_NORM: {
+            /* One activation in and out, shape-preserving. Scale is a weight
+             * and bias an optional one, each holding one value per position
+             * along the axis the kernel normalizes, which is the last stored
+             * one. */
+            if (op->num_inputs != 1u || op->num_outputs != 1u ||
+                input->ndim == 0u || input->ndim != output->ndim ||
+                input->size_bytes != output->size_bytes ||
+                op->weight_idx == TIGRIS_NO_WEIGHT)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *shape = tigris_tensor_shape(plan, input);
+            int32_t width = shape[input->ndim - 1u];
+            if (width <= 0)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            uint32_t need = (uint32_t)width * (uint32_t)sizeof(float);
+            if (plan->weight_entries[op->weight_idx].size_bytes != need)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            if (op->bias_idx != TIGRIS_NO_WEIGHT &&
+                plan->weight_entries[op->bias_idx].size_bytes != need)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
 
         case TIGRIS_OP_MATMUL: {
             /* Both operands are activations, so neither is a weight entry.
@@ -956,29 +1008,115 @@ tigris_error_t tigris_plan_load(
                 !bounds_ok(attr->data_offset, attr->data_len, attrs_data_len))
                 return TIGRIS_ERR_BAD_SECTION;
             const tigris_op_t *op = &candidate.ops[attr->op_index];
-            if (attr->type != TIGRIS_OP_ATTR_TRANSPOSE_PERM ||
-                op->op_type != TIGRIS_OP_TRANSPOSE ||
-                op->num_inputs != 1 || op->num_outputs != 1)
+            /* Every kind a schema-8 plan may carry is validated here whether
+             * or not an operator consumes it yet, so an operator behind one
+             * of them lands without a further version. A kind this build does
+             * not know still fails closed, in the default arm. */
+            if (attr->type > TIGRIS_OP_ATTR_TRANSPOSE_PERM &&
+                hdr->version < TIGRIS_SCHEMA_VERSION_V8)
+                return TIGRIS_ERR_BAD_SECTION;
+            if (op->num_inputs < 1u || op->num_outputs != 1u)
+                return TIGRIS_ERR_BAD_SECTION;
+            /* A kind belongs to the operator that reads it, whether or not a
+             * kernel for that operator exists yet, so a stray payload cannot
+             * ride along on an unrelated op. */
+            if (!attr_kind_matches_op(attr->type, op->op_type))
                 return TIGRIS_ERR_BAD_SECTION;
             uint16_t input_idx = candidate.index_pool[op->inputs_off];
             uint16_t output_idx = candidate.index_pool[op->outputs_off];
             const tigris_tensor_t *input = &candidate.tensors[input_idx];
             const tigris_tensor_t *output = &candidate.tensors[output_idx];
-            if (attr->data_len != input->ndim || output->ndim != input->ndim)
-                return TIGRIS_ERR_BAD_SECTION;
-            const uint8_t *perm = candidate.op_attribute_data + attr->data_offset;
-            for (uint8_t axis = 0; axis < attr->data_len; axis++) {
-                if (perm[axis] >= attr->data_len ||
+            switch (attr->type) {
+            case TIGRIS_OP_ATTR_TRANSPOSE_PERM: {
+                if (op->num_inputs != 1u ||
+                    attr->data_len != input->ndim ||
+                    output->ndim != input->ndim ||
                     output->size_bytes != input->size_bytes)
                     return TIGRIS_ERR_BAD_SECTION;
-                for (uint8_t prior = 0; prior < axis; prior++) {
-                    if (perm[prior] == perm[axis])
+                const uint8_t *perm =
+                    candidate.op_attribute_data + attr->data_offset;
+                const int32_t *in_shape =
+                    tigris_tensor_shape(&candidate, input);
+                const int32_t *out_shape =
+                    tigris_tensor_shape(&candidate, output);
+                for (uint8_t axis = 0; axis < attr->data_len; axis++) {
+                    if (perm[axis] >= attr->data_len)
+                        return TIGRIS_ERR_BAD_SECTION;
+                    for (uint8_t prior = 0; prior < axis; prior++) {
+                        if (perm[prior] == perm[axis])
+                            return TIGRIS_ERR_BAD_SECTION;
+                    }
+                    if (out_shape[axis] != in_shape[perm[axis]])
                         return TIGRIS_ERR_BAD_SECTION;
                 }
-                const int32_t *in_shape = tigris_tensor_shape(&candidate, input);
-                const int32_t *out_shape = tigris_tensor_shape(&candidate, output);
-                if (out_shape[axis] != in_shape[perm[axis]])
+                break;
+            }
+            case TIGRIS_OP_ATTR_EPSILON:
+            case TIGRIS_OP_ATTR_ALPHA: {
+                float value;
+                if (attr->data_len != sizeof(value))
                     return TIGRIS_ERR_BAD_SECTION;
+                memcpy(&value,
+                       candidate.op_attribute_data + attr->data_offset,
+                       sizeof(value));
+                /* A variance floor must be positive; a negative slope must be
+                 * finite. Both would otherwise reach a kernel as a divisor or
+                 * a multiplier with no defined result. */
+                if (!isfinite(value) ||
+                    (attr->type == TIGRIS_OP_ATTR_EPSILON && value <= 0.0f))
+                    return TIGRIS_ERR_BAD_SECTION;
+                break;
+            }
+            case TIGRIS_OP_ATTR_CLIP_BOUNDS: {
+                float bounds[2];
+                if (attr->data_len != sizeof(bounds))
+                    return TIGRIS_ERR_BAD_SECTION;
+                memcpy(bounds,
+                       candidate.op_attribute_data + attr->data_offset,
+                       sizeof(bounds));
+                if (!isfinite(bounds[0]) || !isfinite(bounds[1]) ||
+                    bounds[0] > bounds[1])
+                    return TIGRIS_ERR_BAD_SECTION;
+                break;
+            }
+            case TIGRIS_OP_ATTR_PADS: {
+                /* Two int32 per axis, leading then trailing. data_len counts
+                 * bytes, so a rank beyond 31 cannot be expressed and is
+                 * refused by the width check rather than truncated. */
+                uint32_t pads_bytes =
+                    2u * (uint32_t)input->ndim * (uint32_t)sizeof(int32_t);
+                if (input->ndim == 0u || pads_bytes > 0xFFu ||
+                    (uint32_t)attr->data_len != pads_bytes ||
+                    (attr->data_offset % 4u) != 0u)
+                    return TIGRIS_ERR_BAD_SECTION;
+                for (uint8_t byte = 0; byte < attr->data_len; byte += 4u) {
+                    int32_t pad;
+                    memcpy(&pad,
+                           candidate.op_attribute_data + attr->data_offset +
+                               byte,
+                           sizeof(pad));
+                    if (pad < 0)
+                        return TIGRIS_ERR_BAD_SECTION;
+                }
+                break;
+            }
+            case TIGRIS_OP_ATTR_AXES: {
+                if (attr->data_len == 0u || attr->data_len > input->ndim)
+                    return TIGRIS_ERR_BAD_SECTION;
+                const uint8_t *axes =
+                    candidate.op_attribute_data + attr->data_offset;
+                for (uint8_t axis = 0; axis < attr->data_len; axis++) {
+                    if (axes[axis] >= input->ndim)
+                        return TIGRIS_ERR_BAD_SECTION;
+                    for (uint8_t prior = 0; prior < axis; prior++) {
+                        if (axes[prior] >= axes[axis])
+                            return TIGRIS_ERR_BAD_SECTION;
+                    }
+                }
+                break;
+            }
+            default:
+                return TIGRIS_ERR_BAD_SECTION;
             }
             previous_op = attr->op_index;
             previous_attr_type = attr->type;
@@ -986,15 +1124,24 @@ tigris_error_t tigris_plan_load(
         uint16_t attr_cursor = 0;
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
             int has_transpose_perm = 0;
+            int has_epsilon = 0;
             while (attr_cursor < candidate.num_op_attributes &&
                    candidate.op_attributes[attr_cursor].op_index == op_idx) {
                 if (candidate.op_attributes[attr_cursor].type ==
                     TIGRIS_OP_ATTR_TRANSPOSE_PERM)
                     has_transpose_perm = 1;
+                if (candidate.op_attributes[attr_cursor].type ==
+                    TIGRIS_OP_ATTR_EPSILON)
+                    has_epsilon = 1;
                 attr_cursor++;
             }
             if ((candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE) !=
                 has_transpose_perm)
+                return TIGRIS_ERR_BAD_SECTION;
+            /* A normalization divides by a variance floor it cannot default,
+             * so the attribute is required rather than optional. */
+            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM) !=
+                has_epsilon)
                 return TIGRIS_ERR_BAD_SECTION;
         }
     } else if (hdr->version >= TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES) {
@@ -1278,6 +1425,11 @@ tigris_error_t tigris_plan_load(
                                    type != TIGRIS_OP_RELU6 &&
                                    type != TIGRIS_OP_SIGMOID &&
                                    type != TIGRIS_OP_TANH &&
+                                   /* Elementwise, and a normalization whose
+                                    * reduced axis both tile axes are ahead
+                                    * of: shape-preserving and halo-free. */
+                                   type != TIGRIS_OP_ERF &&
+                                   type != TIGRIS_OP_LAYER_NORM &&
                                    /* Softmax normalizes along the final
                                     * stored dimension, which a height stripe
                                     * never cuts, so it belongs beside the

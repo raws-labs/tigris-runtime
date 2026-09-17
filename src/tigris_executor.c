@@ -1823,6 +1823,287 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
     return result;
 }
 
+/**
+ * The rows and columns a tensor presents to a row band, or 0 if it presents
+ * none.
+ *
+ * A rank-2 matrix is one directly. A rank-3 tensor with a unit leading axis in
+ * the model's own order is the same bytes as that matrix, which is what lets
+ * the Reshape pair around a lowered matrix product join the band: it moves no
+ * data, so the band means the same on both sides of it.
+ */
+static int tensor_row_view(
+    const tigris_plan_t *plan, const tigris_tensor_t *t,
+    int32_t *rows, int32_t *cols)
+{
+    /* Read the rank and the pool before the shape: this runs on every stage
+     * of every plan, including one that carries no shape pool at all, where
+     * offsetting it is undefined rather than merely wrong. */
+    if (plan->shape_pool == NULL)
+        return 0;
+    if (t->ndim != 2u && t->ndim != 3u)
+        return 0;
+    const int32_t *shape = tigris_tensor_shape(plan, t);
+    if (t->ndim == 2u) {
+        *rows = shape[0];
+        *cols = shape[1];
+        return 1;
+    }
+    if (shape[0] == 1 && (t->flags & TIGRIS_TENSOR_LINEAR) != 0u) {
+        *rows = shape[1];
+        *cols = shape[2];
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * Whether every op in a stage keeps a rank-2 matrix's rows independent.
+ *
+ * A matrix product against a constant reads one row of its left operand to
+ * write one row of its output, and the pointwise operators beside it preserve
+ * rows outright. Neither needs anything from a neighbouring row, so a band of
+ * rows computes exactly the rows it holds. A second activation operand is
+ * excluded for the reason it is everywhere else: nothing co-tiles it.
+ */
+static int is_row_tiling_op(uint8_t type)
+{
+    return type == TIGRIS_OP_FULLY_CONN ||
+           type == TIGRIS_OP_RELU ||
+           type == TIGRIS_OP_RELU6 ||
+           type == TIGRIS_OP_SIGMOID ||
+           type == TIGRIS_OP_TANH ||
+           type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_SOFTMAX ||
+           type == TIGRIS_OP_LAYER_NORM ||
+           type == TIGRIS_OP_RESHAPE ||
+           type == TIGRIS_OP_FLATTEN;
+}
+
+/**
+ * Whether a stage is a rank-2 matrix pipeline that tiles along its rows.
+ *
+ * Rank 2 has no batch or spatial axis, so the stripe contract never reaches
+ * it: a transformer's projections lower to exactly this shape and would
+ * otherwise have to hold both operands whole. Every tensor the stage touches
+ * must agree on the row count, which is what makes a band of rows mean the
+ * same thing on each of them.
+ */
+static int stage_is_row_tiled(
+    const tigris_plan_t *plan, const tigris_stage_t *stage, int32_t *out_rows)
+{
+    const uint16_t *sops = tigris_stage_ops(plan, stage);
+    const uint16_t *sin = tigris_stage_inputs(plan, stage);
+    const uint16_t *sout = tigris_stage_outputs(plan, stage);
+
+    if (stage->ops_count == 0u || stage->inputs_count == 0u ||
+        stage->outputs_count == 0u || stage->chain_len != 0u)
+        return 0;
+
+    int32_t rows = -1;
+    int32_t cols = 0;
+    for (uint16_t i = 0; i < stage->inputs_count; i++) {
+        int32_t r;
+        if (!tensor_row_view(plan, &plan->tensors[sin[i]], &r, &cols))
+            return 0;
+        if (rows < 0)
+            rows = r;
+        if (r != rows)
+            return 0;
+    }
+    for (uint16_t i = 0; i < stage->outputs_count; i++) {
+        int32_t r;
+        if (!tensor_row_view(plan, &plan->tensors[sout[i]], &r, &cols))
+            return 0;
+        if (r != rows)
+            return 0;
+    }
+    if (rows <= 1)
+        return 0;
+
+    for (uint16_t j = 0; j < stage->ops_count; j++) {
+        const tigris_op_t *op = &plan->ops[sops[j]];
+        if (!is_row_tiling_op(op->op_type) || op->num_inputs != 1u ||
+            op->num_outputs != 1u)
+            return 0;
+        /* Every intermediate is rank 2 with the same rows, or a band means
+         * something different partway through the stage. */
+        const uint16_t *outs = tigris_op_outputs(plan, op);
+        int32_t r;
+        if (!tensor_row_view(plan, &plan->tensors[outs[0]], &r, &cols) ||
+            r != rows)
+            return 0;
+    }
+    *out_rows = rows;
+    return 1;
+}
+
+/**
+ * One band of a row-tiled stage: load the band of each stage input, run the
+ * ops at the band's row count, spill the band of each stage output. Rows are
+ * independent, so the mapping is 1:1 on every tensor and there is no halo.
+ */
+static tigris_exec_error_t run_row_band(
+    const tigris_plan_t  *plan,
+    const tigris_stage_t *stage,
+    tigris_mem_t         *mem,
+    tigris_kernel_fn      kernel,
+    void                 *user_ctx,
+    void                **in_slow_bases,
+    void                **out_slow_bases,
+    int32_t               rows,
+    int32_t               start,
+    int32_t               end)
+{
+    const uint16_t *sops = tigris_stage_ops(plan, stage);
+    const uint16_t *sin = tigris_stage_inputs(plan, stage);
+    const uint16_t *sout = tigris_stage_outputs(plan, stage);
+
+    mem->tile.active = 1;
+    mem->tile.row_tiled = 1;
+    mem->tile.in_h = end - start;
+    mem->tile.out_h = end - start;
+    mem->tile.in_w = 1;
+    mem->tile.out_w = 1;
+
+    for (uint16_t i = 0; i < stage->inputs_count; i++) {
+        mem->tensor_ptrs[sin[i]] = in_slow_bases[i];
+        if (tigris_mem_load_tile(mem, plan, sin[i], start, end)
+                != TIGRIS_MEM_OK)
+            return TIGRIS_EXEC_ERR_MEM;
+    }
+
+    for (uint16_t j = 0; j < stage->ops_count; j++) {
+        uint16_t op_idx = sops[j];
+        const tigris_op_t *op = &plan->ops[op_idx];
+        uint16_t tidx = tigris_op_outputs(plan, op)[0];
+        const tigris_tensor_t *t = &plan->tensors[tidx];
+        uint32_t band_bytes =
+            (uint32_t)((uint64_t)(t->size_bytes / (uint32_t)rows) *
+                       (uint32_t)(end - start));
+        if (tigris_mem_alloc_fast(mem, tidx, band_bytes) != TIGRIS_MEM_OK)
+            return TIGRIS_EXEC_ERR_MEM;
+        if (kernel(plan, op, op_idx, mem, user_ctx) != 0)
+            return TIGRIS_EXEC_ERR_KERNEL;
+    }
+
+    for (uint16_t i = 0; i < stage->outputs_count; i++) {
+        if (tigris_mem_spill_tile(mem, plan, sout[i], out_slow_bases[i],
+                                  start, end) != TIGRIS_MEM_OK)
+            return TIGRIS_EXEC_ERR_MEM;
+    }
+    return TIGRIS_EXEC_OK;
+}
+
+/**
+ * Execute a rank-2 matrix pipeline a band of rows at a time.
+ *
+ * Rows are independent, so a band needs no halo and the mapping is 1:1 on
+ * every tensor: load the band of each stage input, run the ops at the band's
+ * row count, spill the band of each stage output. Marked TIGRIS_NOINLINE to
+ * keep the inlined dispatcher within its per-frame stack budget.
+ */
+static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
+    const tigris_plan_t      *plan,
+    const tigris_stage_t     *stage,
+    tigris_mem_t             *mem,
+    tigris_kernel_fn          kernel,
+    void                     *user_ctx,
+    executor_workspace_impl_t *workspace,
+    int32_t                   rows)
+{
+    const uint16_t *sops = tigris_stage_ops(plan, stage);
+    const uint16_t *sin = tigris_stage_inputs(plan, stage);
+    const uint16_t *sout = tigris_stage_outputs(plan, stage);
+    void **out_slow_bases = workspace->output_ptrs;
+    void **in_slow_bases = workspace->input_ptrs;
+
+    for (uint16_t i = 0; i < stage->outputs_count; i++) {
+        if (tigris_mem_alloc_slow(mem, sout[i],
+                                  plan->tensors[sout[i]].size_bytes)
+                != TIGRIS_MEM_OK)
+            return TIGRIS_EXEC_ERR_MEM;
+        out_slow_bases[i] = mem->tensor_ptrs[sout[i]];
+    }
+    for (uint16_t i = 0; i < stage->inputs_count; i++) {
+        in_slow_bases[i] = mem->tensor_ptrs[sin[i]];
+        if (!in_slow_bases[i])
+            return TIGRIS_EXEC_ERR_MEM;
+    }
+
+    /* Largest band whose stage inputs and every op output fit together. Each
+     * is its own aligned allocation, so the alignment is paid per tensor
+     * rather than once on the total, and the search recomputes it per
+     * candidate rather than scaling one figure. */
+    uint32_t available = mem->fast_size - mem->fast_reserved;
+    int32_t band = 0;
+    int32_t low = 1;
+    int32_t high = rows;
+    while (low <= high) {
+        int32_t candidate = low + (high - low) / 2;
+        /* Each tensor is its own aligned allocation, so the alignment is paid
+         * per tensor rather than once on the total. */
+        uint64_t total = 0;
+        for (uint16_t i = 0; i < stage->inputs_count; i++) {
+            const tigris_tensor_t *t = &plan->tensors[sin[i]];
+            uint32_t bytes;
+            if (!align_tensor_size(
+                    (uint32_t)((uint64_t)(t->size_bytes / (uint32_t)rows) *
+                               (uint32_t)candidate), &bytes))
+                return TIGRIS_EXEC_ERR_TILE;
+            total += bytes;
+        }
+        for (uint16_t j = 0; j < stage->ops_count; j++) {
+            const tigris_op_t *op = &plan->ops[sops[j]];
+            const tigris_tensor_t *t =
+                &plan->tensors[tigris_op_outputs(plan, op)[0]];
+            uint32_t bytes;
+            if (!align_tensor_size(
+                    (uint32_t)((uint64_t)(t->size_bytes / (uint32_t)rows) *
+                               (uint32_t)candidate), &bytes))
+                return TIGRIS_EXEC_ERR_TILE;
+            total += bytes;
+        }
+        if (total <= available) {
+            band = candidate;
+            low = candidate + 1;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    if (band == 0)
+        return TIGRIS_EXEC_ERR_TILE;
+
+    tigris_exec_error_t result = TIGRIS_EXEC_OK;
+    for (int32_t start = 0; start < rows; start += band) {
+        int32_t end = rows - start < band ? rows : start + band;
+        result = run_row_band(plan, stage, mem, kernel, user_ctx,
+                              in_slow_bases, out_slow_bases, rows, start, end);
+        if (result != TIGRIS_EXEC_OK)
+            break;
+        tigris_mem_reset_fast(mem);
+        TIGRIS_PLATFORM_FEED_WDT();
+    }
+
+    memset(&mem->tile, 0, sizeof(mem->tile));
+    tigris_mem_reset_fast(mem);
+    for (uint16_t i = 0; i < stage->inputs_count; i++)
+        mem->tensor_ptrs[sin[i]] = in_slow_bases[i];
+    for (uint16_t i = 0; i < stage->outputs_count; i++)
+        mem->tensor_ptrs[sout[i]] = out_slow_bases[i];
+    /* Intermediates lived only inside a band. */
+    for (uint16_t j = 0; j < stage->ops_count; j++) {
+        uint16_t tidx = tigris_op_outputs(plan, &plan->ops[sops[j]])[0];
+        int is_stage_out = 0;
+        for (uint16_t i = 0; i < stage->outputs_count; i++) {
+            if (tidx == sout[i]) { is_stage_out = 1; break; }
+        }
+        if (!is_stage_out)
+            mem->tensor_ptrs[tidx] = NULL;
+    }
+    return result;
+}
+
 /* Chained tiled execution */
 
 /**
@@ -2784,12 +3065,17 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
              * its output rows come from a column range of its input. Same
              * reason as above: the stripe contract cannot express it. */
             int transposed = stage_is_tiled_transpose(run_plan, stage);
+            /* A rank-2 matrix pipeline has no axis the stripe contract names,
+             * but its rows are independent, so it bands along them. */
+            int32_t band_rows = 0;
+            int row_tiled =
+                stage_is_row_tiled(run_plan, stage, &band_rows);
             int axis1_tileable =
-                input_driven || transposed ||
+                input_driven || transposed || row_tiled ||
                 (common_tile_rank &&
                  stage_supports_axis1_tiling(run_plan, stage, rank));
             int needs_tiling =
-                common_tile_rank &&
+                (common_tile_rank || row_tiled) &&
                 total_io > (mem->fast_size - mem->fast_reserved);
 
             /* Schema-v5 stages may serialize the height/length axis (1D) or the
@@ -2807,7 +3093,7 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
                  !run_plan->tile_plans[stage->tile_plan_idx].tileable ||
                  (tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH &&
                   tile_axis != TIGRIS_TILE_AXIS_HW) ||
-                 ((input_driven || transposed) &&
+                 ((input_driven || transposed || row_tiled) &&
                   tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) ||
                  !axis1_tileable)) {
                 result = TIGRIS_EXEC_ERR_TILE;
@@ -2823,7 +3109,10 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
              * misrouted to exec_stage_tiled. */
             int may_tile_2d =
                 needs_tiling && is_hw_axis && axis1_tileable &&
-                !input_driven && !transposed;
+                !input_driven && !transposed && !row_tiled;
+            int may_tile_rows =
+                needs_tiling && row_tiled &&
+                tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
             int may_tile_by_input =
                 needs_tiling && input_driven &&
                 tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
@@ -2832,13 +3121,26 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
                 tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
 
             int may_tile =
-                axis1_tileable && !input_driven && !transposed &&
+                axis1_tileable && !input_driven && !transposed && !row_tiled &&
                 (rank == 4 ||
                  (run_plan->header->version >=
                       TIGRIS_SCHEMA_VERSION_TILE_AXIS &&
                   tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH));
 
-            if (may_tile_transpose) {
+            if (may_tile_rows) {
+                tigris_exec_error_t err = exec_stage_tiled_rows(
+                    run_plan, stage, mem, kernel, user_ctx, workspace,
+                    band_rows);
+                if (err != TIGRIS_EXEC_OK) {
+                    TIGRIS_PLATFORM_DBG("S%u rows ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
+                        s, (int)err, (unsigned long)total_io,
+                        (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
+                        (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
+                    result = err;
+                    goto restore_fast_arena;
+                }
+                if (stats) stats->stages_tiled++;
+            } else if (may_tile_transpose) {
                 tigris_exec_error_t err = exec_stage_tiled_transpose(
                     run_plan, stage, mem, kernel, user_ctx);
                 if (err != TIGRIS_EXEC_OK) {

@@ -118,6 +118,54 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_LAYER_NORM;
 }
 
+/**
+ * The rows and columns a tensor presents to a row band, or 0 if it presents
+ * none. Mirrors tensor_row_view in the executor.
+ */
+static int tensor_row_view(
+    const tigris_plan_t *plan, const tigris_tensor_t *t,
+    int32_t *rows, int32_t *cols)
+{
+    /* Read the rank and the pool before the shape: this runs on every stage
+     * of every plan, including one that carries no shape pool at all, where
+     * offsetting it is undefined rather than merely wrong. */
+    if (plan->shape_pool == NULL)
+        return 0;
+    if (t->ndim != 2u && t->ndim != 3u)
+        return 0;
+    const int32_t *shape = tigris_tensor_shape(plan, t);
+    if (t->ndim == 2u) {
+        *rows = shape[0];
+        *cols = shape[1];
+        return 1;
+    }
+    if (shape[0] == 1 && (t->flags & TIGRIS_TENSOR_LINEAR) != 0u) {
+        *rows = shape[1];
+        *cols = shape[2];
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * Whether an operator keeps a rank-2 matrix's rows independent, so a band of
+ * rows computes exactly the rows it holds. Mirrors is_row_tiling_op in the
+ * executor.
+ */
+static int is_row_tiling_op(uint8_t type)
+{
+    return type == TIGRIS_OP_FULLY_CONN ||
+           type == TIGRIS_OP_RELU ||
+           type == TIGRIS_OP_RELU6 ||
+           type == TIGRIS_OP_SIGMOID ||
+           type == TIGRIS_OP_TANH ||
+           type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_SOFTMAX ||
+           type == TIGRIS_OP_LAYER_NORM ||
+           type == TIGRIS_OP_RESHAPE ||
+           type == TIGRIS_OP_FLATTEN;
+}
+
 static int is_axis1_binary_pointwise_op(uint8_t type)
 {
     return type == TIGRIS_OP_ADD || type == TIGRIS_OP_SUB ||
@@ -1317,21 +1365,71 @@ tigris_error_t tigris_plan_load(
                     candidate.index_pool[stage->inputs_off];
                 uint16_t first_output =
                     candidate.index_pool[stage->outputs_off];
-                uint8_t rank = candidate.tensors[first_input].ndim;
-                if ((rank != 3 && rank != 4) ||
-                    candidate.tensors[first_output].ndim != rank)
-                    return TIGRIS_ERR_BAD_SECTION;
-                for (uint16_t j = 0; j < stage->inputs_count; j++) {
-                    uint16_t tensor_idx =
-                        candidate.index_pool[stage->inputs_off + j];
-                    if (candidate.tensors[tensor_idx].ndim != rank)
-                        return TIGRIS_ERR_BAD_SECTION;
+                /* A row-banded stage is checked on its own terms first: its
+                 * tensors need not share a rank, only a row count, because a
+                 * Reshape that drops a unit leading axis moves no data. */
+                int32_t band_rows = 0;
+                int32_t band_cols = 0;
+                int row_banded = tensor_row_view(
+                    &candidate, &candidate.tensors[first_input],
+                    &band_rows, &band_cols) && band_rows > 1 &&
+                    stage->chain_len == 0;
+                if (row_banded) {
+                    for (uint16_t j = 0; j < stage->ops_count; j++) {
+                        const tigris_op_t *rop = &candidate.ops[
+                            candidate.index_pool[stage->ops_off + j]];
+                        int32_t r = 0;
+                        int32_t c = 0;
+                        if (rop->num_inputs != 1u || rop->num_outputs != 1u ||
+                            !is_row_tiling_op(rop->op_type) ||
+                            !tensor_row_view(
+                                &candidate,
+                                &candidate.tensors[
+                                    candidate.index_pool[rop->outputs_off]],
+                                &r, &c) ||
+                            r != band_rows) {
+                            row_banded = 0;
+                            break;
+                        }
+                    }
                 }
-                for (uint16_t j = 0; j < stage->outputs_count; j++) {
-                    uint16_t tensor_idx =
-                        candidate.index_pool[stage->outputs_off + j];
-                    if (candidate.tensors[tensor_idx].ndim != rank)
-                        return TIGRIS_ERR_BAD_SECTION;
+                if (row_banded) {
+                    for (uint16_t j = 0; j < stage->outputs_count; j++) {
+                        int32_t r = 0;
+                        int32_t c = 0;
+                        if (!tensor_row_view(
+                                &candidate,
+                                &candidate.tensors[
+                                    candidate.index_pool[
+                                        stage->outputs_off + j]],
+                                &r, &c) || r != band_rows) {
+                            row_banded = 0;
+                            break;
+                        }
+                    }
+                }
+
+                uint8_t rank = candidate.tensors[first_input].ndim;
+                if (!row_banded &&
+                    ((rank != 3 && rank != 4) ||
+                     candidate.tensors[first_output].ndim != rank))
+                    return TIGRIS_ERR_BAD_SECTION;
+                /* A row band agrees on rows, not on rank: the Reshape pair
+                 * around a lowered matrix product drops a unit leading axis
+                 * without moving a byte, and its row count is checked above. */
+                if (!row_banded) {
+                    for (uint16_t j = 0; j < stage->inputs_count; j++) {
+                        uint16_t tensor_idx =
+                            candidate.index_pool[stage->inputs_off + j];
+                        if (candidate.tensors[tensor_idx].ndim != rank)
+                            return TIGRIS_ERR_BAD_SECTION;
+                    }
+                    for (uint16_t j = 0; j < stage->outputs_count; j++) {
+                        uint16_t tensor_idx =
+                            candidate.index_pool[stage->outputs_off + j];
+                        if (candidate.tensors[tensor_idx].ndim != rank)
+                            return TIGRIS_ERR_BAD_SECTION;
+                    }
                 }
 
                 /* Schema v5 adds the rank-3 NLC length contract. Unary
@@ -1340,7 +1438,9 @@ tigris_error_t tigris_plan_load(
                  * with a strided Conv1D can expose different length
                  * resolutions. Rank-4 stages retain the existing audited
                  * height contract and are checked again by the executor. */
-                if (stage->ops_count == 1 &&
+                if (row_banded) {
+                    /* Already validated on its own terms above. */
+                } else if (stage->ops_count == 1 &&
                     candidate.ops[
                         candidate.index_pool[stage->ops_off]
                     ].op_type == TIGRIS_OP_TRANSPOSE) {

@@ -161,6 +161,10 @@ static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
         return tensor_numel(plan, tidx);
     const tigris_tensor_t *t = &plan->tensors[tidx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
+    /* A rank-2 matrix tiled along its rows has no batch axis to multiply by:
+     * out_h counts the rows in the band and the trailing axis is the row. */
+    if (mem->tile.row_tiled)
+        return (uint32_t)mem->tile.out_h * (uint32_t)shape[t->ndim - 1];
     /* Serialized activations are NHWC or NLC. */
     uint32_t width = t->ndim == 4 ? (uint32_t)mem->tile.out_w : 1u;
     return (uint32_t)shape[0] * (uint32_t)mem->tile.out_h *
@@ -610,6 +614,10 @@ static TIGRIS_KERNEL_NOINLINE int kern_fully_connected_s8(
         OC = y_shape[0];
     }
     int IC = (int)(x_numel / (uint32_t)N);
+    /* A row band computes its own rows against the whole weight. IC is taken
+     * above from the full element count, so the narrowing happens after it. */
+    if (mem->tile.active && mem->tile.row_tiled)
+        N = (int)mem->tile.out_h;
 
     /* Compute: [N, OC] */
     for (int n = 0; n < N; n++) {

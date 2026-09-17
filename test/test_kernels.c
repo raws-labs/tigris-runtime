@@ -1618,6 +1618,160 @@ static void test_sigmoid(void)
         TEST_ASSERT_NEAR(out_buf[i], expected[i], 1e-4f, "sigmoid output");
 }
 
+static void test_erf(void)
+{
+    printf("  test_erf...\n");
+
+    float X[4] = {0.0f, 0.5f, -1.0f, 2.0f};
+    float expected[4] = {0.0f, 0.5204999f, -0.8427008f, 0.9953223f};
+    int32_t shape[] = {1, 2, 2, 1};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    for (int i = 0; i < 2; i++) {
+        tensors[i].shape_off = 0; tensors[i].ndim = 4;
+        tensors[i].size_bytes = sizeof(X); tensors[i].dtype = 1;
+    }
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_ERF;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape;
+    plan.strings = g_strings;
+
+    void *ptrs[2];
+    float out_buf[4];
+    ptrs[0] = X; ptrs[1] = out_buf;
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "dispatch returns 0");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(out_buf[i], expected[i], 1e-5f, "erf output");
+}
+
+/**
+ * Layer normalization over the trailing axis, checked against the definition
+ * rather than against a recorded output: each row must come out zero-mean and
+ * unit-variance before scale and bias, so the assertions below read the
+ * result back through that.
+ */
+static void test_layer_norm(void)
+{
+    printf("  test_layer_norm...\n");
+
+    /* Two rows of four, deliberately different in mean and in spread. */
+    float X[8] = {1.0f, 2.0f, 3.0f, 4.0f, -6.0f, -2.0f, 2.0f, 6.0f};
+    float scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float bias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int32_t shape[] = {1, 1, 2, 4};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    for (int i = 0; i < 2; i++) {
+        tensors[i].shape_off = 0; tensors[i].ndim = 4;
+        tensors[i].size_bytes = sizeof(X); tensors[i].dtype = 1;
+    }
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_weight_entry_t weights[2];
+    memset(weights, 0, sizeof(weights));
+    weights[0].offset = 0;
+    weights[0].size_bytes = sizeof(scale);
+    weights[1].offset = sizeof(scale);
+    weights[1].size_bytes = sizeof(bias);
+    uint8_t blob[sizeof(scale) + sizeof(bias)];
+    memcpy(blob, scale, sizeof(scale));
+    memcpy(blob + sizeof(scale), bias, sizeof(bias));
+
+    float epsilon = 1e-5f;
+    tigris_op_attribute_t attribute;
+    memset(&attribute, 0, sizeof(attribute));
+    attribute.op_index = 0;
+    attribute.type = TIGRIS_OP_ATTR_EPSILON;
+    attribute.data_len = (uint8_t)sizeof(epsilon);
+    attribute.data_offset = 0;
+    uint8_t attr_data[sizeof(epsilon)];
+    memcpy(attr_data, &epsilon, sizeof(epsilon));
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_LAYER_NORM;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = 0;
+    op.bias_idx = 1;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1; header.num_weights = 2;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape;
+    plan.strings = g_strings;
+    plan.weight_entries = weights;
+    plan.weight_blob = blob;
+    plan.op_attributes = &attribute;
+    plan.op_attribute_data = attr_data;
+    plan.num_op_attributes = 1;
+
+    void *ptrs[2];
+    float out_buf[8];
+    ptrs[0] = X; ptrs[1] = out_buf;
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "dispatch returns 0");
+    for (int row = 0; row < 2; row++) {
+        float sum = 0.0f;
+        float sq = 0.0f;
+        for (int c = 0; c < 4; c++) {
+            sum += out_buf[row * 4 + c];
+            sq += out_buf[row * 4 + c] * out_buf[row * 4 + c];
+        }
+        TEST_ASSERT_NEAR(sum / 4.0f, 0.0f, 1e-5f, "normalized row is centered");
+        TEST_ASSERT_NEAR(sq / 4.0f, 1.0f, 1e-4f, "normalized row has unit variance");
+    }
+    /* Order is preserved, so the two rows normalize to the same shape even
+     * though their spreads differ by a factor of four. */
+    TEST_ASSERT(out_buf[0] < out_buf[1] && out_buf[1] < out_buf[2],
+                "normalization preserves order");
+
+    /* A missing variance floor is refused rather than defaulted. */
+    plan.num_op_attributes = 0;
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0,
+                "a missing variance floor is refused");
+}
+
 static void test_softmax(void)
 {
     printf("  test_softmax...\n");
@@ -2025,6 +2179,8 @@ int main(void)
     test_concat();
     test_resize_nearest();
     test_sigmoid();
+    test_erf();
+    test_layer_norm();
     test_softmax();
     test_mul();
     test_constant_binary_f32();

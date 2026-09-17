@@ -1285,6 +1285,125 @@ static TIGRIS_KERNEL_NOINLINE int kern_sigmoid_s8(
     return 0;
 }
 
+/* Erf via a 256-entry LUT, mirroring kern_sigmoid_s8. int8 in, int8 out with
+ * its own output quant. */
+static TIGRIS_KERNEL_NOINLINE int kern_erf_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (!X || !Y)
+        return -1;
+
+    const tigris_quant_param_t *in_qp =
+        tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    const tigris_quant_param_t *out_qp =
+        tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    float in_scale = in_qp ? in_qp->scale : 1.0f;
+    int32_t in_zp = in_qp ? in_qp->zero_point : 0;
+    float out_scale = out_qp ? out_qp->scale : 1.0f;
+    int32_t out_zp = out_qp ? out_qp->zero_point : 0;
+    if (!(out_scale > 0.0f))
+        return -1;
+
+    int8_t lut[256];
+    for (int i = 0; i < 256; i++) {
+        int8_t x_val = (int8_t)i;
+        float real = in_scale * (float)((int32_t)x_val - in_zp);
+        int32_t q = (int32_t)roundf(erff(real) / out_scale) + out_zp;
+        lut[i] = clamp_s8(q);
+    }
+
+    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
+    for (uint32_t i = 0; i < n; i++)
+        Y[i] = lut[(uint8_t)X[i]];
+    return 0;
+}
+
+/**
+ * Layer normalization over the final stored dimension, int8 in and out.
+ *
+ * The statistics are taken in float from the dequantized row, because a
+ * normalization divides by a per-row standard deviation that no fixed
+ * multiplier can stand in for. Scale and bias stay float weights, as they are
+ * in the plan, and only the result is requantized.
+ */
+static TIGRIS_KERNEL_NOINLINE int kern_layer_norm_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (!X || !Y)
+        return -1;
+
+    const tigris_tensor_t *in = &plan->tensors[ins[0]];
+    const int32_t *shape = tigris_tensor_shape(plan, in);
+    if (in->ndim == 0u)
+        return -1;
+    int32_t width = shape[in->ndim - 1u];
+    if (width <= 0)
+        return -1;
+
+    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
+    if (n % (uint32_t)width != 0u)
+        return -1;
+    uint32_t rows = n / (uint32_t)width;
+
+    const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, in);
+    const tigris_quant_param_t *out_qp =
+        tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    float in_scale = in_qp ? in_qp->scale : 1.0f;
+    int32_t in_zp = in_qp ? in_qp->zero_point : 0;
+    float out_scale = out_qp ? out_qp->scale : 1.0f;
+    int32_t out_zp = out_qp ? out_qp->zero_point : 0;
+    if (!(out_scale > 0.0f))
+        return -1;
+
+    const float *scale = (const float *)tigris_op_weight(plan, op);
+    const float *bias = (const float *)tigris_op_bias(plan, op);
+    if (!scale)
+        return -1;
+
+    uint8_t attr_len = 0;
+    const uint8_t *raw = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_EPSILON, &attr_len);
+    if (!raw || attr_len != sizeof(float))
+        return -1;
+    float epsilon;
+    memcpy(&epsilon, raw, sizeof(epsilon));
+
+    for (uint32_t r = 0; r < rows; r++) {
+        const int8_t *row = X + (size_t)r * (size_t)width;
+        int8_t *out_row = Y + (size_t)r * (size_t)width;
+        float sum = 0.0f;
+        for (int32_t c = 0; c < width; c++)
+            sum += in_scale * (float)((int32_t)row[c] - in_zp);
+        float mean = sum / (float)width;
+        float sq = 0.0f;
+        for (int32_t c = 0; c < width; c++) {
+            float d = in_scale * (float)((int32_t)row[c] - in_zp) - mean;
+            sq += d * d;
+        }
+        float inv = 1.0f / sqrtf(sq / (float)width + epsilon);
+        for (int32_t c = 0; c < width; c++) {
+            float real = in_scale * (float)((int32_t)row[c] - in_zp);
+            float norm = (real - mean) * inv * scale[c] +
+                         (bias ? bias[c] : 0.0f);
+            int32_t q = (int32_t)roundf(norm / out_scale) + out_zp;
+            out_row[c] = clamp_s8(q);
+        }
+    }
+    return 0;
+}
+
 /* Tanh via a 256-entry LUT, mirroring kern_sigmoid_s8 (tanh in place of the
  * logistic). int8 input -> int8 output with its own output quant. */
 static TIGRIS_KERNEL_NOINLINE int kern_tanh_s8(
@@ -1485,6 +1604,8 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_GLOBAL_MAX:  return kern_global_max_pool_s8(plan, op, mem);
     case TIGRIS_OP_MATMUL:      return kern_matmul_s8(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_ERF:         return kern_erf_s8(plan, op, mem);
+    case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm_s8(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */
     }

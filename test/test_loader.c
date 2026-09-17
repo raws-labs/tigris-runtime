@@ -1011,6 +1011,134 @@ static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
     }
 }
 
+/**
+ * Schema 8 declares every attribute kind at once so the operators behind them
+ * land one at a time. Each kind is validated on load whether or not a kernel
+ * reads it yet, and belongs only to the operator that will.
+ */
+static void test_op_attribute_kinds(void)
+{
+    printf("  test_op_attribute_kinds...\n");
+    _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_op_attribute_t *attr;
+
+    /* Every kind other than the permutation belongs to another operator, so
+     * on a Transpose each one is refused. */
+    const uint8_t kinds[] = {
+        TIGRIS_OP_ATTR_EPSILON,
+        TIGRIS_OP_ATTR_ALPHA,
+        TIGRIS_OP_ATTR_CLIP_BOUNDS,
+        TIGRIS_OP_ATTR_PADS,
+        TIGRIS_OP_ATTR_AXES,
+    };
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        build_transpose_plan(buf);
+        attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+        attr->type = kinds[i];
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                       TIGRIS_ERR_BAD_SECTION,
+                       "a kind on the wrong operator is refused");
+    }
+
+    build_transpose_plan(buf);
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_MAX + 1u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "a kind beyond the set is refused");
+
+    /* A schema-7 plan carries no kind but the permutation, whatever the
+     * operator, because the loader that reads it knows no other. */
+    build_transpose_plan(buf);
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V7;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_EPSILON;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a schema-7 plan carries no kind beyond the permutation");
+}
+
+/**
+ * The payload checks each kind applies. The operator each belongs to has no
+ * kernel yet, so the plan is refused later for that; what these assert is the
+ * error the payload itself produces first.
+ */
+static void test_op_attribute_payloads(void)
+{
+    printf("  test_op_attribute_payloads...\n");
+    _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_op_attribute_t *attr;
+    float value;
+
+    /* A variance floor must be positive and finite. */
+    build_transpose_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_LAYER_NORM;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_EPSILON;
+    attr->data_len = (uint8_t)sizeof(float);
+    value = 0.0f;
+    memcpy(buf + TRANSPOSE_ATTR_DATA_OFF, &value, sizeof(value));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "a zero variance floor is refused");
+
+    /* The same record with a positive floor gets past the payload check and
+     * is refused for the operator instead, which is a different error. */
+    value = 1e-5f;
+    memcpy(buf + TRANSPOSE_ATTR_DATA_OFF, &value, sizeof(value));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "a positive variance floor passes the payload check");
+
+    /* A wrong payload width is refused whatever the value. */
+    build_transpose_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_LEAKY_RELU;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_ALPHA;
+    attr->data_len = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "a short slope payload is refused");
+
+    /* Clip bounds must be ordered. */
+    build_transpose_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_CLIP;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_CLIP_BOUNDS;
+    attr->data_len = (uint8_t)(2u * sizeof(float));
+    float bounds[2] = {1.0f, -1.0f};
+    memcpy(buf + TRANSPOSE_ATTR_DATA_OFF, bounds, sizeof(bounds));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "reversed clip bounds are refused");
+
+    /* Pads are two per axis and never negative. */
+    build_transpose_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_PAD;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_PADS;
+    attr->data_len = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a pad list that is not two per axis is refused");
+
+    /* Reduction axes are in range and strictly increasing. */
+    build_transpose_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type =
+        TIGRIS_OP_REDUCE_MEAN;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_AXES;
+    attr->data_len = 2;
+    buf[TRANSPOSE_ATTR_DATA_OFF] = 1;
+    buf[TRANSPOSE_ATTR_DATA_OFF + 1u] = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "repeated reduction axes refused");
+
+    buf[TRANSPOSE_ATTR_DATA_OFF] = 0;
+    buf[TRANSPOSE_ATTR_DATA_OFF + 1u] = 9;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a reduction axis past the rank is refused");
+}
+
 static void test_tiled_conversion_contract(void)
 {
     printf("  test_tiled_conversion_contract...\n");
@@ -1991,6 +2119,7 @@ static void test_schema_compatibility_fixtures(void)
          TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH},
         {"schema-v6-interface-dtype.tgrs", TIGRIS_SCHEMA_VERSION_V6, 3, 0, 0, 0},
         {"schema-v7-tensor-layout.tgrs", TIGRIS_SCHEMA_VERSION_V7, 0, 2, 0, 0},
+        {"schema-v8-layer-norm.tgrs", TIGRIS_SCHEMA_VERSION_V8, 0, 3, 0, 0},
     };
     const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
 
@@ -2138,6 +2267,8 @@ int main(int argc, char *argv[])
     test_compressed_block_guards();
     test_cross_reference_guards();
     test_transpose_attribute_guards();
+    test_op_attribute_kinds();
+    test_op_attribute_payloads();
     test_tiled_conversion_contract();
     test_tiled_reduction_contract();
     test_operator_semantic_guards();

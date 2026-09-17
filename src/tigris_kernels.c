@@ -421,6 +421,88 @@ static int kern_sigmoid(
     return 0;
 }
 
+static int kern_erf(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
+    for (uint32_t i = 0; i < n; i++)
+        Y[i] = erff(X[i]);
+    return 0;
+}
+
+/**
+ * Layer normalization over the final stored dimension.
+ *
+ * The normalizer places the operand in the layout whose last stored axis is
+ * the one the model normalizes, so the kernel always walks the trailing axis
+ * and a height tile holds whole normalization rows, exactly as for Softmax.
+ * Scale is the operator's weight and bias its optional bias, both indexed by
+ * position along that axis.
+ */
+static int kern_layer_norm(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (!X || !Y)
+        return -1;
+
+    const tigris_tensor_t *in = &plan->tensors[ins[0]];
+    const int32_t *shape = tigris_tensor_shape(plan, in);
+    if (in->ndim == 0u)
+        return -1;
+    int32_t width = shape[in->ndim - 1u];
+    if (width <= 0)
+        return -1;
+
+    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
+    if (n % (uint32_t)width != 0u)
+        return -1;
+    uint32_t rows = n / (uint32_t)width;
+
+    const float *scale = (const float *)tigris_op_weight(plan, op);
+    const float *bias = (const float *)tigris_op_bias(plan, op);
+    if (!scale)
+        return -1;
+
+    uint8_t attr_len = 0;
+    const uint8_t *raw = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_EPSILON, &attr_len);
+    if (!raw || attr_len != sizeof(float))
+        return -1;
+    float epsilon;
+    memcpy(&epsilon, raw, sizeof(epsilon));
+
+    for (uint32_t r = 0; r < rows; r++) {
+        const float *row = X + (size_t)r * (size_t)width;
+        float *out_row = Y + (size_t)r * (size_t)width;
+        float sum = 0.0f;
+        for (int32_t c = 0; c < width; c++)
+            sum += row[c];
+        float mean = sum / (float)width;
+        float sq = 0.0f;
+        for (int32_t c = 0; c < width; c++) {
+            float d = row[c] - mean;
+            sq += d * d;
+        }
+        float inv = 1.0f / sqrtf(sq / (float)width + epsilon);
+        for (int32_t c = 0; c < width; c++) {
+            float norm = (row[c] - mean) * inv;
+            out_row[c] = norm * scale[c] + (bias ? bias[c] : 0.0f);
+        }
+    }
+    return 0;
+}
+
 static int kern_tanh(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1193,6 +1275,8 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_GLOBAL_MAX: return kern_global_max_pool(plan, op, mem);
     case TIGRIS_OP_MATMUL:      return kern_matmul(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_ERF:         return kern_erf(plan, op, mem);
+    case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */
     }

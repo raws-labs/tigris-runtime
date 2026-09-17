@@ -1888,8 +1888,12 @@ static void test_exec_height_tiling_contract(void)
 
     run_height_tiling_contract_case(
         4, TIGRIS_OP_RELU, pointwise_shape, 128, TIGRIS_EXEC_OK);
+    /* A global reduction collapses the output height, so it takes the
+     * input-driven path rather than the output-driven stripe loop. Every
+     * call still carries a tile context, and the stage still counts as
+     * tiled, which is what the assertions below check. */
     run_height_tiling_contract_case(
-        4, TIGRIS_OP_GLOBAL_AVG, gap_shape, 128, TIGRIS_EXEC_ERR_TILE);
+        4, TIGRIS_OP_GLOBAL_AVG, gap_shape, 128, TIGRIS_EXEC_OK);
     run_height_tiling_contract_case(
         4, TIGRIS_OP_RESIZE, resize_shape, 128, TIGRIS_EXEC_ERR_TILE);
     run_height_tiling_contract_case(

@@ -54,6 +54,16 @@ typedef struct {
     uint16_t pad_left;      /* effective left padding for this tile */
     uint16_t pad_right;     /* effective right padding for this tile */
     uint8_t  width_tiled;   /* 0=height-only tile, 1=2D (HW) tile active */
+    /* Running accumulator for a reduction tiled along its input. A global
+     * reduction collapses the axis the output-driven tile loop walks, so the
+     * executor walks the input instead and hands the kernel one partial per
+     * (batch, channel): int32 for the int8 kernels, float for the float32
+     * ones. reduce_first selects initialization over continuation,
+     * reduce_last selects writing the output tensor. NULL and zero on every
+     * other path, where the kernel reduces the whole tensor as before. */
+    void    *reduce_acc;
+    uint8_t  reduce_first;
+    uint8_t  reduce_last;
 } tigris_tile_ctx_t;
 
 /* Tensor alignment */

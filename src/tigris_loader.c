@@ -1193,8 +1193,12 @@ tigris_error_t tigris_plan_load(
                 return TIGRIS_ERR_BAD_SECTION;
         }
     } else if (hdr->version >= TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES) {
+        /* No attribute section at all, so every operator that requires one is
+         * refused here on the same terms the loop above applies when there
+         * is a section. */
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
-            if (candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE)
+            if (candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE ||
+                candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM)
                 return TIGRIS_ERR_BAD_SECTION;
         }
     }
@@ -1367,13 +1371,32 @@ tigris_error_t tigris_plan_load(
                     candidate.index_pool[stage->outputs_off];
                 /* A row-banded stage is checked on its own terms first: its
                  * tensors need not share a rank, only a row count, because a
-                 * Reshape that drops a unit leading axis moves no data. */
+                 * Reshape that drops a unit leading axis moves no data.
+                 * Every stage input has to present that row view, not just
+                 * the first: stage_is_row_tiled in the executor checks them
+                 * all, and accepting a stage it will decline sends the stage
+                 * through the normal path instead of refusing the plan. */
                 int32_t band_rows = 0;
                 int32_t band_cols = 0;
                 int row_banded = tensor_row_view(
                     &candidate, &candidate.tensors[first_input],
                     &band_rows, &band_cols) && band_rows > 1 &&
                     stage->chain_len == 0;
+                if (row_banded) {
+                    for (uint16_t j = 1; j < stage->inputs_count; j++) {
+                        int32_t r = 0;
+                        int32_t c = 0;
+                        if (!tensor_row_view(
+                                &candidate,
+                                &candidate.tensors[
+                                    candidate.index_pool[
+                                        stage->inputs_off + j]],
+                                &r, &c) || r != band_rows) {
+                            row_banded = 0;
+                            break;
+                        }
+                    }
+                }
                 if (row_banded) {
                     for (uint16_t j = 0; j < stage->ops_count; j++) {
                         const tigris_op_t *rop = &candidate.ops[

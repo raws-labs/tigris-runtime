@@ -214,6 +214,13 @@ tigris_mem_error_t tigris_mem_spill_tile(
     int32_t H = t->ndim == 2 ? shape[0] : shape[1];
     int32_t W = t->ndim == 4 ? shape[2] : 1;
     int32_t C = shape[t->ndim - 1];
+
+    /* Same guard the load path and both 2D primitives apply, so the whole set
+     * of tile transfers refuses an out-of-range row window rather than
+     * writing past the destination tensor. */
+    if (h_start < 0 || h_end <= h_start || h_end > H)
+        return TIGRIS_MEM_ERR_BAD_INDEX;
+
     int32_t tile_h = h_end - h_start;
     uint32_t elem_size = t->size_bytes / (uint32_t)(N * H * W * C);
     uint32_t row_bytes = (uint32_t)W * (uint32_t)C * elem_size;

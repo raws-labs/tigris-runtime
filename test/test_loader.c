@@ -1283,6 +1283,22 @@ static void test_transpose_attribute_guards(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_OPERATOR,
                    "v4 custom opcode remains fail-closed");
+
+    /* A normalization needs its variance floor as surely as a Transpose needs
+     * its permutation, and the arm taken when there is no attribute section
+     * at all has to say so too. This fixture carries no scale weight, so it
+     * would be refused either way; the error says which guard fired, and
+     * before the section arm covered normalizations it was the operator
+     * check. A plan whose normalization is otherwise well formed had nothing
+     * left to catch it and failed at inference instead. */
+    build_transpose_plan(buf);
+    dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+    memset(&dir[6], 0, sizeof(dir[6]));
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type =
+        TIGRIS_OP_LAYER_NORM;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "attribute-free normalization rejected");
 }
 
 static void build_unary_plan(uint8_t *buf)

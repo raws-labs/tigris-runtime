@@ -1554,6 +1554,271 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_by_input(
     return result;
 }
 
+/**
+ * The two extents a layout conversion transposes, or 0 if this operator is
+ * not one.
+ *
+ * A conversion between the spatial and linear orders moves the channel axis
+ * past the spatial ones and leaves those in their relative order, so once the
+ * axes that travel together are read as one it is a plain matrix transpose.
+ * Rank 3 permutes (0,2,1) directly. Rank 4 permutes (0,3,1,2) going to linear
+ * and (0,2,3,1) coming back, and in both the two spatial axes stay adjacent
+ * and ordered, so H*W collapses into one extent.
+ */
+static int transpose_extents(
+    const tigris_plan_t *plan, uint16_t op_idx,
+    uint16_t in_idx, int32_t *rows, int32_t *cols)
+{
+    const tigris_tensor_t *in = &plan->tensors[in_idx];
+    uint8_t perm_rank = 0;
+    const uint8_t *perm = tigris_op_attribute_data(
+        plan, op_idx, TIGRIS_OP_ATTR_TRANSPOSE_PERM, &perm_rank);
+    if (!perm || perm_rank != in->ndim)
+        return 0;
+
+    const int32_t *shape = tigris_tensor_shape(plan, in);
+    if (in->ndim == 3u) {
+        if (perm[0] != 0u || perm[1] != 2u || perm[2] != 1u)
+            return 0;
+        *rows = shape[1];
+        *cols = shape[2];
+        return 1;
+    }
+    if (in->ndim == 4u) {
+        if (perm[0] != 0u)
+            return 0;
+        if (perm[1] == 3u && perm[2] == 1u && perm[3] == 2u) {
+            /* [N, H, W, C] -> [N, C, H, W]: the spatial pair is the row axis. */
+            *rows = shape[1] * shape[2];
+            *cols = shape[3];
+            return 1;
+        }
+        if (perm[1] == 2u && perm[2] == 3u && perm[3] == 1u) {
+            /* [N, C, H, W] -> [N, H, W, C]: the channel axis is the row axis. */
+            *rows = shape[1];
+            *cols = shape[2] * shape[3];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * Whether a stage is a standalone layout conversion the stripe contract
+ * cannot serve.
+ *
+ * A conversion moves the channel axis past the spatial ones, so a tile of its
+ * output needs a column range of its input, not a row range. Accepted only as
+ * the whole stage, since nothing else could carry a height across it.
+ */
+static int stage_is_tiled_transpose(
+    const tigris_plan_t *plan, const tigris_stage_t *stage)
+{
+    if (stage->ops_count != 1 || stage->inputs_count != 1 ||
+        stage->outputs_count != 1)
+        return 0;
+
+    uint16_t op_idx = tigris_stage_ops(plan, stage)[0];
+    const tigris_op_t *op = &plan->ops[op_idx];
+    if (op->op_type != TIGRIS_OP_TRANSPOSE ||
+        op->num_inputs != 1 || op->num_outputs != 1)
+        return 0;
+
+    uint16_t in_idx = tigris_stage_inputs(plan, stage)[0];
+    uint16_t out_idx = tigris_stage_outputs(plan, stage)[0];
+    if (tigris_op_inputs(plan, op)[0] != in_idx ||
+        tigris_op_outputs(plan, op)[0] != out_idx)
+        return 0;
+
+    const tigris_tensor_t *in = &plan->tensors[in_idx];
+    const tigris_tensor_t *out = &plan->tensors[out_idx];
+    if (in->ndim != out->ndim)
+        return 0;
+
+    int32_t rows = 0;
+    int32_t cols = 0;
+    if (!transpose_extents(plan, op_idx, in_idx, &rows, &cols))
+        return 0;
+
+    const int32_t *in_shape = tigris_tensor_shape(plan, in);
+    const int32_t *out_shape = tigris_tensor_shape(plan, out);
+    return rows > 0 && cols > 0 && in_shape[0] > 0 &&
+           out_shape[0] == in_shape[0] &&
+           in->size_bytes == out->size_bytes;
+}
+
+/**
+ * Execute a standalone layout conversion a band at a time.
+ *
+ * The band runs along the longer of the two permuted axes, so the fast arena
+ * holds one slice of each side and never a whole plane. That axis is a row
+ * range on one side and a column range on the other, so exactly one of the
+ * two transfers is strided: gathering the input columns when the input is the
+ * short-rowed side, scattering the output columns when it is not.
+ * Marked TIGRIS_NOINLINE to keep the inlined dispatcher within its per-frame
+ * stack budget.
+ */
+static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
+    const tigris_plan_t      *plan,
+    const tigris_stage_t     *stage,
+    tigris_mem_t             *mem,
+    tigris_kernel_fn          kernel,
+    void                     *user_ctx)
+{
+    uint16_t in_idx = tigris_stage_inputs(plan, stage)[0];
+    uint16_t out_idx = tigris_stage_outputs(plan, stage)[0];
+    uint16_t op_idx = tigris_stage_ops(plan, stage)[0];
+    const tigris_op_t *op = &plan->ops[op_idx];
+
+    const tigris_tensor_t *in = &plan->tensors[in_idx];
+    const tigris_tensor_t *out = &plan->tensors[out_idx];
+    const int32_t *in_shape = tigris_tensor_shape(plan, in);
+    int32_t batch = in_shape[0];
+    int32_t rows = 0;   /* becomes the output's column count */
+    int32_t cols = 0;   /* becomes the output's row count */
+    if (!transpose_extents(plan, op_idx, in_idx, &rows, &cols))
+        return TIGRIS_EXEC_ERR_TILE;
+
+    uint64_t numel = (uint64_t)batch * (uint32_t)rows * (uint32_t)cols;
+    if (numel == 0u || in->size_bytes % numel != 0u)
+        return TIGRIS_EXEC_ERR_TILE;
+    uint32_t elem_size = (uint32_t)(in->size_bytes / numel);
+
+    /* Band the longer axis: it gives the most bands and the smallest slice,
+     * since a slice holds batch * (the other axis) * band elements. */
+    int band_on_cols = cols >= rows;
+    int32_t banded = band_on_cols ? cols : rows;
+    int32_t other = band_on_cols ? rows : cols;
+
+    void *in_slow_base = mem->tensor_ptrs[in_idx];
+    if (!in_slow_base)
+        return TIGRIS_EXEC_ERR_MEM;
+
+    if (tigris_mem_alloc_slow(mem, out_idx, out->size_bytes) != TIGRIS_MEM_OK)
+        return TIGRIS_EXEC_ERR_MEM;
+    void *out_slow_base = mem->tensor_ptrs[out_idx];
+
+    /* Largest band of output rows whose gathered input rectangle and packed
+     * output tile fit together. Both hold the same element count, aligned
+     * separately because they are two arena allocations. */
+    uint32_t available = mem->fast_size - mem->fast_reserved;
+    int32_t band = 0;
+    int32_t low = 1;
+    int32_t high = banded;
+    while (low <= high) {
+        int32_t candidate = low + (high - low) / 2;
+        uint64_t tile_elems =
+            (uint64_t)batch * (uint32_t)other * (uint32_t)candidate;
+        if (tile_elems > UINT32_MAX / elem_size) {
+            high = candidate - 1;
+            continue;
+        }
+        uint32_t one;
+        if (!align_tensor_size((uint32_t)tile_elems * elem_size, &one))
+            return TIGRIS_EXEC_ERR_TILE;
+        if ((uint64_t)one * 2u <= available) {
+            band = candidate;
+            low = candidate + 1;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    if (band == 0)
+        return TIGRIS_EXEC_ERR_TILE;
+
+    /* Both sides are the same [batch, rows, cols] matrix in memory whatever
+     * the tensor's rank, so the two transfers are expressed on it directly
+     * rather than through the rank-4 rectangle helpers, which slice the width
+     * axis and cannot express a range of channels. */
+    tigris_exec_error_t result = TIGRIS_EXEC_OK;
+    for (int32_t start = 0; start < banded; start += band) {
+        int32_t end = banded - start < band ? banded : start + band;
+        int32_t width = end - start;
+        uint32_t tile_bytes = (uint32_t)((uint64_t)batch * (uint32_t)other *
+                                         (uint32_t)width * elem_size);
+        uint32_t strip = (uint32_t)width * elem_size;
+
+        mem->tile.active = 1;
+        mem->tile.transposed_tile = 1;
+        mem->tile.in_h = band_on_cols ? other : width;
+        mem->tile.in_w = band_on_cols ? width : other;
+        mem->tile.out_h = band_on_cols ? width : other;
+        mem->tile.out_w = band_on_cols ? other : width;
+
+        /* LOAD: a column range when the band runs along the input's columns,
+         * a contiguous row range otherwise. */
+        const uint8_t *src = (const uint8_t *)in_slow_base;
+        if (tigris_mem_alloc_fast(mem, in_idx, tile_bytes) != TIGRIS_MEM_OK) {
+            result = TIGRIS_EXEC_ERR_MEM;
+            break;
+        }
+        uint8_t *in_tile = (uint8_t *)mem->tensor_ptrs[in_idx];
+        if (band_on_cols) {
+            for (int32_t n = 0; n < batch; n++) {
+                for (int32_t r = 0; r < other; r++) {
+                    memcpy(in_tile + ((size_t)n * (size_t)other + (size_t)r) *
+                                         strip,
+                           src + (((size_t)n * (size_t)other + (size_t)r) *
+                                      (size_t)banded + (size_t)start) *
+                                     elem_size,
+                           strip);
+                }
+            }
+        } else {
+            size_t rows_bytes = (size_t)width * (size_t)other * elem_size;
+            for (int32_t n = 0; n < batch; n++) {
+                memcpy(in_tile + (size_t)n * rows_bytes,
+                       src + ((size_t)n * (size_t)banded + (size_t)start) *
+                                 (size_t)other * elem_size,
+                       rows_bytes);
+            }
+        }
+
+        if (tigris_mem_alloc_fast(mem, out_idx, tile_bytes) != TIGRIS_MEM_OK) {
+            result = TIGRIS_EXEC_ERR_MEM;
+            break;
+        }
+
+        if (kernel(plan, op, op_idx, mem, user_ctx) != 0) {
+            result = TIGRIS_EXEC_ERR_KERNEL;
+            break;
+        }
+
+        /* SPILL: the mirror of the load, on the other side of the transpose. */
+        const uint8_t *out_tile = (const uint8_t *)mem->tensor_ptrs[out_idx];
+        uint8_t *dst = (uint8_t *)out_slow_base;
+        if (band_on_cols) {
+            size_t rows_bytes = (size_t)width * (size_t)other * elem_size;
+            for (int32_t n = 0; n < batch; n++) {
+                memcpy(dst + ((size_t)n * (size_t)banded + (size_t)start) *
+                                 (size_t)other * elem_size,
+                       out_tile + (size_t)n * rows_bytes,
+                       rows_bytes);
+            }
+        } else {
+            for (int32_t n = 0; n < batch; n++) {
+                for (int32_t r = 0; r < other; r++) {
+                    memcpy(dst + (((size_t)n * (size_t)other + (size_t)r) *
+                                      (size_t)banded + (size_t)start) *
+                                     elem_size,
+                           out_tile + ((size_t)n * (size_t)other + (size_t)r) *
+                                          strip,
+                           strip);
+                }
+            }
+        }
+
+        tigris_mem_reset_fast(mem);
+        TIGRIS_PLATFORM_FEED_WDT();
+    }
+
+    memset(&mem->tile, 0, sizeof(mem->tile));
+    tigris_mem_reset_fast(mem);
+    mem->tensor_ptrs[in_idx] = in_slow_base;
+    mem->tensor_ptrs[out_idx] = out_slow_base;
+    return result;
+}
+
 /* Chained tiled execution */
 
 /**
@@ -2511,8 +2776,12 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
              * this stage collapses. */
             int input_driven =
                 stage_is_input_driven_reduction(run_plan, stage);
+            /* A layout conversion swaps the two axes on either side of it, so
+             * its output rows come from a column range of its input. Same
+             * reason as above: the stripe contract cannot express it. */
+            int transposed = stage_is_tiled_transpose(run_plan, stage);
             int axis1_tileable =
-                input_driven ||
+                input_driven || transposed ||
                 (common_tile_rank &&
                  stage_supports_axis1_tiling(run_plan, stage, rank));
             int needs_tiling =
@@ -2534,7 +2803,7 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
                  !run_plan->tile_plans[stage->tile_plan_idx].tileable ||
                  (tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH &&
                   tile_axis != TIGRIS_TILE_AXIS_HW) ||
-                 (input_driven &&
+                 ((input_driven || transposed) &&
                   tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) ||
                  !axis1_tileable)) {
                 result = TIGRIS_EXEC_ERR_TILE;
@@ -2549,19 +2818,35 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
              * because a rank-4 stage otherwise satisfies may_tile and would be
              * misrouted to exec_stage_tiled. */
             int may_tile_2d =
-                needs_tiling && is_hw_axis && axis1_tileable && !input_driven;
+                needs_tiling && is_hw_axis && axis1_tileable &&
+                !input_driven && !transposed;
             int may_tile_by_input =
                 needs_tiling && input_driven &&
                 tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+            int may_tile_transpose =
+                needs_tiling && transposed &&
+                tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
 
             int may_tile =
-                axis1_tileable && !input_driven &&
+                axis1_tileable && !input_driven && !transposed &&
                 (rank == 4 ||
                  (run_plan->header->version >=
                       TIGRIS_SCHEMA_VERSION_TILE_AXIS &&
                   tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH));
 
-            if (may_tile_by_input) {
+            if (may_tile_transpose) {
+                tigris_exec_error_t err = exec_stage_tiled_transpose(
+                    run_plan, stage, mem, kernel, user_ctx);
+                if (err != TIGRIS_EXEC_OK) {
+                    TIGRIS_PLATFORM_DBG("S%u convert ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
+                        s, (int)err, (unsigned long)total_io,
+                        (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
+                        (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
+                    result = err;
+                    goto restore_fast_arena;
+                }
+                if (stats) stats->stages_tiled++;
+            } else if (may_tile_by_input) {
                 tigris_exec_error_t err = exec_stage_tiled_by_input(
                     run_plan, stage, mem, kernel, user_ctx);
                 if (err != TIGRIS_EXEC_OK) {

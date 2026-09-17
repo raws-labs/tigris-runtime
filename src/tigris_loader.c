@@ -1229,6 +1229,13 @@ tigris_error_t tigris_plan_load(
                                    type != TIGRIS_OP_RELU6 &&
                                    type != TIGRIS_OP_SIGMOID &&
                                    type != TIGRIS_OP_TANH &&
+                                   /* Softmax normalizes along the final
+                                    * stored dimension, which a height stripe
+                                    * never cuts, so it belongs beside the
+                                    * unary operators here exactly as it does
+                                    * in the rank-3 contract above and in
+                                    * is_height_tiling_op. */
+                                   type != TIGRIS_OP_SOFTMAX &&
                                    type != TIGRIS_OP_ADD &&
                                    type != TIGRIS_OP_MUL &&
                                    type != TIGRIS_OP_CONCAT) {

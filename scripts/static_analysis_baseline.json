@@ -19,10 +19,10 @@
     "counts": {}
   },
   "misra": {
-    "total": 3478,
-    "misra_total": 3447,
+    "total": 3504,
+    "misra_total": 3473,
     "config_errors": 2,
-    "fingerprint_sha256": "3dc076f0609b368b815d9ae435014a8539cd74f4b2ffd7acaf12146fcde780fc",
+    "fingerprint_sha256": "fac2afce14adf41b891fedefaec6950cc6a4024564bc17473c261014b80b4cae",
     "counts": {
       "include/tigris.h": {
         "misra-c2012-10.4": 4,
@@ -94,17 +94,18 @@
       "src/tigris_kernels.c": {
         "constParameterPointer": 10,
         "misra-c2012-10.3": 4,
-        "misra-c2012-10.4": 50,
+        "misra-c2012-10.4": 51,
         "misra-c2012-10.8": 1,
-        "misra-c2012-11.5": 58,
-        "misra-c2012-12.1": 147,
+        "misra-c2012-11.5": 62,
+        "misra-c2012-11.6": 2,
+        "misra-c2012-12.1": 151,
         "misra-c2012-12.3": 1,
         "misra-c2012-14.4": 17,
-        "misra-c2012-15.5": 72,
-        "misra-c2012-15.6": 80,
-        "misra-c2012-17.7": 7,
+        "misra-c2012-15.5": 75,
+        "misra-c2012-15.6": 85,
+        "misra-c2012-17.7": 8,
         "misra-c2012-17.8": 1,
-        "misra-c2012-18.4": 24,
+        "misra-c2012-18.4": 30,
         "misra-c2012-21.15": 2,
         "misra-c2012-5.9": 4,
         "misra-c2012-8.7": 1

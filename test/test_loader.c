@@ -878,6 +878,208 @@ static void build_transpose_plan(uint8_t *buf)
     buf[TRANSPOSE_ATTR_DATA_OFF + 1u] = 0;
 }
 
+/* A schema-v7 plan whose single stage carries a height tile plan. The tiled
+ * contract admits two stage shapes the stripe rules cannot express: a global
+ * reduction, which collapses the height, and a layout conversion, which
+ * permutes it. Both are validated here, where the executor is not reached. */
+#define TILED_PLAN_SIZE       308u
+#define TILED_TENSORS_OFF     120u
+#define TILED_OPS_OFF         152u
+#define TILED_STAGES_OFF      190u
+#define TILED_TILE_PLANS_OFF  218u
+#define TILED_INDEX_OFF       242u
+#define TILED_SHAPES_OFF      256u
+#define TILED_STRINGS_OFF     288u
+#define TILED_ATTRS_OFF       292u
+#define TILED_ATTR_DATA_OFF   304u
+
+/**
+ * Build the plan above. `op_type` selects the stage's single operator;
+ * `ndim` its tensor rank. Shapes are the conversion's by default and are
+ * overwritten by the caller for a reduction.
+ */
+static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
+{
+    memset(buf, 0, TILED_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = TILED_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 2;
+    hdr->num_ops = 1;
+    hdr->num_stages = 1;
+    hdr->num_tile_plans = 1;
+    hdr->model_io_off = 2;
+    hdr->num_model_inputs = 1;
+    hdr->num_model_outputs = 1;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, TILED_TENSORS_OFF};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, TILED_OPS_OFF};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, TILED_STAGES_OFF};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_TILE_PLANS,
+                                      TILED_TILE_PLANS_OFF};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, TILED_INDEX_OFF};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, TILED_SHAPES_OFF};
+    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, TILED_STRINGS_OFF};
+    /* Only a Transpose carries an attribute, and the section exists only when
+     * it has a record: an empty one is not a shape the emitter produces. */
+    if (op_type == TIGRIS_OP_TRANSPOSE)
+        dir[7] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES,
+                                          TILED_ATTRS_OFF};
+
+    int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    uint32_t elems;
+    if (ndim == 3u) {
+        shapes[0] = 1; shapes[1] = 4; shapes[2] = 8;
+        shapes[4] = 1; shapes[5] = 8; shapes[6] = 4;
+        elems = 32u;
+    } else {
+        shapes[0] = 1; shapes[1] = 2; shapes[2] = 4; shapes[3] = 8;
+        shapes[4] = 1; shapes[5] = 8; shapes[6] = 2; shapes[7] = 4;
+        elems = 64u;
+    }
+
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    for (uint16_t i = 0; i < 2u; i++) {
+        tensors[i].size_bytes = elems * (uint32_t)sizeof(float);
+        tensors[i].shape_off = (uint16_t)(i * 4u);
+        tensors[i].ndim = ndim;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+    tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    tensors[1].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+
+    tigris_op_t *op = (tigris_op_t *)(buf + TILED_OPS_OFF);
+    op->op_type = op_type;
+    op->num_inputs = 1;
+    op->num_outputs = 1;
+    op->inputs_off = 0;
+    op->outputs_off = 1;
+    op->weight_idx = TIGRIS_NO_WEIGHT;
+    op->bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + TILED_STAGES_OFF);
+    stage->ops_off = 4;
+    stage->ops_count = 1;
+    stage->inputs_off = 5;
+    stage->inputs_count = 1;
+    stage->outputs_off = 6;
+    stage->outputs_count = 1;
+    stage->tile_plan_idx = 0;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    tigris_tile_plan_t *tile =
+        (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+    tile->tileable = 1;
+    tile->axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    tile->tile_height = 1;
+    tile->num_tiles = 4;
+    tile->original_height = 4;
+
+    uint16_t *indices = (uint16_t *)(buf + TILED_INDEX_OFF);
+    indices[0] = 0;  /* op input */
+    indices[1] = 1;  /* op output */
+    indices[2] = 0;  /* model input */
+    indices[3] = 1;  /* model output */
+    indices[4] = 0;  /* stage op */
+    indices[5] = 0;  /* stage input */
+    indices[6] = 1;  /* stage output */
+
+    buf[TILED_STRINGS_OFF] = '\0';
+
+    uint16_t count = (op_type == TIGRIS_OP_TRANSPOSE) ? 1u : 0u;
+    memcpy(buf + TILED_ATTRS_OFF, &count, sizeof(count));
+    if (count == 0u)
+        return;
+
+    tigris_op_attribute_t *attr =
+        (tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u);
+    attr->op_index = 0;
+    attr->type = TIGRIS_OP_ATTR_TRANSPOSE_PERM;
+    attr->data_len = ndim;
+    attr->data_offset = 0;
+    uint8_t *perm = buf + TILED_ATTR_DATA_OFF;
+    if (ndim == 3u) {
+        perm[0] = 0; perm[1] = 2; perm[2] = 1;
+    } else {
+        perm[0] = 0; perm[1] = 3; perm[2] = 1; perm[3] = 2;
+    }
+}
+
+static void test_tiled_conversion_contract(void)
+{
+    printf("  test_tiled_conversion_contract...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 3);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "rank-3 conversion may carry a height tile plan");
+
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 4);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "rank-4 conversion may carry a height tile plan");
+
+    /* A permutation that also reorders the spatial pair is not a conversion. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 4);
+    buf[TILED_ATTR_DATA_OFF + 2u] = 2;
+    buf[TILED_ATTR_DATA_OFF + 3u] = 1;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[5] = 8;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[6] = 4;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[7] = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "a non-conversion permutation may not claim a tile plan");
+
+    /* Rank 2 has no axis a height tile could cut, so it is refused before
+     * the conversion contract is even consulted. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 3);
+    ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[0].ndim = 2;
+    ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].ndim = 2;
+    ((tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u))->data_len = 2;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[0] = 4;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[1] = 8;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[4] = 8;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[5] = 4;
+    buf[TILED_ATTR_DATA_OFF] = 1;
+    buf[TILED_ATTR_DATA_OFF + 1u] = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a rank-2 transpose may not claim a tile plan");
+}
+
+static void test_tiled_reduction_contract(void)
+{
+    printf("  test_tiled_reduction_contract...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+    int32_t *shapes;
+
+    /* [1, 2, 4, 8] reduced to [1, 1, 1, 8]. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_GLOBAL_AVG, 4);
+    shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[4] = 1; shapes[5] = 1; shapes[6] = 1; shapes[7] = 8;
+    ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].size_bytes =
+        8u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "a collapsed reduction may carry a height tile plan");
+
+    /* An output that still has spatial extent is not a global reduction. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_GLOBAL_AVG, 4);
+    shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[4] = 1; shapes[5] = 1; shapes[6] = 2; shapes[7] = 8;
+    ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].size_bytes =
+        16u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "an uncollapsed reduction may not claim a tile plan");
+}
+
 static void test_transpose_attribute_guards(void)
 {
     printf("  test_transpose_attribute_guards...\n");
@@ -1936,6 +2138,8 @@ int main(int argc, char *argv[])
     test_compressed_block_guards();
     test_cross_reference_guards();
     test_transpose_attribute_guards();
+    test_tiled_conversion_contract();
+    test_tiled_reduction_contract();
     test_operator_semantic_guards();
     test_nonweighted_operator_semantics();
     test_convolution_semantic_guards();

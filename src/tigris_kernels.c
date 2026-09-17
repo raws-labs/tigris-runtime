@@ -1104,27 +1104,35 @@ int tigris_transpose_execute(
         return -1;
     uint32_t element_size = input->size_bytes / elements;
 
-    /* A conversion stage tiled along its output rows hands this kernel a
-     * packed [N, in_h, in_w] slice of the input and expects a packed
-     * [N, out_h, out_w] slice of the output. The walk below then runs on the
-     * tile extents while the element size stays the tensor's. Only the rank-3
-     * last-two-axis case is routed here, so the extents are fixed. */
-    int32_t tiled_in[3];
-    int32_t tiled_out[3];
+    /* A conversion stage hands this kernel a packed [batch, in_h, in_w] slice
+     * of the input and expects a packed [batch, out_h, out_w] slice of the
+     * output. Whatever the tensor's rank, the permutation a conversion
+     * performs is a plain matrix transpose once the axes that keep their
+     * relative order are read as one, so the slice is transposed directly
+     * rather than through the general index walk below. */
     if (mem->tile.active && mem->tile.transposed_tile) {
-        if (rank != 3 || mem->tile.in_h <= 0 || mem->tile.in_w <= 0 ||
-            mem->tile.out_h <= 0 || mem->tile.out_w <= 0)
+        int32_t batch = input_shape[0];
+        int32_t rows = mem->tile.in_h;
+        int32_t cols = mem->tile.in_w;
+        if (batch <= 0 || rows <= 0 || cols <= 0 ||
+            mem->tile.out_h != cols || mem->tile.out_w != rows)
             return -1;
-        tiled_in[0] = input_shape[0];
-        tiled_in[1] = mem->tile.in_h;
-        tiled_in[2] = mem->tile.in_w;
-        tiled_out[0] = output_shape[0];
-        tiled_out[1] = mem->tile.out_h;
-        tiled_out[2] = mem->tile.out_w;
-        input_shape = tiled_in;
-        output_shape = tiled_out;
-        elements = (uint32_t)tiled_out[0] * (uint32_t)tiled_out[1] *
-                   (uint32_t)tiled_out[2];
+        for (int32_t n = 0; n < batch; n++) {
+            const uint8_t *src_n =
+                src + (size_t)n * (size_t)rows * (size_t)cols * element_size;
+            uint8_t *dst_n =
+                dst + (size_t)n * (size_t)rows * (size_t)cols * element_size;
+            for (int32_t r = 0; r < rows; r++) {
+                for (int32_t c = 0; c < cols; c++) {
+                    memcpy(dst_n + ((size_t)c * (size_t)rows + (size_t)r) *
+                                       element_size,
+                           src_n + ((size_t)r * (size_t)cols + (size_t)c) *
+                                       element_size,
+                           element_size);
+                }
+            }
+        }
+        return 0;
     }
 
     for (uint32_t output_index = 0; output_index < elements; output_index++) {

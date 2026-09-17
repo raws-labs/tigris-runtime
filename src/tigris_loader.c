@@ -1197,21 +1197,33 @@ tigris_error_t tigris_plan_load(
                     candidate.ops[
                         candidate.index_pool[stage->ops_off]
                     ].op_type == TIGRIS_OP_TRANSPOSE) {
-                    /* A layout conversion is tiled along its output rows,
-                     * gathering the input columns each band transposes. Only
-                     * the rank-3 last-two-axis permutation is executable that
-                     * way, and only as the whole stage. */
+                    /* A layout conversion is tiled a band at a time along
+                     * the longer of the two extents it transposes. Only a
+                     * permutation that moves the channel axis past the
+                     * spatial ones, leaving those in their relative order, is
+                     * executable that way, and only as the whole stage.
+                     * Mirrors transpose_extents in the executor. */
                     uint16_t conv_op = candidate.index_pool[stage->ops_off];
                     uint8_t perm_rank = 0;
                     const uint8_t *perm = tigris_op_attribute_data(
                         &candidate, conv_op,
                         TIGRIS_OP_ATTR_TRANSPOSE_PERM, &perm_rank);
-                    if (rank != 3 ||
+                    int convertible = 0;
+                    if (perm && perm_rank == rank && perm[0] == 0u) {
+                        if (rank == 3u) {
+                            convertible = (perm[1] == 2u && perm[2] == 1u);
+                        } else if (rank == 4u) {
+                            convertible =
+                                (perm[1] == 3u && perm[2] == 1u &&
+                                 perm[3] == 2u) ||
+                                (perm[1] == 2u && perm[2] == 3u &&
+                                 perm[3] == 1u);
+                        }
+                    }
+                    if (!convertible ||
                         stage->inputs_count != 1 ||
                         stage->outputs_count != 1 ||
-                        stage->chain_len != 0 ||
-                        !perm || perm_rank != 3u ||
-                        perm[0] != 0u || perm[1] != 2u || perm[2] != 1u)
+                        stage->chain_len != 0)
                         return TIGRIS_ERR_BAD_OPERATOR;
                 } else if (rank == 3) {
                     uint16_t conv_count = 0;

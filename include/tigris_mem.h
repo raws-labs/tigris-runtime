@@ -69,6 +69,10 @@ typedef struct {
      * packed [N, out_h, out_w] output, so it walks the tile extents above
      * rather than the tensor's own. Zero on every other path. */
     uint8_t  transposed_tile;
+    /* A rank-2 matrix tiled along its rows. Rank 2 has no batch or spatial
+     * axis, so the row axis is axis 0 rather than axis 1 and out_h counts the
+     * rows in this band. Zero on every other path. */
+    uint8_t  row_tiled;
 } tigris_tile_ctx_t;
 
 /* Tensor alignment */

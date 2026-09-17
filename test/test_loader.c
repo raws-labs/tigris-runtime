@@ -1164,8 +1164,8 @@ static void test_tiled_conversion_contract(void)
                    TIGRIS_ERR_BAD_OPERATOR,
                    "a non-conversion permutation may not claim a tile plan");
 
-    /* Rank 2 has no axis a height tile could cut, so it is refused before
-     * the conversion contract is even consulted. */
+    /* Rank 2 has only the row band, and a Transpose does not keep rows
+     * independent, so the stage qualifies for no tiling contract at all. */
     build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 3);
     ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[0].ndim = 2;
     ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].ndim = 2;

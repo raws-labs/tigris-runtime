@@ -41,6 +41,10 @@ static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
         return tensor_numel(plan, tidx);
     const tigris_tensor_t *t = &plan->tensors[tidx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
+    /* A rank-2 matrix tiled along its rows has no batch axis to multiply by:
+     * out_h counts the rows in the band and the trailing axis is the row. */
+    if (mem->tile.row_tiled)
+        return (uint32_t)mem->tile.out_h * (uint32_t)shape[t->ndim - 1];
     /* Serialized activations are NHWC or NLC. */
     uint32_t width = t->ndim == 4 ? (uint32_t)mem->tile.out_w : 1u;
     return (uint32_t)shape[0] * (uint32_t)mem->tile.out_h *
@@ -820,6 +824,10 @@ static int kern_fully_connected(
         N  = 1;
         OC = y_shape[y_tensor->ndim - 1];
     }
+    /* A row band computes its own rows against the whole weight, so only the
+     * row count changes; the loaded operand already starts at the band. */
+    if (mem->tile.active && mem->tile.row_tiled)
+        N = (int)mem->tile.out_h;
     /* IC from weight: total weight elements / OC */
     const tigris_weight_entry_t *we = &plan->weight_entries[op->weight_idx];
     int IC = (int)(we->size_bytes / sizeof(float)) / OC;
@@ -920,7 +928,15 @@ static int kern_reshape(
     const uint16_t *outs = tigris_op_outputs(plan, op);
     const void *X = tigris_mem_tensor_ptr(mem, ins[0]);
     void       *Y = tigris_mem_tensor_ptr(mem, outs[0]);
-    uint32_t sz = plan->tensors[ins[0]].size_bytes;
+    /* A reshape moves no data, so under a tile it moves exactly the tile: the
+     * element count the tile holds, not the tensor's. The int8 twin has
+     * always done this; the float one copied the whole tensor, which a row
+     * band would write past the end of. */
+    const tigris_tensor_t *in = &plan->tensors[ins[0]];
+    uint32_t elems = tensor_numel(plan, ins[0]);
+    uint32_t sz = in->size_bytes;
+    if (elems != 0u)
+        sz = (in->size_bytes / elems) * tile_aware_numel(plan, ins[0], mem);
     if (X != Y)
         memcpy(Y, X, sz);
     return 0;

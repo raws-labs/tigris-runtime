@@ -146,12 +146,14 @@ tigris_mem_error_t tigris_mem_load_tile(
     const tigris_tensor_t *t = &plan->tensors[tensor_idx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
 
-    if (t->ndim != 3 && t->ndim != 4)
+    if (t->ndim < 2 || t->ndim > 4)
         return TIGRIS_MEM_ERR_BAD_INDEX;
 
-    /* Serialized activations are NHWC [N,H,W,C] or NLC [N,L,C]. */
-    int32_t N = shape[0];
-    int32_t H = shape[1];
+    /* Serialized activations are NHWC [N,H,W,C] or NLC [N,L,C]. A rank-2
+     * matrix is the same memory as [1, rows, 1, cols], which is what lets a
+     * row band of one take the same row helper. */
+    int32_t N = t->ndim == 2 ? 1 : shape[0];
+    int32_t H = t->ndim == 2 ? shape[0] : shape[1];
     int32_t W = t->ndim == 4 ? shape[2] : 1;
     int32_t C = shape[t->ndim - 1];
 
@@ -202,12 +204,14 @@ tigris_mem_error_t tigris_mem_spill_tile(
     const tigris_tensor_t *t = &plan->tensors[tensor_idx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
 
-    if (t->ndim != 3 && t->ndim != 4)
+    if (t->ndim < 2 || t->ndim > 4)
         return TIGRIS_MEM_ERR_BAD_INDEX;
 
-    /* Serialized activations are NHWC [N,H,W,C] or NLC [N,L,C]. */
-    int32_t N = shape[0];
-    int32_t H = shape[1];
+    /* Serialized activations are NHWC [N,H,W,C] or NLC [N,L,C]. A rank-2
+     * matrix is the same memory as [1, rows, 1, cols], which is what lets a
+     * row band of one take the same row helper. */
+    int32_t N = t->ndim == 2 ? 1 : shape[0];
+    int32_t H = t->ndim == 2 ? shape[0] : shape[1];
     int32_t W = t->ndim == 4 ? shape[2] : 1;
     int32_t C = shape[t->ndim - 1];
     int32_t tile_h = h_end - h_start;

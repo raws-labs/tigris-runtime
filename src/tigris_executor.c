@@ -1836,14 +1836,20 @@ static int tensor_row_view(
     const tigris_plan_t *plan, const tigris_tensor_t *t,
     int32_t *rows, int32_t *cols)
 {
+    /* Read the rank and the pool before the shape: this runs on every stage
+     * of every plan, including one that carries no shape pool at all, where
+     * offsetting it is undefined rather than merely wrong. */
+    if (plan->shape_pool == NULL)
+        return 0;
+    if (t->ndim != 2u && t->ndim != 3u)
+        return 0;
     const int32_t *shape = tigris_tensor_shape(plan, t);
     if (t->ndim == 2u) {
         *rows = shape[0];
         *cols = shape[1];
         return 1;
     }
-    if (t->ndim == 3u && shape[0] == 1 &&
-        (t->flags & TIGRIS_TENSOR_LINEAR) != 0u) {
+    if (shape[0] == 1 && (t->flags & TIGRIS_TENSOR_LINEAR) != 0u) {
         *rows = shape[1];
         *cols = shape[2];
         return 1;

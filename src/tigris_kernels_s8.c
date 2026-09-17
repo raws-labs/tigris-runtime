@@ -142,6 +142,29 @@ static inline int32_t get_shift(
     return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
 }
 
+/** Re-encode a value that a kernel carried through unchanged.
+ *
+ * Max preserves the value, but not its encoding: when the output tensor
+ * declares a different scale or zero point from the input's, the same value
+ * is a different int8. Defined the way kern_avg_pool_s8 defines the mismatched
+ * case, dequantize then requantize with round() so half ties go away from
+ * zero, since TFLite rejects mismatched pool quantization and there is no
+ * canonical integer-kernel result to match.
+ */
+static inline int32_t requantize_passthrough(
+    int32_t q, int32_t in_zp, float in_scale, int32_t out_zp, float out_scale)
+{
+    if (in_scale == out_scale && in_zp == out_zp)
+        return q;
+    double value = (double)(q - in_zp) * (double)in_scale;
+    double scaled = round(value / (double)out_scale) + (double)out_zp;
+    if (scaled < -128.0)
+        return -128;
+    if (scaled > 127.0)
+        return 127;
+    return (int32_t)scaled;
+}
+
 /** Total number of elements in a tensor. */
 static uint32_t tensor_numel(const tigris_plan_t *plan, uint16_t tidx)
 {
@@ -1047,6 +1070,22 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_max_pool_s8(
     int W = x_shape[2];
     int C = x_shape[3];
 
+    /* Max preserves the value, not its encoding: see kern_max_pool_s8. */
+    const tigris_quant_param_t *in_qp =
+        tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    const tigris_quant_param_t *out_qp =
+        tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    int32_t input_zp = in_qp ? in_qp->zero_point : 0;
+    int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+    float in_scale = in_qp ? in_qp->scale : 1.0f;
+    float out_scale = out_qp ? out_qp->scale : 1.0f;
+    if (!(in_scale > 0.0f))
+        in_scale = 1.0f;
+    if (!(out_scale > 0.0f)) {
+        out_scale = in_scale;
+        output_zp = input_zp;
+    }
+
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
             int32_t best = -128;
@@ -1056,7 +1095,9 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_max_pool_s8(
                     if (v > best) best = v;
                 }
             }
-            Y[n * C + c] = clamp_act(best, op->act_min, op->act_max);
+            int32_t out_q = requantize_passthrough(
+                best, input_zp, in_scale, output_zp, out_scale);
+            Y[n * C + c] = clamp_act(out_q, op->act_min, op->act_max);
         }
     }
     return 0;
@@ -1120,7 +1161,23 @@ static TIGRIS_KERNEL_NOINLINE int kern_max_pool_s8(
         in_row_start  = mem->tile.in_row_start;
     }
 
-    /* Max preserves scale/zp - no requantization needed */
+    /* Max preserves the value. The encoding is only preserved when the two
+     * tensors declare the same quantization, which nothing enforces. */
+    const tigris_quant_param_t *in_qp =
+        tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    const tigris_quant_param_t *out_qp =
+        tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    int32_t input_zp = in_qp ? in_qp->zero_point : 0;
+    int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+    float in_scale = in_qp ? in_qp->scale : 1.0f;
+    float out_scale = out_qp ? out_qp->scale : 1.0f;
+    if (!(in_scale > 0.0f))
+        in_scale = 1.0f;
+    if (!(out_scale > 0.0f)) {
+        out_scale = in_scale;
+        output_zp = input_zp;
+    }
+
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
@@ -1139,8 +1196,10 @@ static TIGRIS_KERNEL_NOINLINE int kern_max_pool_s8(
                     }
                     /* Apply the fused activation clamp, as TFLM/CMSIS MaxPool do
                      * (no-op when act range is the full [-128, 127]). */
+                    int32_t out_q = requantize_passthrough(
+                        max_val, input_zp, in_scale, output_zp, out_scale);
                     Y[((n * OH + oh_g) * OW + ow) * C + c] =
-                        clamp_act(max_val, op->act_min, op->act_max);
+                        clamp_act(out_q, op->act_min, op->act_max);
                 }
             }
         }

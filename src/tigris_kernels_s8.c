@@ -13,6 +13,7 @@
 #include "tigris_kernels_s8.h"
 #include "tigris_kernels.h"
 #include "tigris_accel_policy.h"
+#include "tigris_kernel_window.h"
 
 #include <math.h>
 #include <string.h>
@@ -142,38 +143,6 @@ static inline int32_t get_shift(
     return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
 }
 
-/** The half-open range of tap indices whose input coordinate is inside the
- * tensor.
- *
- * The coordinate is base + k * dilation and is strictly increasing in k, so
- * the taps that land inside form one interval and the inner loops need no
- * bounds test. Computing the interval per output row and per output column
- * also stops it being recomputed for every channel, which the
- * channel-innermost loop order made the convolution kernels do.
- */
-static inline void tap_range(
-    int base, int extent, int taps, int dilation, int *first, int *last)
-{
-    int lo = 0;
-    int hi = taps;
-    int span = extent - 1 - base;
-    if (base < 0) {
-        lo = (-base + dilation - 1) / dilation;
-        if (lo > taps)
-            lo = taps;
-    }
-    if (span < 0) {
-        hi = 0;
-    } else {
-        int bound = span / dilation + 1;
-        if (bound < hi)
-            hi = bound;
-    }
-    if (hi < lo)
-        hi = lo;
-    *first = lo;
-    *last = hi;
-}
 
 /** Total number of elements in a tensor. */
 static uint32_t tensor_numel(const tigris_plan_t *plan, uint16_t tidx)

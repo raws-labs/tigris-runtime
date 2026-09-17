@@ -244,13 +244,16 @@ tigris_mem_error_t tigris_mem_load_tile_2d(
     const int32_t *shape = tigris_tensor_shape(plan, t);
 
     /* Only rank-4 NHWC tensors have a width axis to slice. */
-    if (t->ndim != 4)
+    /* A rank-3 tensor is the same memory as rank 4 with a single channel:
+     * [N, H, W] and [N, H, W, 1] have identical strides. Saying so here is what
+     * lets a rank-3 tensor take a rectangle, which a transposed spill needs. */
+    if (t->ndim != 3 && t->ndim != 4)
         return TIGRIS_MEM_ERR_BAD_INDEX;
 
     int32_t N = shape[0];
     int32_t H = shape[1];
     int32_t W = shape[2];
-    int32_t C = shape[3];
+    int32_t C = t->ndim == 4 ? shape[3] : 1;
 
     if (h0 < 0 || h1 <= h0 || h1 > H || w0 < 0 || w1 <= w0 || w1 > W)
         return TIGRIS_MEM_ERR_BAD_INDEX;
@@ -301,13 +304,16 @@ tigris_mem_error_t tigris_mem_spill_tile_2d(
     const tigris_tensor_t *t = &plan->tensors[tidx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
 
-    if (t->ndim != 4)
+    /* A rank-3 tensor is the same memory as rank 4 with a single channel:
+     * [N, H, W] and [N, H, W, 1] have identical strides. Saying so here is what
+     * lets a rank-3 tensor take a rectangle, which a transposed spill needs. */
+    if (t->ndim != 3 && t->ndim != 4)
         return TIGRIS_MEM_ERR_BAD_INDEX;
 
     int32_t N = shape[0];
     int32_t H = shape[1];
     int32_t W = shape[2];
-    int32_t C = shape[3];
+    int32_t C = t->ndim == 4 ? shape[3] : 1;
 
     if (h0 < 0 || h1 <= h0 || h1 > H || w0 < 0 || w1 <= w0 || w1 > W)
         return TIGRIS_MEM_ERR_BAD_INDEX;

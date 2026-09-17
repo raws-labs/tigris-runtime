@@ -142,6 +142,39 @@ static inline int32_t get_shift(
     return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
 }
 
+/** The half-open range of tap indices whose input coordinate is inside the
+ * tensor.
+ *
+ * The coordinate is base + k * dilation and is strictly increasing in k, so
+ * the taps that land inside form one interval and the inner loops need no
+ * bounds test. Computing the interval per output row and per output column
+ * also stops it being recomputed for every channel, which the
+ * channel-innermost loop order made the convolution kernels do.
+ */
+static inline void tap_range(
+    int base, int extent, int taps, int dilation, int *first, int *last)
+{
+    int lo = 0;
+    int hi = taps;
+    int span = extent - 1 - base;
+    if (base < 0) {
+        lo = (-base + dilation - 1) / dilation;
+        if (lo > taps)
+            lo = taps;
+    }
+    if (span < 0) {
+        hi = 0;
+    } else {
+        int bound = span / dilation + 1;
+        if (bound < hi)
+            hi = bound;
+    }
+    if (hi < lo)
+        hi = lo;
+    *first = lo;
+    *last = hi;
+}
+
 /** Total number of elements in a tensor. */
 static uint32_t tensor_numel(const tigris_plan_t *plan, uint16_t tidx)
 {
@@ -307,15 +340,19 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv2d_s8(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, DH, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, DW, &kw0, &kw1);
                 for (int oc = 0; oc < OC; oc++) {
                     int32_t acc = B ? load_bias_s32(B, (uint32_t)oc) : 0;
-                    for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh_g * SH - PT + kh * DH - in_row_start;
-                        if (ih < 0 || ih >= IH) continue;
-                        for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PL + kw * DW;
-                            if (iw < 0 || iw >= IW) continue;
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh * DH;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw * DW;
                             for (int ic = 0; ic < IC; ic++) {
                                 int32_t x_val = (int32_t)X[((n*IH+ih)*IW+iw)*IC+ic] - input_zp;
                                 int32_t w_val = (int32_t)W[((oc*KH+kh)*KW+kw)*IC+ic];
@@ -558,15 +595,19 @@ static TIGRIS_KERNEL_NOINLINE int kern_depthwise_conv2d_s8(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, DH, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, DW, &kw0, &kw1);
                 for (int c = 0; c < C; c++) {
                     int32_t acc = B ? load_bias_s32(B, (uint32_t)c) : 0;
-                    for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh_g * SH - PT + kh * DH - in_row_start;
-                        if (ih < 0 || ih >= IH) continue;
-                        for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PL + kw * DW;
-                            if (iw < 0 || iw >= IW) continue;
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh * DH;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw * DW;
                             int32_t x_val = (int32_t)X[((n*IH+ih)*IW+iw)*C+c] - input_zp;
                             int32_t w_val = (int32_t)W[(kh*KW+kw)*C+c];
                             acc += x_val * w_val;
@@ -1124,15 +1165,19 @@ static TIGRIS_KERNEL_NOINLINE int kern_max_pool_s8(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, 1, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, 1, &kw0, &kw1);
                 for (int c = 0; c < C; c++) {
                     int8_t max_val = -128;
-                    for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh_g * SH - PT + kh - in_row_start;
-                        if (ih < 0 || ih >= IH) continue;
-                        for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PL + kw;
-                            if (iw < 0 || iw >= IW) continue;
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw;
                             int8_t v = X[((n * IH + ih) * IW + iw) * C + c];
                             if (v > max_val) max_val = v;
                         }

@@ -1929,9 +1929,15 @@ static int stage_is_row_tiled(
         /* Every intermediate is rank 2 with the same rows, or a band means
          * something different partway through the stage. */
         const uint16_t *outs = tigris_op_outputs(plan, op);
+        const tigris_tensor_t *out = &plan->tensors[outs[0]];
         int32_t r;
-        if (!tensor_row_view(plan, &plan->tensors[outs[0]], &r, &cols) ||
-            r != rows)
+        if (!tensor_row_view(plan, out, &r, &cols) || r != rows)
+            return 0;
+        /* A row view accepts a rank-3 [1, rows, cols] as the same memory, but
+         * kern_fully_connected reads its channel count out of y_shape[1],
+         * which on a rank-3 output is the row count. The matrix product is
+         * the one operator here whose rank the row view does not settle. */
+        if (op->op_type == TIGRIS_OP_FULLY_CONN && out->ndim != 2u)
             return 0;
     }
     *out_rows = rows;

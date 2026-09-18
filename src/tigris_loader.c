@@ -378,6 +378,35 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
 
+        case TIGRIS_OP_REDUCE_MEAN: {
+            /* One rank-3 activation in, one of its axes collapsed. The result
+             * keeps that axis at one or drops it, which is the difference
+             * between keepdims and not, and every other extent stays put. */
+            uint8_t num_axes = 0u;
+            const uint8_t *axes = tigris_op_attribute_data(
+                plan, op_index, TIGRIS_OP_ATTR_AXES, &num_axes);
+            if (!op_has_plain_io(op, 1, 1) || input->ndim != 3u ||
+                axes == NULL || num_axes != 1u || axes[0] >= 3u ||
+                (output->ndim != 3u && output->ndim != 2u))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *in_shape = tigris_tensor_shape(plan, input);
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            uint8_t written = 0u;
+            for (uint8_t axis = 0; axis < 3u; axis++) {
+                if (in_shape[axis] <= 0)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                int32_t want = (axis == axes[0]) ? 1 : in_shape[axis];
+                if (axis == axes[0] && output->ndim == 2u)
+                    continue;  /* keepdims=0 drops the axis instead */
+                if (written >= output->ndim || out_shape[written] != want)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                written++;
+            }
+            if (written != output->ndim)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
+
         case TIGRIS_OP_LAYER_NORM: {
             /* One activation in and out, shape-preserving. Scale is a weight
              * and bias an optional one, each holding one value per position
@@ -1189,6 +1218,7 @@ tigris_error_t tigris_plan_load(
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
             int has_transpose_perm = 0;
             int has_epsilon = 0;
+            int has_axes = 0;
             while (attr_cursor < candidate.num_op_attributes &&
                    candidate.op_attributes[attr_cursor].op_index == op_idx) {
                 if (candidate.op_attributes[attr_cursor].type ==
@@ -1197,6 +1227,9 @@ tigris_error_t tigris_plan_load(
                 if (candidate.op_attributes[attr_cursor].type ==
                     TIGRIS_OP_ATTR_EPSILON)
                     has_epsilon = 1;
+                if (candidate.op_attributes[attr_cursor].type ==
+                    TIGRIS_OP_ATTR_AXES)
+                    has_axes = 1;
                 attr_cursor++;
             }
             if ((candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE) !=
@@ -1207,6 +1240,10 @@ tigris_error_t tigris_plan_load(
             if ((candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM) !=
                 has_epsilon)
                 return TIGRIS_ERR_BAD_SECTION;
+            /* A reduction cannot default the axes it collapses either. */
+            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MEAN) !=
+                has_axes)
+                return TIGRIS_ERR_BAD_SECTION;
         }
     } else if (hdr->version >= TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES) {
         /* No attribute section at all, so every operator that requires one is
@@ -1214,7 +1251,8 @@ tigris_error_t tigris_plan_load(
          * is a section. */
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
             if (candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE ||
-                candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM)
+                candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM ||
+                candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MEAN)
                 return TIGRIS_ERR_BAD_SECTION;
         }
     }

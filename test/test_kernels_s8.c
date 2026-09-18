@@ -1616,6 +1616,71 @@ static void test_transpose_s8(void)
                        "transpose_s8 value");
 }
 
+
+/* The int8 mean folds the reciprocal into the requant multiplier, so a plan
+ * whose output declares a different encoding than its input has to come back
+ * on the output's scale. A rescaling case and a same-scale case, because the
+ * first is what a quantizer actually assigns and the second is the arithmetic
+ * anyone can check by hand. */
+static void test_reduce_mean_s8(void)
+{
+    printf("  test_reduce_mean_s8...\n");
+    plan_reset();
+    tigris_plan_t plan;
+
+    /* [1, 4, 2], mean over the token axis.
+     * columns: (2+4+6+8)/4 = 5 and (10+12+14+16)/4 = 13 */
+    uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    int32_t x_shape[] = {1, 4, 2};
+    int32_t y_shape[] = {1, 1, 2};
+    uint16_t t_in = add_tensor(&plan, "x", x_shape, 3, 3, 8, in_qp);
+    uint16_t t_out = add_tensor(&plan, "y", y_shape, 3, 3, 2, out_qp);
+    uint16_t ins[] = {t_in}, outs[] = {t_out};
+    test_ops[0].op_type = TIGRIS_OP_REDUCE_MEAN;
+    test_ops[0].num_inputs = 1; test_ops[0].num_outputs = 1;
+    test_ops[0].inputs_off = add_indices(ins, 1);
+    test_ops[0].outputs_off = add_indices(outs, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_AXES, 1, 0};
+    const uint8_t axes[] = {1};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = axes;
+    plan.num_op_attributes = 1;
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[4096], slow[4096]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
+                    slow, sizeof(slow));
+    const int8_t values[] = {2, 10, 4, 12, 6, 14, 8, 16};
+    tigris_mem_alloc_fast(&mem, t_in, sizeof(values));
+    memcpy(ptrs[t_in], values, sizeof(values));
+    tigris_mem_alloc_fast(&mem, t_out, 2);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                             NULL), 0,
+                   "reduce_mean_s8 returns 0");
+    TEST_ASSERT_EQ(((int8_t *)ptrs[t_out])[0], 5, "reduce_mean_s8 column 0");
+    TEST_ASSERT_EQ(((int8_t *)ptrs[t_out])[1], 13, "reduce_mean_s8 column 1");
+
+    /* Same values through a half-sized output scale and a shifted zero point:
+     * 5 and 13 in input units become 10 and 26 steps, less the shift. */
+    test_qp[out_qp].scale = 0.5f;
+    test_qp[out_qp].zero_point = -4;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                             NULL), 0,
+                   "rescaled reduce_mean_s8 returns 0");
+    TEST_ASSERT_EQ(((int8_t *)ptrs[t_out])[0], 6, "rescaled column 0");
+    TEST_ASSERT_EQ(((int8_t *)ptrs[t_out])[1], 22, "rescaled column 1");
+
+    /* A plan that does not say which axis it collapses is refused. */
+    plan.num_op_attributes = 0;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                          NULL) != 0,
+                "reduce_mean_s8 without axes is refused");
+}
+
 /* Main */
 
 int main(void)
@@ -1643,6 +1708,7 @@ int main(void)
     test_softmax_s8();
     test_conv1d_s8();
     test_transpose_s8();
+    test_reduce_mean_s8();
     test_unsupported_op_s8();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

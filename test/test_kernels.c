@@ -2378,6 +2378,80 @@ static void test_pointwise_row_band_covers_every_batch(void)
 
 /* Main */
 
+/* A mean over one axis of a rank-3 tensor. The axis the plan names is a
+ * serialized one, so the same kernel collapses a sequence's token axis and a
+ * feature map's channel axis; both are checked, plus the two ways a plan may
+ * state the result's rank. */
+static void run_reduce_mean_case(
+    uint8_t axis, uint8_t out_ndim, const float *expected, int count)
+{
+    /* [2, 3, 2], values 0..11 */
+    int32_t shapes[] = {2, 3, 2, 0, 0, 0};
+    float input[12];
+    for (int i = 0; i < 12; i++)
+        input[i] = (float)i;
+    int32_t kept[3];
+    uint8_t written = 0;
+    for (uint8_t a = 0; a < 3u; a++) {
+        if (a == axis && out_ndim == 2u)
+            continue;
+        kept[written++] = (a == axis) ? 1 : shapes[a];
+    }
+    for (uint8_t a = 0; a < written; a++)
+        shapes[3 + a] = kept[a];
+
+    uint16_t indices[] = {0, 1};
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 3;
+    tensors[0].dtype = 1; tensors[0].size_bytes = sizeof(input);
+    tensors[1].shape_off = 3; tensors[1].ndim = out_ndim;
+    tensors[1].dtype = 1;
+    tensors[1].size_bytes = (uint32_t)count * sizeof(float);
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_REDUCE_MEAN;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_AXES, 1, 0};
+    const uint8_t axes[] = {axis};
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header; plan.tensors = tensors; plan.ops = &op;
+    plan.index_pool = indices; plan.shape_pool = shapes;
+    plan.op_attributes = &attr; plan.op_attribute_data = axes;
+    plan.num_op_attributes = 1;
+    void *ptrs[2]; uint8_t fast[256], slow[256]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, 2, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, 0, sizeof(input));
+    memcpy(ptrs[0], input, sizeof(input));
+    tigris_mem_alloc_fast(&mem, 1, tensors[1].size_bytes);
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "reduce mean returns 0");
+    for (int i = 0; i < count; i++)
+        TEST_ASSERT_NEAR(((float *)ptrs[1])[i], expected[i], EPS,
+                         "reduce mean value");
+}
+
+static void test_reduce_mean(void)
+{
+    printf("  test_reduce_mean...\n");
+    /* Mean over the middle axis: rows 0,2,4 and 1,3,5 of each batch. */
+    const float over_rows[] = {2.0f, 3.0f, 8.0f, 9.0f};
+    run_reduce_mean_case(1, 3, over_rows, 4);
+    run_reduce_mean_case(1, 2, over_rows, 4);
+    /* Mean over the innermost axis pairs neighbours. */
+    const float over_inner[] = {0.5f, 2.5f, 4.5f, 6.5f, 8.5f, 10.5f};
+    run_reduce_mean_case(2, 3, over_inner, 6);
+    /* Mean over the outermost axis averages the two batches. */
+    const float over_outer[] = {3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+    run_reduce_mean_case(0, 3, over_outer, 6);
+}
+
+
 int main(void)
 {
     printf("TiGrIS Kernel Tests\n\n");
@@ -2403,6 +2477,7 @@ int main(void)
     test_sigmoid();
     test_erf();
     test_layer_norm();
+    test_reduce_mean();
     test_softmax();
     test_mul();
     test_constant_binary_f32();

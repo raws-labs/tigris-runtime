@@ -925,9 +925,10 @@ static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
     dir[4] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, TILED_INDEX_OFF};
     dir[5] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, TILED_SHAPES_OFF};
     dir[6] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, TILED_STRINGS_OFF};
-    /* Only a Transpose carries an attribute, and the section exists only when
-     * it has a record: an empty one is not a shape the emitter produces. */
-    if (op_type == TIGRIS_OP_TRANSPOSE)
+    /* The section exists only when it has a record: an empty one is not a
+     * shape the emitter produces. A Transpose carries its permutation and a
+     * reduction the axis it collapses. */
+    if (op_type == TIGRIS_OP_TRANSPOSE || op_type == TIGRIS_OP_REDUCE_MEAN)
         dir[7] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES,
                                           TILED_ATTRS_OFF};
 
@@ -992,7 +993,8 @@ static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
 
     buf[TILED_STRINGS_OFF] = '\0';
 
-    uint16_t count = (op_type == TIGRIS_OP_TRANSPOSE) ? 1u : 0u;
+    uint16_t count = (op_type == TIGRIS_OP_TRANSPOSE ||
+                      op_type == TIGRIS_OP_REDUCE_MEAN) ? 1u : 0u;
     memcpy(buf + TILED_ATTRS_OFF, &count, sizeof(count));
     if (count == 0u)
         return;
@@ -1000,15 +1002,89 @@ static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
     tigris_op_attribute_t *attr =
         (tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u);
     attr->op_index = 0;
+    attr->data_offset = 0;
+    if (op_type == TIGRIS_OP_REDUCE_MEAN) {
+        attr->type = TIGRIS_OP_ATTR_AXES;
+        attr->data_len = 1;
+        buf[TILED_ATTR_DATA_OFF] = 1;
+        return;
+    }
     attr->type = TIGRIS_OP_ATTR_TRANSPOSE_PERM;
     attr->data_len = ndim;
-    attr->data_offset = 0;
     uint8_t *perm = buf + TILED_ATTR_DATA_OFF;
     if (ndim == 3u) {
         perm[0] = 0; perm[1] = 2; perm[2] = 1;
     } else {
         perm[0] = 0; perm[1] = 3; perm[2] = 1; perm[3] = 2;
     }
+}
+
+/* A reduction states the one axis it collapses, and the result either keeps
+ * that axis at one or drops it. Everything else about the shape has to stay
+ * put, and a plan that does not say which axis it means is refused rather
+ * than defaulted, the way a normalization's variance floor is. */
+static void test_reduce_mean_contract(void)
+{
+    printf("  test_reduce_mean_contract...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    /* [1, 4, 8] with the middle axis collapsed, kept at one. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_REDUCE_MEAN, 3u);
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + TILED_STAGES_OFF);
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    shapes[4] = 1; shapes[5] = 1; shapes[6] = 8;
+    tensors[1].size_bytes = 8u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "kept reduced axis accepted");
+
+    /* The same result with the axis dropped instead. */
+    tensors[1].ndim = 2u;
+    shapes[4] = 1; shapes[5] = 8; shapes[6] = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "dropped reduced axis accepted");
+
+    /* A result that keeps the collapsed extent is not a reduction. Its byte
+     * count follows the shape, or the tensor check fires before the operator
+     * one and the test would prove nothing about the reduction. */
+    shapes[4] = 1; shapes[5] = 4; shapes[6] = 0;
+    tensors[1].size_bytes = 4u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "uncollapsed axis rejected");
+
+    /* An axis outside the rank names nothing. */
+    tensors[1].ndim = 3u;
+    shapes[4] = 1; shapes[5] = 1; shapes[6] = 8;
+    tensors[1].size_bytes = 8u * (uint32_t)sizeof(float);
+    buf[TILED_ATTR_DATA_OFF] = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "axis outside the rank rejected");
+
+    /* Two axes name a reduction this contract does not cover. */
+    buf[TILED_ATTR_DATA_OFF] = 0;
+    buf[TILED_ATTR_DATA_OFF + 1u] = 1;
+    tigris_op_attribute_t *attr =
+        (tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u);
+    attr->data_len = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "multi-axis reduction rejected");
+
+    /* And a plan that states no axis at all is refused on the section, the
+     * way a normalization with no variance floor is. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_REDUCE_MEAN, 3u);
+    stage = (tigris_stage_t *)(buf + TILED_STAGES_OFF);
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+    memset(&dir[7], 0, sizeof(dir[7]));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "attribute-free reduction rejected");
 }
 
 /**
@@ -2324,6 +2400,7 @@ int main(int argc, char *argv[])
     test_cross_reference_guards();
     test_transpose_attribute_guards();
     test_op_attribute_kinds();
+    test_reduce_mean_contract();
     test_op_attribute_payloads();
     test_tiled_conversion_contract();
     test_tiled_reduction_contract();

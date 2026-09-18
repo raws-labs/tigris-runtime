@@ -824,6 +824,72 @@ static int kern_global_avg_pool(
     return 0;
 }
 
+/**
+ * Mean over one axis of a rank-3 tensor.
+ *
+ * The plan names a serialized axis, so the operator reads the same whichever
+ * order a tensor states its own axes in: the token axis of a sequence and the
+ * channel axis of a feature map are both just one axis of [outer, reduced,
+ * inner]. Collapsing the token axis is what a mean-pooled sequence head does.
+ */
+static int reduce_mean_extents(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    int32_t *outer, int32_t *reduced, int32_t *inner)
+{
+    const tigris_tensor_t *in = &plan->tensors[tigris_op_inputs(plan, op)[0]];
+    uint8_t num_axes = 0u;
+    const uint8_t *axes = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_AXES, &num_axes);
+    if (axes == NULL || num_axes != 1u || in->ndim != 3u || axes[0] >= 3u)
+        return -1;
+
+    const int32_t *shape = tigris_tensor_shape(plan, in);
+    int32_t lead = 1;
+    int32_t trail = 1;
+    for (uint8_t axis = 0; axis < 3u; axis++) {
+        if (shape[axis] <= 0)
+            return -1;
+        if (axis < axes[0])
+            lead *= shape[axis];
+        else if (axis > axes[0])
+            trail *= shape[axis];
+    }
+    *outer = lead;
+    *reduced = shape[axes[0]];
+    *inner = trail;
+    return 0;
+}
+
+static int kern_reduce_mean(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    int32_t outer;
+    int32_t reduced;
+    int32_t inner;
+    if (reduce_mean_extents(plan, op, op_index, &outer, &reduced, &inner) != 0)
+        return -1;
+
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    for (int32_t o = 0; o < outer; o++) {
+        const float *src = X + (size_t)o * (size_t)reduced * (size_t)inner;
+        float *dst = Y + (size_t)o * (size_t)inner;
+        for (int32_t i = 0; i < inner; i++)
+            dst[i] = 0.0f;
+        for (int32_t r = 0; r < reduced; r++) {
+            const float *row = src + (size_t)r * (size_t)inner;
+            for (int32_t i = 0; i < inner; i++)
+                dst[i] += row[i];
+        }
+        for (int32_t i = 0; i < inner; i++)
+            dst[i] /= (float)reduced;
+    }
+    return 0;
+}
+
 static int kern_fully_connected(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1447,6 +1513,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ERF:         return kern_erf(plan, op, mem);
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm(plan, op, op_index, mem);
+    case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */
     }

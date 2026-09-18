@@ -963,6 +963,77 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
     return 0;
 }
 
+/**
+ * Mean over one axis of a rank-3 tensor, the int8 twin of kern_reduce_mean.
+ *
+ * Follows TFLite QuantizedMeanOrSum: sum the raw bytes, subtract the zero
+ * point once over the full count, and fold the reciprocal into the requant
+ * multiplier so the division never leaves the integer domain.
+ */
+static TIGRIS_KERNEL_NOINLINE int kern_reduce_mean_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const tigris_tensor_t *in = &plan->tensors[ins[0]];
+    uint8_t num_axes = 0u;
+    const uint8_t *axes = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_AXES, &num_axes);
+    if (axes == NULL || num_axes != 1u || in->ndim != 3u || axes[0] >= 3u)
+        return -1;
+
+    const int32_t *shape = tigris_tensor_shape(plan, in);
+    int32_t outer = 1;
+    int32_t inner = 1;
+    for (uint8_t axis = 0; axis < 3u; axis++) {
+        if (shape[axis] <= 0)
+            return -1;
+        if (axis < axes[0])
+            outer *= shape[axis];
+        else if (axis > axes[0])
+            inner *= shape[axis];
+    }
+    int32_t reduced = shape[axes[0]];
+
+    const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, in);
+    const tigris_quant_param_t *out_qp =
+        tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    int32_t input_zp = in_qp ? in_qp->zero_point : 0;
+    float in_scale = in_qp ? in_qp->scale : 1.0f;
+    float out_scale = out_qp ? out_qp->scale : 1.0f;
+    int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+    if (!(out_scale > 0.0f)) {
+        out_scale = in_scale;
+        output_zp = input_zp;
+    }
+
+    int32_t mult;
+    int shift0;
+    compute_mean_quant_mult(
+        (double)in_scale / (double)out_scale, (int)reduced, &mult, &shift0);
+
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    for (int32_t o = 0; o < outer; o++) {
+        const int8_t *src = X + (size_t)o * (size_t)reduced * (size_t)inner;
+        int8_t *dst = Y + (size_t)o * (size_t)inner;
+        for (int32_t i = 0; i < inner; i++) {
+            const int8_t *xp = src + i;
+            int32_t sum = 0;
+            for (int32_t r = 0; r < reduced; r++) {
+                sum += *xp;
+                xp += inner;
+            }
+            int32_t shifted = sum - input_zp * reduced;
+            int32_t q = multiply_by_quantized_multiplier(shifted, mult, shift0) +
+                        output_zp;
+            dst[i] = clamp_s8(q);
+        }
+    }
+    return 0;
+}
+
 static TIGRIS_KERNEL_NOINLINE int kern_avg_pool_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1773,6 +1844,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ERF:         return kern_erf_s8(plan, op, mem);
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean_s8(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */
     }

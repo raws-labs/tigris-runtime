@@ -1561,6 +1561,7 @@ tigris_error_t tigris_plan_load(
                                     * is_height_tiling_op. */
                                    type != TIGRIS_OP_SOFTMAX &&
                                    type != TIGRIS_OP_ADD &&
+                                   type != TIGRIS_OP_SUB &&
                                    type != TIGRIS_OP_MUL &&
                                    type != TIGRIS_OP_CONCAT) {
                             return TIGRIS_ERR_BAD_OPERATOR;
@@ -1609,7 +1610,15 @@ tigris_error_t tigris_plan_load(
                            op_type != TIGRIS_OP_RELU6 &&
                            op_type != TIGRIS_OP_SIGMOID &&
                            op_type != TIGRIS_OP_TANH &&
+                           /* The same shape-preserving, halo-free set the
+                            * stripe contract admits above: a chain is a run
+                            * of stripe-tileable stages, so its operator list
+                            * is that one. */
+                           op_type != TIGRIS_OP_SOFTMAX &&
+                           op_type != TIGRIS_OP_ERF &&
+                           op_type != TIGRIS_OP_LAYER_NORM &&
                            op_type != TIGRIS_OP_ADD &&
+                           op_type != TIGRIS_OP_SUB &&
                            op_type != TIGRIS_OP_MUL &&
                            op_type != TIGRIS_OP_CONCAT) {
                     return TIGRIS_ERR_BAD_OPERATOR;

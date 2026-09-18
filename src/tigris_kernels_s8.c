@@ -813,8 +813,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_relu6_s8(
 /* Add and Sub differ only in the sign of the second scaled term; everything
  * around it, including the requantization, is identical. */
 static TIGRIS_KERNEL_NOINLINE int kern_addsub_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem,
-    int subtract)
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem, int subtract)
 {
     /* Constants are absent from the tensor/quant tables in the current wire
      * format. Without their scale and zero point, one-input + weight_idx Add
@@ -847,13 +847,29 @@ static TIGRIS_KERNEL_NOINLINE int kern_addsub_s8(
      * (sa/sy)*(a-za)+... drifted ~1 LSB/op, accumulating to tens of LSB across a
      * residual network like MobileNetV2. */
     const int LEFT_SHIFT = 20;
-    double twice_max = 2.0 * ((sa > sb) ? (double)sa : (double)sb);
     int32_t a_mult, b_mult, y_mult;
     int a_shift, b_shift, y_shift;
-    compute_quant_mult((double)sa / twice_max, &a_mult, &a_shift);
-    compute_quant_mult((double)sb / twice_max, &b_mult, &b_shift);
-    compute_quant_mult(twice_max / (((double)(1 << LEFT_SHIFT)) * (double)sy),
-                       &y_mult, &y_shift);
+    uint8_t requant_len = 0u;
+    const uint8_t *requant = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_BINARY_REQUANT, &requant_len);
+    if (requant != NULL &&
+        requant_len == TIGRIS_OP_ATTR_BINARY_REQUANT_LEN) {
+        /* The three pairs are compile-time constants of the operand scales,
+         * so a plan that states them spares the kernel three frexp-and-round
+         * sequences per call and gives a vendor kernel what it needs. */
+        int32_t pairs[6];
+        memcpy(pairs, requant, sizeof(pairs));
+        a_mult = pairs[0]; a_shift = (int)pairs[1];
+        b_mult = pairs[2]; b_shift = (int)pairs[3];
+        y_mult = pairs[4]; y_shift = (int)pairs[5];
+    } else {
+        double twice_max = 2.0 * ((sa > sb) ? (double)sa : (double)sb);
+        compute_quant_mult((double)sa / twice_max, &a_mult, &a_shift);
+        compute_quant_mult((double)sb / twice_max, &b_mult, &b_shift);
+        compute_quant_mult(
+            twice_max / (((double)(1 << LEFT_SHIFT)) * (double)sy),
+            &y_mult, &y_shift);
+    }
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
     if (mem->tile.active) {
@@ -880,15 +896,17 @@ static TIGRIS_KERNEL_NOINLINE int kern_addsub_s8(
 }
 
 static TIGRIS_KERNEL_NOINLINE int kern_add_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
 {
-    return kern_addsub_s8(plan, op, mem, 0);
+    return kern_addsub_s8(plan, op, op_index, mem, 0);
 }
 
 static TIGRIS_KERNEL_NOINLINE int kern_sub_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
 {
-    return kern_addsub_s8(plan, op, mem, 1);
+    return kern_addsub_s8(plan, op, op_index, mem, 1);
 }
 
 static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
@@ -1824,7 +1842,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_FULLY_CONN:  return kern_fully_connected_s8(plan, op, mem);
     case TIGRIS_OP_RELU:        return kern_relu_s8(plan, op, mem);
     case TIGRIS_OP_RELU6:       return kern_relu6_s8(plan, op, mem);
-    case TIGRIS_OP_ADD:         return kern_add_s8(plan, op, mem);
+    case TIGRIS_OP_ADD:         return kern_add_s8(plan, op, op_index, mem);
     case TIGRIS_OP_GLOBAL_AVG:  return kern_global_avg_pool_s8(plan, op, mem);
     case TIGRIS_OP_AVG_POOL:     return kern_avg_pool_s8(plan, op, mem);
     case TIGRIS_OP_RESHAPE:     return kern_reshape_s8(plan, op, mem);
@@ -1838,7 +1856,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
     case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose_s8(plan, op, mem);
-    case TIGRIS_OP_SUB:         return kern_sub_s8(plan, op, mem);
+    case TIGRIS_OP_SUB:         return kern_sub_s8(plan, op, op_index, mem);
     case TIGRIS_OP_GLOBAL_MAX:  return kern_global_max_pool_s8(plan, op, mem);
     case TIGRIS_OP_MATMUL:      return kern_matmul_s8(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);

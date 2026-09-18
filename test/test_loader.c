@@ -1377,6 +1377,51 @@ static void test_transpose_attribute_guards(void)
                    "attribute-free normalization rejected");
 }
 
+
+/* A declared interface dtype is a promise the runtime converts on every call,
+ * and the only conversion it has is a float interface over a quantized int8
+ * tensor. Saying so on load refuses the plan once rather than on whichever
+ * call first reaches tigris_iface.c. */
+static void test_declared_interface_dtype_contract(void)
+{
+    printf("  test_declared_interface_dtype_contract...\n");
+    _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_tensor_t *tensors;
+
+    build_transpose_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "undeclared interface loads");
+
+    /* A dtype the runtime has no conversion for at all. */
+    build_transpose_plan(buf);
+    tensors = (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
+    tensors[0].iface_dtype = 11u;  /* float64 */
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_TENSOR,
+                   "unconvertible declared dtype rejected");
+
+    /* An int8 interface over a float tensor is the conversion in the
+     * direction the runtime does not perform. */
+    build_transpose_plan(buf);
+    tensors = (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
+    tensors[0].iface_dtype = 3u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_TENSOR,
+                   "int8 interface over a float tensor rejected");
+
+    /* A float interface over a tensor that carries no quantization has
+     * nothing to convert with. */
+    build_transpose_plan(buf);
+    tensors = (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
+    tensors[0].dtype = 3u;
+    tensors[0].size_bytes = 6u;
+    tensors[0].iface_dtype = 1u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_TENSOR,
+                   "float interface without quantization rejected");
+}
+
 static void build_unary_plan(uint8_t *buf)
 {
     build_transpose_plan(buf);
@@ -2235,6 +2280,9 @@ static void test_schema_compatibility_fixtures(void)
      *   v5 Conv1D:   explicit serialized length axis
      *   v6 QDQ Conv: a boundary tensor declaring its float model interface
      *   v7 MatMul:   tensors recording whether they are stored in model order
+     *   v8 LayerNorm:the typed attribute kinds
+     *   v9 QDQ Add:  a quantized sum stating the multipliers that scale its
+     *                two operands and its result
      */
     static const struct {
         const char *filename;
@@ -2252,6 +2300,7 @@ static void test_schema_compatibility_fixtures(void)
         {"schema-v6-interface-dtype.tgrs", TIGRIS_SCHEMA_VERSION_V6, 3, 0, 0, 0},
         {"schema-v7-tensor-layout.tgrs", TIGRIS_SCHEMA_VERSION_V7, 0, 2, 0, 0},
         {"schema-v8-layer-norm.tgrs", TIGRIS_SCHEMA_VERSION_V8, 0, 3, 0, 0},
+        {"schema-v9-binary-requant.tgrs", TIGRIS_SCHEMA_VERSION_V9, 3, 1, 0, 0},
     };
     const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
 
@@ -2400,6 +2449,7 @@ int main(int argc, char *argv[])
     test_cross_reference_guards();
     test_transpose_attribute_guards();
     test_op_attribute_kinds();
+    test_declared_interface_dtype_contract();
     test_reduce_mean_contract();
     test_op_attribute_payloads();
     test_tiled_conversion_contract();

@@ -204,6 +204,8 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     case TIGRIS_OP_ATTR_CLIP_BOUNDS:    return op_type == TIGRIS_OP_CLIP;
     case TIGRIS_OP_ATTR_PADS:           return op_type == TIGRIS_OP_PAD;
     case TIGRIS_OP_ATTR_AXES:           return op_type == TIGRIS_OP_REDUCE_MEAN;
+    case TIGRIS_OP_ATTR_BINARY_REQUANT: return op_type == TIGRIS_OP_ADD ||
+                                               op_type == TIGRIS_OP_SUB;
     default:                            return 0;
     }
 }
@@ -1000,6 +1002,13 @@ tigris_error_t tigris_plan_load(
                                   TIGRIS_TENSOR_MODEL_OUTPUT)) == 0 ||
                 tensor->iface_dtype == tensor->dtype)
                 return TIGRIS_ERR_BAD_TENSOR;
+            /* The only conversion this runtime performs is between a float
+             * interface and a quantized int8 plan tensor, and tigris_iface.c
+             * refuses anything else. Saying so here refuses the plan when it
+             * is loaded rather than when a caller first writes an input. */
+            if (tensor->iface_dtype != 1u || tensor->dtype != 3u ||
+                tensor->quant_param_idx == TIGRIS_NO_QUANT_PARAM)
+                return TIGRIS_ERR_BAD_TENSOR;
         }
         uint32_t elements = 1;
         for (uint8_t dim = 0; dim < tensor->ndim; dim++) {
@@ -1189,6 +1198,29 @@ tigris_error_t tigris_plan_load(
                                byte,
                            sizeof(pad));
                     if (pad < 0)
+                        return TIGRIS_ERR_BAD_SECTION;
+                }
+                break;
+            }
+            case TIGRIS_OP_ATTR_BINARY_REQUANT: {
+                /* Three Q0.31 pairs. A shift outside the range the requant
+                 * helper can apply would shift by more than the width of the
+                 * accumulator, which is undefined rather than saturating. */
+                if (attr->data_len != TIGRIS_OP_ATTR_BINARY_REQUANT_LEN ||
+                    hdr->version < TIGRIS_SCHEMA_VERSION_BINARY_REQUANT)
+                    return TIGRIS_ERR_BAD_SECTION;
+                for (uint8_t pair = 0; pair < 3u; pair++) {
+                    int32_t multiplier;
+                    int32_t shift;
+                    memcpy(&multiplier,
+                           candidate.op_attribute_data + attr->data_offset +
+                               (uint32_t)pair * 8u,
+                           sizeof(multiplier));
+                    memcpy(&shift,
+                           candidate.op_attribute_data + attr->data_offset +
+                               (uint32_t)pair * 8u + 4u,
+                           sizeof(shift));
+                    if (multiplier < 0 || shift < -31 || shift > 31)
                         return TIGRIS_ERR_BAD_SECTION;
                 }
                 break;

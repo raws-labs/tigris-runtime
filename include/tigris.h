@@ -29,11 +29,12 @@ extern "C" {
 
 #define TIGRIS_MAGIC           0x53524754  /* "TGRS" in little-endian */
 #define TIGRIS_MAGIC_BYTES     "TGRS"
+#define TIGRIS_SCHEMA_VERSION_V9 9
 #define TIGRIS_SCHEMA_VERSION_V8 8
 #define TIGRIS_SCHEMA_VERSION_V7 7
 #define TIGRIS_SCHEMA_VERSION_V6 6
 #define TIGRIS_SCHEMA_VERSION_V5 5
-#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V8
+#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V9
 #define TIGRIS_SCHEMA_VERSION_V4 4
 #define TIGRIS_SCHEMA_VERSION_V3 3
 #define TIGRIS_SCHEMA_VERSION_V2 2
@@ -49,6 +50,11 @@ extern "C" {
  * boundary's element order is recoverable from the plan rather than inferred
  * from the shape of the graph that produced it. */
 #define TIGRIS_SCHEMA_VERSION_TENSOR_LAYOUT TIGRIS_SCHEMA_VERSION_V7
+
+/* A quantized sum states the multipliers that scale each operand and its own
+ * result, so the kernel stops deriving them in double precision on every
+ * call and a vendor kernel that takes them can be given them. */
+#define TIGRIS_SCHEMA_VERSION_BINARY_REQUANT TIGRIS_SCHEMA_VERSION_V9
 #define TIGRIS_QUANT_PAGE_ELEMS 65536u
 
 /* Section type IDs */
@@ -75,7 +81,12 @@ extern "C" {
 #define TIGRIS_OP_ATTR_CLIP_BOUNDS    4  /* float32[2], lower then upper */
 #define TIGRIS_OP_ATTR_PADS           5  /* int32[2*rank], leading, trailing */
 #define TIGRIS_OP_ATTR_AXES           6  /* uint8[n], axes a reduction takes */
-#define TIGRIS_OP_ATTR_MAX            6
+#define TIGRIS_OP_ATTR_BINARY_REQUANT 7  /* int32[6], see below */
+#define TIGRIS_OP_ATTR_MAX            7
+
+/* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
+ * first operand's, the second operand's, and the result's. */
+#define TIGRIS_OP_ATTR_BINARY_REQUANT_LEN 24u
 
 /* Compression types */
 #define TIGRIS_COMPRESS_NONE  0

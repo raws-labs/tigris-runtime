@@ -1230,13 +1230,11 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_2d(
     int32_t eff_kh = sp ? ((sp->kernel_h - 1) * dh + 1) : 1;
     int32_t eff_kw = sp ? ((sp->kernel_w - 1) * dw + 1) : 1;
 
-    /* Tile geometry: tile_height is a named field; the compiler packs
-     * tile_width into the low 16 bits of the tile plan's reserved word. */
     const tigris_tile_plan_t *tp = tigris_stage_tile_plan(plan, stage);
     if (!tp)
         return TIGRIS_EXEC_ERR_TILE;
     int32_t th = (int32_t)tp->tile_height;
-    int32_t tw = (int32_t)(tp->_reserved & 0xFFFFu);
+    int32_t tw = (int32_t)tp->tile_width;
     if (th <= 0 || tw <= 0 || OH <= 0 || OW <= 0)
         return TIGRIS_EXEC_ERR_TILE;
 
@@ -1788,8 +1786,18 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
     int32_t block = (int32_t)(elem_size / dtype_size);
 
     /* Band the longer axis: it gives the most bands and the smallest slice,
-     * since a slice holds batch * (the other axis) * band elements. */
-    int band_on_cols = cols >= rows;
+     * since a slice holds batch * (the other axis) * band elements. Which one
+     * that is belongs to whoever sized the band, so a plan that states it is
+     * obeyed and only an older one is re-derived here. */
+    const tigris_tile_plan_t *conversion_plan =
+        tigris_stage_tile_plan(plan, stage);
+    int band_on_cols;
+    if (plan->header->version >= TIGRIS_SCHEMA_VERSION_BAND_ORIENTATION &&
+        conversion_plan != NULL)
+        band_on_cols = (conversion_plan->flags &
+                        TIGRIS_TILE_FLAG_BAND_ON_COLUMNS) != 0u;
+    else
+        band_on_cols = cols >= rows;
     int32_t banded = band_on_cols ? cols : rows;
     int32_t other = band_on_cols ? rows : cols;
 

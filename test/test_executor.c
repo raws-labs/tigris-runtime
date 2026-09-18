@@ -1994,7 +1994,7 @@ static void run_convtranspose_tiling_case(
     tile_plan.tile_height = 8;
     tile_plan.num_tiles = 4;
     tile_plan.original_height = 16;
-    tile_plan._reserved = 8;  /* tile_width packed in low 16 bits (2D path) */
+    tile_plan.tile_width = 8;
 
     plan.header = &header;
     plan.tensors = tensors;

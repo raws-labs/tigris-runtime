@@ -1415,7 +1415,7 @@ static void te_build_conv_plan_f32(
     tile_plans[0].halo = TE_K - 1;
     tile_plans[0].receptive_field = TE_K;
     tile_plans[0].original_height = TE_H;
-    tile_plans[0]._reserved = (uint32_t)TE_TW; /* tile_width in low 16 bits */
+    tile_plans[0].tile_width = TE_TW;
 
     model_io[0] = 0; model_io[1] = 1;
 
@@ -1518,7 +1518,7 @@ static void te_build_conv_plan_s8(
     tile_plans[0].halo = TE_K - 1;
     tile_plans[0].receptive_field = TE_K;
     tile_plans[0].original_height = TE_H;
-    tile_plans[0]._reserved = (uint32_t)TE_TW;
+    tile_plans[0].tile_width = TE_TW;
 
     model_io[0] = 0; model_io[1] = 1;
 

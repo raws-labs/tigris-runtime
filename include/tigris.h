@@ -55,6 +55,10 @@ extern "C" {
  * result, so the kernel stops deriving them in double precision on every
  * call and a vendor kernel that takes them can be given them. */
 #define TIGRIS_SCHEMA_VERSION_BINARY_REQUANT TIGRIS_SCHEMA_VERSION_V9
+
+/* A conversion's tile plan states which of the two swapped axes its band runs
+ * along, instead of both sides deriving it from the extents. */
+#define TIGRIS_SCHEMA_VERSION_BAND_ORIENTATION TIGRIS_SCHEMA_VERSION_V9
 #define TIGRIS_QUANT_PAGE_ELEMS 65536u
 
 /* Section type IDs */
@@ -319,8 +323,14 @@ typedef struct {
     uint16_t    original_height;    /* 10 */
     uint32_t    tiled_peak_bytes;   /* 12 */
     uint32_t    overhead_bytes;     /* 16 */
-    uint32_t    _reserved;          /* 20 */
+    uint16_t    tile_width;         /* 20: 2D tile width, 0 when the plan is 1D */
+    uint16_t    flags;              /* 22: TIGRIS_TILE_FLAG_* (v9+), else 0 */
 } tigris_tile_plan_t;               /* 24 bytes total */
+
+/* Which of the two axes a layout conversion's band runs along. Both sides
+ * used to pick the longer one and agree only by coincidence when the two are
+ * equal, which is what a square attention block is. */
+#define TIGRIS_TILE_FLAG_BAND_ON_COLUMNS 0x0001u
 
 /**
  * Weight entry - 12 bytes.

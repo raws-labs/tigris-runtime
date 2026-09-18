@@ -13,6 +13,7 @@
 #include "tigris_kernels_s8.h"
 #include "tigris_kernels.h"
 #include "tigris_accel_policy.h"
+#include "tigris_kernel_window.h"
 
 #include <math.h>
 #include <string.h>
@@ -415,15 +416,19 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv2d_s8(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, DH, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, DW, &kw0, &kw1);
                 for (int oc = 0; oc < OC; oc++) {
                     int32_t acc = B ? load_bias_s32(B, (uint32_t)oc) : 0;
-                    for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh_g * SH - PT + kh * DH - in_row_start;
-                        if (ih < 0 || ih >= IH) continue;
-                        for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PL + kw * DW;
-                            if (iw < 0 || iw >= IW) continue;
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh * DH;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw * DW;
                             for (int ic = 0; ic < IC; ic++) {
                                 int32_t x_val = (int32_t)X[((n*IH+ih)*IW+iw)*IC+ic] - input_zp;
                                 int32_t w_val = (int32_t)W[((oc*KH+kh)*KW+kw)*IC+ic];
@@ -658,15 +663,19 @@ static TIGRIS_KERNEL_NOINLINE int kern_depthwise_conv2d_s8(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, DH, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, DW, &kw0, &kw1);
                 for (int c = 0; c < C; c++) {
                     int32_t acc = B ? load_bias_s32(B, (uint32_t)c) : 0;
-                    for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh_g * SH - PT + kh * DH - in_row_start;
-                        if (ih < 0 || ih >= IH) continue;
-                        for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PL + kw * DW;
-                            if (iw < 0 || iw >= IW) continue;
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh * DH;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw * DW;
                             int32_t x_val = (int32_t)X[((n*IH+ih)*IW+iw)*C+c] - input_zp;
                             int32_t w_val = (int32_t)W[(kh*KW+kw)*C+c];
                             acc += x_val * w_val;
@@ -1246,15 +1255,19 @@ static TIGRIS_KERNEL_NOINLINE int kern_max_pool_s8(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, 1, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, 1, &kw0, &kw1);
                 for (int c = 0; c < C; c++) {
                     int8_t max_val = -128;
-                    for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh_g * SH - PT + kh - in_row_start;
-                        if (ih < 0 || ih >= IH) continue;
-                        for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PL + kw;
-                            if (iw < 0 || iw >= IW) continue;
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw;
                             int8_t v = X[((n * IH + ih) * IW + iw) * C + c];
                             if (v > max_val) max_val = v;
                         }

@@ -8,6 +8,8 @@
 
 #include "tigris_kernels.h"
 
+#include "tigris_kernel_window.h"
+
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
@@ -191,19 +193,23 @@ static int kern_conv2d(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, DH, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, DW, &kw0, &kw1);
                 for (int oc = 0; oc < OC; oc++) {
                     float sum = B ? B[oc] : 0.0f;
-                    for (int kh = 0; kh < KH; kh++) {
-                        for (int kw = 0; kw < KW; kw++) {
-                            int ih = oh_g * SH - PT + kh * DH - in_row_start;
-                            int iw = ow * SW - PL + kw * DW;
-                            if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
-                                for (int ic = 0; ic < IC; ic++) {
-                                    float x_val = X[((n * IH + ih) * IW + iw) * IC + ic];
-                                    float w_val = W[((oc * KH + kh) * KW + kw) * IC + ic];
-                                    sum += x_val * w_val;
-                                }
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh * DH;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw * DW;
+                            for (int ic = 0; ic < IC; ic++) {
+                                float x_val = X[((n * IH + ih) * IW + iw) * IC + ic];
+                                float w_val = W[((oc * KH + kh) * KW + kw) * IC + ic];
+                                sum += x_val * w_val;
                             }
                         }
                     }
@@ -360,18 +366,22 @@ static int kern_depthwise_conv2d(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, DH, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, DW, &kw0, &kw1);
                 for (int c = 0; c < C; c++) {
                     float sum = B ? B[c] : 0.0f;
-                    for (int kh = 0; kh < KH; kh++) {
-                        for (int kw = 0; kw < KW; kw++) {
-                            int ih = oh_g * SH - PT + kh * DH - in_row_start;
-                            int iw = ow * SW - PL + kw * DW;
-                            if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
-                                float x_val = X[((n * IH + ih) * IW + iw) * C + c];
-                                float w_val = W[(kh * KW + kw) * C + c];
-                                sum += x_val * w_val;
-                            }
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh * DH;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw * DW;
+                            float x_val = X[((n * IH + ih) * IW + iw) * C + c];
+                            float w_val = W[(kh * KW + kw) * C + c];
+                            sum += x_val * w_val;
                         }
                     }
                     Y[((n * OH + oh_g) * OW + ow) * C + c] = apply_fused_act_f32(sum, op->fused_act);
@@ -995,15 +1005,19 @@ static int kern_max_pool(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, 1, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, 1, &kw0, &kw1);
                 for (int c = 0; c < C; c++) {
                     float max_val = -FLT_MAX;
-                    for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh_g * SH - PT + kh - in_row_start;
-                        if (ih < 0 || ih >= IH) continue;
-                        for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PL + kw;
-                            if (iw < 0 || iw >= IW) continue;
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw;
                             float v = X[((n * IH + ih) * IW + iw) * C + c];
                             if (v > max_val) max_val = v;
                         }
@@ -1065,22 +1079,27 @@ static int kern_avg_pool(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, 1, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, 1, &kw0, &kw1);
+                /* The window's sample count is the size of the two ranges,
+                 * the same number the per-tap counter arrived at. */
+                int count = (kh1 - kh0) * (kw1 - kw0);
+                if (count == 0)
+                    return -1;
                 for (int c = 0; c < C; c++) {
                     float sum = 0.0f;
-                    int count = 0;
-                    for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh_g * SH - PT + kh - in_row_start;
-                        if (ih < 0 || ih >= IH) continue;
-                        for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PL + kw;
-                            if (iw < 0 || iw >= IW) continue;
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw;
                             sum += X[((n * IH + ih) * IW + iw) * C + c];
-                            count++;
                         }
                     }
-                    if (count == 0)
-                        return -1;
                     Y[((n * OH + oh_g) * OW + ow) * C + c] = sum / (float)count;
                 }
             }

@@ -2626,9 +2626,11 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                 mem->tile.pad_bottom = 0;
             }
 
-            /* Track current data height flowing through the stage.
-             * Starts at tile_in_h, decreases after each spatial op. */
+            /* Track the data height and width flowing through the stage.
+             * Starts at the stage's input geometry and takes each spatial
+             * op's output geometry after it runs. */
             int32_t cur_data_h = tile_in_h;
+            int32_t cur_data_w = info[c].full_in_w;
             int sp_j = 0;  /* next spatial op index within this stage */
 
             /* Line-buffer roll gating for this stage on this tile. A stage may
@@ -2690,6 +2692,21 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                     mem->tile.pad_bottom = workspace->sp_tile_pb[spi];
                     mem->tile.in_w       = workspace->sp_full_in_ws[spi];
                     mem->tile.out_w      = workspace->sp_full_out_ws[spi];
+                } else {
+                    /* Pointwise op: height and width preserved, no padding.
+                     * Stating it per op rather than once before the loop is
+                     * what exec_stage_tiled does, and the difference is not
+                     * cosmetic: an op ahead of the spatial one was handed the
+                     * stage's OUTPUT height, so it computed only the rows the
+                     * stage finally emits and left the halo rows of its own
+                     * output untouched. The spatial op then read those as
+                     * data. */
+                    mem->tile.in_h       = cur_data_h;
+                    mem->tile.out_h      = cur_data_h;
+                    mem->tile.in_w       = cur_data_w;
+                    mem->tile.out_w      = cur_data_w;
+                    mem->tile.pad_top    = 0;
+                    mem->tile.pad_bottom = 0;
                 }
 
                 /* Spatial op outputs have fewer rows than input (stride).
@@ -2820,8 +2837,9 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                 if (sp_j < info[c].sp_count &&
                     (int32_t)op_idx == workspace->sp_op_indices[spi]) {
                     cur_data_h = workspace->sp_tile_out_h[spi];
+                    cur_data_w = workspace->sp_full_out_ws[spi];
                     mem->tile.in_h = cur_data_h;
-                    mem->tile.in_w = workspace->sp_full_out_ws[spi];
+                    mem->tile.in_w = cur_data_w;
                     run_gs = workspace->sp_tile_out_gs[spi];
                     run_ge = workspace->sp_tile_out_ge[spi];
                     sp_j++;

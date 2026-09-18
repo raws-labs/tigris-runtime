@@ -501,6 +501,55 @@ static void test_load_tile_1d_rejects_bad_bounds(void)
     TEST_ASSERT_EQ(e_over, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range h_end rejected");
 }
 
+static void test_spill_tile_1d_rejects_bad_bounds(void)
+{
+    printf("  test_spill_tile_1d_rejects_bad_bounds...\n");
+
+    tigris_tensor_t tensor;
+    int32_t shape[4];
+    tigris_plan_t plan;
+    t2d_build_plan(&tensor, shape, &plan);
+
+    /* The band the caller claims to be spilling, and the destination it is
+     * spilled into. A window past H would write past the end of slow_buf. */
+    int8_t band_buf[T2D_N * T2D_H * T2D_W * T2D_C];
+    int8_t slow_buf[T2D_N * T2D_H * T2D_W * T2D_C];
+    memset(band_buf, 7, sizeof(band_buf));
+    memset(slow_buf, 0, sizeof(slow_buf));
+
+    uint8_t fast_arena[256];
+    uint8_t slow_arena[128];
+    void *tensor_ptrs[1] = { NULL };
+
+    tigris_mem_t mem;
+    tigris_mem_error_t merr = tigris_mem_init(&mem, tensor_ptrs, 1,
+                                               fast_arena, sizeof(fast_arena),
+                                               slow_arena, sizeof(slow_arena));
+    TEST_ASSERT_EQ(merr, TIGRIS_MEM_OK, "mem init ok");
+
+    /* A window ending exactly at H is the last band and still spills. */
+    mem.tensor_ptrs[T2D_TIDX] = band_buf;
+    tigris_mem_error_t e_ok = tigris_mem_spill_tile(
+        &mem, &plan, T2D_TIDX, slow_buf, 4, T2D_H);
+    TEST_ASSERT_EQ(e_ok, TIGRIS_MEM_OK, "in-range 1D spill (h_end == H) ok");
+
+    mem.tensor_ptrs[T2D_TIDX] = band_buf;
+    tigris_mem_error_t e_neg = tigris_mem_spill_tile(
+        &mem, &plan, T2D_TIDX, slow_buf, -1, 6);
+    TEST_ASSERT_EQ(e_neg, TIGRIS_MEM_ERR_BAD_INDEX, "negative h_start rejected");
+
+    mem.tensor_ptrs[T2D_TIDX] = band_buf;
+    tigris_mem_error_t e_eq = tigris_mem_spill_tile(
+        &mem, &plan, T2D_TIDX, slow_buf, 3, 3);
+    TEST_ASSERT_EQ(e_eq, TIGRIS_MEM_ERR_BAD_INDEX, "h_end == h_start rejected");
+
+    /* The one that writes out of bounds: rows past the destination height. */
+    mem.tensor_ptrs[T2D_TIDX] = band_buf;
+    tigris_mem_error_t e_over = tigris_mem_spill_tile(
+        &mem, &plan, T2D_TIDX, slow_buf, 4, T2D_H + 4);
+    TEST_ASSERT_EQ(e_over, TIGRIS_MEM_ERR_BAD_INDEX, "out-of-range h_end rejected");
+}
+
 static void test_spill_tile_2d_rejects_bad_bounds(void)
 {
     printf("  test_spill_tile_2d_rejects_bad_bounds...\n");
@@ -1680,6 +1729,7 @@ int main(void)
     test_spill_tile_2d_roundtrip();
     test_load_tile_2d_rejects_bad_bounds();
     test_load_tile_1d_rejects_bad_bounds();
+    test_spill_tile_1d_rejects_bad_bounds();
     test_spill_tile_2d_rejects_bad_bounds();
     test_tile_2d_rank3_rectangle_round_trip();
 

@@ -61,7 +61,7 @@ typedef struct {
     tigris_tile_plan_t tile_plan;
     tigris_weight_entry_t weights[2];
     float blob[TEST_IN * TEST_OUT + TEST_OUT];
-    int32_t shapes[6];
+    int32_t shapes[9];   /* 6 used; the tail holds a rank-3 view */
     uint16_t indices[8];
     tigris_plan_t plan;
 } rows_fixture_t;
@@ -325,6 +325,45 @@ static void test_mismatched_rows_are_not_banded(void)
 }
 
 /**
+ * A rank-3 linear [1, rows, cols] is the same memory as the rank-2 matrix and
+ * passes the row view, but kern_fully_connected reads its channel count out
+ * of y_shape[1], which on a rank 3 is the row count. The row view alone does
+ * not settle the matrix product's rank, so the stage contract has to. The
+ * loader refuses such a plan on its own terms; this is the executor's half of
+ * the same contract, which the file's comments say re-checks what the loader
+ * promised.
+ */
+static void test_a_rank3_matrix_product_output_is_not_banded(void)
+{
+    printf("  test_a_rank3_matrix_product_output_is_not_banded...\n");
+
+    rows_fixture_t fx;
+    build_fixture(&fx);
+    fx.shapes[6] = 1;
+    fx.shapes[7] = TEST_ROWS;
+    fx.shapes[8] = TEST_OUT;
+    fx.tensors[1].ndim = 3;
+    fx.tensors[1].shape_off = 6;
+    fx.tensors[1].flags |= TIGRIS_TENSOR_LINEAR;
+
+    float input[IN_ELEMS];
+    for (int i = 0; i < IN_ELEMS; i++)
+        input[i] = 1.0f;
+    float out[OUT_ELEMS];
+    uint16_t tiled = 1;
+
+    /* An arena too small for the whole stage, so the band is genuinely
+     * considered. Declining it leaves the stage to run whole, which then does
+     * not fit: the memory error is how the refusal surfaces. Admitting it
+     * instead returns success with a matrix product computed against the row
+     * count as its channel count. */
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t small[512];
+    TEST_ASSERT_EQ(run_case(&fx, small, sizeof(small), input, out, &tiled),
+                   TIGRIS_EXEC_ERR_MEM,
+                   "a rank-3 matrix product output is not banded");
+}
+
+/**
  * The two ways a row band can fail to start. Neither may produce a partial
  * result: a band that cannot be sized and an assembled output that has
  * nowhere to live both have to say so.
@@ -376,6 +415,7 @@ int main(void)
     printf("Row-banded matrix tiling tests:\n");
     test_rows_are_band_invariant();
     test_mismatched_rows_are_not_banded();
+    test_a_rank3_matrix_product_output_is_not_banded();
     test_row_band_failures_are_reported();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

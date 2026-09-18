@@ -8,6 +8,8 @@
 
 #include "tigris_loader.h"
 
+#include "tigris_transpose_band.h"
+
 #include <math.h>
 #include <string.h>
 
@@ -1512,29 +1514,24 @@ tigris_error_t tigris_plan_load(
                     candidate.ops[
                         candidate.index_pool[stage->ops_off]
                     ].op_type == TIGRIS_OP_TRANSPOSE) {
-                    /* A layout conversion is tiled a band at a time along
-                     * the longer of the two extents it transposes. Only a
-                     * permutation that moves the channel axis past the
-                     * spatial ones, leaving those in their relative order, is
-                     * executable that way, and only as the whole stage.
-                     * Mirrors transpose_extents in the executor. */
+                    /* A transpose is banded along the longer of the two
+                     * extents it swaps, and only as the whole stage.
+                     * transpose_band_groups states which permutations that
+                     * is: the ones that swap two adjacent groups of axes and
+                     * leave the rest in order. The executor reads the same
+                     * rule from the same header rather than from a copy. */
                     uint16_t conv_op = candidate.index_pool[stage->ops_off];
                     uint8_t perm_rank = 0;
                     const uint8_t *perm = tigris_op_attribute_data(
                         &candidate, conv_op,
                         TIGRIS_OP_ATTR_TRANSPOSE_PERM, &perm_rank);
-                    int convertible = 0;
-                    if (perm && perm_rank == rank && perm[0] == 0u) {
-                        if (rank == 3u) {
-                            convertible = (perm[1] == 2u && perm[2] == 1u);
-                        } else if (rank == 4u) {
-                            convertible =
-                                (perm[1] == 3u && perm[2] == 1u &&
-                                 perm[3] == 2u) ||
-                                (perm[1] == 2u && perm[2] == 3u &&
-                                 perm[3] == 1u);
-                        }
-                    }
+                    uint8_t tb_prefix = 0;
+                    uint8_t tb_split = 0;
+                    uint8_t tb_middle = 0;
+                    int convertible =
+                        perm && perm_rank == rank &&
+                        transpose_band_groups(perm, rank, &tb_prefix,
+                                              &tb_split, &tb_middle);
                     if (!convertible ||
                         stage->inputs_count != 1 ||
                         stage->outputs_count != 1 ||

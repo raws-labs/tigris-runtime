@@ -1305,19 +1305,26 @@ int tigris_transpose_execute(
      * relative order are read as one, so the slice is transposed directly
      * rather than through the general index walk below. */
     if (mem->tile.active && mem->tile.transposed_tile) {
-        int32_t batch = input_shape[0];
+        int32_t batch = mem->tile.transpose_outer;
         int32_t rows = mem->tile.in_h;
         int32_t cols = mem->tile.in_w;
         if (batch <= 0 || rows <= 0 || cols <= 0 ||
             mem->tile.out_h != cols || mem->tile.out_w != rows)
             return -1;
-        int typed = transpose_elements_are_typed(dst, src, element_size);
+        /* The axes behind the swapped pair travel with the element, so the
+         * slice is a matrix of blocks rather than of scalars. The executor
+         * states how many elements a position holds, because the slice is a
+         * band and the tensor's own shape describes the whole. */
+        int32_t block = mem->tile.transpose_block > 0
+                            ? mem->tile.transpose_block : 1;
+        uint32_t block_size = element_size * (uint32_t)block;
+        int typed = transpose_elements_are_typed(dst, src, block_size);
         for (int32_t n = 0; n < batch; n++) {
             const uint8_t *src_n =
-                src + (size_t)n * (size_t)rows * (size_t)cols * element_size;
+                src + (size_t)n * (size_t)rows * (size_t)cols * block_size;
             uint8_t *dst_n =
-                dst + (size_t)n * (size_t)rows * (size_t)cols * element_size;
-            transpose_matrix(dst_n, src_n, rows, cols, element_size, typed);
+                dst + (size_t)n * (size_t)rows * (size_t)cols * block_size;
+            transpose_matrix(dst_n, src_n, rows, cols, block_size, typed);
         }
         return 0;
     }

@@ -2184,10 +2184,11 @@ static void transpose_reference(
     }
 }
 
-static void run_transpose_case(
+static void run_transpose_case_block(
     int rank, const int32_t *in_shape, const uint8_t *perm,
     uint32_t elem_size, int misalign, int banded,
-    int32_t rows, int32_t cols, const char *what)
+    int32_t outer, int32_t rows, int32_t cols, int32_t block,
+    const char *what)
 {
     int32_t shapes[8];
     uint32_t elements = 1;
@@ -2236,12 +2237,47 @@ static void run_transpose_case(
     if (banded) {
         mem.tile.active = 1;
         mem.tile.transposed_tile = 1;
+        mem.tile.transpose_outer = outer;
+        mem.tile.transpose_block = block;
         mem.tile.in_h = rows; mem.tile.in_w = cols;
         mem.tile.out_h = cols; mem.tile.out_w = rows;
     }
 
     TEST_ASSERT(tigris_transpose_execute(&plan, &op, 0, &mem) == 0, what);
     TEST_ASSERT(memcmp(out, ref_buf, elements * elem_size) == 0, what);
+}
+
+static void run_transpose_case(
+    int rank, const int32_t *in_shape, const uint8_t *perm,
+    uint32_t elem_size, int misalign, int banded,
+    int32_t rows, int32_t cols, const char *what)
+{
+    run_transpose_case_block(rank, in_shape, perm, elem_size, misalign,
+                             banded, 1, rows, cols, 1, what);
+}
+
+/* A transpose the band path accepts swaps two adjacent groups of axes and
+ * leaves the rest in order, so the axes behind the swapped pair travel with
+ * the element and the slice is a matrix of blocks. An attention block's head
+ * permutation is the first one with such a suffix; the three the path used to
+ * name were the cases with none. */
+static void test_transpose_carries_a_block(void)
+{
+    printf("  test_transpose_carries_a_block...\n");
+
+    /* [1, 6, 2, 3] -> [1, 2, 6, 3] under stored perm (0, 2, 1, 3): a 6 by 2
+     * transpose carrying three elements at each position. */
+    const int32_t shape[4] = {1, 6, 2, 3};
+    const uint8_t perm[4] = {0, 2, 1, 3};
+    run_transpose_case_block(4, shape, perm, 4, 0, 1, 1, 6, 2, 3,
+                             "rank-4 float banded with a block of three");
+    run_transpose_case_block(4, shape, perm, 1, 0, 1, 1, 6, 2, 3,
+                             "rank-4 int8 banded with a block of three");
+
+    /* The same permutation with a batch ahead of the swapped pair. */
+    const int32_t batched[4] = {4, 6, 2, 3};
+    run_transpose_case_block(4, batched, perm, 4, 0, 1, 4, 6, 2, 3,
+                             "a batch ahead of the swapped pair");
 }
 
 static void test_transpose_element_paths(void)
@@ -2373,6 +2409,7 @@ int main(void)
     test_malformed_constant_binary_f32();
     test_transpose();
     test_transpose_element_paths();
+    test_transpose_carries_a_block();
     test_pointwise_row_band_covers_every_batch();
     test_unsupported_op();
 

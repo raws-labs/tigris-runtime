@@ -19,10 +19,10 @@
     "counts": {}
   },
   "misra": {
-    "total": 3590,
-    "misra_total": 3561,
+    "total": 3600,
+    "misra_total": 3571,
     "config_errors": 2,
-    "fingerprint_sha256": "a7a03a6426d39755205cfa1458dcba17457812cd5ccb526573db7e355d1b0ee6",
+    "fingerprint_sha256": "e0c058017886425ef3134c7be67fff821089cf95a5691c6f10c2529fc847a3f6",
     "counts": {
       "include/tigris.h": {
         "misra-c2012-10.4": 4,
@@ -49,7 +49,7 @@
         "misra-c2012-10.3": 16,
         "misra-c2012-10.4": 172,
         "misra-c2012-10.6": 3,
-        "misra-c2012-10.8": 4,
+        "misra-c2012-10.8": 5,
         "misra-c2012-11.4": 29,
         "misra-c2012-11.5": 10,
         "misra-c2012-11.6": 4,
@@ -59,8 +59,8 @@
         "misra-c2012-14.4": 37,
         "misra-c2012-15.1": 10,
         "misra-c2012-15.4": 3,
-        "misra-c2012-15.5": 143,
-        "misra-c2012-15.6": 193,
+        "misra-c2012-15.5": 142,
+        "misra-c2012-15.6": 199,
         "misra-c2012-15.7": 1,
         "misra-c2012-17.7": 20,
         "misra-c2012-17.8": 1,
@@ -101,7 +101,7 @@
         "misra-c2012-10.8": 1,
         "misra-c2012-11.5": 62,
         "misra-c2012-11.6": 2,
-        "misra-c2012-12.1": 143,
+        "misra-c2012-12.1": 144,
         "misra-c2012-12.3": 9,
         "misra-c2012-14.4": 17,
         "misra-c2012-15.5": 75,
@@ -138,18 +138,18 @@
       },
       "src/tigris_loader.c": {
         "constVariable": 1,
-        "misra-c2012-10.3": 7,
+        "misra-c2012-10.3": 6,
         "misra-c2012-10.4": 278,
         "misra-c2012-10.6": 1,
         "misra-c2012-11.3": 13,
-        "misra-c2012-12.1": 283,
+        "misra-c2012-12.1": 277,
         "misra-c2012-12.3": 3,
         "misra-c2012-13.3": 1,
         "misra-c2012-14.4": 14,
         "misra-c2012-15.4": 2,
         "misra-c2012-15.5": 204,
         "misra-c2012-15.6": 190,
-        "misra-c2012-15.7": 6,
+        "misra-c2012-15.7": 5,
         "misra-c2012-17.7": 16,
         "misra-c2012-18.4": 48,
         "misra-c2012-21.14": 1,
@@ -185,6 +185,11 @@
         "misra-c2012-17.7": 8,
         "misra-c2012-18.4": 17,
         "misra-c2012-8.7": 3
+      },
+      "src/tigris_transpose_band.h": {
+        "misra-c2012-12.1": 4,
+        "misra-c2012-15.5": 6,
+        "misra-c2012-5.9": 1
       }
     }
   }

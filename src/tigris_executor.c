@@ -5,6 +5,7 @@
 
 #include "tigris_executor.h"
 #include "tigris_lz4.h"
+#include "tigris_transpose_band.h"
 
 #include <string.h>
 
@@ -1559,52 +1560,49 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_by_input(
 }
 
 /**
- * The two extents a layout conversion transposes, or 0 if this operator is
- * not one.
+ * The batch and the two extents a banded transpose swaps, or 0 if this
+ * operator is not one.
  *
- * A conversion between the spatial and linear orders moves the channel axis
- * past the spatial ones and leaves those in their relative order, so once the
- * axes that travel together are read as one it is a plain matrix transpose.
- * Rank 3 permutes (0,2,1) directly. Rank 4 permutes (0,3,1,2) going to linear
- * and (0,2,3,1) coming back, and in both the two spatial axes stay adjacent
- * and ordered, so H*W collapses into one extent.
+ * transpose_band_groups states the rule: the permutation swaps two adjacent
+ * groups of axes and leaves the rest in order. Everything ahead of the pair
+ * is a batch the transpose repeats over and everything behind it is a block
+ * that travels with the element, so a layout conversion, an attention block's
+ * key transpose and its head permutation all reduce to the same matrix
+ * transpose.
  */
 static int transpose_extents(
     const tigris_plan_t *plan, uint16_t op_idx,
-    uint16_t in_idx, int32_t *rows, int32_t *cols)
+    uint16_t in_idx, int32_t *outer, int32_t *rows, int32_t *cols)
 {
     const tigris_tensor_t *in = &plan->tensors[in_idx];
     uint8_t perm_rank = 0;
     const uint8_t *perm = tigris_op_attribute_data(
         plan, op_idx, TIGRIS_OP_ATTR_TRANSPOSE_PERM, &perm_rank);
-    if (!perm || perm_rank != in->ndim)
+    if (!perm || perm_rank != in->ndim || in->ndim < 2u)
+        return 0;
+
+    uint8_t prefix = 0;
+    uint8_t split = 0;
+    uint8_t middle = 0;
+    if (!transpose_band_groups(perm, in->ndim, &prefix, &split, &middle))
         return 0;
 
     const int32_t *shape = tigris_tensor_shape(plan, in);
-    if (in->ndim == 3u) {
-        if (perm[0] != 0u || perm[1] != 2u || perm[2] != 1u)
-            return 0;
-        *rows = shape[1];
-        *cols = shape[2];
-        return 1;
-    }
-    if (in->ndim == 4u) {
-        if (perm[0] != 0u)
-            return 0;
-        if (perm[1] == 3u && perm[2] == 1u && perm[3] == 2u) {
-            /* [N, H, W, C] -> [N, C, H, W]: the spatial pair is the row axis. */
-            *rows = shape[1] * shape[2];
-            *cols = shape[3];
-            return 1;
-        }
-        if (perm[1] == 2u && perm[2] == 3u && perm[3] == 1u) {
-            /* [N, C, H, W] -> [N, H, W, C]: the channel axis is the row axis. */
-            *rows = shape[1];
-            *cols = shape[2] * shape[3];
-            return 1;
-        }
-    }
-    return 0;
+    int32_t batch = 1;
+    int32_t a = 1;
+    int32_t b = 1;
+    for (uint8_t i = 0; i < prefix; i++)
+        batch *= shape[i];
+    for (uint8_t i = 0; i < split; i++)
+        a *= shape[prefix + i];
+    for (uint8_t i = split; i < middle; i++)
+        b *= shape[prefix + i];
+    if (batch <= 0 || a <= 0 || b <= 0)
+        return 0;
+    *outer = batch;
+    *rows = a;
+    *cols = b;
+    return 1;
 }
 
 /**
@@ -1639,15 +1637,13 @@ static int stage_is_tiled_transpose(
     if (in->ndim != out->ndim)
         return 0;
 
+    int32_t batch = 0;
     int32_t rows = 0;
     int32_t cols = 0;
-    if (!transpose_extents(plan, op_idx, in_idx, &rows, &cols))
+    if (!transpose_extents(plan, op_idx, in_idx, &batch, &rows, &cols))
         return 0;
 
-    const int32_t *in_shape = tigris_tensor_shape(plan, in);
-    const int32_t *out_shape = tigris_tensor_shape(plan, out);
-    return rows > 0 && cols > 0 && in_shape[0] > 0 &&
-           out_shape[0] == in_shape[0] &&
+    return batch > 0 && rows > 0 && cols > 0 &&
            in->size_bytes == out->size_bytes;
 }
 
@@ -1676,17 +1672,29 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
 
     const tigris_tensor_t *in = &plan->tensors[in_idx];
     const tigris_tensor_t *out = &plan->tensors[out_idx];
-    const int32_t *in_shape = tigris_tensor_shape(plan, in);
-    int32_t batch = in_shape[0];
+    int32_t batch = 0;  /* the axes ahead of the swapped pair */
     int32_t rows = 0;   /* becomes the output's column count */
     int32_t cols = 0;   /* becomes the output's row count */
-    if (!transpose_extents(plan, op_idx, in_idx, &rows, &cols))
+    if (!transpose_extents(plan, op_idx, in_idx, &batch, &rows, &cols))
         return TIGRIS_EXEC_ERR_TILE;
 
-    uint64_t numel = (uint64_t)batch * (uint32_t)rows * (uint32_t)cols;
-    if (numel == 0u || in->size_bytes % numel != 0u)
+    uint64_t positions = (uint64_t)batch * (uint32_t)rows * (uint32_t)cols;
+    if (positions == 0u || in->size_bytes % positions != 0u)
         return TIGRIS_EXEC_ERR_TILE;
-    uint32_t elem_size = (uint32_t)(in->size_bytes / numel);
+    /* What one position of the transposed matrix holds: the dtype, times the
+     * axes behind the swapped pair, which travel with it. The kernel works in
+     * dtype units, so it is told the block separately. */
+    uint32_t elem_size = (uint32_t)(in->size_bytes / positions);
+    const int32_t *full_shape = tigris_tensor_shape(plan, in);
+    uint64_t total = 1;
+    for (uint8_t axis = 0; axis < in->ndim; axis++)
+        total *= (uint32_t)full_shape[axis];
+    if (total == 0u || in->size_bytes % total != 0u)
+        return TIGRIS_EXEC_ERR_TILE;
+    uint32_t dtype_size = (uint32_t)(in->size_bytes / total);
+    if (dtype_size == 0u || elem_size % dtype_size != 0u)
+        return TIGRIS_EXEC_ERR_TILE;
+    int32_t block = (int32_t)(elem_size / dtype_size);
 
     /* Band the longer axis: it gives the most bands and the smallest slice,
      * since a slice holds batch * (the other axis) * band elements. */
@@ -1744,6 +1752,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
 
         mem->tile.active = 1;
         mem->tile.transposed_tile = 1;
+        mem->tile.transpose_outer = batch;
+        mem->tile.transpose_block = block;
         mem->tile.in_h = band_on_cols ? other : width;
         mem->tile.in_w = band_on_cols ? width : other;
         mem->tile.out_h = band_on_cols ? width : other;

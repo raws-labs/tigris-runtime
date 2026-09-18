@@ -694,6 +694,21 @@ static tigris_exec_error_t exec_stage_normal(
         if (stats) stats->spills_bytes += plan->tensors[tidx].size_bytes;
     }
 
+    /* Dropping the fast arena invalidates every pointer into it. A tensor
+     * whose buffer an in-place reshape shares is not freed by its own last
+     * use, and one nothing reads again is never freed at all; either way the
+     * stale pointer would look to the next stage's compaction like a live
+     * allocation sitting where that stage has already put something else. */
+    {
+        const uint8_t *low = mem->fast_base + mem->fast_reserved;
+        const uint8_t *high = mem->fast_base + mem->fast_size;
+        for (uint16_t i = 0; i < mem->num_tensors; i++) {
+            const uint8_t *p = (const uint8_t *)mem->tensor_ptrs[i];
+            if (p >= low && p < high)
+                mem->tensor_ptrs[i] = NULL;
+        }
+    }
+
     tigris_mem_reset_fast(mem);
 
     /* Restore stage input pointers to slow */
@@ -2091,13 +2106,16 @@ static int stage_is_row_tiled(
             int32_t ib;
             int32_t ir;
             int32_t ic;
+            /* An operand the band does not cut is read whole, which only a
+             * matrix product's second operand is entitled to be. The role
+             * settles it before the shape does: an operand read whole is
+             * never also cut, however its own row count reads. */
+            if (k > 0u && is_whole_operand_op(op->op_type))
+                continue;
             if (tensor_row_view(plan, in, &ib, &ir, &ic) &&
                 ib == batch && ir == rows)
                 continue;
-            /* An operand the band does not cut is read whole, which only a
-             * matrix product's second operand is entitled to be. */
-            if (k == 0u || !is_whole_operand_op(op->op_type))
-                return 0;
+            return 0;
         }
     }
     for (uint16_t i = 0; i < stage->inputs_count; i++) {
@@ -2108,6 +2126,32 @@ static int stage_is_row_tiled(
     }
     *out_rows = rows;
     return 1;
+}
+
+/**
+ * Whether a row band reads this stage tensor whole rather than cutting it.
+ *
+ * A matrix product reads every row of its second operand to produce one row
+ * of its output. Which tensors the band cuts is a property of the role each
+ * plays, not of its shape: an operand whose own row count happens to equal
+ * the band's is still read whole, and cutting it computes a partial product.
+ * Mirrors _whole_band_operands in the compiler.
+ */
+static int is_whole_band_operand(
+    const tigris_plan_t *plan, const tigris_stage_t *stage, uint16_t tidx)
+{
+    const uint16_t *sops = tigris_stage_ops(plan, stage);
+    for (uint16_t j = 0; j < stage->ops_count; j++) {
+        const tigris_op_t *op = &plan->ops[sops[j]];
+        if (!is_whole_operand_op(op->op_type))
+            continue;
+        const uint16_t *ins = tigris_op_inputs(plan, op);
+        for (uint8_t k = 1u; k < op->num_inputs; k++) {
+            if (ins[k] == tidx)
+                return 1;
+        }
+    }
+    return 0;
 }
 
 /**
@@ -2147,7 +2191,7 @@ static tigris_exec_error_t run_row_band(
         int32_t c;
         if (!tensor_row_view(plan, t, &b, &r, &c))
             return TIGRIS_EXEC_ERR_TILE;
-        if (r != rows) {
+        if (r != rows || is_whole_band_operand(plan, stage, tidx)) {
             /* An operand the band does not cut is read whole, straight out of
              * the arena it already lives in. Nothing to copy and nothing to
              * allocate. */

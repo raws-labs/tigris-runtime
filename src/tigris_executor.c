@@ -510,6 +510,66 @@ static uint8_t stage_tile_axis(
 
 /* Non-tiled stage execution */
 
+/**
+ * Whether an operator gives a tensor a new shape without moving a byte.
+ *
+ * A reshape produces the same bytes in the same order, and only the shape the
+ * consumer reads differs, in two cases. Two tensors that each state their own
+ * axis order hold their elements in the order the shape lists them, so
+ * regrouping the shape moves nothing. Two spatial tensors hold their channel
+ * axis last and their spatial axes in order ahead of it, so regrouping only
+ * the spatial axes moves nothing either: that is what an unfold is, and it is
+ * how a vision transformer turns a feature map into patches. There the batch
+ * and the channel extent have to survive, because they are the ends of the
+ * stored order and a reshape that changes either is moving bytes.
+ *
+ * The output can then share the input's buffer instead of being allocated and
+ * copied into. Mirrors pure_reinterpretations in the compiler, which counts
+ * the two as one allocation when it decides whether a stage fits.
+ */
+static int states_its_own_order(const tigris_tensor_t *t)
+{
+    return (t->flags & TIGRIS_TENSOR_LINEAR) != 0u || t->ndim <= 2u;
+}
+
+static int is_pure_reinterpretation(
+    const tigris_plan_t *plan, const tigris_op_t *op)
+{
+    if (op->op_type != TIGRIS_OP_RESHAPE && op->op_type != TIGRIS_OP_FLATTEN)
+        return 0;
+    if (op->num_inputs != 1u || op->num_outputs != 1u)
+        return 0;
+    const tigris_tensor_t *in =
+        &plan->tensors[tigris_op_inputs(plan, op)[0]];
+    const tigris_tensor_t *out =
+        &plan->tensors[tigris_op_outputs(plan, op)[0]];
+    if (in->size_bytes != out->size_bytes)
+        return 0;
+    /* The bytes are only the same bytes if they mean the same thing. A plan
+     * may give the two tensors different quantization, and then the reshape
+     * has to re-encode rather than pass through. */
+    const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, in);
+    const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, out);
+    if (in_qp != out_qp) {
+        if (!in_qp || !out_qp)
+            return 0;
+        if (in_qp->scale != out_qp->scale ||
+            in_qp->zero_point != out_qp->zero_point)
+            return 0;
+    }
+    int in_own = states_its_own_order(in);
+    int out_own = states_its_own_order(out);
+    if (in_own && out_own)
+        return 1;
+    if (in_own || out_own)
+        return 0;
+    if (plan->shape_pool == NULL || in->ndim == 0u || out->ndim == 0u)
+        return 0;
+    const int32_t *a = tigris_tensor_shape(plan, in);
+    const int32_t *b = tigris_tensor_shape(plan, out);
+    return a[0] == b[0] && a[in->ndim - 1u] == b[out->ndim - 1u];
+}
+
 static tigris_exec_error_t exec_stage_normal(
     const tigris_plan_t *plan,
     const tigris_stage_t *stage,
@@ -566,8 +626,24 @@ static tigris_exec_error_t exec_stage_normal(
         uint16_t op_idx = sops[j];
         const tigris_op_t *op = &plan->ops[op_idx];
 
-        /* Allocate outputs (with compaction retry on OOM, slow fallback) */
+        /* A reshape that moves no byte shares its input's buffer, so there is
+         * nothing to allocate and nothing for the kernel to copy. The
+         * compiler counts the two as one allocation when it decides whether
+         * the stage fits, so not doing this would need more memory than it
+         * was promised. */
         const uint16_t *outs = tigris_op_outputs(plan, op);
+        if (is_pure_reinterpretation(plan, op)) {
+            uint16_t src = tigris_op_inputs(plan, op)[0];
+            if (!mem->tensor_ptrs[outs[0]] && mem->tensor_ptrs[src]) {
+                mem->tensor_ptrs[outs[0]] = mem->tensor_ptrs[src];
+                /* The buffer outlives the input tensor's own last use. */
+                if (src < num_t)
+                    last_use_op[src] = UINT16_MAX;
+                continue;
+            }
+        }
+
+        /* Allocate outputs (with compaction retry on OOM, slow fallback) */
         for (uint8_t k = 0; k < op->num_outputs; k++) {
             uint16_t tidx = outs[k];
             if (!mem->tensor_ptrs[tidx]) {

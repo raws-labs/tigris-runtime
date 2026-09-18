@@ -13,6 +13,7 @@
 #include "tigris_kernels_s8.h"
 #include "tigris_kernels.h"
 #include "tigris_accel_policy.h"
+#include "tigris_kernel_window.h"
 
 #include <math.h>
 #include <string.h>
@@ -142,6 +143,113 @@ static inline int32_t get_shift(
     return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
 }
 
+/** Re-encode a value that a kernel carried through unchanged.
+ *
+ * Max preserves the value, but not its encoding: when the output tensor
+ * declares a different scale or zero point from the input's, the same value
+ * is a different int8. Defined the way kern_avg_pool_s8 defines the mismatched
+ * case, dequantize then requantize with round() so half ties go away from
+ * zero, since TFLite rejects mismatched pool quantization and there is no
+ * canonical integer-kernel result to match.
+ */
+static inline int32_t requantize_passthrough(
+    int32_t q, int32_t in_zp, float in_scale, int32_t out_zp, float out_scale)
+{
+    if (in_scale == out_scale && in_zp == out_zp)
+        return q;
+    double value = (double)(q - in_zp) * (double)in_scale;
+    double scaled = round(value / (double)out_scale) + (double)out_zp;
+    if (scaled < -128.0)
+        return -128;
+    if (scaled > 127.0)
+        return 127;
+    return (int32_t)scaled;
+}
+
+/** The input and output quantization of a value-preserving operator. */
+typedef struct {
+    int32_t in_zp;
+    int32_t out_zp;
+    float   in_scale;
+    float   out_scale;
+    int     same;
+} passthrough_quant_t;
+
+static inline passthrough_quant_t passthrough_quant(
+    const tigris_plan_t *plan, uint16_t in_idx, uint16_t out_idx)
+{
+    const tigris_quant_param_t *in_qp =
+        tigris_tensor_quant(plan, &plan->tensors[in_idx]);
+    const tigris_quant_param_t *out_qp =
+        tigris_tensor_quant(plan, &plan->tensors[out_idx]);
+    passthrough_quant_t q;
+    q.in_zp = in_qp ? in_qp->zero_point : 0;
+    q.in_scale = in_qp ? in_qp->scale : 1.0f;
+    if (!(q.in_scale > 0.0f))
+        q.in_scale = 1.0f;
+    /* A tensor with no quantization parameters states nothing to re-encode
+     * to, so the pair counts as matching and the value passes through. Only a
+     * plan that declares both, and declares them different, asks for the
+     * conversion. */
+    q.out_zp = q.in_zp;
+    q.out_scale = q.in_scale;
+    q.same = 1;
+    if (in_qp && out_qp && out_qp->scale > 0.0f) {
+        q.out_zp = out_qp->zero_point;
+        q.out_scale = out_qp->scale;
+        q.same = (q.in_scale == q.out_scale) && (q.in_zp == q.out_zp);
+    }
+    return q;
+}
+
+/** The requantization parameters of an output tensor, resolved once.
+ *
+ * get_multiplier and get_shift chase plan->header and recompute the page
+ * offset on every call, and the weighted kernels called them once per output
+ * element for two numbers that vary only with the channel. The arrays sit
+ * next to each other in one page, so one resolution serves the whole kernel.
+ */
+typedef struct {
+    const int32_t *multiplier;  /* NULL when the tensor carries no params */
+    const int32_t *shift;
+    int            per_channel; /* index by the channel, otherwise by 0 */
+} requant_params_t;
+
+static inline requant_params_t requant_resolve(
+    const tigris_plan_t *plan, const tigris_quant_param_t *qp)
+{
+    requant_params_t rq;
+    rq.multiplier = NULL;
+    rq.shift = NULL;
+    rq.per_channel = 0;
+    if (qp) {
+        uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2
+                            ? 0u : qp->_pad;
+        const int32_t *base = plan->quant_data +
+                              (size_t)page * TIGRIS_QUANT_PAGE_ELEMS;
+        rq.multiplier = base + qp->multiplier_off;
+        rq.shift = base + qp->shift_off;
+        rq.per_channel = qp->num_channels > 1 ? 1 : 0;
+    }
+    return rq;
+}
+
+/* The multiplier and shift a channel requantizes with. A tensor without quant
+ * params keeps the (1, 0) the kernels used before, which is a Q0.31 multiply
+ * rather than the identity, so the result is unchanged. */
+static inline int32_t requant_apply(
+    const requant_params_t *rq, int32_t acc, int channel)
+{
+    int32_t m = 1;
+    int32_t sh = 0;
+    if (rq->multiplier) {
+        int idx = rq->per_channel ? channel : 0;
+        m = rq->multiplier[idx];
+        sh = rq->shift[idx];
+    }
+    return multiply_by_quantized_multiplier(acc, m, sh);
+}
+
 /** Total number of elements in a tensor. */
 static uint32_t tensor_numel(const tigris_plan_t *plan, uint16_t tidx)
 {
@@ -264,6 +372,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv2d_s8(
     /* Output quant param for requantization */
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
     int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+    requant_params_t rq = requant_resolve(plan, out_qp);
 
     /* Output qp holds the pre-computed per-channel multiplier/shift for
      * requantization (effective_scale = input_scale * weight_scale / output_scale). */
@@ -307,15 +416,19 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv2d_s8(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, DH, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, DW, &kw0, &kw1);
                 for (int oc = 0; oc < OC; oc++) {
                     int32_t acc = B ? load_bias_s32(B, (uint32_t)oc) : 0;
-                    for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh_g * SH - PT + kh * DH - in_row_start;
-                        if (ih < 0 || ih >= IH) continue;
-                        for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PL + kw * DW;
-                            if (iw < 0 || iw >= IW) continue;
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh * DH;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw * DW;
                             for (int ic = 0; ic < IC; ic++) {
                                 int32_t x_val = (int32_t)X[((n*IH+ih)*IW+iw)*IC+ic] - input_zp;
                                 int32_t w_val = (int32_t)W[((oc*KH+kh)*KW+kw)*IC+ic];
@@ -323,11 +436,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv2d_s8(
                             }
                         }
                     }
-                    /* Requantize: per-channel uses oc, per-tensor uses 0 */
-                    int ch = (out_qp && out_qp->num_channels > 1) ? oc : 0;
-                    int32_t m = out_qp ? get_multiplier(plan, out_qp, ch) : 1;
-                    int32_t s = out_qp ? get_shift(plan, out_qp, ch) : 0;
-                    int32_t scaled = multiply_by_quantized_multiplier(acc, m, s);
+                    int32_t scaled = requant_apply(&rq, acc, oc);
                     Y[((n*OH+oh_g)*OW+ow)*OC+oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
                 }
             }
@@ -369,6 +478,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv_transpose_s8(
     /* Output quant param for requantization */
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
     int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+    requant_params_t rq = requant_resolve(plan, out_qp);
 
     /* NHWC layout */
     int N  = x_shape[0];
@@ -428,11 +538,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv_transpose_s8(
                             }
                         }
                     }
-                    /* Requantize: per-channel uses oc, per-tensor uses 0 */
-                    int ch = (out_qp && out_qp->num_channels > 1) ? oc : 0;
-                    int32_t m = out_qp ? get_multiplier(plan, out_qp, ch) : 1;
-                    int32_t s = out_qp ? get_shift(plan, out_qp, ch) : 0;
-                    int32_t scaled = multiply_by_quantized_multiplier(acc, m, s);
+                    int32_t scaled = requant_apply(&rq, acc, oc);
                     Y[((n*OH+oh)*OW+ow)*OC+oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
                 }
             }
@@ -461,6 +567,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv1d_s8(
     int32_t input_zp = in_qp ? in_qp->zero_point : 0;
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
     int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+    requant_params_t rq = requant_resolve(plan, out_qp);
 
     /* NLC layout (transposed from NCL) */
     int N  = x_shape[0];
@@ -492,10 +599,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv1d_s8(
                         acc += x_val * w_val;
                     }
                 }
-                int ch = (out_qp && out_qp->num_channels > 1) ? oc : 0;
-                int32_t m = out_qp ? get_multiplier(plan, out_qp, ch) : 1;
-                int32_t s = out_qp ? get_shift(plan, out_qp, ch) : 0;
-                int32_t scaled = multiply_by_quantized_multiplier(acc, m, s);
+                int32_t scaled = requant_apply(&rq, acc, oc);
                 Y[(n*OT+ot)*OC+oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
             }
         }
@@ -521,6 +625,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_depthwise_conv2d_s8(
     int32_t input_zp = in_qp ? in_qp->zero_point : 0;
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
     int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+    requant_params_t rq = requant_resolve(plan, out_qp);
 
     int N  = x_shape[0];
     int IH = x_shape[1];
@@ -558,24 +663,25 @@ static TIGRIS_KERNEL_NOINLINE int kern_depthwise_conv2d_s8(
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, DH, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, DW, &kw0, &kw1);
                 for (int c = 0; c < C; c++) {
                     int32_t acc = B ? load_bias_s32(B, (uint32_t)c) : 0;
-                    for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh_g * SH - PT + kh * DH - in_row_start;
-                        if (ih < 0 || ih >= IH) continue;
-                        for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PL + kw * DW;
-                            if (iw < 0 || iw >= IW) continue;
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh * DH;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw * DW;
                             int32_t x_val = (int32_t)X[((n*IH+ih)*IW+iw)*C+c] - input_zp;
                             int32_t w_val = (int32_t)W[(kh*KW+kw)*C+c];
                             acc += x_val * w_val;
                         }
                     }
-                    int ch = (out_qp && out_qp->num_channels > 1) ? c : 0;
-                    int32_t m = out_qp ? get_multiplier(plan, out_qp, ch) : 1;
-                    int32_t s = out_qp ? get_shift(plan, out_qp, ch) : 0;
-                    int32_t scaled = multiply_by_quantized_multiplier(acc, m, s);
+                    int32_t scaled = requant_apply(&rq, acc, c);
                     Y[((n*OH+oh_g)*OW+ow)*C+c] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
                 }
             }
@@ -601,6 +707,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_fully_connected_s8(
     int32_t input_zp = in_qp ? in_qp->zero_point : 0;
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
     int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+    requant_params_t rq = requant_resolve(plan, out_qp);
 
     /* Input: [N, IC], Weight: [OC, IC], Output: [N, OC] */
     const tigris_tensor_t *y_tensor = &plan->tensors[outs[0]];
@@ -628,10 +735,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_fully_connected_s8(
                 int32_t w_val = (int32_t)W[oc * IC + ic];
                 acc += x_val * w_val;
             }
-            int ch = (out_qp && out_qp->num_channels > 1) ? oc : 0;
-            int32_t m = out_qp ? get_multiplier(plan, out_qp, ch) : 1;
-            int32_t s = out_qp ? get_shift(plan, out_qp, ch) : 0;
-            int32_t scaled = multiply_by_quantized_multiplier(acc, m, s);
+            int32_t scaled = requant_apply(&rq, acc, oc);
             Y[n * OC + oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
         }
     }
@@ -647,14 +751,23 @@ static TIGRIS_KERNEL_NOINLINE int kern_relu_s8(
     const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
 
-    /* Quantized relu: max(x, zero_point) */
-    const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
-    int8_t zp = in_qp ? (int8_t)in_qp->zero_point : 0;
+    /* Quantized relu: max(x, zero_point). The clamp is in the input's domain,
+     * so the result has to be re-encoded when the output declares a different
+     * scale or zero point. */
+    passthrough_quant_t q = passthrough_quant(plan, ins[0], outs[0]);
+    int8_t zp = clamp_s8(q.in_zp);
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
     apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
-    for (uint32_t i = 0; i < n; i++) {
-        Y[i] = X[i] > zp ? X[i] : zp;
+    if (q.same) {
+        for (uint32_t i = 0; i < n; i++)
+            Y[i] = X[i] > zp ? X[i] : zp;
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            int32_t v = X[i] > zp ? X[i] : zp;
+            Y[i] = (int8_t)requantize_passthrough(
+                v, q.in_zp, q.in_scale, q.out_zp, q.out_scale);
+        }
     }
     return 0;
 }
@@ -668,10 +781,11 @@ static TIGRIS_KERNEL_NOINLINE int kern_relu6_s8(
     const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
 
-    /* Quantized relu6: clamp to [zp_0, zp_6] */
-    const tigris_quant_param_t *qp = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
-    float scale = qp ? qp->scale : 1.0f;
-    int32_t zp = qp ? qp->zero_point : 0;
+    /* Quantized relu6: clamp to [zp_0, zp_6] in the input's domain, then
+     * re-encode if the output declares a different scale or zero point. */
+    passthrough_quant_t q = passthrough_quant(plan, ins[0], outs[0]);
+    float scale = q.in_scale;
+    int32_t zp = q.in_zp;
     int8_t lo = clamp_s8(zp);  /* quantized 0 */
     /* Round (not truncate) the quantized 6.0 ceiling to match TFLite's activation
      * max and the compiler's fused-Relu6 bound; truncation is 1 LSB too low when
@@ -684,7 +798,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_relu6_s8(
         int8_t v = X[i];
         if (v < lo) v = lo;
         if (v > hi) v = hi;
-        Y[i] = v;
+        Y[i] = q.same ? v : (int8_t)requantize_passthrough(
+            v, q.in_zp, q.in_scale, q.out_zp, q.out_scale);
     }
     return 0;
 }
@@ -1047,6 +1162,9 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_max_pool_s8(
     int W = x_shape[2];
     int C = x_shape[3];
 
+    /* Max preserves the value, not its encoding: see kern_max_pool_s8. */
+    passthrough_quant_t q = passthrough_quant(plan, ins[0], outs[0]);
+
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
             int32_t best = -128;
@@ -1056,7 +1174,9 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_max_pool_s8(
                     if (v > best) best = v;
                 }
             }
-            Y[n * C + c] = clamp_act(best, op->act_min, op->act_max);
+            int32_t out_q = requantize_passthrough(
+                best, q.in_zp, q.in_scale, q.out_zp, q.out_scale);
+            Y[n * C + c] = clamp_act(out_q, op->act_min, op->act_max);
         }
     }
     return 0;
@@ -1072,7 +1192,15 @@ static TIGRIS_KERNEL_NOINLINE int kern_reshape_s8(
     int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
-    if (X != Y) {
+    /* A reshape moves no value, so with matching quantization it is a copy or
+     * nothing at all. A plan that declares a different output encoding still
+     * has to be honored, and then it is a pass over the elements. */
+    passthrough_quant_t q = passthrough_quant(plan, ins[0], outs[0]);
+    if (!q.same) {
+        for (uint32_t i = 0; i < n; i++)
+            Y[i] = (int8_t)requantize_passthrough(
+                X[i], q.in_zp, q.in_scale, q.out_zp, q.out_scale);
+    } else if (X != Y) {
         memcpy(Y, X, n);
     }
     return 0;
@@ -1120,27 +1248,36 @@ static TIGRIS_KERNEL_NOINLINE int kern_max_pool_s8(
         in_row_start  = mem->tile.in_row_start;
     }
 
-    /* Max preserves scale/zp - no requantization needed */
+    /* Max preserves the value. The encoding is only preserved when the two
+     * tensors declare the same quantization, which nothing enforces. */
+    passthrough_quant_t q = passthrough_quant(plan, ins[0], outs[0]);
+
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
+            int base_h = oh_g * SH - PT - in_row_start;
+            int kh0, kh1;
+            tap_range(base_h, IH, KH, 1, &kh0, &kh1);
             for (int ow = 0; ow < OW; ow++) {
+                int base_w = ow * SW - PL;
+                int kw0, kw1;
+                tap_range(base_w, IW, KW, 1, &kw0, &kw1);
                 for (int c = 0; c < C; c++) {
                     int8_t max_val = -128;
-                    for (int kh = 0; kh < KH; kh++) {
-                        int ih = oh_g * SH - PT + kh - in_row_start;
-                        if (ih < 0 || ih >= IH) continue;
-                        for (int kw = 0; kw < KW; kw++) {
-                            int iw = ow * SW - PL + kw;
-                            if (iw < 0 || iw >= IW) continue;
+                    for (int kh = kh0; kh < kh1; kh++) {
+                        int ih = base_h + kh;
+                        for (int kw = kw0; kw < kw1; kw++) {
+                            int iw = base_w + kw;
                             int8_t v = X[((n * IH + ih) * IW + iw) * C + c];
                             if (v > max_val) max_val = v;
                         }
                     }
                     /* Apply the fused activation clamp, as TFLM/CMSIS MaxPool do
                      * (no-op when act range is the full [-128, 127]). */
+                    int32_t out_q = requantize_passthrough(
+                        max_val, q.in_zp, q.in_scale, q.out_zp, q.out_scale);
                     Y[((n * OH + oh_g) * OW + ow) * C + c] =
-                        clamp_act(max_val, op->act_min, op->act_max);
+                        clamp_act(out_q, op->act_min, op->act_max);
                 }
             }
         }
@@ -1239,7 +1376,11 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_nearest_s8(
         OW = mem->tile.out_w;
     }
 
-    /* Nearest-neighbor: just copy bytes, no arithmetic */
+    /* Nearest-neighbor picks a value, it does not compute one, so with
+     * matching quantization it is a byte copy. A plan that declares a
+     * different output encoding still has to be honored. */
+    passthrough_quant_t q = passthrough_quant(plan, ins[0], outs[0]);
+
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int ih = oh / scale_h;
@@ -1249,7 +1390,14 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_nearest_s8(
                 if (iw >= IW) iw = IW - 1;
                 const int8_t *src = X + ((n * IH + ih) * IW + iw) * C;
                 int8_t *dst = Y + ((n * OH + oh) * OW + ow) * C;
-                memcpy(dst, src, (size_t)C);
+                if (q.same) {
+                    memcpy(dst, src, (size_t)C);
+                } else {
+                    for (int c = 0; c < C; c++)
+                        dst[c] = (int8_t)requantize_passthrough(
+                            src[c], q.in_zp, q.in_scale,
+                            q.out_zp, q.out_scale);
+                }
             }
         }
     }
@@ -1765,6 +1913,17 @@ int tigris_accel_try_s8_ref(
      * other op still routes to s8_ref. */
     if (mem->tile.active && mem->tile.width_tiled &&
         !is_conv_or_depthwise(op)) {
+        *handled = 1;
+        return tigris_dispatch_kernel_s8(
+            plan, op, op_index, mem, user_ctx);
+    }
+
+    /* A row band hands the kernel a buffer holding only the band's rows, and
+     * says so in mem->tile.out_h rather than in the tensor shape. The vendor
+     * FullyConnected kernels take their row count from the output tensor, so
+     * they would read and write the whole matrix into a band-sized allocation.
+     * The s8 reference kernel honors the band, so route there. */
+    if (mem->tile.active && mem->tile.row_tiled) {
         *handled = 1;
         return tigris_dispatch_kernel_s8(
             plan, op, op_index, mem, user_ctx);

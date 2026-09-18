@@ -2154,6 +2154,125 @@ static void test_transpose(void)
                          "transpose value");
 }
 
+
+/* The transpose kernel moves elements with typed stores where the pointers
+ * allow it and memcpy where they do not. Both have to agree with the plain
+ * index walk, on every rank and on both paths through the kernel. */
+static void transpose_reference(
+    uint8_t *out, const uint8_t *in, int rank, const int32_t *in_shape,
+    const uint8_t *perm, uint32_t elem_size)
+{
+    int32_t out_shape[4];
+    uint32_t elements = 1;
+    for (int a = 0; a < rank; a++) {
+        out_shape[a] = in_shape[perm[a]];
+        elements *= (uint32_t)in_shape[a];
+    }
+    for (uint32_t o = 0; o < elements; o++) {
+        uint32_t remainder = o;
+        uint32_t in_index = 0;
+        for (int a = rank - 1; a >= 0; a--) {
+            uint32_t coord = remainder % (uint32_t)out_shape[a];
+            remainder /= (uint32_t)out_shape[a];
+            uint32_t stride = 1;
+            for (int b = perm[a] + 1; b < rank; b++)
+                stride *= (uint32_t)in_shape[b];
+            in_index += coord * stride;
+        }
+        memcpy(out + (size_t)o * elem_size,
+               in + (size_t)in_index * elem_size, elem_size);
+    }
+}
+
+static void run_transpose_case(
+    int rank, const int32_t *in_shape, const uint8_t *perm,
+    uint32_t elem_size, int misalign, int banded,
+    int32_t rows, int32_t cols, const char *what)
+{
+    int32_t shapes[8];
+    uint32_t elements = 1;
+    for (int a = 0; a < rank; a++) {
+        shapes[a] = in_shape[a];
+        shapes[4 + a] = in_shape[perm[a]];
+        elements *= (uint32_t)in_shape[a];
+    }
+
+    static uint8_t in_buf[1024];
+    static uint8_t out_buf[1024];
+    static uint8_t ref_buf[1024];
+    uint8_t *in = in_buf + misalign;
+    uint8_t *out = out_buf + misalign;
+    for (uint32_t i = 0; i < elements * elem_size; i++)
+        in[i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
+    memset(out, 0, elements * elem_size);
+    transpose_reference(ref_buf, in, rank, in_shape, perm, elem_size);
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = (uint8_t)rank;
+    tensors[0].size_bytes = elements * elem_size;
+    tensors[1].shape_off = 4; tensors[1].ndim = (uint8_t)rank;
+    tensors[1].size_bytes = elements * elem_size;
+
+    uint16_t indices[2] = {0, 1};
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_TRANSPOSE;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    tigris_op_attribute_t attr = {
+        0, TIGRIS_OP_ATTR_TRANSPOSE_PERM, (uint8_t)rank, 0};
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.tensors = tensors; plan.ops = &op;
+    plan.index_pool = indices; plan.shape_pool = shapes;
+    plan.op_attributes = &attr; plan.op_attribute_data = perm;
+    plan.num_op_attributes = 1;
+
+    void *ptrs[2] = { in, out };
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs; mem.num_tensors = 2;
+    if (banded) {
+        mem.tile.active = 1;
+        mem.tile.transposed_tile = 1;
+        mem.tile.in_h = rows; mem.tile.in_w = cols;
+        mem.tile.out_h = cols; mem.tile.out_w = rows;
+    }
+
+    TEST_ASSERT(tigris_transpose_execute(&plan, &op, 0, &mem) == 0, what);
+    TEST_ASSERT(memcmp(out, ref_buf, elements * elem_size) == 0, what);
+}
+
+static void test_transpose_element_paths(void)
+{
+    printf("  test_transpose_element_paths...\n");
+
+    const int32_t r4[4] = {1, 5, 6, 4};
+    const uint8_t p4[4] = {0, 3, 1, 2};
+    run_transpose_case(4, r4, p4, 4, 0, 0, 0, 0,
+                       "rank-4 float general walk");
+    run_transpose_case(4, r4, p4, 1, 0, 0, 0, 0,
+                       "rank-4 int8 general walk");
+    /* One byte in defeats the typed stores and takes the memcpy fallback. */
+    run_transpose_case(4, r4, p4, 4, 1, 0, 0, 0,
+                       "rank-4 float misaligned falls back");
+
+    const int32_t r3[3] = {1, 12, 7};
+    const uint8_t p3[3] = {0, 2, 1};
+    run_transpose_case(3, r3, p3, 4, 0, 1, 12, 7,
+                       "rank-3 float banded");
+    run_transpose_case(3, r3, p3, 1, 0, 1, 12, 7,
+                       "rank-3 int8 banded");
+    run_transpose_case(3, r3, p3, 4, 1, 1, 12, 7,
+                       "rank-3 float banded misaligned falls back");
+
+    const int32_t r4b[4] = {1, 4, 3, 5};
+    const uint8_t p4b[4] = {0, 2, 3, 1};
+    run_transpose_case(4, r4b, p4b, 4, 0, 1, 4, 15,
+                       "rank-4 float banded the other way");
+}
+
 /* Main */
 
 int main(void)
@@ -2186,6 +2305,7 @@ int main(void)
     test_constant_binary_f32();
     test_malformed_constant_binary_f32();
     test_transpose();
+    test_transpose_element_paths();
     test_unsupported_op();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

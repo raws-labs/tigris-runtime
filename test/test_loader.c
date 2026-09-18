@@ -1319,6 +1319,46 @@ static void build_unary_plan(uint8_t *buf)
     shapes[3] = 3;
 }
 
+/* A row band cuts the second to last axis, so on a rank-4 tensor the leading
+ * axes are batch the band spans rather than cuts. The loader mirrors that
+ * because it decides whether the stage is row-banded before it applies the
+ * stripe contract, and a stage it accepts that the executor declines runs
+ * through the wrong path instead of being refused. */
+static void test_rank4_row_band_contract(void)
+{
+    printf("  test_rank4_row_band_contract...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    /* Both sides are the same [1, 2, 4, 8] matrix batch in the model's own
+     * axis order: batch 2, four rows of eight. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_ERF, 4);
+    int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[4] = 1; shapes[5] = 2; shapes[6] = 4; shapes[7] = 8;
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    tensors[0].flags |= TIGRIS_TENSOR_LINEAR;
+    tensors[1].flags |= TIGRIS_TENSOR_LINEAR;
+    tigris_tile_plan_t *tile =
+        (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+    tile->num_tiles = 2;
+    tile->tile_height = 2;
+    tile->original_height = 4;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "a rank-4 row band loads");
+
+    /* The same shapes held channels-last are not a matrix batch, so the band
+     * does not apply and the stripe contract decides instead. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_ERF, 4);
+    shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[4] = 1; shapes[5] = 2; shapes[6] = 4; shapes[7] = 8;
+    tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+    tile->num_tiles = 2;
+    tile->tile_height = 1;
+    tile->original_height = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "the spatial reading of the same shapes still loads");
+}
+
 static void test_operator_semantic_guards(void)
 {
     printf("  test_operator_semantic_guards...\n");
@@ -2287,6 +2327,7 @@ int main(int argc, char *argv[])
     test_op_attribute_payloads();
     test_tiled_conversion_contract();
     test_tiled_reduction_contract();
+    test_rank4_row_band_contract();
     test_operator_semantic_guards();
     test_nonweighted_operator_semantics();
     test_convolution_semantic_guards();

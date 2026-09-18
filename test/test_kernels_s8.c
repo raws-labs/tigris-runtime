@@ -1276,6 +1276,80 @@ static void test_max_pool_s8_requantizes(void)
     TEST_ASSERT_EQ(out[0], 4, "max 7 at scale 1.0 is 4 at scale 0.5, zp -10");
 }
 
+/* A row band hands the matrix product a band of its first operand's rows and
+ * the whole of its second, and says how many rows in tile.out_h rather than in
+ * the shape. Taking the row count from the shape would compute the whole
+ * matrix into a band-sized output. */
+static void test_matmul_s8_row_band(void)
+{
+    printf("  test_matmul_s8_row_band...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+
+    /* An effective scale of 1: the Q0.31 multiplier for 1.0 is 2^30 with a
+     * shift of 1, which is the identity the other kernels use. */
+    int32_t mult[] = {1 << 30};
+    int32_t shift[] = {1};
+    uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(1.0f, 0, 1, mult, shift);
+
+    enum { ROWS = 4, INNER = 2, COLS = 2, BAND = 2 };
+    int32_t a_shape[] = {ROWS, INNER};
+    int32_t b_shape[] = {INNER, COLS};
+    int32_t y_shape[] = {ROWS, COLS};
+    uint16_t t_a = add_tensor(&plan, "a", a_shape, 2, 3,
+                              ROWS * INNER, in_qp);
+    uint16_t t_b = add_tensor(&plan, "b", b_shape, 2, 3,
+                              INNER * COLS, in_qp);
+    uint16_t t_y = add_tensor(&plan, "y", y_shape, 2, 3,
+                              ROWS * COLS, out_qp);
+
+    test_ops[0].op_type = TIGRIS_OP_MATMUL;
+    test_ops[0].num_inputs = 2;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_a, t_b};
+    uint16_t outp[] = {t_y};
+    test_ops[0].inputs_off = add_indices(inp, 2);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].act_min = -128;
+    test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+
+    build_plan(&plan);
+
+    /* The band buffer holds the first two rows of a; b is whole. */
+    int8_t a_band[BAND * INNER] = {1, 2, 3, 4};
+    int8_t b_whole[INNER * COLS] = {1, 0, 0, 1};   /* identity */
+    int8_t y_band[BAND * COLS];
+    memset(y_band, 99, sizeof(y_band));
+
+    void *ptrs[MAX_TENSORS];
+    memset(ptrs, 0, sizeof(ptrs));
+    ptrs[t_a] = a_band;
+    ptrs[t_b] = b_whole;
+    ptrs[t_y] = y_band;
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = test_header.num_tensors;
+    mem.tile.active = 1;
+    mem.tile.row_tiled = 1;
+    mem.tile.in_h = BAND;
+    mem.tile.out_h = BAND;
+    mem.tile.in_w = 1;
+    mem.tile.out_w = 1;
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "matmul_s8 over a row band returns 0");
+    TEST_ASSERT_EQ(y_band[0], 1, "band row 0 column 0");
+    TEST_ASSERT_EQ(y_band[1], 2, "band row 0 column 1");
+    TEST_ASSERT_EQ(y_band[2], 3, "band row 1 column 0");
+    TEST_ASSERT_EQ(y_band[3], 4, "band row 1 column 1");
+}
+
 static void test_unsupported_op_s8(void)
 {
     printf("  test_unsupported_op_s8...\n");
@@ -1564,6 +1638,7 @@ int main(void)
     test_global_avg_pool_s8();
     test_global_max_pool_s8();
     test_max_pool_s8_requantizes();
+    test_matmul_s8_row_band();
     test_tanh_s8();
     test_softmax_s8();
     test_conv1d_s8();

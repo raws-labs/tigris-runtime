@@ -269,10 +269,16 @@ static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
         return tensor_numel(plan, tidx);
     const tigris_tensor_t *t = &plan->tensors[tidx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
-    /* A rank-2 matrix tiled along its rows has no batch axis to multiply by:
-     * out_h counts the rows in the band and the trailing axis is the row. */
-    if (mem->tile.row_tiled)
-        return (uint32_t)mem->tile.out_h * (uint32_t)shape[t->ndim - 1];
+    /* A row band cuts the second to last axis, so out_h counts the rows in
+     * the band, the trailing axis is the row, and everything ahead of the
+     * pair is batch that the band spans rather than cuts. */
+    if (mem->tile.row_tiled) {
+        uint32_t batch = 1;
+        for (uint8_t axis = 0; axis + 2u < t->ndim; axis++)
+            batch *= (uint32_t)shape[axis];
+        return batch * (uint32_t)mem->tile.out_h *
+               (uint32_t)shape[t->ndim - 1];
+    }
     /* Serialized activations are NHWC or NLC. */
     uint32_t width = t->ndim == 4 ? (uint32_t)mem->tile.out_w : 1u;
     return (uint32_t)shape[0] * (uint32_t)mem->tile.out_h *
@@ -1116,6 +1122,11 @@ static TIGRIS_KERNEL_NOINLINE int kern_matmul_s8(
     int M = a_shape[last - 1u];
     int K = a_shape[last];
     int N = b_shape[last];
+
+    /* A row band states its row count in tile.out_h, not in the shape. See
+     * kern_matmul. */
+    if (mem->tile.active && mem->tile.row_tiled && mem->tile.out_h > 0)
+        M = mem->tile.out_h;
 
     int batches = 1;
     for (uint8_t axis = 0; axis + 2u <= last; axis++)

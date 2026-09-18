@@ -124,27 +124,31 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
  */
 static int tensor_row_view(
     const tigris_plan_t *plan, const tigris_tensor_t *t,
-    int32_t *rows, int32_t *cols)
+    int32_t *batch, int32_t *rows, int32_t *cols)
 {
-    /* Read the rank and the pool before the shape: this runs on every stage
-     * of every plan, including one that carries no shape pool at all, where
-     * offsetting it is undefined rather than merely wrong. */
     if (plan->shape_pool == NULL)
         return 0;
-    if (t->ndim != 2u && t->ndim != 3u)
+    if (t->ndim < 2u)
         return 0;
     const int32_t *shape = tigris_tensor_shape(plan, t);
     if (t->ndim == 2u) {
+        *batch = 1;
         *rows = shape[0];
         *cols = shape[1];
         return 1;
     }
-    if (shape[0] == 1 && (t->flags & TIGRIS_TENSOR_LINEAR) != 0u) {
-        *rows = shape[1];
-        *cols = shape[2];
-        return 1;
+    if ((t->flags & TIGRIS_TENSOR_LINEAR) == 0u)
+        return 0;
+    int32_t outer = 1;
+    for (uint8_t axis = 0; axis + 2u < t->ndim; axis++) {
+        if (shape[axis] <= 0)
+            return 0;
+        outer *= shape[axis];
     }
-    return 0;
+    *batch = outer;
+    *rows = shape[t->ndim - 2u];
+    *cols = shape[t->ndim - 1u];
+    return 1;
 }
 
 /**
@@ -152,6 +156,12 @@ static int tensor_row_view(
  * rows computes exactly the rows it holds. Mirrors is_row_tiling_op in the
  * executor.
  */
+/* Mirrors is_whole_operand_op in the executor. */
+static int is_whole_operand_op(uint8_t type)
+{
+    return type == TIGRIS_OP_FULLY_CONN || type == TIGRIS_OP_MATMUL;
+}
+
 static int is_row_tiling_op(uint8_t type)
 {
     return type == TIGRIS_OP_FULLY_CONN ||
@@ -163,7 +173,11 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_LAYER_NORM ||
            type == TIGRIS_OP_RESHAPE ||
-           type == TIGRIS_OP_FLATTEN;
+           type == TIGRIS_OP_FLATTEN ||
+           type == TIGRIS_OP_MATMUL ||
+           type == TIGRIS_OP_ADD ||
+           type == TIGRIS_OP_SUB ||
+           type == TIGRIS_OP_MUL;
 }
 
 static int is_axis1_binary_pointwise_op(uint8_t type)
@@ -1370,62 +1384,93 @@ tigris_error_t tigris_plan_load(
                 uint16_t first_output =
                     candidate.index_pool[stage->outputs_off];
                 /* A row-banded stage is checked on its own terms first: its
-                 * tensors need not share a rank, only a row count, because a
-                 * Reshape that drops a unit leading axis moves no data.
-                 * Every stage input has to present that row view, not just
-                 * the first: stage_is_row_tiled in the executor checks them
-                 * all, and accepting a stage it will decline sends the stage
+                 * tensors need not share a rank, only a batch and a row
+                 * count, because a Reshape that regroups the leading axes
+                 * moves no data. The outputs settle the band, since an output
+                 * is always banded; an input the band does not cut is read
+                 * whole, which only a matrix product's second operand is
+                 * entitled to be. Mirrors stage_is_row_tiled in the executor,
+                 * and accepting a stage it will decline sends the stage
                  * through the normal path instead of refusing the plan. */
-                int32_t band_rows = 0;
+                int32_t band_batch = -1;
+                int32_t band_rows = -1;
                 int32_t band_cols = 0;
-                int row_banded = tensor_row_view(
-                    &candidate, &candidate.tensors[first_input],
-                    &band_rows, &band_cols) && band_rows > 1 &&
-                    stage->chain_len == 0;
-                if (row_banded) {
-                    for (uint16_t j = 1; j < stage->inputs_count; j++) {
-                        int32_t r = 0;
-                        int32_t c = 0;
-                        if (!tensor_row_view(
-                                &candidate,
-                                &candidate.tensors[
-                                    candidate.index_pool[
-                                        stage->inputs_off + j]],
-                                &r, &c) || r != band_rows) {
-                            row_banded = 0;
-                            break;
-                        }
-                    }
-                }
-                if (row_banded) {
-                    for (uint16_t j = 0; j < stage->ops_count; j++) {
-                        const tigris_op_t *rop = &candidate.ops[
-                            candidate.index_pool[stage->ops_off + j]];
-                        int32_t r = 0;
-                        int32_t c = 0;
-                        if (rop->num_inputs != 1u || rop->num_outputs != 1u ||
-                            !is_row_tiling_op(rop->op_type) ||
-                            !tensor_row_view(
-                                &candidate,
-                                &candidate.tensors[
-                                    candidate.index_pool[rop->outputs_off]],
-                                &r, &c) ||
-                            r != band_rows) {
-                            row_banded = 0;
-                            break;
-                        }
-                    }
-                }
+                int row_banded = stage->chain_len == 0 &&
+                                 stage->outputs_count > 0;
                 if (row_banded) {
                     for (uint16_t j = 0; j < stage->outputs_count; j++) {
+                        int32_t b = 0;
                         int32_t r = 0;
-                        int32_t c = 0;
                         if (!tensor_row_view(
                                 &candidate,
                                 &candidate.tensors[
                                     candidate.index_pool[
                                         stage->outputs_off + j]],
-                                &r, &c) || r != band_rows) {
+                                &b, &r, &band_cols)) {
+                            row_banded = 0;
+                            break;
+                        }
+                        if (band_rows < 0) {
+                            band_batch = b;
+                            band_rows = r;
+                        }
+                        if (b != band_batch || r != band_rows) {
+                            row_banded = 0;
+                            break;
+                        }
+                    }
+                }
+                if (row_banded && band_rows <= 1)
+                    row_banded = 0;
+                if (row_banded) {
+                    for (uint16_t j = 0; j < stage->ops_count; j++) {
+                        const tigris_op_t *rop = &candidate.ops[
+                            candidate.index_pool[stage->ops_off + j]];
+                        int32_t b = 0;
+                        int32_t r = 0;
+                        if (rop->num_inputs == 0u || rop->num_outputs != 1u ||
+                            !is_row_tiling_op(rop->op_type) ||
+                            !tensor_row_view(
+                                &candidate,
+                                &candidate.tensors[
+                                    candidate.index_pool[rop->outputs_off]],
+                                &b, &r, &band_cols) ||
+                            b != band_batch || r != band_rows) {
+                            row_banded = 0;
+                            break;
+                        }
+                        for (uint8_t k = 0; k < rop->num_inputs; k++) {
+                            int32_t ib = 0;
+                            int32_t ir = 0;
+                            int32_t ic = 0;
+                            if (tensor_row_view(
+                                    &candidate,
+                                    &candidate.tensors[
+                                        candidate.index_pool[
+                                            rop->inputs_off + k]],
+                                    &ib, &ir, &ic) &&
+                                ib == band_batch && ir == band_rows)
+                                continue;
+                            if (k == 0u ||
+                                !is_whole_operand_op(rop->op_type)) {
+                                row_banded = 0;
+                                break;
+                            }
+                        }
+                        if (!row_banded)
+                            break;
+                    }
+                }
+                if (row_banded) {
+                    for (uint16_t j = 0; j < stage->inputs_count; j++) {
+                        int32_t b = 0;
+                        int32_t r = 0;
+                        if (!tensor_row_view(
+                                &candidate,
+                                &candidate.tensors[
+                                    candidate.index_pool[
+                                        stage->inputs_off + j]],
+                                &b, &r, &band_cols)) {
                             row_banded = 0;
                             break;
                         }

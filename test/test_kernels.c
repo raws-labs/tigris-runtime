@@ -2273,6 +2273,73 @@ static void test_transpose_element_paths(void)
                        "rank-4 float banded the other way");
 }
 
+
+/* A row band cuts the second to last axis, so on a rank-4 tensor the head
+ * axis is batch that the band spans rather than cuts. The element count a
+ * pointwise kernel works from has to include it: while a band meant one
+ * matrix there was no batch to multiply by, and the first rank-4 band left
+ * every batch but the first untouched. */
+static void test_pointwise_row_band_covers_every_batch(void)
+{
+    printf("  test_pointwise_row_band_covers_every_batch...\n");
+
+    enum { BATCH = 3, ROWS = 4, COLS = 2, BAND = 2 };
+    int32_t shape[] = {1, BATCH, ROWS, COLS};
+    uint16_t indices[] = {0, 1};
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    for (int i = 0; i < 2; i++) {
+        tensors[i].shape_off = 0;
+        tensors[i].ndim = 4;
+        tensors[i].dtype = 1;
+        tensors[i].flags = TIGRIS_TENSOR_LINEAR;
+        tensors[i].size_bytes =
+            (uint32_t)(BATCH * ROWS * COLS) * sizeof(float);
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_RELU;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT; op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header; plan.tensors = tensors; plan.ops = &op;
+    plan.index_pool = indices; plan.shape_pool = shape;
+
+    /* The band buffers hold BAND rows for every batch, laid out the way the
+     * band gather writes them. */
+    float in[BATCH * BAND * COLS];
+    float out[BATCH * BAND * COLS];
+    for (int i = 0; i < BATCH * BAND * COLS; i++)
+        in[i] = -1.0f - (float)i;
+    for (int i = 0; i < BATCH * BAND * COLS; i++)
+        out[i] = 12345.0f;
+
+    void *ptrs[2] = { in, out };
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs; mem.num_tensors = 2;
+    mem.tile.active = 1;
+    mem.tile.row_tiled = 1;
+    mem.tile.in_h = BAND;
+    mem.tile.out_h = BAND;
+    mem.tile.in_w = 1;
+    mem.tile.out_w = 1;
+
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "relu over a rank-4 row band returns 0");
+    for (int i = 0; i < BATCH * BAND * COLS; i++)
+        TEST_ASSERT_NEAR(out[i], 0.0f, EPS,
+                         "every batch of the band was written");
+}
+
 /* Main */
 
 int main(void)
@@ -2306,6 +2373,7 @@ int main(void)
     test_malformed_constant_binary_f32();
     test_transpose();
     test_transpose_element_paths();
+    test_pointwise_row_band_covers_every_batch();
     test_unsupported_op();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

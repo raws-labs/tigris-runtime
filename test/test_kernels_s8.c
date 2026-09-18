@@ -1174,9 +1174,11 @@ static void test_global_max_pool_s8(void)
     plan_reset();
     tigris_plan_t plan;
 
-    /* A maximum is one of the input values, so it keeps the input's scale and
-     * zero point and needs no requantization. The negative rules out an
-     * unsigned read of the input. */
+    /* A maximum is one of the input values, so with matching quantization it
+     * passes through unchanged. The negative rules out an unsigned read of the
+     * input. The sibling test below covers the case where the two tensors
+     * declare different quantization, where the value survives but its
+     * encoding does not. */
     uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
     uint16_t out_qp_idx = add_quant_param(1.0f, 0, 1, NULL, NULL);
 
@@ -1216,6 +1218,62 @@ static void test_global_max_pool_s8(void)
 
     int8_t *out = (int8_t *)ptrs[t_out];
     TEST_ASSERT_EQ(out[0], 7, "max(-9,4,7,3) = 7");
+}
+
+/* A maximum preserves the value, not the encoding. When the output tensor
+ * declares a different scale or zero point, the same value is a different
+ * int8, and both max kernels used to write the input's encoding straight out.
+ * kern_avg_pool_s8 beside them has always defined this case; these now match
+ * it. */
+static void test_max_pool_s8_requantizes(void)
+{
+    printf("  test_max_pool_s8_requantizes...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+
+    /* Input at scale 1.0, zero point 0; output at scale 0.5, zero point -10.
+     * max(-9, 4, 7, 3) is 7, so the value is 7.0 and its encoding at the
+     * output is round(7.0 / 0.5) + (-10) = 4. */
+    uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t out_qp_idx = add_quant_param(0.5f, -10, 1, NULL, NULL);
+
+    int32_t x_shape[] = {1, 2, 2, 1};
+    int32_t y_shape[] = {1, 1, 1, 1};
+    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
+    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 1, out_qp_idx);
+
+    test_ops[0].op_type = TIGRIS_OP_GLOBAL_MAX;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in};
+    uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].act_min = -128;
+    test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[4096], slow_buf[4096];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
+                    slow_buf, sizeof(slow_buf));
+
+    int8_t input_data[] = {-9, 4, 7, 3};
+    tigris_mem_alloc_fast(&mem, t_in, 4);
+    memcpy(ptrs[t_in], input_data, 4);
+    tigris_mem_alloc_fast(&mem, t_out, 1);
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "global_max_pool_s8 returns 0");
+
+    int8_t *out = (int8_t *)ptrs[t_out];
+    TEST_ASSERT_EQ(out[0], 4, "max 7 at scale 1.0 is 4 at scale 0.5, zp -10");
 }
 
 static void test_unsupported_op_s8(void)
@@ -1505,6 +1563,7 @@ int main(void)
     test_fc_s8();
     test_global_avg_pool_s8();
     test_global_max_pool_s8();
+    test_max_pool_s8_requantizes();
     test_tanh_s8();
     test_softmax_s8();
     test_conv1d_s8();

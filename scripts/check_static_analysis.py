@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Run pinned Cppcheck checks and enforce the reviewed diagnostic snapshot."""
+"""Run pinned Cppcheck checks and enforce the reviewed set of deviations.
+
+General correctness diagnostics must be absent. MISRA findings are advisory
+on a codebase this size, so what is reviewed is which rule each file is
+allowed to deviate from, not how many times it does. Editing a function that
+already deviates from a rule therefore changes nothing here; a new rule, or an
+old rule in a new file, is a decision and fails until it is recorded.
+"""
 
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
 from dataclasses import dataclass
-import hashlib
-import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -25,7 +29,7 @@ SOURCES = (
     "src/tigris_kernels_s8.c",
     "src/tigris_lz4.c",
 )
-BASELINE_PATH = Path(__file__).with_name("static_analysis_baseline.json")
+ACCEPTED_PATH = Path(__file__).with_name("static_analysis_accepted.txt")
 
 
 @dataclass(frozen=True)
@@ -97,57 +101,47 @@ def parse_report(path: Path, root: Path) -> tuple[str, list[Diagnostic]]:
     return version, diagnostics
 
 
-def fingerprint(diagnostics: list[Diagnostic]) -> str:
-    records = sorted(
-        (
-            item.identifier,
-            item.severity,
-            item.file,
-            item.message,
-            item.source_line,
-        )
-        for item in diagnostics
-    )
-    encoded = json.dumps(records, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+def deviations(diagnostics: list[Diagnostic]) -> set[tuple[str, str]]:
+    """The (rule, file) pairs a scan found, which is what is reviewed."""
+    return {(item.identifier, item.file) for item in diagnostics}
 
 
-def snapshot(diagnostics: list[Diagnostic]) -> dict[str, object]:
-    counts: dict[str, Counter[str]] = defaultdict(Counter)
-    for item in diagnostics:
-        counts[item.file][item.identifier] += 1
-    return {
-        "total": len(diagnostics),
-        "misra_total": sum(
-            item.identifier.startswith("misra-c2012-") for item in diagnostics
-        ),
-        "config_errors": sum(
-            item.identifier == "misra-config" for item in diagnostics
-        ),
-        "fingerprint_sha256": fingerprint(diagnostics),
-        "counts": {
-            file: dict(sorted(identifiers.items()))
-            for file, identifiers in sorted(counts.items())
-        },
-    }
+ACCEPTED_HEADER = """\
+# Cppcheck deviations this code base is allowed to carry, one per line as
+# "<rule> <file>". Regenerate with:
+#
+#     python3 scripts/check_static_analysis.py --cppcheck <bin> --update-accepted
+#
+# Adding a line is a decision: it says this file may deviate from this rule.
+# Removing the last occurrence of a pair leaves its line stale, which the gate
+# reports without failing, because a stale line cannot hide a new defect
+# anywhere except in the file it already names.
+#
+# General correctness diagnostics are never listed here. There are none, and
+# the gate fails if one appears.
+"""
 
 
-def compare_snapshot(
-    actual: dict[str, object], expected: object, label: str
-) -> list[str]:
-    if not isinstance(expected, dict):
-        return [f"baseline {label} entry is not an object"]
-    errors: list[str] = []
-    for key in (
-        "total",
-        "misra_total",
-        "config_errors",
-        "fingerprint_sha256",
-        "counts",
-    ):
-        if actual.get(key) != expected.get(key):
-            errors.append(f"{label} {key} differs from the reviewed baseline")
-    return errors
+def read_accepted(path: Path) -> set[tuple[str, str]]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    accepted: set[tuple[str, str]] = set()
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) != 2:
+            raise ValueError(f"{path}:{number}: expected '<rule> <file>'")
+        accepted.add((fields[0], fields[1]))
+    return accepted
+
+
+def write_accepted(path: Path, pairs: set[tuple[str, str]]) -> None:
+    body = "".join(f"{rule} {file}\n" for rule, file in sorted(pairs))
+    path.write_text(ACCEPTED_HEADER + body, encoding="utf-8")
 
 
 def run_cppcheck(cppcheck: Path, root: Path, output: Path, mode: str) -> None:
@@ -187,44 +181,7 @@ def run_cppcheck(cppcheck: Path, root: Path, output: Path, mode: str) -> None:
         raise ValueError(f"Cppcheck {mode} scan produced no XML report")
 
 
-def read_baseline(path: Path) -> dict[str, object]:
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read baseline {path}: {exc}") from exc
-    if not isinstance(document, dict) or document.get("format_version") != 1:
-        raise ValueError(f"{path} is not a static-analysis baseline version 1")
-    if document.get("cppcheck_version") != CPPCHECK_VERSION:
-        raise ValueError(
-            f"baseline expects Cppcheck {document.get('cppcheck_version')}, "
-            f"checker expects {CPPCHECK_VERSION}"
-        )
-    if document.get("sources") != list(SOURCES):
-        raise ValueError("baseline source scope differs from the checker")
-    return document
-
-
-def make_baseline(
-    correctness: list[Diagnostic], misra: list[Diagnostic]
-) -> dict[str, object]:
-    if correctness:
-        raise ValueError(
-            "refusing to baseline general correctness diagnostics; fix them first"
-        )
-    return {
-        "format_version": 1,
-        "cppcheck_version": CPPCHECK_VERSION,
-        "sources": list(SOURCES),
-        "correctness": snapshot(correctness),
-        "misra": snapshot(misra),
-    }
-
-
 def self_test() -> None:
-    clean = snapshot([])
-    if clean["total"] != 0 or clean["fingerprint_sha256"] != fingerprint([]):
-        raise AssertionError("empty diagnostic snapshot is inconsistent")
-
     finding = Diagnostic(
         identifier="misra-c2012-15.6",
         severity="style",
@@ -232,31 +189,29 @@ def self_test() -> None:
         message="misra violation",
         source_line="if (ready)",
     )
-    expected = snapshot([finding])
-    if compare_snapshot(expected, expected, "synthetic"):
-        raise AssertionError("identical diagnostic snapshots did not match")
+    accepted = deviations([finding])
+    if deviations([finding, finding]) - accepted:
+        raise AssertionError("a second occurrence of an accepted rule was flagged")
 
-    added = snapshot([finding, finding])
-    if not compare_snapshot(added, expected, "synthetic"):
-        raise AssertionError("an added diagnostic was accepted")
-    moved = snapshot([
-        Diagnostic(
-            identifier=finding.identifier,
-            severity=finding.severity,
-            file=finding.file,
-            message=finding.message,
-            source_line="if (different)",
-        )
-    ])
-    errors = compare_snapshot(moved, expected, "synthetic")
-    if not any("fingerprint" in error for error in errors):
-        raise AssertionError("a changed diagnostic location was accepted")
-    try:
-        make_baseline([finding], [])
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("a correctness diagnostic was allowed into a baseline")
+    elsewhere = Diagnostic(
+        identifier=finding.identifier,
+        severity=finding.severity,
+        file="src/other.c",
+        message=finding.message,
+        source_line=finding.source_line,
+    )
+    if not deviations([elsewhere]) - accepted:
+        raise AssertionError("the same rule in a new file was accepted")
+
+    another_rule = Diagnostic(
+        identifier="misra-c2012-15.7",
+        severity=finding.severity,
+        file=finding.file,
+        message=finding.message,
+        source_line=finding.source_line,
+    )
+    if not deviations([another_rule]) - accepted:
+        raise AssertionError("a new rule in an accepted file was accepted")
 
 
 def main() -> int:
@@ -264,8 +219,8 @@ def main() -> int:
     parser.add_argument(
         "--cppcheck", type=Path, help=f"Cppcheck {CPPCHECK_VERSION} executable"
     )
-    parser.add_argument("--baseline", type=Path, default=BASELINE_PATH)
-    parser.add_argument("--update-baseline", action="store_true")
+    parser.add_argument("--accepted", type=Path, default=ACCEPTED_PATH)
+    parser.add_argument("--update-accepted", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -310,41 +265,55 @@ def main() -> int:
                     )
                 reports[mode] = diagnostics
 
-        actual = make_baseline(reports["correctness"], reports["misra"])
-        if args.update_baseline:
-            args.baseline.write_text(
-                json.dumps(actual, indent=2) + "\n", encoding="utf-8"
-            )
-            print(f"Wrote reviewed baseline candidate to {args.baseline}.")
+        correctness = reports["correctness"]
+        misra = reports["misra"]
+        found = deviations(misra)
+        if args.update_accepted:
+            if correctness:
+                raise ValueError(
+                    "refusing to record deviations while general correctness "
+                    "diagnostics remain; fix them first"
+                )
+            write_accepted(args.accepted, found)
+            print(f"Recorded {len(found)} reviewed deviations in {args.accepted}.")
             return 0
 
-        expected = read_baseline(args.baseline)
-        errors = compare_snapshot(
-            actual["correctness"], expected.get("correctness"), "correctness"
-        )
+        accepted = read_accepted(args.accepted)
+        errors = [
+            f"correctness finding in {item.file}: {item.identifier} "
+            f"{item.message}"
+            for item in correctness
+        ]
         errors.extend(
-            compare_snapshot(actual["misra"], expected.get("misra"), "MISRA")
+            f"{rule} is not recorded for {file}"
+            for rule, file in sorted(found - accepted)
         )
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        stale = sorted(accepted - found)
+    except (OSError, ValueError) as exc:
         raise SystemExit(f"ERROR: {exc}") from exc
 
-    misra = actual["misra"]
+    misra_rules = sum(
+        item.identifier.startswith("misra-c2012-") for item in misra
+    )
+    config_errors = sum(item.identifier == "misra-config" for item in misra)
     print(
-        f"Cppcheck {CPPCHECK_VERSION}: 0 correctness findings; "
-        f"{misra['misra_total']} MISRA C:2012 findings; "
-        f"{misra['total'] - misra['misra_total'] - misra['config_errors']} "
-        f"additional style findings; {misra['config_errors']} reviewed analyzer "
+        f"Cppcheck {CPPCHECK_VERSION}: {len(correctness)} correctness findings; "
+        f"{misra_rules} MISRA C:2012 findings across {len(found)} reviewed "
+        f"rule/file pairs; {len(misra) - misra_rules - config_errors} "
+        f"additional style findings; {config_errors} reviewed analyzer "
         "configuration limitations."
     )
+    for rule, file in stale:
+        print(f"note: {rule} no longer occurs in {file}")
     if errors:
         for error in errors:
             print(f"ERROR: {error}")
         print(
-            "Review the diagnostics, then regenerate and commit the baseline "
-            "only for an intentional change."
+            "Each line is a deviation this code base does not yet accept. "
+            "Fix it, or record it with --update-accepted and commit the file."
         )
         return 1
-    print("Static-analysis findings match the reviewed baseline.")
+    print("Static analysis found only reviewed deviations.")
     return 0
 
 

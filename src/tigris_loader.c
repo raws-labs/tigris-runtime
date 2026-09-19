@@ -8,6 +8,8 @@
 
 #include "tigris_loader.h"
 
+#include "tigris_transpose_band.h"
+
 #include <math.h>
 #include <string.h>
 
@@ -124,27 +126,31 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
  */
 static int tensor_row_view(
     const tigris_plan_t *plan, const tigris_tensor_t *t,
-    int32_t *rows, int32_t *cols)
+    int32_t *batch, int32_t *rows, int32_t *cols)
 {
-    /* Read the rank and the pool before the shape: this runs on every stage
-     * of every plan, including one that carries no shape pool at all, where
-     * offsetting it is undefined rather than merely wrong. */
     if (plan->shape_pool == NULL)
         return 0;
-    if (t->ndim != 2u && t->ndim != 3u)
+    if (t->ndim < 2u)
         return 0;
     const int32_t *shape = tigris_tensor_shape(plan, t);
     if (t->ndim == 2u) {
+        *batch = 1;
         *rows = shape[0];
         *cols = shape[1];
         return 1;
     }
-    if (shape[0] == 1 && (t->flags & TIGRIS_TENSOR_LINEAR) != 0u) {
-        *rows = shape[1];
-        *cols = shape[2];
-        return 1;
+    if ((t->flags & TIGRIS_TENSOR_LINEAR) == 0u)
+        return 0;
+    int32_t outer = 1;
+    for (uint8_t axis = 0; axis + 2u < t->ndim; axis++) {
+        if (shape[axis] <= 0)
+            return 0;
+        outer *= shape[axis];
     }
-    return 0;
+    *batch = outer;
+    *rows = shape[t->ndim - 2u];
+    *cols = shape[t->ndim - 1u];
+    return 1;
 }
 
 /**
@@ -152,6 +158,12 @@ static int tensor_row_view(
  * rows computes exactly the rows it holds. Mirrors is_row_tiling_op in the
  * executor.
  */
+/* Mirrors is_whole_operand_op in the executor. */
+static int is_whole_operand_op(uint8_t type)
+{
+    return type == TIGRIS_OP_FULLY_CONN || type == TIGRIS_OP_MATMUL;
+}
+
 static int is_row_tiling_op(uint8_t type)
 {
     return type == TIGRIS_OP_FULLY_CONN ||
@@ -163,7 +175,11 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_LAYER_NORM ||
            type == TIGRIS_OP_RESHAPE ||
-           type == TIGRIS_OP_FLATTEN;
+           type == TIGRIS_OP_FLATTEN ||
+           type == TIGRIS_OP_MATMUL ||
+           type == TIGRIS_OP_ADD ||
+           type == TIGRIS_OP_SUB ||
+           type == TIGRIS_OP_MUL;
 }
 
 static int is_axis1_binary_pointwise_op(uint8_t type)
@@ -188,6 +204,8 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     case TIGRIS_OP_ATTR_CLIP_BOUNDS:    return op_type == TIGRIS_OP_CLIP;
     case TIGRIS_OP_ATTR_PADS:           return op_type == TIGRIS_OP_PAD;
     case TIGRIS_OP_ATTR_AXES:           return op_type == TIGRIS_OP_REDUCE_MEAN;
+    case TIGRIS_OP_ATTR_BINARY_REQUANT: return op_type == TIGRIS_OP_ADD ||
+                                               op_type == TIGRIS_OP_SUB;
     default:                            return 0;
     }
 }
@@ -361,6 +379,35 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 input->size_bytes != output->size_bytes)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
+
+        case TIGRIS_OP_REDUCE_MEAN: {
+            /* One rank-3 activation in, one of its axes collapsed. The result
+             * keeps that axis at one or drops it, which is the difference
+             * between keepdims and not, and every other extent stays put. */
+            uint8_t num_axes = 0u;
+            const uint8_t *axes = tigris_op_attribute_data(
+                plan, op_index, TIGRIS_OP_ATTR_AXES, &num_axes);
+            if (!op_has_plain_io(op, 1, 1) || input->ndim != 3u ||
+                axes == NULL || num_axes != 1u || axes[0] >= 3u ||
+                (output->ndim != 3u && output->ndim != 2u))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *in_shape = tigris_tensor_shape(plan, input);
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            uint8_t written = 0u;
+            for (uint8_t axis = 0; axis < 3u; axis++) {
+                if (in_shape[axis] <= 0)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                int32_t want = (axis == axes[0]) ? 1 : in_shape[axis];
+                if (axis == axes[0] && output->ndim == 2u)
+                    continue;  /* keepdims=0 drops the axis instead */
+                if (written >= output->ndim || out_shape[written] != want)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                written++;
+            }
+            if (written != output->ndim)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
 
         case TIGRIS_OP_LAYER_NORM: {
             /* One activation in and out, shape-preserving. Scale is a weight
@@ -955,6 +1002,13 @@ tigris_error_t tigris_plan_load(
                                   TIGRIS_TENSOR_MODEL_OUTPUT)) == 0 ||
                 tensor->iface_dtype == tensor->dtype)
                 return TIGRIS_ERR_BAD_TENSOR;
+            /* The only conversion this runtime performs is between a float
+             * interface and a quantized int8 plan tensor, and tigris_iface.c
+             * refuses anything else. Saying so here refuses the plan when it
+             * is loaded rather than when a caller first writes an input. */
+            if (tensor->iface_dtype != 1u || tensor->dtype != 3u ||
+                tensor->quant_param_idx == TIGRIS_NO_QUANT_PARAM)
+                return TIGRIS_ERR_BAD_TENSOR;
         }
         uint32_t elements = 1;
         for (uint8_t dim = 0; dim < tensor->ndim; dim++) {
@@ -1148,6 +1202,29 @@ tigris_error_t tigris_plan_load(
                 }
                 break;
             }
+            case TIGRIS_OP_ATTR_BINARY_REQUANT: {
+                /* Three Q0.31 pairs. A shift outside the range the requant
+                 * helper can apply would shift by more than the width of the
+                 * accumulator, which is undefined rather than saturating. */
+                if (attr->data_len != TIGRIS_OP_ATTR_BINARY_REQUANT_LEN ||
+                    hdr->version < TIGRIS_SCHEMA_VERSION_BINARY_REQUANT)
+                    return TIGRIS_ERR_BAD_SECTION;
+                for (uint8_t pair = 0; pair < 3u; pair++) {
+                    int32_t multiplier;
+                    int32_t shift;
+                    memcpy(&multiplier,
+                           candidate.op_attribute_data + attr->data_offset +
+                               (uint32_t)pair * 8u,
+                           sizeof(multiplier));
+                    memcpy(&shift,
+                           candidate.op_attribute_data + attr->data_offset +
+                               (uint32_t)pair * 8u + 4u,
+                           sizeof(shift));
+                    if (multiplier < 0 || shift < -31 || shift > 31)
+                        return TIGRIS_ERR_BAD_SECTION;
+                }
+                break;
+            }
             case TIGRIS_OP_ATTR_AXES: {
                 if (attr->data_len == 0u || attr->data_len > input->ndim)
                     return TIGRIS_ERR_BAD_SECTION;
@@ -1173,6 +1250,7 @@ tigris_error_t tigris_plan_load(
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
             int has_transpose_perm = 0;
             int has_epsilon = 0;
+            int has_axes = 0;
             while (attr_cursor < candidate.num_op_attributes &&
                    candidate.op_attributes[attr_cursor].op_index == op_idx) {
                 if (candidate.op_attributes[attr_cursor].type ==
@@ -1181,6 +1259,9 @@ tigris_error_t tigris_plan_load(
                 if (candidate.op_attributes[attr_cursor].type ==
                     TIGRIS_OP_ATTR_EPSILON)
                     has_epsilon = 1;
+                if (candidate.op_attributes[attr_cursor].type ==
+                    TIGRIS_OP_ATTR_AXES)
+                    has_axes = 1;
                 attr_cursor++;
             }
             if ((candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE) !=
@@ -1191,6 +1272,10 @@ tigris_error_t tigris_plan_load(
             if ((candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM) !=
                 has_epsilon)
                 return TIGRIS_ERR_BAD_SECTION;
+            /* A reduction cannot default the axes it collapses either. */
+            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MEAN) !=
+                has_axes)
+                return TIGRIS_ERR_BAD_SECTION;
         }
     } else if (hdr->version >= TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES) {
         /* No attribute section at all, so every operator that requires one is
@@ -1198,7 +1283,8 @@ tigris_error_t tigris_plan_load(
          * is a section. */
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
             if (candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE ||
-                candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM)
+                candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM ||
+                candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MEAN)
                 return TIGRIS_ERR_BAD_SECTION;
         }
     }
@@ -1370,62 +1456,93 @@ tigris_error_t tigris_plan_load(
                 uint16_t first_output =
                     candidate.index_pool[stage->outputs_off];
                 /* A row-banded stage is checked on its own terms first: its
-                 * tensors need not share a rank, only a row count, because a
-                 * Reshape that drops a unit leading axis moves no data.
-                 * Every stage input has to present that row view, not just
-                 * the first: stage_is_row_tiled in the executor checks them
-                 * all, and accepting a stage it will decline sends the stage
+                 * tensors need not share a rank, only a batch and a row
+                 * count, because a Reshape that regroups the leading axes
+                 * moves no data. The outputs settle the band, since an output
+                 * is always banded; an input the band does not cut is read
+                 * whole, which only a matrix product's second operand is
+                 * entitled to be. Mirrors stage_is_row_tiled in the executor,
+                 * and accepting a stage it will decline sends the stage
                  * through the normal path instead of refusing the plan. */
-                int32_t band_rows = 0;
+                int32_t band_batch = -1;
+                int32_t band_rows = -1;
                 int32_t band_cols = 0;
-                int row_banded = tensor_row_view(
-                    &candidate, &candidate.tensors[first_input],
-                    &band_rows, &band_cols) && band_rows > 1 &&
-                    stage->chain_len == 0;
-                if (row_banded) {
-                    for (uint16_t j = 1; j < stage->inputs_count; j++) {
-                        int32_t r = 0;
-                        int32_t c = 0;
-                        if (!tensor_row_view(
-                                &candidate,
-                                &candidate.tensors[
-                                    candidate.index_pool[
-                                        stage->inputs_off + j]],
-                                &r, &c) || r != band_rows) {
-                            row_banded = 0;
-                            break;
-                        }
-                    }
-                }
-                if (row_banded) {
-                    for (uint16_t j = 0; j < stage->ops_count; j++) {
-                        const tigris_op_t *rop = &candidate.ops[
-                            candidate.index_pool[stage->ops_off + j]];
-                        int32_t r = 0;
-                        int32_t c = 0;
-                        if (rop->num_inputs != 1u || rop->num_outputs != 1u ||
-                            !is_row_tiling_op(rop->op_type) ||
-                            !tensor_row_view(
-                                &candidate,
-                                &candidate.tensors[
-                                    candidate.index_pool[rop->outputs_off]],
-                                &r, &c) ||
-                            r != band_rows) {
-                            row_banded = 0;
-                            break;
-                        }
-                    }
-                }
+                int row_banded = stage->chain_len == 0 &&
+                                 stage->outputs_count > 0;
                 if (row_banded) {
                     for (uint16_t j = 0; j < stage->outputs_count; j++) {
+                        int32_t b = 0;
                         int32_t r = 0;
-                        int32_t c = 0;
                         if (!tensor_row_view(
                                 &candidate,
                                 &candidate.tensors[
                                     candidate.index_pool[
                                         stage->outputs_off + j]],
-                                &r, &c) || r != band_rows) {
+                                &b, &r, &band_cols)) {
+                            row_banded = 0;
+                            break;
+                        }
+                        if (band_rows < 0) {
+                            band_batch = b;
+                            band_rows = r;
+                        }
+                        if (b != band_batch || r != band_rows) {
+                            row_banded = 0;
+                            break;
+                        }
+                    }
+                }
+                if (row_banded && band_rows <= 1)
+                    row_banded = 0;
+                if (row_banded) {
+                    for (uint16_t j = 0; j < stage->ops_count; j++) {
+                        const tigris_op_t *rop = &candidate.ops[
+                            candidate.index_pool[stage->ops_off + j]];
+                        int32_t b = 0;
+                        int32_t r = 0;
+                        if (rop->num_inputs == 0u || rop->num_outputs != 1u ||
+                            !is_row_tiling_op(rop->op_type) ||
+                            !tensor_row_view(
+                                &candidate,
+                                &candidate.tensors[
+                                    candidate.index_pool[rop->outputs_off]],
+                                &b, &r, &band_cols) ||
+                            b != band_batch || r != band_rows) {
+                            row_banded = 0;
+                            break;
+                        }
+                        for (uint8_t k = 0; k < rop->num_inputs; k++) {
+                            int32_t ib = 0;
+                            int32_t ir = 0;
+                            int32_t ic = 0;
+                            if (tensor_row_view(
+                                    &candidate,
+                                    &candidate.tensors[
+                                        candidate.index_pool[
+                                            rop->inputs_off + k]],
+                                    &ib, &ir, &ic) &&
+                                ib == band_batch && ir == band_rows)
+                                continue;
+                            if (k == 0u ||
+                                !is_whole_operand_op(rop->op_type)) {
+                                row_banded = 0;
+                                break;
+                            }
+                        }
+                        if (!row_banded)
+                            break;
+                    }
+                }
+                if (row_banded) {
+                    for (uint16_t j = 0; j < stage->inputs_count; j++) {
+                        int32_t b = 0;
+                        int32_t r = 0;
+                        if (!tensor_row_view(
+                                &candidate,
+                                &candidate.tensors[
+                                    candidate.index_pool[
+                                        stage->inputs_off + j]],
+                                &b, &r, &band_cols)) {
                             row_banded = 0;
                             break;
                         }
@@ -1467,29 +1584,24 @@ tigris_error_t tigris_plan_load(
                     candidate.ops[
                         candidate.index_pool[stage->ops_off]
                     ].op_type == TIGRIS_OP_TRANSPOSE) {
-                    /* A layout conversion is tiled a band at a time along
-                     * the longer of the two extents it transposes. Only a
-                     * permutation that moves the channel axis past the
-                     * spatial ones, leaving those in their relative order, is
-                     * executable that way, and only as the whole stage.
-                     * Mirrors transpose_extents in the executor. */
+                    /* A transpose is banded along the longer of the two
+                     * extents it swaps, and only as the whole stage.
+                     * transpose_band_groups states which permutations that
+                     * is: the ones that swap two adjacent groups of axes and
+                     * leave the rest in order. The executor reads the same
+                     * rule from the same header rather than from a copy. */
                     uint16_t conv_op = candidate.index_pool[stage->ops_off];
                     uint8_t perm_rank = 0;
                     const uint8_t *perm = tigris_op_attribute_data(
                         &candidate, conv_op,
                         TIGRIS_OP_ATTR_TRANSPOSE_PERM, &perm_rank);
-                    int convertible = 0;
-                    if (perm && perm_rank == rank && perm[0] == 0u) {
-                        if (rank == 3u) {
-                            convertible = (perm[1] == 2u && perm[2] == 1u);
-                        } else if (rank == 4u) {
-                            convertible =
-                                (perm[1] == 3u && perm[2] == 1u &&
-                                 perm[3] == 2u) ||
-                                (perm[1] == 2u && perm[2] == 3u &&
-                                 perm[3] == 1u);
-                        }
-                    }
+                    uint8_t tb_prefix = 0;
+                    uint8_t tb_split = 0;
+                    uint8_t tb_middle = 0;
+                    int convertible =
+                        perm && perm_rank == rank &&
+                        transpose_band_groups(perm, rank, &tb_prefix,
+                                              &tb_split, &tb_middle);
                     if (!convertible ||
                         stage->inputs_count != 1 ||
                         stage->outputs_count != 1 ||

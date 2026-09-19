@@ -269,10 +269,16 @@ static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
         return tensor_numel(plan, tidx);
     const tigris_tensor_t *t = &plan->tensors[tidx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
-    /* A rank-2 matrix tiled along its rows has no batch axis to multiply by:
-     * out_h counts the rows in the band and the trailing axis is the row. */
-    if (mem->tile.row_tiled)
-        return (uint32_t)mem->tile.out_h * (uint32_t)shape[t->ndim - 1];
+    /* A row band cuts the second to last axis, so out_h counts the rows in
+     * the band, the trailing axis is the row, and everything ahead of the
+     * pair is batch that the band spans rather than cuts. */
+    if (mem->tile.row_tiled) {
+        uint32_t batch = 1;
+        for (uint8_t axis = 0; axis + 2u < t->ndim; axis++)
+            batch *= (uint32_t)shape[axis];
+        return batch * (uint32_t)mem->tile.out_h *
+               (uint32_t)shape[t->ndim - 1];
+    }
     /* Serialized activations are NHWC or NLC. */
     uint32_t width = t->ndim == 4 ? (uint32_t)mem->tile.out_w : 1u;
     return (uint32_t)shape[0] * (uint32_t)mem->tile.out_h *
@@ -807,8 +813,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_relu6_s8(
 /* Add and Sub differ only in the sign of the second scaled term; everything
  * around it, including the requantization, is identical. */
 static TIGRIS_KERNEL_NOINLINE int kern_addsub_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem,
-    int subtract)
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem, int subtract)
 {
     /* Constants are absent from the tensor/quant tables in the current wire
      * format. Without their scale and zero point, one-input + weight_idx Add
@@ -841,13 +847,29 @@ static TIGRIS_KERNEL_NOINLINE int kern_addsub_s8(
      * (sa/sy)*(a-za)+... drifted ~1 LSB/op, accumulating to tens of LSB across a
      * residual network like MobileNetV2. */
     const int LEFT_SHIFT = 20;
-    double twice_max = 2.0 * ((sa > sb) ? (double)sa : (double)sb);
     int32_t a_mult, b_mult, y_mult;
     int a_shift, b_shift, y_shift;
-    compute_quant_mult((double)sa / twice_max, &a_mult, &a_shift);
-    compute_quant_mult((double)sb / twice_max, &b_mult, &b_shift);
-    compute_quant_mult(twice_max / (((double)(1 << LEFT_SHIFT)) * (double)sy),
-                       &y_mult, &y_shift);
+    uint8_t requant_len = 0u;
+    const uint8_t *requant = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_BINARY_REQUANT, &requant_len);
+    if (requant != NULL &&
+        requant_len == TIGRIS_OP_ATTR_BINARY_REQUANT_LEN) {
+        /* The three pairs are compile-time constants of the operand scales,
+         * so a plan that states them spares the kernel three frexp-and-round
+         * sequences per call and gives a vendor kernel what it needs. */
+        int32_t pairs[6];
+        memcpy(pairs, requant, sizeof(pairs));
+        a_mult = pairs[0]; a_shift = (int)pairs[1];
+        b_mult = pairs[2]; b_shift = (int)pairs[3];
+        y_mult = pairs[4]; y_shift = (int)pairs[5];
+    } else {
+        double twice_max = 2.0 * ((sa > sb) ? (double)sa : (double)sb);
+        compute_quant_mult((double)sa / twice_max, &a_mult, &a_shift);
+        compute_quant_mult((double)sb / twice_max, &b_mult, &b_shift);
+        compute_quant_mult(
+            twice_max / (((double)(1 << LEFT_SHIFT)) * (double)sy),
+            &y_mult, &y_shift);
+    }
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
     if (mem->tile.active) {
@@ -874,15 +896,17 @@ static TIGRIS_KERNEL_NOINLINE int kern_addsub_s8(
 }
 
 static TIGRIS_KERNEL_NOINLINE int kern_add_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
 {
-    return kern_addsub_s8(plan, op, mem, 0);
+    return kern_addsub_s8(plan, op, op_index, mem, 0);
 }
 
 static TIGRIS_KERNEL_NOINLINE int kern_sub_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
 {
-    return kern_addsub_s8(plan, op, mem, 1);
+    return kern_addsub_s8(plan, op, op_index, mem, 1);
 }
 
 static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
@@ -952,6 +976,77 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
             int32_t shifted = sum - input_zp * HW;
             int32_t q = multiply_by_quantized_multiplier(shifted, mult, shift0) + output_zp;
             Y[n * C + c] = clamp_s8(q);
+        }
+    }
+    return 0;
+}
+
+/**
+ * Mean over one axis of a rank-3 tensor, the int8 twin of kern_reduce_mean.
+ *
+ * Follows TFLite QuantizedMeanOrSum: sum the raw bytes, subtract the zero
+ * point once over the full count, and fold the reciprocal into the requant
+ * multiplier so the division never leaves the integer domain.
+ */
+static TIGRIS_KERNEL_NOINLINE int kern_reduce_mean_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const tigris_tensor_t *in = &plan->tensors[ins[0]];
+    uint8_t num_axes = 0u;
+    const uint8_t *axes = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_AXES, &num_axes);
+    if (axes == NULL || num_axes != 1u || in->ndim != 3u || axes[0] >= 3u)
+        return -1;
+
+    const int32_t *shape = tigris_tensor_shape(plan, in);
+    int32_t outer = 1;
+    int32_t inner = 1;
+    for (uint8_t axis = 0; axis < 3u; axis++) {
+        if (shape[axis] <= 0)
+            return -1;
+        if (axis < axes[0])
+            outer *= shape[axis];
+        else if (axis > axes[0])
+            inner *= shape[axis];
+    }
+    int32_t reduced = shape[axes[0]];
+
+    const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, in);
+    const tigris_quant_param_t *out_qp =
+        tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    int32_t input_zp = in_qp ? in_qp->zero_point : 0;
+    float in_scale = in_qp ? in_qp->scale : 1.0f;
+    float out_scale = out_qp ? out_qp->scale : 1.0f;
+    int32_t output_zp = out_qp ? out_qp->zero_point : 0;
+    if (!(out_scale > 0.0f)) {
+        out_scale = in_scale;
+        output_zp = input_zp;
+    }
+
+    int32_t mult;
+    int shift0;
+    compute_mean_quant_mult(
+        (double)in_scale / (double)out_scale, (int)reduced, &mult, &shift0);
+
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    for (int32_t o = 0; o < outer; o++) {
+        const int8_t *src = X + (size_t)o * (size_t)reduced * (size_t)inner;
+        int8_t *dst = Y + (size_t)o * (size_t)inner;
+        for (int32_t i = 0; i < inner; i++) {
+            const int8_t *xp = src + i;
+            int32_t sum = 0;
+            for (int32_t r = 0; r < reduced; r++) {
+                sum += *xp;
+                xp += inner;
+            }
+            int32_t shifted = sum - input_zp * reduced;
+            int32_t q = multiply_by_quantized_multiplier(shifted, mult, shift0) +
+                        output_zp;
+            dst[i] = clamp_s8(q);
         }
     }
     return 0;
@@ -1116,6 +1211,11 @@ static TIGRIS_KERNEL_NOINLINE int kern_matmul_s8(
     int M = a_shape[last - 1u];
     int K = a_shape[last];
     int N = b_shape[last];
+
+    /* A row band states its row count in tile.out_h, not in the shape. See
+     * kern_matmul. */
+    if (mem->tile.active && mem->tile.row_tiled && mem->tile.out_h > 0)
+        M = mem->tile.out_h;
 
     int batches = 1;
     for (uint8_t axis = 0; axis + 2u <= last; axis++)
@@ -1742,7 +1842,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_FULLY_CONN:  return kern_fully_connected_s8(plan, op, mem);
     case TIGRIS_OP_RELU:        return kern_relu_s8(plan, op, mem);
     case TIGRIS_OP_RELU6:       return kern_relu6_s8(plan, op, mem);
-    case TIGRIS_OP_ADD:         return kern_add_s8(plan, op, mem);
+    case TIGRIS_OP_ADD:         return kern_add_s8(plan, op, op_index, mem);
     case TIGRIS_OP_GLOBAL_AVG:  return kern_global_avg_pool_s8(plan, op, mem);
     case TIGRIS_OP_AVG_POOL:     return kern_avg_pool_s8(plan, op, mem);
     case TIGRIS_OP_RESHAPE:     return kern_reshape_s8(plan, op, mem);
@@ -1756,12 +1856,13 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
     case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose_s8(plan, op, mem);
-    case TIGRIS_OP_SUB:         return kern_sub_s8(plan, op, mem);
+    case TIGRIS_OP_SUB:         return kern_sub_s8(plan, op, op_index, mem);
     case TIGRIS_OP_GLOBAL_MAX:  return kern_global_max_pool_s8(plan, op, mem);
     case TIGRIS_OP_MATMUL:      return kern_matmul_s8(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ERF:         return kern_erf_s8(plan, op, mem);
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean_s8(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */
     }

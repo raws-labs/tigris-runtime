@@ -44,10 +44,16 @@ static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
         return tensor_numel(plan, tidx);
     const tigris_tensor_t *t = &plan->tensors[tidx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
-    /* A rank-2 matrix tiled along its rows has no batch axis to multiply by:
-     * out_h counts the rows in the band and the trailing axis is the row. */
-    if (mem->tile.row_tiled)
-        return (uint32_t)mem->tile.out_h * (uint32_t)shape[t->ndim - 1];
+    /* A row band cuts the second to last axis, so out_h counts the rows in
+     * the band, the trailing axis is the row, and everything ahead of the
+     * pair is batch that the band spans rather than cuts. */
+    if (mem->tile.row_tiled) {
+        uint32_t batch = 1;
+        for (uint8_t axis = 0; axis + 2u < t->ndim; axis++)
+            batch *= (uint32_t)shape[axis];
+        return batch * (uint32_t)mem->tile.out_h *
+               (uint32_t)shape[t->ndim - 1];
+    }
     /* Serialized activations are NHWC or NLC. */
     uint32_t width = t->ndim == 4 ? (uint32_t)mem->tile.out_w : 1u;
     return (uint32_t)shape[0] * (uint32_t)mem->tile.out_h *
@@ -818,6 +824,72 @@ static int kern_global_avg_pool(
     return 0;
 }
 
+/**
+ * Mean over one axis of a rank-3 tensor.
+ *
+ * The plan names a serialized axis, so the operator reads the same whichever
+ * order a tensor states its own axes in: the token axis of a sequence and the
+ * channel axis of a feature map are both just one axis of [outer, reduced,
+ * inner]. Collapsing the token axis is what a mean-pooled sequence head does.
+ */
+static int reduce_mean_extents(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    int32_t *outer, int32_t *reduced, int32_t *inner)
+{
+    const tigris_tensor_t *in = &plan->tensors[tigris_op_inputs(plan, op)[0]];
+    uint8_t num_axes = 0u;
+    const uint8_t *axes = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_AXES, &num_axes);
+    if (axes == NULL || num_axes != 1u || in->ndim != 3u || axes[0] >= 3u)
+        return -1;
+
+    const int32_t *shape = tigris_tensor_shape(plan, in);
+    int32_t lead = 1;
+    int32_t trail = 1;
+    for (uint8_t axis = 0; axis < 3u; axis++) {
+        if (shape[axis] <= 0)
+            return -1;
+        if (axis < axes[0])
+            lead *= shape[axis];
+        else if (axis > axes[0])
+            trail *= shape[axis];
+    }
+    *outer = lead;
+    *reduced = shape[axes[0]];
+    *inner = trail;
+    return 0;
+}
+
+static int kern_reduce_mean(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    int32_t outer;
+    int32_t reduced;
+    int32_t inner;
+    if (reduce_mean_extents(plan, op, op_index, &outer, &reduced, &inner) != 0)
+        return -1;
+
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    for (int32_t o = 0; o < outer; o++) {
+        const float *src = X + (size_t)o * (size_t)reduced * (size_t)inner;
+        float *dst = Y + (size_t)o * (size_t)inner;
+        for (int32_t i = 0; i < inner; i++)
+            dst[i] = 0.0f;
+        for (int32_t r = 0; r < reduced; r++) {
+            const float *row = src + (size_t)r * (size_t)inner;
+            for (int32_t i = 0; i < inner; i++)
+                dst[i] += row[i];
+        }
+        for (int32_t i = 0; i < inner; i++)
+            dst[i] /= (float)reduced;
+    }
+    return 0;
+}
+
 static int kern_fully_connected(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -884,6 +956,13 @@ static int kern_matmul(
     int M = a_shape[last - 1u];
     int K = a_shape[last];
     int N = b_shape[last];
+
+    /* A row band hands this kernel a band of the first operand's rows and the
+     * whole of the second, and says how many rows in tile.out_h rather than in
+     * the shape. The batch count and both inner extents are unchanged: a band
+     * cuts the second to last axis and nothing else. */
+    if (mem->tile.active && mem->tile.row_tiled && mem->tile.out_h > 0)
+        M = mem->tile.out_h;
 
     int batches = 1;
     for (uint8_t axis = 0; axis + 2u <= last; axis++)
@@ -1292,19 +1371,26 @@ int tigris_transpose_execute(
      * relative order are read as one, so the slice is transposed directly
      * rather than through the general index walk below. */
     if (mem->tile.active && mem->tile.transposed_tile) {
-        int32_t batch = input_shape[0];
+        int32_t batch = mem->tile.transpose_outer;
         int32_t rows = mem->tile.in_h;
         int32_t cols = mem->tile.in_w;
         if (batch <= 0 || rows <= 0 || cols <= 0 ||
             mem->tile.out_h != cols || mem->tile.out_w != rows)
             return -1;
-        int typed = transpose_elements_are_typed(dst, src, element_size);
+        /* The axes behind the swapped pair travel with the element, so the
+         * slice is a matrix of blocks rather than of scalars. The executor
+         * states how many elements a position holds, because the slice is a
+         * band and the tensor's own shape describes the whole. */
+        int32_t block = mem->tile.transpose_block > 0
+                            ? mem->tile.transpose_block : 1;
+        uint32_t block_size = element_size * (uint32_t)block;
+        int typed = transpose_elements_are_typed(dst, src, block_size);
         for (int32_t n = 0; n < batch; n++) {
             const uint8_t *src_n =
-                src + (size_t)n * (size_t)rows * (size_t)cols * element_size;
+                src + (size_t)n * (size_t)rows * (size_t)cols * block_size;
             uint8_t *dst_n =
-                dst + (size_t)n * (size_t)rows * (size_t)cols * element_size;
-            transpose_matrix(dst_n, src_n, rows, cols, element_size, typed);
+                dst + (size_t)n * (size_t)rows * (size_t)cols * block_size;
+            transpose_matrix(dst_n, src_n, rows, cols, block_size, typed);
         }
         return 0;
     }
@@ -1427,6 +1513,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ERF:         return kern_erf(plan, op, mem);
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm(plan, op, op_index, mem);
+    case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */
     }

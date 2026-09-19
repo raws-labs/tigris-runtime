@@ -183,6 +183,12 @@ static void build_plan(tigris_plan_t *plan)
     plan->num_quant_params = (uint16_t)qp_cursor;
     plan->model_inputs = NULL;
     plan->model_outputs = NULL;
+    /* A test that wants attributes sets them after this call. Leaving the
+     * fields alone would let a stack-local plan carry whatever the previous
+     * frame left there, which any kernel that reads an attribute follows. */
+    plan->op_attributes = NULL;
+    plan->op_attribute_data = NULL;
+    plan->num_op_attributes = 0;
 }
 
 /* Tests */
@@ -1276,6 +1282,80 @@ static void test_max_pool_s8_requantizes(void)
     TEST_ASSERT_EQ(out[0], 4, "max 7 at scale 1.0 is 4 at scale 0.5, zp -10");
 }
 
+/* A row band hands the matrix product a band of its first operand's rows and
+ * the whole of its second, and says how many rows in tile.out_h rather than in
+ * the shape. Taking the row count from the shape would compute the whole
+ * matrix into a band-sized output. */
+static void test_matmul_s8_row_band(void)
+{
+    printf("  test_matmul_s8_row_band...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+
+    /* An effective scale of 1: the Q0.31 multiplier for 1.0 is 2^30 with a
+     * shift of 1, which is the identity the other kernels use. */
+    int32_t mult[] = {1 << 30};
+    int32_t shift[] = {1};
+    uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(1.0f, 0, 1, mult, shift);
+
+    enum { ROWS = 4, INNER = 2, COLS = 2, BAND = 2 };
+    int32_t a_shape[] = {ROWS, INNER};
+    int32_t b_shape[] = {INNER, COLS};
+    int32_t y_shape[] = {ROWS, COLS};
+    uint16_t t_a = add_tensor(&plan, "a", a_shape, 2, 3,
+                              ROWS * INNER, in_qp);
+    uint16_t t_b = add_tensor(&plan, "b", b_shape, 2, 3,
+                              INNER * COLS, in_qp);
+    uint16_t t_y = add_tensor(&plan, "y", y_shape, 2, 3,
+                              ROWS * COLS, out_qp);
+
+    test_ops[0].op_type = TIGRIS_OP_MATMUL;
+    test_ops[0].num_inputs = 2;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_a, t_b};
+    uint16_t outp[] = {t_y};
+    test_ops[0].inputs_off = add_indices(inp, 2);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].act_min = -128;
+    test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+
+    build_plan(&plan);
+
+    /* The band buffer holds the first two rows of a; b is whole. */
+    int8_t a_band[BAND * INNER] = {1, 2, 3, 4};
+    int8_t b_whole[INNER * COLS] = {1, 0, 0, 1};   /* identity */
+    int8_t y_band[BAND * COLS];
+    memset(y_band, 99, sizeof(y_band));
+
+    void *ptrs[MAX_TENSORS];
+    memset(ptrs, 0, sizeof(ptrs));
+    ptrs[t_a] = a_band;
+    ptrs[t_b] = b_whole;
+    ptrs[t_y] = y_band;
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = test_header.num_tensors;
+    mem.tile.active = 1;
+    mem.tile.row_tiled = 1;
+    mem.tile.in_h = BAND;
+    mem.tile.out_h = BAND;
+    mem.tile.in_w = 1;
+    mem.tile.out_w = 1;
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "matmul_s8 over a row band returns 0");
+    TEST_ASSERT_EQ(y_band[0], 1, "band row 0 column 0");
+    TEST_ASSERT_EQ(y_band[1], 2, "band row 0 column 1");
+    TEST_ASSERT_EQ(y_band[2], 3, "band row 1 column 0");
+    TEST_ASSERT_EQ(y_band[3], 4, "band row 1 column 1");
+}
+
 static void test_unsupported_op_s8(void)
 {
     printf("  test_unsupported_op_s8...\n");
@@ -1542,6 +1622,152 @@ static void test_transpose_s8(void)
                        "transpose_s8 value");
 }
 
+
+/* The int8 mean folds the reciprocal into the requant multiplier, so a plan
+ * whose output declares a different encoding than its input has to come back
+ * on the output's scale. A rescaling case and a same-scale case, because the
+ * first is what a quantizer actually assigns and the second is the arithmetic
+ * anyone can check by hand. */
+static void test_reduce_mean_s8(void)
+{
+    printf("  test_reduce_mean_s8...\n");
+    plan_reset();
+    tigris_plan_t plan;
+
+    /* [1, 4, 2], mean over the token axis.
+     * columns: (2+4+6+8)/4 = 5 and (10+12+14+16)/4 = 13 */
+    uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    int32_t x_shape[] = {1, 4, 2};
+    int32_t y_shape[] = {1, 1, 2};
+    uint16_t t_in = add_tensor(&plan, "x", x_shape, 3, 3, 8, in_qp);
+    uint16_t t_out = add_tensor(&plan, "y", y_shape, 3, 3, 2, out_qp);
+    uint16_t ins[] = {t_in}, outs[] = {t_out};
+    test_ops[0].op_type = TIGRIS_OP_REDUCE_MEAN;
+    test_ops[0].num_inputs = 1; test_ops[0].num_outputs = 1;
+    test_ops[0].inputs_off = add_indices(ins, 1);
+    test_ops[0].outputs_off = add_indices(outs, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_AXES, 1, 0};
+    const uint8_t axes[] = {1};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = axes;
+    plan.num_op_attributes = 1;
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[4096], slow[4096]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
+                    slow, sizeof(slow));
+    const int8_t values[] = {2, 10, 4, 12, 6, 14, 8, 16};
+    tigris_mem_alloc_fast(&mem, t_in, sizeof(values));
+    memcpy(ptrs[t_in], values, sizeof(values));
+    tigris_mem_alloc_fast(&mem, t_out, 2);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                             NULL), 0,
+                   "reduce_mean_s8 returns 0");
+    TEST_ASSERT_EQ(((int8_t *)ptrs[t_out])[0], 5, "reduce_mean_s8 column 0");
+    TEST_ASSERT_EQ(((int8_t *)ptrs[t_out])[1], 13, "reduce_mean_s8 column 1");
+
+    /* Same values through a half-sized output scale and a shifted zero point:
+     * 5 and 13 in input units become 10 and 26 steps, less the shift. */
+    test_qp[out_qp].scale = 0.5f;
+    test_qp[out_qp].zero_point = -4;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                             NULL), 0,
+                   "rescaled reduce_mean_s8 returns 0");
+    TEST_ASSERT_EQ(((int8_t *)ptrs[t_out])[0], 6, "rescaled column 0");
+    TEST_ASSERT_EQ(((int8_t *)ptrs[t_out])[1], 22, "rescaled column 1");
+
+    /* A plan that does not say which axis it collapses is refused. */
+    plan.num_op_attributes = 0;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                          NULL) != 0,
+                "reduce_mean_s8 without axes is refused");
+}
+
+
+/* A plan may state the three pairs that scale a quantized sum's operands and
+ * its result. The kernel has to read them when they are there and derive them
+ * when they are not: a plan whose pairs are ignored would run on numbers the
+ * vendor kernels were never given. That the stated pairs equal the derived
+ * ones is the cross-repository gate's job, since only the compiler produces
+ * them; what is checkable here is that each path is taken. */
+static void test_binary_requant_is_read_from_the_plan(void)
+{
+    printf("  test_binary_requant_is_read_from_the_plan...\n");
+    plan_reset();
+    tigris_plan_t plan;
+
+    uint16_t qa = add_quant_param(0.05f, 0, 1, NULL, NULL);
+    uint16_t qb = add_quant_param(0.03f, -4, 1, NULL, NULL);
+    uint16_t qy = add_quant_param(0.06f, 2, 1, NULL, NULL);
+    int32_t shape[] = {1, 16};
+    uint16_t t_a = add_tensor(&plan, "a", shape, 2, 3, 16, qa);
+    uint16_t t_b = add_tensor(&plan, "b", shape, 2, 3, 16, qb);
+    uint16_t t_y = add_tensor(&plan, "y", shape, 2, 3, 16, qy);
+    uint16_t ins[] = {t_a, t_b}, outs[] = {t_y};
+    test_ops[0].op_type = TIGRIS_OP_ADD;
+    test_ops[0].num_inputs = 2; test_ops[0].num_outputs = 1;
+    test_ops[0].inputs_off = add_indices(ins, 2);
+    test_ops[0].outputs_off = add_indices(outs, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[4096], slow[4096]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
+                    slow, sizeof(slow));
+    int8_t left[16], right[16];
+    for (int i = 0; i < 16; i++) {
+        left[i] = (int8_t)(i * 7 - 50);
+        right[i] = (int8_t)(60 - i * 5);
+    }
+    tigris_mem_alloc_fast(&mem, t_a, sizeof(left));
+    memcpy(ptrs[t_a], left, sizeof(left));
+    tigris_mem_alloc_fast(&mem, t_b, sizeof(right));
+    memcpy(ptrs[t_b], right, sizeof(right));
+    tigris_mem_alloc_fast(&mem, t_y, 16);
+
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                             NULL), 0,
+                   "add without stated pairs returns 0");
+    int8_t derived[16];
+    memcpy(derived, ptrs[t_y], sizeof(derived));
+
+    /* Halving the first operand's multiplier is a change the derived path
+     * cannot produce, so the output moving proves the plan was read. */
+    int32_t pairs[6] = {1 << 30, 0, 1 << 30, 0, 1 << 30, -20};
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_BINARY_REQUANT,
+                                  (uint8_t)TIGRIS_OP_ATTR_BINARY_REQUANT_LEN,
+                                  0};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = (const uint8_t *)pairs;
+    plan.num_op_attributes = 1;
+    memset(ptrs[t_y], 0, 16);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                             NULL), 0,
+                   "add with stated pairs returns 0");
+    int differs = 0;
+    for (int i = 0; i < 16; i++)
+        if (((int8_t *)ptrs[t_y])[i] != derived[i])
+            differs = 1;
+    TEST_ASSERT(differs, "stated pairs reach the arithmetic");
+
+    /* A payload of the wrong length is not a stated pair set, so the kernel
+     * falls back rather than reading past it. */
+    attr.data_len = 8;
+    memset(ptrs[t_y], 0, 16);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                             NULL), 0,
+                   "add with a short payload returns 0");
+    for (int i = 0; i < 16; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], derived[i],
+                       "a short payload falls back to the derived pairs");
+}
+
 /* Main */
 
 int main(void)
@@ -1564,10 +1790,13 @@ int main(void)
     test_global_avg_pool_s8();
     test_global_max_pool_s8();
     test_max_pool_s8_requantizes();
+    test_matmul_s8_row_band();
     test_tanh_s8();
     test_softmax_s8();
     test_conv1d_s8();
     test_transpose_s8();
+    test_reduce_mean_s8();
+    test_binary_requant_is_read_from_the_plan();
     test_unsupported_op_s8();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

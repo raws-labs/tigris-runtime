@@ -2184,10 +2184,11 @@ static void transpose_reference(
     }
 }
 
-static void run_transpose_case(
+static void run_transpose_case_block(
     int rank, const int32_t *in_shape, const uint8_t *perm,
     uint32_t elem_size, int misalign, int banded,
-    int32_t rows, int32_t cols, const char *what)
+    int32_t outer, int32_t rows, int32_t cols, int32_t block,
+    const char *what)
 {
     int32_t shapes[8];
     uint32_t elements = 1;
@@ -2236,12 +2237,47 @@ static void run_transpose_case(
     if (banded) {
         mem.tile.active = 1;
         mem.tile.transposed_tile = 1;
+        mem.tile.transpose_outer = outer;
+        mem.tile.transpose_block = block;
         mem.tile.in_h = rows; mem.tile.in_w = cols;
         mem.tile.out_h = cols; mem.tile.out_w = rows;
     }
 
     TEST_ASSERT(tigris_transpose_execute(&plan, &op, 0, &mem) == 0, what);
     TEST_ASSERT(memcmp(out, ref_buf, elements * elem_size) == 0, what);
+}
+
+static void run_transpose_case(
+    int rank, const int32_t *in_shape, const uint8_t *perm,
+    uint32_t elem_size, int misalign, int banded,
+    int32_t rows, int32_t cols, const char *what)
+{
+    run_transpose_case_block(rank, in_shape, perm, elem_size, misalign,
+                             banded, 1, rows, cols, 1, what);
+}
+
+/* A transpose the band path accepts swaps two adjacent groups of axes and
+ * leaves the rest in order, so the axes behind the swapped pair travel with
+ * the element and the slice is a matrix of blocks. An attention block's head
+ * permutation is the first one with such a suffix; the three the path used to
+ * name were the cases with none. */
+static void test_transpose_carries_a_block(void)
+{
+    printf("  test_transpose_carries_a_block...\n");
+
+    /* [1, 6, 2, 3] -> [1, 2, 6, 3] under stored perm (0, 2, 1, 3): a 6 by 2
+     * transpose carrying three elements at each position. */
+    const int32_t shape[4] = {1, 6, 2, 3};
+    const uint8_t perm[4] = {0, 2, 1, 3};
+    run_transpose_case_block(4, shape, perm, 4, 0, 1, 1, 6, 2, 3,
+                             "rank-4 float banded with a block of three");
+    run_transpose_case_block(4, shape, perm, 1, 0, 1, 1, 6, 2, 3,
+                             "rank-4 int8 banded with a block of three");
+
+    /* The same permutation with a batch ahead of the swapped pair. */
+    const int32_t batched[4] = {4, 6, 2, 3};
+    run_transpose_case_block(4, batched, perm, 4, 0, 1, 4, 6, 2, 3,
+                             "a batch ahead of the swapped pair");
 }
 
 static void test_transpose_element_paths(void)
@@ -2273,7 +2309,148 @@ static void test_transpose_element_paths(void)
                        "rank-4 float banded the other way");
 }
 
+
+/* A row band cuts the second to last axis, so on a rank-4 tensor the head
+ * axis is batch that the band spans rather than cuts. The element count a
+ * pointwise kernel works from has to include it: while a band meant one
+ * matrix there was no batch to multiply by, and the first rank-4 band left
+ * every batch but the first untouched. */
+static void test_pointwise_row_band_covers_every_batch(void)
+{
+    printf("  test_pointwise_row_band_covers_every_batch...\n");
+
+    enum { BATCH = 3, ROWS = 4, COLS = 2, BAND = 2 };
+    int32_t shape[] = {1, BATCH, ROWS, COLS};
+    uint16_t indices[] = {0, 1};
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    for (int i = 0; i < 2; i++) {
+        tensors[i].shape_off = 0;
+        tensors[i].ndim = 4;
+        tensors[i].dtype = 1;
+        tensors[i].flags = TIGRIS_TENSOR_LINEAR;
+        tensors[i].size_bytes =
+            (uint32_t)(BATCH * ROWS * COLS) * sizeof(float);
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_RELU;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT; op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header; plan.tensors = tensors; plan.ops = &op;
+    plan.index_pool = indices; plan.shape_pool = shape;
+
+    /* The band buffers hold BAND rows for every batch, laid out the way the
+     * band gather writes them. */
+    float in[BATCH * BAND * COLS];
+    float out[BATCH * BAND * COLS];
+    for (int i = 0; i < BATCH * BAND * COLS; i++)
+        in[i] = -1.0f - (float)i;
+    for (int i = 0; i < BATCH * BAND * COLS; i++)
+        out[i] = 12345.0f;
+
+    void *ptrs[2] = { in, out };
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs; mem.num_tensors = 2;
+    mem.tile.active = 1;
+    mem.tile.row_tiled = 1;
+    mem.tile.in_h = BAND;
+    mem.tile.out_h = BAND;
+    mem.tile.in_w = 1;
+    mem.tile.out_w = 1;
+
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "relu over a rank-4 row band returns 0");
+    for (int i = 0; i < BATCH * BAND * COLS; i++)
+        TEST_ASSERT_NEAR(out[i], 0.0f, EPS,
+                         "every batch of the band was written");
+}
+
 /* Main */
+
+/* A mean over one axis of a rank-3 tensor. The axis the plan names is a
+ * serialized one, so the same kernel collapses a sequence's token axis and a
+ * feature map's channel axis; both are checked, plus the two ways a plan may
+ * state the result's rank. */
+static void run_reduce_mean_case(
+    uint8_t axis, uint8_t out_ndim, const float *expected, int count)
+{
+    /* [2, 3, 2], values 0..11 */
+    int32_t shapes[] = {2, 3, 2, 0, 0, 0};
+    float input[12];
+    for (int i = 0; i < 12; i++)
+        input[i] = (float)i;
+    int32_t kept[3];
+    uint8_t written = 0;
+    for (uint8_t a = 0; a < 3u; a++) {
+        if (a == axis && out_ndim == 2u)
+            continue;
+        kept[written++] = (a == axis) ? 1 : shapes[a];
+    }
+    for (uint8_t a = 0; a < written; a++)
+        shapes[3 + a] = kept[a];
+
+    uint16_t indices[] = {0, 1};
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 3;
+    tensors[0].dtype = 1; tensors[0].size_bytes = sizeof(input);
+    tensors[1].shape_off = 3; tensors[1].ndim = out_ndim;
+    tensors[1].dtype = 1;
+    tensors[1].size_bytes = (uint32_t)count * sizeof(float);
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_REDUCE_MEAN;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_AXES, 1, 0};
+    const uint8_t axes[] = {axis};
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header; plan.tensors = tensors; plan.ops = &op;
+    plan.index_pool = indices; plan.shape_pool = shapes;
+    plan.op_attributes = &attr; plan.op_attribute_data = axes;
+    plan.num_op_attributes = 1;
+    void *ptrs[2]; uint8_t fast[256], slow[256]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, 2, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, 0, sizeof(input));
+    memcpy(ptrs[0], input, sizeof(input));
+    tigris_mem_alloc_fast(&mem, 1, tensors[1].size_bytes);
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "reduce mean returns 0");
+    for (int i = 0; i < count; i++)
+        TEST_ASSERT_NEAR(((float *)ptrs[1])[i], expected[i], EPS,
+                         "reduce mean value");
+}
+
+static void test_reduce_mean(void)
+{
+    printf("  test_reduce_mean...\n");
+    /* Mean over the middle axis: rows 0,2,4 and 1,3,5 of each batch. */
+    const float over_rows[] = {2.0f, 3.0f, 8.0f, 9.0f};
+    run_reduce_mean_case(1, 3, over_rows, 4);
+    run_reduce_mean_case(1, 2, over_rows, 4);
+    /* Mean over the innermost axis pairs neighbours. */
+    const float over_inner[] = {0.5f, 2.5f, 4.5f, 6.5f, 8.5f, 10.5f};
+    run_reduce_mean_case(2, 3, over_inner, 6);
+    /* Mean over the outermost axis averages the two batches. */
+    const float over_outer[] = {3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+    run_reduce_mean_case(0, 3, over_outer, 6);
+}
+
 
 int main(void)
 {
@@ -2300,12 +2477,15 @@ int main(void)
     test_sigmoid();
     test_erf();
     test_layer_norm();
+    test_reduce_mean();
     test_softmax();
     test_mul();
     test_constant_binary_f32();
     test_malformed_constant_binary_f32();
     test_transpose();
     test_transpose_element_paths();
+    test_transpose_carries_a_block();
+    test_pointwise_row_band_covers_every_batch();
     test_unsupported_op();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

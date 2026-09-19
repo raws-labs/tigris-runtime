@@ -73,6 +73,14 @@ typedef struct {
      * axis, so the row axis is axis 0 rather than axis 1 and out_h counts the
      * rows in this band. Zero on every other path. */
     uint8_t  row_tiled;
+    /* The batch a banded transpose spans. A transpose the band path accepts
+     * swaps two adjacent groups of axes and leaves the rest in order, so the
+     * axes ahead of the swapped pair are a batch the band repeats over and the
+     * axes behind it are a block that travels with the element. in_h and in_w
+     * are the two swapped extents, and these are the batch and the block.
+     * Both zero on every other path. */
+    int32_t  transpose_outer;
+    int32_t  transpose_block;
 } tigris_tile_ctx_t;
 
 /* Tensor alignment */

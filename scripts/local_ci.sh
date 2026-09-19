@@ -21,7 +21,7 @@
 #                     one-time source build entirely.
 #
 # A check is SKIPPED (not failed) when the toolchain it is calibrated against
-# is missing, because the coverage floors and MISRA baseline only mean anything
+# is missing, because the coverage floors and the reviewed deviations only mean anything
 # against the pinned tools. Skips are reported loudly; --strict turns them into
 # failures so a pre-push gate can insist the full suite ran.
 

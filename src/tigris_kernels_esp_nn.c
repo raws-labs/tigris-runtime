@@ -185,7 +185,7 @@ static void esp_conv_tile_input_dims(
                 return;             /* untiled stage: keep full dims */
             th = (int32_t)tp->tile_height;
             if (tp->axis == TIGRIS_TILE_AXIS_HW)   /* 2D: width also tiled */
-                tw = (int32_t)(tp->_reserved & 0xFFFFu);
+                tw = (int32_t)tp->tile_width;
         }
         if (th <= 0)
             th = (int32_t)IH;

@@ -1994,7 +1994,7 @@ static void run_convtranspose_tiling_case(
     tile_plan.tile_height = 8;
     tile_plan.num_tiles = 4;
     tile_plan.original_height = 16;
-    tile_plan._reserved = 8;  /* tile_width packed in low 16 bits (2D path) */
+    tile_plan.tile_width = 8;
 
     plan.header = &header;
     plan.tensors = tensors;
@@ -2430,6 +2430,223 @@ static void test_exec_compaction_preserves_data(void)
                 "output survives slow-arena compaction");
 }
 
+typedef struct {
+    uint8_t  flags;
+    uint8_t  ndim;
+    uint32_t size_bytes;
+    uint16_t quant_param_idx;
+    int32_t  shape[4];
+} alias_spec_t;
+
+typedef struct {
+    int calls;
+    int aliased;
+    int passthrough;
+} alias_ctx_t;
+
+static int alias_kernel(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem, void *user_ctx)
+{
+    alias_ctx_t *ctx = (alias_ctx_t *)user_ctx;
+    const uint16_t *inputs = tigris_op_inputs(plan, op);
+    const uint16_t *outputs = tigris_op_outputs(plan, op);
+    (void)op_index;
+    ctx->calls++;
+    if (op->op_type == TIGRIS_OP_RELU) {
+        /* The consumer is the only place the sharing is observable: a tensor
+         * released after its last use has a null pointer by the time the run
+         * returns. */
+        const uint8_t *in = (const uint8_t *)mem->tensor_ptrs[inputs[0]];
+        ctx->aliased = mem->tensor_ptrs[0] != NULL &&
+                       mem->tensor_ptrs[inputs[0]] == mem->tensor_ptrs[0];
+        ctx->passthrough = in != NULL && in[0] == 0x11u;
+    }
+    memset(mem->tensor_ptrs[outputs[0]], 0x5a,
+           plan->tensors[outputs[0]].size_bytes);
+    return 0;
+}
+
+/* Run [Reshape(t0 -> t1), Relu(t1 -> t2)] and report whether the reshape
+ * handed its input's buffer through instead of allocating and copying. */
+static int reshape_passes_buffer_through(
+    const alias_spec_t *src, const alias_spec_t *dst, alias_ctx_t *out)
+{
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[3];
+    tigris_op_t ops[2];
+    tigris_stage_t stage;
+    tigris_quant_param_t quant[3];
+    int32_t shape_pool[12];
+    const uint16_t indices[] = {0, 1, 1, 2, 0, 1, 0, 2};
+    tigris_plan_t plan;
+    void *ptrs[3];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[512];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[256];
+    tigris_mem_t mem;
+    uint8_t workspace[
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+    tigris_exec_stats_t stats;
+    alias_ctx_t ctx = {0};
+
+    memset(&header, 0, sizeof(header));
+    memset(tensors, 0, sizeof(tensors));
+    memset(ops, 0, sizeof(ops));
+    memset(&stage, 0, sizeof(stage));
+    memset(&plan, 0, sizeof(plan));
+    memset(shape_pool, 0, sizeof(shape_pool));
+
+    quant[0].scale = 0.5f;
+    quant[0].zero_point = -3;
+    quant[0].num_channels = 1;
+    quant[0].multiplier_off = 0;
+    quant[0].shift_off = 0;
+    quant[0]._pad = 0;
+    quant[1] = quant[0];
+    quant[1].scale = 0.25f;
+    quant[2] = quant[0];
+
+    header.num_tensors = 3;
+    header.num_ops = 2;
+    header.num_stages = 1;
+    header.num_model_inputs = 1;
+    header.num_model_outputs = 1;
+
+    tensors[0].size_bytes = src->size_bytes;
+    tensors[0].flags = src->flags;
+    tensors[0].ndim = src->ndim;
+    tensors[0].quant_param_idx = src->quant_param_idx;
+    tensors[0].shape_off = 0;
+    tensors[1].size_bytes = dst->size_bytes;
+    tensors[1].flags = dst->flags;
+    tensors[1].ndim = dst->ndim;
+    tensors[1].quant_param_idx = dst->quant_param_idx;
+    tensors[1].shape_off = 4;
+    tensors[2].size_bytes = dst->size_bytes;
+    tensors[2].flags = dst->flags;
+    tensors[2].ndim = dst->ndim;
+    tensors[2].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    tensors[2].shape_off = 8;
+    for (size_t i = 0; i < 4; i++) {
+        shape_pool[i] = src->shape[i];
+        shape_pool[4 + i] = dst->shape[i];
+        shape_pool[8 + i] = dst->shape[i];
+    }
+
+    ops[0].op_type = TIGRIS_OP_RESHAPE;
+    ops[0].num_inputs = 1;
+    ops[0].num_outputs = 1;
+    ops[0].inputs_off = 0;
+    ops[0].outputs_off = 1;
+    ops[1].op_type = TIGRIS_OP_RELU;
+    ops[1].num_inputs = 1;
+    ops[1].num_outputs = 1;
+    ops[1].inputs_off = 2;
+    ops[1].outputs_off = 3;
+
+    stage.ops_off = 4;
+    stage.ops_count = 2;
+    stage.inputs_off = 6;
+    stage.inputs_count = 1;
+    stage.outputs_off = 7;
+    stage.outputs_count = 1;
+    stage.tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage.chain_id = TIGRIS_NO_CHAIN;
+
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = ops;
+    plan.stages = &stage;
+    plan.index_pool = indices;
+    plan.shape_pool = shape_pool;
+    plan.quant_params = quant;
+    plan.model_inputs = &indices[6];
+    plan.model_outputs = &indices[7];
+
+    TEST_ASSERT_EQ(
+        tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), slow, sizeof(slow)),
+        TIGRIS_MEM_OK, "reshape-alias memory init");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes),
+                   TIGRIS_MEM_OK, "reshape-alias input allocation");
+    memset(mem.tensor_ptrs[0], 0x11, tensors[0].size_bytes);
+
+    TEST_ASSERT_EQ(
+        tigris_run_with_workspace_buffer(
+            &plan, &mem, alias_kernel, &ctx, &stats, workspace,
+            sizeof(workspace)),
+        TIGRIS_EXEC_OK, "reshape-alias execution");
+    *out = ctx;
+    return ctx.aliased;
+}
+
+static void test_exec_reshape_alias(void)
+{
+    printf("  test_exec_reshape_alias...\n");
+    /* Two tensors that each state their own axis order: regrouping the shape
+     * moves nothing, so the output is the input. */
+    const alias_spec_t linear_src = {
+        TIGRIS_TENSOR_LINEAR, 2u, 64u, TIGRIS_NO_QUANT_PARAM, {4, 16, 0, 0}};
+    const alias_spec_t linear_dst = {
+        TIGRIS_TENSOR_LINEAR, 3u, 64u, TIGRIS_NO_QUANT_PARAM, {4, 4, 4, 0}};
+    /* Two spatial tensors where only the spatial axes regroup and the channel
+     * axis stays last, which is what a vision transformer's unfold is. */
+    const alias_spec_t spatial_src = {
+        0u, 4u, 64u, TIGRIS_NO_QUANT_PARAM, {1, 4, 4, 4}};
+    const alias_spec_t spatial_dst = {
+        0u, 3u, 64u, TIGRIS_NO_QUANT_PARAM, {1, 16, 4, 0}};
+    /* Same rank-4 bytes regrouped across the channel axis: the stored order
+     * changes, so this one has to go through the kernel. */
+    const alias_spec_t channel_dst = {
+        0u, 3u, 64u, TIGRIS_NO_QUANT_PARAM, {1, 4, 16, 0}};
+    alias_ctx_t r;
+
+    TEST_ASSERT(reshape_passes_buffer_through(&linear_src, &linear_dst, &r),
+                "a reshape between own-order tensors shares its input");
+    TEST_ASSERT_EQ(r.calls, 1, "the shared reshape runs no kernel");
+    TEST_ASSERT(r.passthrough, "the consumer reads the input's own bytes");
+
+    TEST_ASSERT(
+        reshape_passes_buffer_through(&spatial_src, &spatial_dst, &r),
+        "a spatial reshape that keeps the channel axis last shares its input");
+    TEST_ASSERT_EQ(r.calls, 1, "the shared spatial reshape runs no kernel");
+
+    TEST_ASSERT(
+        !reshape_passes_buffer_through(&spatial_src, &channel_dst, &r),
+        "a reshape that moves channels does not share its input");
+    TEST_ASSERT_EQ(r.calls, 2, "the copying reshape runs its kernel");
+
+    /* One side states its own order and the other does not: the stored orders
+     * disagree even when the extents would line up. */
+    TEST_ASSERT(
+        !reshape_passes_buffer_through(&spatial_src, &linear_dst, &r),
+        "a reshape across the layout boundary does not share its input");
+    TEST_ASSERT_EQ(r.calls, 2, "the layout-crossing reshape runs its kernel");
+
+    /* Same stored bytes, different meaning: the reshape has to re-encode. */
+    alias_spec_t quantized_src = linear_src;
+    alias_spec_t quantized_dst = linear_dst;
+    quantized_src.quant_param_idx = 0u;
+    quantized_dst.quant_param_idx = 1u;
+    TEST_ASSERT(
+        !reshape_passes_buffer_through(&quantized_src, &quantized_dst, &r),
+        "a reshape that rescales does not share its input");
+    TEST_ASSERT_EQ(r.calls, 2, "the rescaling reshape runs its kernel");
+
+    TEST_ASSERT(
+        !reshape_passes_buffer_through(&quantized_src, &linear_dst, &r),
+        "a reshape that drops quantization does not share its input");
+    quantized_dst.quant_param_idx = 2u;
+    TEST_ASSERT(
+        reshape_passes_buffer_through(&quantized_src, &quantized_dst, &r),
+        "a reshape whose two quantizations agree shares its input");
+
+    /* Different byte counts are never the same bytes. */
+    alias_spec_t shorter = linear_dst;
+    shorter.size_bytes = 32u;
+    TEST_ASSERT(!reshape_passes_buffer_through(&linear_src, &shorter, &r),
+                "a reshape that changes size does not share its input");
+}
+
 /* Main */
 
 int main(int argc, char *argv[])
@@ -2468,6 +2685,7 @@ int main(int argc, char *argv[])
     test_exec_mixed_conv_convtranspose_not_tiled();
     test_exec_chained_convtranspose_fails_closed();
     test_exec_compaction_preserves_data();
+    test_exec_reshape_alias();
     test_exec_error_strings();
 
     if (argc > 1) {

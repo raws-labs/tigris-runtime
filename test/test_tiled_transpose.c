@@ -126,6 +126,10 @@ static void build_fixture(transpose_fixture_t *fx, int32_t rows, int32_t cols)
     fx->tile_plan.tile_height = 1;
     fx->tile_plan.num_tiles = (uint16_t)(rows > cols ? rows : cols);
     fx->tile_plan.original_height = (uint16_t)(rows > cols ? rows : cols);
+    /* The solver bands the longer axis and says which one that is, so the
+     * fixture states what the compiler would. */
+    fx->tile_plan.flags = (uint16_t)((cols >= rows)
+                                     ? TIGRIS_TILE_FLAG_BAND_ON_COLUMNS : 0u);
 
     fx->plan.header = &fx->header;
     fx->plan.tensors = fx->tensors;
@@ -314,6 +318,49 @@ static void check_rank4(int32_t h, int32_t w, int32_t c, int spatial_first,
     TEST_ASSERT_EQ(mismatches, 0, "rank-4 conversion matches the permutation");
 }
 
+
+/* Which axis the band runs along is a memory choice, not a correctness one,
+ * so a plan that states the other side still has to produce the permutation.
+ * That is what makes the stated bit safe to obey: the executor no longer has
+ * to agree with the solver by coincidence. A plan from before schema 9 states
+ * nothing, and the executor derives it as it always did. */
+static void check_band_orientation(int32_t rows, int32_t cols)
+{
+    printf("  check_band_orientation...\n");
+
+    float input[TEST_ELEMENTS];
+    for (int i = 0; i < TEST_ELEMENTS; i++)
+        input[i] = (float)i * 0.25f - 48.0f;
+
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t small[1024];
+    float expected[TEST_ELEMENTS];
+    uint16_t tiled = 0;
+    transpose_fixture_t fx;
+
+    build_fixture(&fx, rows, cols);
+    TEST_ASSERT_EQ(run_case(&fx, small, sizeof(small), input, expected, &tiled),
+                   TIGRIS_EXEC_OK, "conversion on the stated axis");
+    TEST_ASSERT_EQ(tiled, 1, "stated-axis run is tiled");
+
+    float other[TEST_ELEMENTS];
+    build_fixture(&fx, rows, cols);
+    fx.tile_plan.flags = (uint16_t)(fx.tile_plan.flags ^
+                                    TIGRIS_TILE_FLAG_BAND_ON_COLUMNS);
+    TEST_ASSERT_EQ(run_case(&fx, small, sizeof(small), input, other, &tiled),
+                   TIGRIS_EXEC_OK, "conversion on the other axis");
+    TEST_ASSERT(memcmp(expected, other, sizeof(expected)) == 0,
+                "both orientations produce the permutation");
+
+    float derived[TEST_ELEMENTS];
+    build_fixture(&fx, rows, cols);
+    fx.header.version = TIGRIS_SCHEMA_VERSION_V8;
+    fx.tile_plan.flags = 0;
+    TEST_ASSERT_EQ(run_case(&fx, small, sizeof(small), input, derived, &tiled),
+                   TIGRIS_EXEC_OK, "conversion on a plan that states nothing");
+    TEST_ASSERT(memcmp(expected, derived, sizeof(expected)) == 0,
+                "a plan from before schema 9 still converts");
+}
+
 /** A permutation that is not a layout conversion must not take the path. */
 static void check_unconvertible_perm_is_refused(void)
 {
@@ -346,6 +393,7 @@ int main(void)
     printf("Layout conversion tiling tests:\n");
     check_band_invariance(TEST_SHORT, TEST_LONG, "gathering input columns");
     check_band_invariance(TEST_LONG, TEST_SHORT, "scattering output columns");
+    check_band_orientation(TEST_SHORT, TEST_LONG);
     check_rank4(4, 4, 24, 1, "rank 4 to linear order");
     check_rank4(4, 4, 24, 0, "rank 4 back to spatial order");
     check_unconvertible_perm_is_refused();

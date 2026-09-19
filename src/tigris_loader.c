@@ -932,6 +932,13 @@ tigris_error_t tigris_plan_load(
         memcpy(&nqp, buf + off, 2);
         memcpy(&qd_field, buf + off + 2, 2);
         candidate.num_quant_params = nqp;
+        /* The header states a count and so does the section. Everything below
+         * bounds a quant_param_idx against one of them and indexes the array
+         * sized by the other, so they have to be reconciled here rather than
+         * after the tables that read them. A header claiming more than the
+         * section holds read past the plan. */
+        if (nqp != hdr->num_quant_params)
+            return TIGRIS_ERR_BAD_SECTION;
         uint32_t entries_size = (uint32_t)nqp * sizeof(tigris_quant_param_t);
         uint32_t data_size;
         if (hdr->version == TIGRIS_SCHEMA_VERSION_V2)
@@ -1348,8 +1355,6 @@ tigris_error_t tigris_plan_load(
         uint32_t qd_len = hdr->version == TIGRIS_SCHEMA_VERSION_V2 ? qd_field :
             (section_ends[TIGRIS_SEC_QUANT_PARAMS] - qp_off - 4u -
              (uint32_t)nqp * sizeof(tigris_quant_param_t)) / sizeof(int32_t);
-        if (nqp != hdr->num_quant_params)
-            return TIGRIS_ERR_BAD_SECTION;
         for (uint16_t i = 0; i < nqp; i++) {
             const tigris_quant_param_t *qp = &candidate.quant_params[i];
             uint32_t page = hdr->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;

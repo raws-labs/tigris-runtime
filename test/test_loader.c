@@ -1552,6 +1552,7 @@ static void test_split_contract(void)
                    "a single part rejected");
 }
 
+
 static void build_unary_plan(uint8_t *buf)
 {
     build_transpose_plan(buf);
@@ -2399,6 +2400,60 @@ static void test_fixture(const char *path)
     free(buf);
 }
 
+/* The header states how many quantization parameters a plan has and so does
+ * the section that holds them. Everything downstream bounds an index against
+ * one and reads the array sized by the other, so a header claiming more than
+ * the section holds read past the plan: a four-byte out-of-bounds read inside
+ * tigris_plan_load, from input the loader exists to police. */
+static void test_quant_param_counts_are_reconciled(void)
+{
+    printf("  test_quant_param_counts_are_reconciled...\n");
+    char path[512];
+    int path_len = snprintf(path, sizeof(path), "%s/%s",
+                            TIGRIS_SCHEMA_COMPAT_DIR,
+                            "schema-v3-qdq-conv.tgrs");
+    if (path_len <= 0 || (size_t)path_len >= sizeof(path))
+        return;
+    uint32_t buf_len = 0;
+    uint8_t *buf = load_file(path, &buf_len);
+    TEST_ASSERT(buf != NULL, "quantized fixture is readable");
+    if (!buf)
+        return;
+
+    tigris_plan_t plan;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan), TIGRIS_OK,
+                   "the fixture loads as emitted");
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    uint16_t present = hdr->num_quant_params;
+    TEST_ASSERT(present > 0u, "the fixture carries quantization");
+    const tigris_section_entry_t *dir =
+        (const tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + dir[0].offset);
+
+    /* A header that claims more than the section holds, and a tensor naming
+     * an index inside the claim but outside the section. */
+    hdr->num_quant_params = 300;
+    for (uint16_t i = 0; i < hdr->num_tensors; i++) {
+        if (tensors[i].quant_param_idx != TIGRIS_NO_QUANT_PARAM) {
+            tensors[i].quant_param_idx = 200;
+            break;
+        }
+    }
+    TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a header claiming more quant params than the section "
+                   "holds is refused");
+
+    /* The reverse mismatch is no better founded. */
+    hdr->num_quant_params = (uint16_t)(present - 1u);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a header claiming fewer is refused too");
+
+    free(buf);
+}
+
 static void test_schema_compatibility_fixtures(void)
 {
     /*
@@ -2594,6 +2649,7 @@ int main(int argc, char *argv[])
 
     printf("\nSchema compatibility fixtures:\n");
     test_schema_compatibility_fixtures();
+    test_quant_param_counts_are_reconciled();
 
     printf("\nStruct size tests:\n");
     test_struct_sizes();

@@ -1422,6 +1422,136 @@ static void test_declared_interface_dtype_contract(void)
                    "float interface without quantization rejected");
 }
 
+
+/* A plan whose single stage splits one rank-3 input into two parts. */
+#define SPLIT_PLAN_SIZE     276u
+#define SPLIT_TENSORS_OFF   104u
+#define SPLIT_OPS_OFF       152u
+#define SPLIT_STAGES_OFF    190u
+#define SPLIT_INDEX_OFF     218u
+#define SPLIT_SHAPES_OFF    236u
+#define SPLIT_STRINGS_OFF   272u
+
+static void build_split_plan(uint8_t *buf)
+{
+    memset(buf, 0, SPLIT_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = SPLIT_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 3;
+    hdr->num_ops = 1;
+    hdr->num_stages = 1;
+    hdr->model_io_off = 3;
+    hdr->num_model_inputs = 1;
+    hdr->num_model_outputs = 1;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, SPLIT_TENSORS_OFF};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, SPLIT_OPS_OFF};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, SPLIT_STAGES_OFF};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, SPLIT_INDEX_OFF};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, SPLIT_SHAPES_OFF};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, SPLIT_STRINGS_OFF};
+
+    int32_t *shapes = (int32_t *)(buf + SPLIT_SHAPES_OFF);
+    shapes[0] = 4; shapes[1] = 2; shapes[2] = 8;   /* input  */
+    shapes[3] = 3; shapes[4] = 2; shapes[5] = 8;   /* part 0 */
+    shapes[6] = 1; shapes[7] = 2; shapes[8] = 8;   /* part 1 */
+
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SPLIT_TENSORS_OFF);
+    for (uint16_t i = 0; i < 3u; i++) {
+        tensors[i].shape_off = (uint16_t)(i * 3u);
+        tensors[i].ndim = 3;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        tensors[i].flags = TIGRIS_TENSOR_LINEAR;
+    }
+    tensors[0].size_bytes = 64u * (uint32_t)sizeof(float);
+    tensors[1].size_bytes = 48u * (uint32_t)sizeof(float);
+    tensors[2].size_bytes = 16u * (uint32_t)sizeof(float);
+    tensors[0].flags |= TIGRIS_TENSOR_MODEL_INPUT;
+    tensors[2].flags |= TIGRIS_TENSOR_MODEL_OUTPUT;
+
+    tigris_op_t *op = (tigris_op_t *)(buf + SPLIT_OPS_OFF);
+    op->op_type = TIGRIS_OP_SPLIT;
+    op->num_inputs = 1;
+    op->num_outputs = 2;
+    op->inputs_off = 0;
+    op->outputs_off = 1;
+    op->weight_idx = TIGRIS_NO_WEIGHT;
+    op->bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + SPLIT_STAGES_OFF);
+    stage->ops_off = 5;
+    stage->ops_count = 1;
+    stage->inputs_off = 6;
+    stage->inputs_count = 1;
+    stage->outputs_off = 7;
+    stage->outputs_count = 1;
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    uint16_t *indices = (uint16_t *)(buf + SPLIT_INDEX_OFF);
+    indices[0] = 0;  /* op input */
+    indices[1] = 1;  /* part 0 */
+    indices[2] = 2;  /* part 1 */
+    indices[3] = 0;  /* model input */
+    indices[4] = 2;  /* model output */
+    indices[5] = 0;  /* stage op */
+    indices[6] = 0;  /* stage input */
+    indices[7] = 2;  /* stage output */
+
+    buf[SPLIT_STRINGS_OFF] = '\0';
+}
+
+/* A split's parts are contiguous runs of its input, which is the only cut
+ * that needs no arithmetic. The loader has to say so: a part that differs
+ * anywhere but the outermost stored axis, or a set that does not cover the
+ * input exactly, would be copied wrongly rather than refused. */
+static void test_split_contract(void)
+{
+    printf("  test_split_contract...\n");
+    _Alignas(4) uint8_t buf[SPLIT_PLAN_SIZE];
+    tigris_plan_t plan;
+    int32_t *shapes;
+    tigris_tensor_t *tensors;
+
+    build_split_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "contiguous parts accepted");
+
+    /* Parts that do not cover the input are not a split of it. */
+    build_split_plan(buf);
+    shapes = (int32_t *)(buf + SPLIT_SHAPES_OFF);
+    tensors = (tigris_tensor_t *)(buf + SPLIT_TENSORS_OFF);
+    shapes[3] = 2;
+    tensors[1].size_bytes = 32u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "parts that leave a gap rejected");
+
+    /* A part that differs on an inner axis would be interleaved, not cut. */
+    build_split_plan(buf);
+    shapes = (int32_t *)(buf + SPLIT_SHAPES_OFF);
+    tensors = (tigris_tensor_t *)(buf + SPLIT_TENSORS_OFF);
+    shapes[5] = 4;
+    tensors[1].size_bytes = 24u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "a part cut on an inner axis rejected");
+
+    /* One part is not a split. */
+    build_split_plan(buf);
+    ((tigris_op_t *)(buf + SPLIT_OPS_OFF))->num_outputs = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "a single part rejected");
+}
+
 static void build_unary_plan(uint8_t *buf)
 {
     build_transpose_plan(buf);
@@ -2450,6 +2580,7 @@ int main(int argc, char *argv[])
     test_transpose_attribute_guards();
     test_op_attribute_kinds();
     test_declared_interface_dtype_contract();
+    test_split_contract();
     test_reduce_mean_contract();
     test_op_attribute_payloads();
     test_tiled_conversion_contract();

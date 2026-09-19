@@ -147,6 +147,7 @@ typedef enum {
     TIGRIS_OP_CONV1D            = 32,
     TIGRIS_OP_LAYER_NORM        = 33,
     TIGRIS_OP_ERF               = 34,
+    TIGRIS_OP_SPLIT             = 35,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

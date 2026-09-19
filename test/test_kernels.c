@@ -2452,6 +2452,57 @@ static void test_reduce_mean(void)
 }
 
 
+/* A split hands out contiguous runs of its input, so the parts are the input
+ * read in order and nothing is interleaved. Uneven parts are here because the
+ * kernel sizes each one from its own tensor rather than dividing. */
+static void test_split(void)
+{
+    printf("  test_split...\n");
+    int32_t shapes[] = {3, 2, 2, 2, 1, 2};
+    float input[6] = {1, 2, 3, 4, 5, 6};
+    uint16_t indices[] = {0, 1, 2};
+    tigris_tensor_t tensors[3];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 2;
+    tensors[0].dtype = 1; tensors[0].size_bytes = sizeof(input);
+    tensors[1].shape_off = 2; tensors[1].ndim = 2;
+    tensors[1].dtype = 1; tensors[1].size_bytes = 4u * sizeof(float);
+    tensors[2].shape_off = 4; tensors[2].ndim = 2;
+    tensors[2].dtype = 1; tensors[2].size_bytes = 2u * sizeof(float);
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_SPLIT;
+    op.num_inputs = 1; op.num_outputs = 2;
+    op.inputs_off = 0; op.outputs_off = 1;
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 3; header.num_ops = 1;
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header; plan.tensors = tensors; plan.ops = &op;
+    plan.index_pool = indices; plan.shape_pool = shapes;
+    void *ptrs[3]; uint8_t fast[256], slow[256]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, 0, sizeof(input));
+    memcpy(ptrs[0], input, sizeof(input));
+    tigris_mem_alloc_fast(&mem, 1, tensors[1].size_bytes);
+    tigris_mem_alloc_fast(&mem, 2, tensors[2].size_bytes);
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "split returns 0");
+    const float first[] = {1, 2, 3, 4};
+    const float second[] = {5, 6};
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(((float *)ptrs[1])[i], first[i], EPS, "split part 0");
+    for (int i = 0; i < 2; i++)
+        TEST_ASSERT_NEAR(((float *)ptrs[2])[i], second[i], EPS, "split part 1");
+
+    /* A part with nowhere to go is refused rather than written past. */
+    mem.tensor_ptrs[2] = NULL;
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0,
+                "split without a destination is refused");
+}
+
+
 int main(void)
 {
     printf("TiGrIS Kernel Tests\n\n");
@@ -2478,6 +2529,7 @@ int main(void)
     test_erf();
     test_layer_norm();
     test_reduce_mean();
+    test_split();
     test_softmax();
     test_mul();
     test_constant_binary_f32();

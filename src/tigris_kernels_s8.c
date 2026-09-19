@@ -1052,6 +1052,33 @@ static TIGRIS_KERNEL_NOINLINE int kern_reduce_mean_s8(
     return 0;
 }
 
+/**
+ * Split a tensor into contiguous parts along its outermost stored axis.
+ *
+ * The loader admits only the split whose parts are runs of the input, so each
+ * output is that many bytes taken in order. Nothing is interleaved and no
+ * shape arithmetic is needed; the parts differ only in how much they take.
+ */
+static TIGRIS_KERNEL_NOINLINE int kern_split_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const uint8_t *source = (const uint8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    if (source == NULL)
+        return -1;
+    uint32_t offset = 0;
+    for (uint8_t i = 0; i < op->num_outputs; i++) {
+        const tigris_tensor_t *part = &plan->tensors[outs[i]];
+        void *destination = tigris_mem_tensor_ptr(mem, outs[i]);
+        if (destination == NULL)
+            return -1;
+        memcpy(destination, source + offset, part->size_bytes);
+        offset += part->size_bytes;
+    }
+    return 0;
+}
+
 static TIGRIS_KERNEL_NOINLINE int kern_avg_pool_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1863,6 +1890,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_ERF:         return kern_erf_s8(plan, op, mem);
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm_s8(plan, op, op_index, mem);
     case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_SPLIT:       return kern_split_s8(plan, op, mem);
     default:
         return -1;  /* unsupported op type */
     }

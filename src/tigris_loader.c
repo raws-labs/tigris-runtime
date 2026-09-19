@@ -380,6 +380,43 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
 
+        case TIGRIS_OP_SPLIT: {
+            /* The parts are contiguous runs of the input, which is what makes
+             * a split need no arithmetic: every output keeps the input's
+             * shape but for the outermost stored axis, and their extents on
+             * that axis sum to the input's. A split anywhere else interleaves
+             * and is refused rather than copied wrongly. */
+            if (op->num_inputs != 1u || op->num_outputs < 2u ||
+                input->ndim == 0u)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *in_shape = tigris_tensor_shape(plan, input);
+            int64_t covered = 0;
+            uint32_t total_bytes = 0;
+            for (uint8_t i = 0; i < op->num_outputs; i++) {
+                const tigris_tensor_t *part = &plan->tensors[outputs[i]];
+                if (part->ndim != input->ndim || part->dtype != input->dtype)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                const int32_t *part_shape = tigris_tensor_shape(plan, part);
+                for (uint8_t axis = 1; axis < input->ndim; axis++) {
+                    if (part_shape[axis] != in_shape[axis])
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                }
+                if (part_shape[0] <= 0)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                covered += part_shape[0];
+                if (total_bytes > UINT32_MAX - part->size_bytes)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                total_bytes += part->size_bytes;
+                if (tigris_tensor_quant(plan, part) !=
+                    tigris_tensor_quant(plan, input))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
+            if (covered != (int64_t)in_shape[0] ||
+                total_bytes != input->size_bytes)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
+
         case TIGRIS_OP_REDUCE_MEAN: {
             /* One rank-3 activation in, one of its axes collapsed. The result
              * keeps that axis at one or drops it, which is the difference

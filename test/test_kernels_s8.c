@@ -1768,6 +1768,58 @@ static void test_binary_requant_is_read_from_the_plan(void)
                        "a short payload falls back to the derived pairs");
 }
 
+
+/* The int8 split is the same contiguous hand-out as the float one: the parts
+ * carry the input's encoding because they are its bytes. */
+static void test_split_s8(void)
+{
+    printf("  test_split_s8...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t qp = add_quant_param(0.25f, -3, 1, NULL, NULL);
+    int32_t whole[] = {3, 4};
+    int32_t part_shape[] = {1, 4};
+    uint16_t t_in = add_tensor(&plan, "x", whole, 2, 3, 12, qp);
+    uint16_t t_a = add_tensor(&plan, "a", part_shape, 2, 3, 4, qp);
+    uint16_t t_b = add_tensor(&plan, "b", part_shape, 2, 3, 4, qp);
+    uint16_t t_c = add_tensor(&plan, "c", part_shape, 2, 3, 4, qp);
+    uint16_t ins[] = {t_in}, outs[] = {t_a, t_b, t_c};
+    test_ops[0].op_type = TIGRIS_OP_SPLIT;
+    test_ops[0].num_inputs = 1; test_ops[0].num_outputs = 3;
+    test_ops[0].inputs_off = add_indices(ins, 1);
+    test_ops[0].outputs_off = add_indices(outs, 3);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[1024], slow[1024]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
+                    slow, sizeof(slow));
+    int8_t values[12];
+    for (int i = 0; i < 12; i++)
+        values[i] = (int8_t)(i - 6);
+    tigris_mem_alloc_fast(&mem, t_in, sizeof(values));
+    memcpy(ptrs[t_in], values, sizeof(values));
+    tigris_mem_alloc_fast(&mem, t_a, 4);
+    tigris_mem_alloc_fast(&mem, t_b, 4);
+    tigris_mem_alloc_fast(&mem, t_c, 4);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                             NULL), 0,
+                   "split_s8 returns 0");
+    for (int i = 0; i < 4; i++) {
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_a])[i], values[i], "split_s8 part 0");
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_b])[i], values[4 + i],
+                       "split_s8 part 1");
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_c])[i], values[8 + i],
+                       "split_s8 part 2");
+    }
+    mem.tensor_ptrs[t_in] = NULL;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
+                                          NULL) != 0,
+                "split_s8 without a source is refused");
+}
+
 /* Main */
 
 int main(void)
@@ -1797,6 +1849,7 @@ int main(void)
     test_transpose_s8();
     test_reduce_mean_s8();
     test_binary_requant_is_read_from_the_plan();
+    test_split_s8();
     test_unsupported_op_s8();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

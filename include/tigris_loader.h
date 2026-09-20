@@ -43,6 +43,23 @@ tigris_error_t tigris_plan_load(
     const uint8_t *buf, uint32_t buf_len, tigris_plan_t *out_plan);
 
 /**
+ * Load a plan and report what it asks of the build.
+ *
+ * Identical to tigris_plan_load, except that *out_required* is filled with
+ * the limits the plan needs, so a caller can say which build would run it
+ * rather than only that this one will not. On TIGRIS_ERR_PLAN_LIMITS it holds
+ * everything read up to the limit this build cannot meet, which is the one to
+ * raise; raising it and loading again reports the next, if there is one. Pass
+ * NULL to ignore.
+ */
+tigris_error_t tigris_plan_load_ex(
+    const uint8_t *buf, uint32_t buf_len, tigris_plan_t *out_plan,
+    tigris_plan_limits_t *out_required);
+
+/** The limits this build was compiled to allow. */
+void tigris_build_limits(tigris_plan_limits_t *out);
+
+/**
  * Return a human-readable string for a loader error code.
  *
  * @param err  Loader error code.

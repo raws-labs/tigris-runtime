@@ -678,9 +678,42 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 
 /* Public API */
 
+void tigris_build_limits(tigris_plan_limits_t *out)
+{
+    if (!out)
+        return;
+    out->tensors = (uint16_t)TIGRIS_MAX_TENSORS;
+    out->stage_inputs = (uint16_t)TIGRIS_MAX_STAGE_INPUTS;
+    out->stage_outputs = (uint16_t)TIGRIS_MAX_STAGE_OUTPUTS;
+    out->chain_stages = (uint16_t)TIGRIS_MAX_CHAIN_STAGES;
+    out->spatial_ops_per_stage = (uint16_t)TIGRIS_MAX_SPATIAL_OPS_PER_STAGE;
+}
+
+/* Raise a reported requirement to cover one more observation. */
+static void note_requirement(uint16_t *slot, uint32_t seen)
+{
+    if (slot != NULL && seen > (uint32_t)*slot)
+        *slot = (seen > 65535u) ? 65535u : (uint16_t)seen;
+}
+
 tigris_error_t tigris_plan_load(
     const uint8_t *buf, uint32_t buf_len, tigris_plan_t *out_plan)
 {
+    return tigris_plan_load_ex(buf, buf_len, out_plan, NULL);
+}
+
+tigris_error_t tigris_plan_load_ex(
+    const uint8_t *buf, uint32_t buf_len, tigris_plan_t *out_plan,
+    tigris_plan_limits_t *out_required)
+{
+    /* A plan that exceeds this build is refused, but the refusal says which
+     * build would run it, so the requirement is gathered as the tables are
+     * walked rather than returned from the first breach. */
+    tigris_plan_limits_t required;
+    memset(&required, 0, sizeof(required));
+    if (out_required)
+        memset(out_required, 0, sizeof(*out_required));
+
     if (!out_plan)
         return TIGRIS_ERR_NULL;
 
@@ -1018,8 +1051,12 @@ tigris_error_t tigris_plan_load(
             return TIGRIS_ERR_BAD_SECTION;
     }
 
-    if (hdr->num_tensors > TIGRIS_MAX_TENSORS)
+    note_requirement(&required.tensors, hdr->num_tensors);
+    if (hdr->num_tensors > TIGRIS_MAX_TENSORS) {
+        if (out_required)
+            *out_required = required;
         return TIGRIS_ERR_PLAN_LIMITS;
+    }
 
     for (uint16_t i = 0; i < hdr->num_tensors; i++) {
         const tigris_tensor_t *tensor = &candidate.tensors[i];
@@ -1415,12 +1452,16 @@ tigris_error_t tigris_plan_load(
             (stage->chain_len == 0 && stage->chain_id != TIGRIS_NO_CHAIN) ||
             (stage->chain_len > 0 && stage->chain_id == TIGRIS_NO_CHAIN))
             return TIGRIS_ERR_BAD_SECTION;
-        if (stage->inputs_count > TIGRIS_MAX_STAGE_INPUTS)
+        note_requirement(&required.stage_inputs, stage->inputs_count);
+        note_requirement(&required.stage_outputs, stage->outputs_count);
+        note_requirement(&required.chain_stages, stage->chain_len);
+        if (stage->inputs_count > TIGRIS_MAX_STAGE_INPUTS ||
+            stage->outputs_count > TIGRIS_MAX_STAGE_OUTPUTS ||
+            stage->chain_len > TIGRIS_MAX_CHAIN_STAGES) {
+            if (out_required)
+                *out_required = required;
             return TIGRIS_ERR_PLAN_LIMITS;
-        if (stage->outputs_count > TIGRIS_MAX_STAGE_OUTPUTS)
-            return TIGRIS_ERR_PLAN_LIMITS;
-        if (stage->chain_len > TIGRIS_MAX_CHAIN_STAGES)
-            return TIGRIS_ERR_PLAN_LIMITS;
+        }
 
         /* A chain is represented redundantly on every member.  The executor
          * only starts it at its declared head and skips the other members, so
@@ -1758,8 +1799,13 @@ tigris_error_t tigris_plan_load(
                     op_type == TIGRIS_OP_MAX_POOL ||
                     op_type == TIGRIS_OP_AVG_POOL) {
                     spatial_count++;
-                    if (spatial_count > TIGRIS_MAX_SPATIAL_OPS_PER_STAGE)
+                    note_requirement(&required.spatial_ops_per_stage,
+                                     spatial_count);
+                    if (spatial_count > TIGRIS_MAX_SPATIAL_OPS_PER_STAGE) {
+                        if (out_required)
+                            *out_required = required;
                         return TIGRIS_ERR_PLAN_LIMITS;
+                    }
                 } else if (op_type != TIGRIS_OP_RELU &&
                            op_type != TIGRIS_OP_RELU6 &&
                            op_type != TIGRIS_OP_SIGMOID &&
@@ -1819,6 +1865,9 @@ tigris_error_t tigris_plan_load(
         if (semantic_error != TIGRIS_OK)
             return semantic_error;
     }
+
+    if (out_required)
+        *out_required = required;
 
     *out_plan = candidate;
     return TIGRIS_OK;

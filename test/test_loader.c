@@ -1553,6 +1553,55 @@ static void test_split_contract(void)
 }
 
 
+
+/* A build states its limits at compile time because they size fixed storage,
+ * and a plan carries what it needs in its own tables. When the two disagree
+ * the refusal has to name the build that would run the plan, or the only way
+ * forward is guessing. */
+static void test_a_refused_plan_names_the_build_it_wants(void)
+{
+    printf("  test_a_refused_plan_names_the_build_it_wants...\n");
+    _Alignas(4) uint8_t buf[STAGED_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_plan_limits_t required;
+    tigris_plan_limits_t build;
+
+    tigris_build_limits(&build);
+    TEST_ASSERT_EQ(build.tensors, TIGRIS_MAX_TENSORS,
+                   "the build reports its own tensor limit");
+    TEST_ASSERT_EQ(build.stage_inputs, TIGRIS_MAX_STAGE_INPUTS,
+                   "the build reports its own stage input limit");
+
+    /* A plan this build can run reports what it needed anyway, so a caller
+     * sizing a target from a plan has the number without failing first. */
+    build_staged_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load_ex(buf, sizeof(buf), &plan, &required),
+                   TIGRIS_OK, "an accepted plan still reports its needs");
+    TEST_ASSERT(required.tensors > 0u && required.tensors <= build.tensors,
+                "an accepted plan needs no more than the build allows");
+
+    /* One past what this build carries: refused, and the refusal says how
+     * many the plan wanted. */
+    build_staged_plan(buf);
+    ((tigris_stage_t *)(buf + STAGED_STAGES_OFF))->inputs_count =
+        (uint16_t)(TIGRIS_MAX_STAGE_INPUTS + 1u);
+    TEST_ASSERT_EQ(tigris_plan_load_ex(buf, sizeof(buf), &plan, &required),
+                   TIGRIS_ERR_PLAN_LIMITS, "over-limit stage inputs refused");
+    TEST_ASSERT_EQ(required.stage_inputs, TIGRIS_MAX_STAGE_INPUTS + 1u,
+                   "the refusal names the stage input count wanted");
+
+    /* The old entry point keeps its behaviour, and takes no reporting. A
+     * table too large for this build is refused the same way; reaching that
+     * check needs a real table of that size, so it is covered by the plans
+     * the cross-repository gate compiles rather than by an edited fixture,
+     * which the section bounds refuse first and rightly. */
+    build_staged_plan(buf);
+    ((tigris_stage_t *)(buf + STAGED_STAGES_OFF))->outputs_count =
+        (uint16_t)(TIGRIS_MAX_STAGE_OUTPUTS + 1u);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_PLAN_LIMITS, "the plain entry point is unchanged");
+}
+
 static void build_unary_plan(uint8_t *buf)
 {
     build_transpose_plan(buf);
@@ -2635,6 +2684,7 @@ int main(int argc, char *argv[])
     test_transpose_attribute_guards();
     test_op_attribute_kinds();
     test_declared_interface_dtype_contract();
+    test_a_refused_plan_names_the_build_it_wants();
     test_split_contract();
     test_reduce_mean_contract();
     test_op_attribute_payloads();

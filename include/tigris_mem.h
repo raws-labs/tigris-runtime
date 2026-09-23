@@ -106,7 +106,7 @@ typedef struct {
   #elif defined(__riscv_vector)
     #define TIGRIS_TENSOR_ALIGN 16   /* RVV */
   #elif defined(__XTENSA__)
-    #define TIGRIS_TENSOR_ALIGN 8    /* ESP32-S3 TIE (ee.vld.l.64.ip) */
+    #define TIGRIS_TENSOR_ALIGN 16   /* ESP-NN kernels read and write 16-byte vectors */
   #elif defined(__ARM_NEON)
     #define TIGRIS_TENSOR_ALIGN 16   /* 32-bit ARM with NEON */
   #elif defined(__ARM_FEATURE_DSP)

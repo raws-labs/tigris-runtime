@@ -2006,6 +2006,44 @@ int tigris_accel_esp_pad_workspace_fits(
     return needed <= workspace_bytes;
 }
 
+int tigris_accel_row_band(
+    int32_t   in_h,
+    uint16_t  pad_top,
+    uint16_t  stride_h,
+    uint16_t  kernel_h,
+    int32_t   out_start,
+    int32_t   out_rows,
+    int32_t  *in_start,
+    int32_t  *in_rows,
+    uint16_t *band_pad_top)
+{
+    if (!in_start || !in_rows || !band_pad_top || in_h <= 0 ||
+        stride_h == 0u || kernel_h == 0u || out_start < 0 || out_rows <= 0)
+        return 0;
+
+    /* The band's first window starts `lead` padding rows above the input when
+     * lead is positive, and -lead rows into it otherwise; `end` is one past
+     * the last row its last window reads. */
+    int64_t first_row = (int64_t)out_start * (int64_t)stride_h;
+    int64_t lead = (int64_t)pad_top - first_row;
+    int64_t end = first_row + ((int64_t)out_rows - 1) * (int64_t)stride_h
+                - (int64_t)pad_top + (int64_t)kernel_h;
+    int64_t start = 0;
+    int64_t pad = 0;
+    if (lead > 0)
+        pad = lead;
+    else
+        start = -lead;
+    int64_t stop = (end < (int64_t)in_h) ? end : (int64_t)in_h;
+    if (stop <= start || pad > (int64_t)UINT16_MAX)
+        return 0;
+
+    *in_start = (int32_t)start;
+    *in_rows = (int32_t)(stop - start);
+    *band_pad_top = (uint16_t)pad;
+    return 1;
+}
+
 tigris_accel_route_t tigris_accel_pre_route(
     tigris_accel_backend_t backend,
     const tigris_plan_t   *plan,

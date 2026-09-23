@@ -1487,6 +1487,201 @@ static void test_concat(void)
         TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "concat output");
 }
 
+/* Concat on the last stored axis at rank 3, and with a constant leading part
+ * (how a learned token is prepended to a sequence). */
+static void test_concat_last_axis_variants(void)
+{
+    printf("  test_concat_last_axis_variants...\n");
+
+    /* NLC: A 1x2x1, B 1x2x2 -> Y 1x2x3; K is the constant leading part. */
+    int32_t shape_pool[12] = {1, 2, 1,  1, 2, 2,  1, 2, 3,  1, 2, 4};
+    float A[2] = {1.0f, 2.0f};
+    float B[4] = {10.0f, 11.0f, 20.0f, 21.0f};
+    float K[2] = {100.0f, 200.0f};
+    float Y[8];
+
+    tigris_tensor_t tensors[4];
+    memset(tensors, 0, sizeof(tensors));
+    const uint16_t offs[4] = {0, 3, 6, 9};
+    const uint32_t sizes[4] = {sizeof(A), sizeof(B), 6 * sizeof(float),
+                               8 * sizeof(float)};
+    for (int i = 0; i < 4; i++) {
+        tensors[i].shape_off = offs[i];
+        tensors[i].ndim = 3;
+        tensors[i].dtype = 1;
+        tensors[i].size_bytes = sizes[i];
+    }
+
+    tigris_weight_entry_t weight;
+    memset(&weight, 0, sizeof(weight));
+    weight.offset = 0;
+    weight.size_bytes = sizeof(K);
+
+    uint16_t index_pool[5] = {0, 1, 2, 1, 3};
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_CONCAT;
+    op.num_inputs = 2; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 2;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 4; header.num_ops = 1; header.num_weights = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+    plan.weight_entries = &weight;
+    plan.weight_blob = (const uint8_t *)K;
+
+    void *ptrs[4] = {A, B, Y, Y};
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 4;
+
+    const float rank3[6] = {1.0f, 10.0f, 11.0f, 2.0f, 20.0f, 21.0f};
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "rank-3 concat succeeds");
+    for (int i = 0; i < 6; i++)
+        TEST_ASSERT_NEAR(Y[i], rank3[i], EPS, "rank-3 concat output");
+
+    /* [K | B | A]: the constant takes the channels the inputs leave over. */
+    index_pool[3] = 1; index_pool[4] = 3;
+    op.inputs_off = 3; op.num_inputs = 1; op.outputs_off = 4;
+    op.weight_idx = 0;
+    tensors[3].size_bytes = 6 * sizeof(float);
+    shape_pool[11] = 3;
+    const float lead[6] = {100.0f, 10.0f, 11.0f, 200.0f, 20.0f, 21.0f};
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "constant leading part succeeds");
+    for (int i = 0; i < 6; i++)
+        TEST_ASSERT_NEAR(Y[i], lead[i], EPS, "constant leading part output");
+
+    mem.tile.active = 1;
+    mem.tile.out_h = 2;
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0,
+                "constant leading part refuses a tile");
+    mem.tile.active = 0;
+
+    shape_pool[11] = 2;  /* inputs cover every channel: nothing left over */
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0,
+                "constant with no leading extent is refused");
+
+    shape_pool[11] = 3;
+    ptrs[1] = NULL;
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0,
+                "missing concat input is refused");
+}
+
+/* Bilinear Resize, checked against ONNX Runtime (opset 13, mode linear) on an
+ * NHWC 1x2x3x2 input holding 1..12, scale 2 on both spatial axes. */
+static const float k_linear_half_pixel[48] = {
+    1, 2, 1.5f, 2.5f, 2.5f, 3.5f, 3.5f, 4.5f, 4.5f, 5.5f, 5, 6,
+    2.5f, 3.5f, 3, 4, 4, 5, 5, 6, 6, 7, 6.5f, 7.5f,
+    5.5f, 6.5f, 6, 7, 7, 8, 8, 9, 9, 10, 9.5f, 10.5f,
+    7, 8, 7.5f, 8.5f, 8.5f, 9.5f, 9.5f, 10.5f, 10.5f, 11.5f, 11, 12,
+};
+static const float k_linear_asymmetric[48] = {
+    1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 5, 6,
+    4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 8, 9,
+    7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 11, 12,
+    7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 11, 12,
+};
+
+static int run_resize_linear(uint16_t convention, const float *X, float *Y,
+                             const tigris_tile_ctx_t *tile)
+{
+    int32_t shape_pool[8] = {1, 2, 3, 2, 1, 4, 6, 2};
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    tensors[0].shape_off = 0; tensors[0].ndim = 4; tensors[0].dtype = 1;
+    tensors[0].size_bytes = 12 * sizeof(float);
+    tensors[1].shape_off = 4; tensors[1].ndim = 4; tensors[1].dtype = 1;
+    tensors[1].size_bytes = 48 * sizeof(float);
+
+    uint16_t index_pool[2] = {0, 1};
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_RESIZE_LINEAR;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.spatial.stride_h = 2; op.spatial.stride_w = 2;
+    op.spatial.kernel_h = convention;  /* 0 half-pixel, 1 asymmetric */
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape_pool;
+    plan.strings = g_strings;
+
+    void *ptrs[2] = {(void *)X, Y};
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+    if (tile)
+        mem.tile = *tile;
+    return tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+}
+
+static void test_resize_linear(void)
+{
+    printf("  test_resize_linear...\n");
+
+    float X[12];
+    float Y[48];
+    for (int i = 0; i < 12; i++)
+        X[i] = (float)(i + 1);
+
+    TEST_ASSERT(run_resize_linear(0, X, Y, NULL) == 0,
+                "half-pixel bilinear succeeds");
+    for (int i = 0; i < 48; i++)
+        TEST_ASSERT_NEAR(Y[i], k_linear_half_pixel[i], EPS,
+                         "half-pixel bilinear matches ONNX Runtime");
+
+    TEST_ASSERT(run_resize_linear(1, X, Y, NULL) == 0,
+                "asymmetric bilinear succeeds");
+    for (int i = 0; i < 48; i++)
+        TEST_ASSERT_NEAR(Y[i], k_linear_asymmetric[i], EPS,
+                         "asymmetric bilinear matches ONNX Runtime");
+
+    /* A height tile: output row 3 alone, from input row 1 alone. The origins
+     * place the band in the full image, so the result is that row of the
+     * untiled output. */
+    tigris_tile_ctx_t tile;
+    memset(&tile, 0, sizeof(tile));
+    tile.active = 1;
+    tile.in_h = 1;  tile.out_h = 1;
+    tile.in_w = 3;  tile.out_w = 6;
+    tile.out_row_origin = 3;
+    tile.in_row_origin = 1;
+    TEST_ASSERT(run_resize_linear(0, X + 6, Y, &tile) == 0,
+                "tiled bilinear succeeds");
+    for (int i = 0; i < 12; i++)
+        TEST_ASSERT_NEAR(Y[i], k_linear_half_pixel[36 + i], EPS,
+                         "tiled bilinear reproduces its rows");
+
+    TEST_ASSERT(run_resize_linear(2, X, Y, NULL) != 0,
+                "unknown coordinate convention is refused");
+}
+
 /* Resize nearest test */
 
 static void test_resize_nearest(void)
@@ -2032,6 +2227,34 @@ static void test_constant_binary_f32(void)
                 "scalar constant Add supports a rank-3 tile");
     assert_f32_array(fx.output, add_scalar_expected,
                      "tiled rank-3 scalar constant Add output");
+
+    /* One value per channel: two positions of two channels, channels
+     * innermost, so the constant repeats every two elements. */
+    const float per_channel[2] = {10.0f, -1.0f};
+    const float add_channel_expected[4] = {11.0f, 1.0f, 13.0f, 3.0f};
+    const float mul_channel_expected[4] = {10.0f, -2.0f, 30.0f, -4.0f};
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_ADD, per_channel, (uint32_t)sizeof(per_channel));
+    fx.shapes[2] = fx.shapes[6] = 1;
+    fx.shapes[3] = fx.shapes[7] = 2;
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == 0,
+                "per-channel constant Add succeeds");
+    assert_f32_array(fx.output, add_channel_expected,
+                     "per-channel constant Add output");
+
+    init_const_binary_fixture(
+        &fx, TIGRIS_OP_MUL, per_channel, (uint32_t)sizeof(per_channel));
+    fx.shapes[2] = fx.shapes[6] = 1;
+    fx.shapes[3] = fx.shapes[7] = 2;
+    fx.mem.tile.active = 1;
+    fx.mem.tile.out_h = 2;
+    fx.mem.tile.out_w = 1;
+    TEST_ASSERT(tigris_dispatch_kernel(
+                    &fx.plan, &fx.op, 0, &fx.mem, NULL) == 0,
+                "per-channel constant Mul supports a tile");
+    assert_f32_array(fx.output, mul_channel_expected,
+                     "tiled per-channel constant Mul output");
 }
 
 static void test_malformed_constant_binary_f32(void)
@@ -2524,7 +2747,9 @@ int main(void)
     test_reshape();
     test_max_pool();
     test_concat();
+    test_concat_last_axis_variants();
     test_resize_nearest();
+    test_resize_linear();
     test_sigmoid();
     test_erf();
     test_layer_norm();

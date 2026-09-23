@@ -56,6 +56,30 @@ int tigris_accel_esp_pad_workspace_fits(
     uint32_t *required_bytes);
 
 /**
+ * Input window of a band of output rows of a padded 2D window op.
+ *
+ * Output rows [out_start, out_start + out_rows) of an op whose input holds
+ * in_h rows behind pad_top leading padding rows read the input rows
+ * [*in_start, *in_start + *in_rows), preceded by *band_pad_top padding rows.
+ * Trailing padding stays implicit: window rows past in_h are padding, as in
+ * the unsplit call. Running the op on that window yields exactly those output
+ * rows of the unsplit op.
+ *
+ * @return 1 on success; 0 for invalid arguments or a band whose windows hold
+ *         no input row, which must not be run as a band.
+ */
+int tigris_accel_row_band(
+    int32_t   in_h,
+    uint16_t  pad_top,
+    uint16_t  stride_h,
+    uint16_t  kernel_h,
+    int32_t   out_start,
+    int32_t   out_rows,
+    int32_t  *in_start,
+    int32_t  *in_rows,
+    uint16_t *band_pad_top);
+
+/**
  * Execute the reference route selected by tigris_accel_pre_route().
  *
  * @param handled  Set to 1 when s8_ref ran, or 0 when the caller should invoke

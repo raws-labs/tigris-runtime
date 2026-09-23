@@ -24,7 +24,9 @@ targets:
   - esp32c3
 dependencies:
   idf: ">=5.0"
-  espressif/esp-nn: ">=1.1.0"
+  # 1.4.0 is the floor: earlier releases miscompute the mult8 1x1 convolution
+  # kernel on some channel counts, and dual-core kernel splitting arrives there.
+  espressif/esp-nn: ">=1.4.0"
 # The example to expose via `idf.py create-project-from-example
 # "raws-labs/tigris-runtime:getting-started"`. The path is explicit because the
 # example is nested under examples/esp32/ (the ESP32 examples bucket).

@@ -231,6 +231,7 @@ int main(int argc, char **argv)
     uint32_t plan_size = 0;
     void **tensor_ptrs = NULL;
     void *fast_buf = NULL;
+    tigris_exec_stats_t stats;
     void *slow_buf = NULL;
     uint32_t fast_size;
     uint32_t required_size;
@@ -345,7 +346,7 @@ int main(int argc, char **argv)
 #endif
     {
         tigris_exec_error_t error =
-            tigris_run(&plan, &mem, dispatch, NULL, NULL);
+            tigris_run(&plan, &mem, dispatch, NULL, &stats);
         if (error != TIGRIS_EXEC_OK) {
             fprintf(stderr, "inference failed: %s\n",
                     tigris_exec_error_str(error));
@@ -359,9 +360,9 @@ int main(int argc, char **argv)
     printf(
         "TIGRIS_CONTRACT_MEMORY budget=%" PRIu32 " activation_limit=%" PRIu32
         " reserve=%" PRIu32 " required=%" PRIu32 " allocated=%" PRIu32
-        " peak=%" PRIu32 "\n",
+        " peak=%" PRIu32 " slow_peak=%" PRIu32 "\n",
         plan.header->budget, activation_limit, overhead, required_size,
-        fast_size, mem.fast_peak);
+        fast_size, mem.fast_peak, stats.slow_peak);
 #ifdef TIGRIS_COUNT_KERNEL_ROWS
     printf(
         "TIGRIS_CONTRACT_ROWS kernel_rows=%lu chain_tiles=%" PRId32

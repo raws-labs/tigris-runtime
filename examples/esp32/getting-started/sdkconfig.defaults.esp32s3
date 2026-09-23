@@ -8,3 +8,8 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# ESP-NN sizes its cache-resident 1x1 filter panel from the configured data
+# cache and is written for 64 KB with 64-byte lines; the 32 KB default halves
+# the panel and slows every pointwise convolution.
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y

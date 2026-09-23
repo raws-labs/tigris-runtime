@@ -28,6 +28,7 @@
 
 #include "sdkconfig.h"   /* CONFIG_NN_OPTIMIZED, CONFIG_IDF_TARGET_ESP32S3 */
 #include <esp_nn.h>
+#include "esp_nn_multicore.h"   /* not pulled in by esp_nn.h */
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,7 @@ static int   s_sram_scratch_size = 0; /* SRAM scratch bytes */
 static int s_conv_sram = 0, s_conv_psram = 0, s_conv_fallback = 0;
 #endif
 static void *s_dw_out_buf   = NULL;   /* DW output bounce (16-align) */
+static int   s_dw_out_size  = 0;      /* DW output bounce bytes */
 static void *s_pad_buf      = NULL;   /* asymmetric padding pre-pad */
 static int   s_pad_size     = 0;
 static int32_t *s_quant_buf = NULL;   /* scalar-to-per-channel expansion */
@@ -136,6 +138,7 @@ void tigris_esp_nn_deinit(void)
     s_sram_scratch = NULL;
     s_sram_scratch_size = 0;
     s_dw_out_buf = NULL;
+    s_dw_out_size = 0;
     s_pad_buf = NULL;
     s_pad_size = 0;
     s_quant_buf = NULL;
@@ -143,6 +146,12 @@ void tigris_esp_nn_deinit(void)
 #ifdef __XTENSA__
     s_conv_sram = s_conv_psram = s_conv_fallback = 0;
 #endif
+}
+
+int tigris_esp_nn_enable_dual_core(void)
+{
+    esp_nn_dual_core_enable();
+    return esp_nn_dual_core_active() ? 1 : 0;
 }
 
 /* Max conv input rect (IH, IW) an op sees at inference. For an op in a tiled
@@ -317,14 +326,14 @@ int tigris_esp_nn_prepare(
             int OH = y_shape[1], OW = y_shape[2];
             int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
 
-            /* When tiling is active, the executor tiles along H.
-             * Cap OH at the budget-derived tile height to avoid
-             * oversizing the bounce buffer for the full tensor. */
+            /* Band height the bounce buffer is sized for. adapt_depthwise
+             * splits every call into row bands that fit the buffer and the
+             * scratch, so this is a size policy, not a bound on what the
+             * executor passes: a spilling stage still runs at full height. */
             int tile_oh = OH;
             if (plan->header->num_stages > 1 && OH > 1) {
-                /* Rough estimate: one row of output = OW * C bytes.
-                 * Budget can hold at most budget / (2 * OW * C) output rows
-                 * (factor of 2: input + output tile both in arena). */
+                /* One output row is OW * C bytes; take the rows a fast arena
+                 * of this size could hold with an input band beside it. */
                 int row_cost = OW * C * 2;
                 if (row_cost > 0) {
                     int max_h = (int)(mem->fast_size / (uint32_t)row_cost);
@@ -353,7 +362,7 @@ int tigris_esp_nn_prepare(
             max_quant_channels = MAX(max_quant_channels, C);
 
             /* DW output bounce buffer: ee.vst.128.xp needs 16-byte alignment.
-             * Size for tile height, not full tensor height. */
+             * At least one full-width row of every depthwise op. */
             max_dw_out = MAX(max_dw_out, tile_oh * OW * C);
         }
     }
@@ -381,6 +390,7 @@ int tigris_esp_nn_prepare(
     if (dw_aligned > 0) {
         s_dw_out_buf = ESP_NN_ALLOC(dw_aligned);
         if (!s_dw_out_buf) goto fail;
+        s_dw_out_size = (int)dw_aligned;
     }
     if (pad_aligned > 0) {
         s_pad_buf  = ESP_NN_ALLOC(pad_aligned);
@@ -608,6 +618,34 @@ static int adapt_conv2d(
 
 /* Depthwise Conv2D */
 
+/* 1 when every band of `band` output rows has an input window and a vendor
+ * scratch requirement within the prepared scratch. */
+static int dw_bands_fit(int IH, int IW, int C, int OH, int OW, int band,
+                        const data_dims_t *filter_dims,
+                        const dw_conv_params_t *params)
+{
+    for (int o0 = 0; o0 < OH; o0 += band) {
+        int rows = (OH - o0 < band) ? OH - o0 : band;
+        int32_t in_start, in_rows;
+        uint16_t band_pad;
+        if (!tigris_accel_row_band(IH, (uint16_t)params->padding.height,
+                                   (uint16_t)params->stride.height,
+                                   (uint16_t)filter_dims->height, o0, rows,
+                                   &in_start, &in_rows, &band_pad))
+            return 0;
+        data_dims_t id = { .width = IW, .height = in_rows,
+                           .channels = C, .extra = 1 };
+        data_dims_t od = { .width = OW, .height = rows,
+                           .channels = C, .extra = 1 };
+        dw_conv_params_t bp = *params;
+        bp.padding.height = band_pad;
+        if (esp_nn_get_depthwise_conv_scratch_size(&id, filter_dims, &od, &bp)
+                > s_scratch_size)
+            return 0;
+    }
+    return 1;
+}
+
 static int adapt_depthwise_conv2d(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -676,18 +714,42 @@ static int adapt_depthwise_conv2d(
         .activation = { .min = op->act_min, .max = op->act_max },
     };
 
-    /* Check scratch fits */
-    if (!s_scratch_buf || !s_dw_out_buf)
+    if (!s_scratch_buf || !s_dw_out_buf || OH <= 0 || OW <= 0)
         return -99;
 
-    /* DW output -> 16-byte aligned bounce buffer, copy back to arena */
-    int y_bytes = OH * OW * C;
+    /* The output goes through the 16-byte-aligned bounce buffer, and the
+     * vendor scratch requirement grows with the call's extent. Split the call
+     * into row bands that fit both, halving the band until they do; every
+     * band is checked before the first write, and if a single row does not
+     * fit, s8_ref runs the op instead. */
+    const int row_bytes = OW * C;
+    int band = s_dw_out_size / row_bytes;
+    if (band > OH)
+        band = OH;
+    while (band > 0 && !dw_bands_fit(IH, IW, C, OH, OW, band,
+                                     &filter_dims, &params))
+        band = (band > 1) ? band / 2 : 0;
+    if (band <= 0)
+        return -99;
+
     int8_t *dw_Y = (int8_t *)s_dw_out_buf;
-
-    esp_nn_depthwise_conv_s8(&input_dims, X, &filter_dims, W, B,
-                             &output_dims, dw_Y, &params, &quant);
-
-    memcpy(Y, dw_Y, (size_t)y_bytes);
+    const uint16_t pad_top = (uint16_t)params.padding.height;
+    for (int o0 = 0; o0 < OH; o0 += band) {
+        int rows = (OH - o0 < band) ? OH - o0 : band;
+        int32_t in_start, in_rows;
+        uint16_t band_pad;
+        (void)tigris_accel_row_band(IH, pad_top,
+                                    (uint16_t)params.stride.height,
+                                    (uint16_t)KH, o0, rows,
+                                    &in_start, &in_rows, &band_pad);
+        input_dims.height = in_rows;
+        output_dims.height = rows;
+        params.padding.height = band_pad;
+        esp_nn_depthwise_conv_s8(&input_dims, X + in_start * IW * C,
+                                 &filter_dims, W, B, &output_dims, dw_Y,
+                                 &params, &quant);
+        memcpy(Y + o0 * row_bytes, dw_Y, (size_t)rows * (size_t)row_bytes);
+    }
     return 0;
 }
 

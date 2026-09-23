@@ -144,9 +144,26 @@ static int is_height_spatial_op(uint8_t type)
            type == TIGRIS_OP_AVG_POOL;
 }
 
+/* An upsample is a spatial operator that runs the geometry the other way:
+ * its output has more rows than its input, so the tile loop back-computes a
+ * source range by dividing rather than multiplying. The factor is in
+ * stride_h, where the compiler writes it for Resize. */
+static int is_height_upsample_op(uint8_t type)
+{
+    return type == TIGRIS_OP_RESIZE || type == TIGRIS_OP_RESIZE_LINEAR;
+}
+
+/* Input rows a resampling operator reads per output row: one for nearest,
+ * the pair it interpolates between for bilinear. */
+static int32_t upsample_taps(uint8_t type)
+{
+    return (type == TIGRIS_OP_RESIZE_LINEAR) ? 2 : 1;
+}
+
 static int is_height_tiling_op(uint8_t type)
 {
     return is_height_spatial_op(type) ||
+           is_height_upsample_op(type) ||
            type == TIGRIS_OP_CONV_TRANSPOSE ||
            type == TIGRIS_OP_RELU ||
            type == TIGRIS_OP_RELU6 ||
@@ -432,8 +449,8 @@ static int find_spatial_op(const tigris_plan_t *plan, const tigris_stage_t *stag
     const uint16_t *sops = tigris_stage_ops(plan, stage);
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         uint8_t t = plan->ops[sops[j]].op_type;
-        if (is_height_spatial_op(t) || t == TIGRIS_OP_CONV1D ||
-            t == TIGRIS_OP_CONV_TRANSPOSE)
+        if (is_height_spatial_op(t) || is_height_upsample_op(t) ||
+            t == TIGRIS_OP_CONV1D || t == TIGRIS_OP_CONV_TRANSPOSE)
             return (int)sops[j];
     }
     return -1;
@@ -487,7 +504,8 @@ static int stage_supports_axis1_tiling(
          * ConvTranspose output. Counting it here keeps mixed stages on the
          * normal path; a pure ConvTranspose (optionally with pointwise) still
          * has spatial_count==1 and takes the HW route. */
-        if (is_height_spatial_op(type) || type == TIGRIS_OP_CONV_TRANSPOSE)
+        if (is_height_spatial_op(type) || is_height_upsample_op(type) ||
+            type == TIGRIS_OP_CONV_TRANSPOSE)
             spatial_count++;
     }
     return spatial_count <= 1;
@@ -620,6 +638,35 @@ static tigris_exec_error_t exec_stage_normal(
             last_use_op[tidx] = UINT16_MAX;
     }
 
+    /* A reshape that moves no byte hands its buffer to its output, so the two
+     * tensors are one allocation and it dies when the later of them is read
+     * for the last time. Give both that step. Walking backwards carries it
+     * through a chain of reshapes, which is what a lowered matrix product
+     * leaves on either side of itself. Without this the buffer was pinned for
+     * the rest of the stage, and a stage holding many of them ran the fast
+     * pool dry and pushed every later operator's output into slow memory. */
+    for (uint16_t j = stage->ops_count; j-- > 0; ) {
+        const tigris_op_t *op = &plan->ops[sops[j]];
+        uint16_t produced;
+        uint16_t source;
+        uint16_t group;
+        if (!is_pure_reinterpretation(plan, op))
+            continue;
+        produced = tigris_op_outputs(plan, op)[0];
+        source = tigris_op_inputs(plan, op)[0];
+        if (produced >= num_t || source >= num_t)
+            continue;
+        if (last_use_op[produced] == UINT16_MAX ||
+            last_use_op[source] == UINT16_MAX) {
+            group = UINT16_MAX;
+        } else {
+            group = last_use_op[produced] > last_use_op[source]
+                  ? last_use_op[produced] : last_use_op[source];
+        }
+        last_use_op[produced] = group;
+        last_use_op[source] = group;
+    }
+
     /* Load stage inputs */
     for (uint16_t i = 0; i < stage->inputs_count; i++) {
         uint16_t tidx = sin[i];
@@ -647,9 +694,6 @@ static tigris_exec_error_t exec_stage_normal(
             uint16_t src = tigris_op_inputs(plan, op)[0];
             if (!mem->tensor_ptrs[outs[0]] && mem->tensor_ptrs[src]) {
                 mem->tensor_ptrs[outs[0]] = mem->tensor_ptrs[src];
-                /* The buffer outlives the input tensor's own last use. */
-                if (src < num_t)
-                    last_use_op[src] = UINT16_MAX;
                 continue;
             }
         }
@@ -690,8 +734,24 @@ static tigris_exec_error_t exec_stage_normal(
         const uint16_t *ins = tigris_op_inputs(plan, op);
         for (uint8_t k = 0; k < op->num_inputs; k++) {
             uint16_t tidx = ins[k];
-            if (tidx < num_t && last_use_op[tidx] == j && mem->tensor_ptrs[tidx])
-                mem->tensor_ptrs[tidx] = NULL;
+            void *dead;
+            if (tidx >= num_t || last_use_op[tidx] != j ||
+                !mem->tensor_ptrs[tidx])
+                continue;
+            dead = mem->tensor_ptrs[tidx];
+            mem->tensor_ptrs[tidx] = NULL;
+            /* Another tensor may hold the same buffer through an in-place
+             * reshape. Its pointer would read to compaction as a live
+             * allocation, so the whole group goes at once. */
+            for (uint16_t q = 0; q < stage->ops_count; q++) {
+                const tigris_op_t *other = &plan->ops[sops[q]];
+                const uint16_t *oouts = tigris_op_outputs(plan, other);
+                for (uint8_t r = 0; r < other->num_outputs; r++) {
+                    if (oouts[r] < num_t &&
+                        mem->tensor_ptrs[oouts[r]] == dead)
+                        mem->tensor_ptrs[oouts[r]] = NULL;
+                }
+            }
         }
     }
 
@@ -764,9 +824,19 @@ static int stage_axis1_fast_bytes(
 {
     const uint16_t *stage_inputs = tigris_stage_inputs(plan, stage);
     const uint16_t *stage_ops = tigris_stage_ops(plan, stage);
-    int64_t input_extent_wide = spatial_op_idx >= 0
-        ? ((int64_t)output_extent - 1) * stride + effective_kernel
-        : output_extent;
+    /* An upsample is handed its factor as a negative stride, because its
+     * source band is the output band divided rather than multiplied. The
+     * effective kernel then counts the rows the resampler mixes. */
+    int64_t input_extent_wide;
+    if (spatial_op_idx >= 0 && stride < 0) {
+        int32_t factor = -stride;
+        input_extent_wide =
+            ((int64_t)output_extent - 1) / factor + effective_kernel;
+    } else {
+        input_extent_wide = spatial_op_idx >= 0
+            ? ((int64_t)output_extent - 1) * stride + effective_kernel
+            : output_extent;
+    }
     if (input_extent_wide <= 0 || input_extent_wide > INT32_MAX)
         return 0;
     int32_t input_extent = (int32_t)input_extent_wide;
@@ -846,6 +916,23 @@ static tigris_exec_error_t exec_stage_tiled(
     int32_t stride = sp_attrs ? sp_attrs->stride_h : 1;
     int32_t dh = (sp_attrs && sp_attrs->dilation_h) ? sp_attrs->dilation_h : 1;
     int32_t eff_kh = sp_attrs ? ((sp_attrs->kernel_h - 1) * dh + 1) : 1;
+    /* An upsample runs the geometry the other way: rows multiply instead of
+     * divide, so the tile loop takes its own branch below and the band
+     * sizing is told about it through a negative stride. */
+    int upsamples = (sp_op_idx >= 0) &&
+        is_height_upsample_op(plan->ops[sp_op_idx].op_type);
+    int32_t scale_h = 1;
+    int32_t taps = 1;
+    if (upsamples) {
+        scale_h = sp_attrs && sp_attrs->stride_h > 0 ? sp_attrs->stride_h : 1;
+        taps = upsample_taps(plan->ops[sp_op_idx].op_type);
+        if (scale_h < 1 ||
+            (int64_t)full_in_h * scale_h != (int64_t)full_out_h)
+            return TIGRIS_EXEC_ERR_TILE;
+        orig_pad_top = 0;
+        stride = -scale_h;
+        eff_kh = taps;
+    }
 
     for (uint16_t i = 0; i < stage->outputs_count; i++) {
         uint16_t tidx = sout[i];
@@ -930,7 +1017,20 @@ static tigris_exec_error_t exec_stage_tiled(
         int32_t eff_pad_top = 0;
         int32_t eff_pad_bottom = 0;
 
-        if (sp_attrs) {
+        if (upsamples) {
+            /* Every source coordinate this tile reads lies between the one
+             * its first output row takes and the one its last takes, so the
+             * range is the floor of each divided by the factor, widened by
+             * the taps the resampler mixes. Both conventions the kernels
+             * implement place the source no earlier than out / scale, so
+             * flooring that is the lower bound for either. */
+            in_start = out_start / scale_h;
+            in_end = (out_end - 1) / scale_h + taps;
+            if (in_end > full_in_h)
+                in_end = full_in_h;
+            if (in_start > in_end - 1)
+                in_start = in_end - 1;
+        } else if (sp_attrs) {
             /* First input row needed: out_start * stride - pad_top */
             in_start = out_start * stride - orig_pad_top;
             /* Last input row needed: (out_end - 1) * stride - pad_top + eff_kh - 1 */
@@ -958,6 +1058,8 @@ static tigris_exec_error_t exec_stage_tiled(
          * input tile dims, the spatial op reduces them, ops after run at the
          * output dims. */
         mem->tile.active = 1;
+        mem->tile.out_row_origin = out_start;
+        mem->tile.in_row_origin = in_start;
 
         /* d. LOAD: load tile for each stage input */
         for (uint16_t i = 0; i < stage->inputs_count; i++) {
@@ -2284,6 +2386,45 @@ static tigris_exec_error_t run_row_band(
 }
 
 /**
+ * Whether a row-banded stage may write its output over its input.
+ *
+ * A band is gathered out of the input's slow buffer into fast before any op
+ * runs and scattered back to the SAME rows afterwards, so sharing one buffer
+ * only ever overwrites rows the band already consumed. That holds while the
+ * mapping is 1:1 in both directions, which is what an identical row view plus
+ * an identical size says, and while nothing after this stage reads the input.
+ * A model input stays out of it: the buffer belongs to the caller, who may
+ * still hold the values for a second run.
+ */
+static int row_band_output_may_alias_input(
+    const tigris_plan_t  *plan,
+    const tigris_stage_t *stage,
+    const uint16_t       *last_consumer,
+    uint16_t              current_stage)
+{
+    const uint16_t *sin = tigris_stage_inputs(plan, stage);
+    const uint16_t *sout = tigris_stage_outputs(plan, stage);
+    int32_t ib, ir, ic, ob, orr, oc;
+
+    if (stage->inputs_count != 1u || stage->outputs_count != 1u)
+        return 0;
+    if (!last_consumer || last_consumer[sin[0]] != current_stage)
+        return 0;
+    if (plan->tensors[sin[0]].size_bytes != plan->tensors[sout[0]].size_bytes)
+        return 0;
+    if (!tensor_row_view(plan, &plan->tensors[sin[0]], &ib, &ir, &ic) ||
+        !tensor_row_view(plan, &plan->tensors[sout[0]], &ob, &orr, &oc))
+        return 0;
+    if (ib != ob || ir != orr || ic != oc)
+        return 0;
+    for (uint8_t i = 0; i < plan->header->num_model_inputs; i++) {
+        if (plan->model_inputs[i] == sin[0])
+            return 0;
+    }
+    return 1;
+}
+
+/**
  * Execute a rank-2 matrix pipeline a band of rows at a time.
  *
  * Rows are independent, so a band needs no halo and the mapping is 1:1 on
@@ -2298,6 +2439,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
     tigris_kernel_fn          kernel,
     void                     *user_ctx,
     executor_workspace_impl_t *workspace,
+    const uint16_t           *last_consumer,
+    uint16_t                  current_stage,
     int32_t                   rows)
 {
     const uint16_t *sops = tigris_stage_ops(plan, stage);
@@ -2306,17 +2449,27 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
     void **out_slow_bases = workspace->output_ptrs;
     void **in_slow_bases = workspace->input_ptrs;
 
-    for (uint16_t i = 0; i < stage->outputs_count; i++) {
-        if (tigris_mem_alloc_slow(mem, sout[i],
-                                  plan->tensors[sout[i]].size_bytes)
-                != TIGRIS_MEM_OK)
-            return TIGRIS_EXEC_ERR_MEM;
-        out_slow_bases[i] = mem->tensor_ptrs[sout[i]];
-    }
+    int aliased = row_band_output_may_alias_input(
+        plan, stage, last_consumer, current_stage);
+
     for (uint16_t i = 0; i < stage->inputs_count; i++) {
         in_slow_bases[i] = mem->tensor_ptrs[sin[i]];
         if (!in_slow_bases[i])
             return TIGRIS_EXEC_ERR_MEM;
+    }
+    if (aliased) {
+        /* One buffer carries both tensors, so the pool never holds the pair
+         * at once. The compiler's slow-pool estimate applies the same rule. */
+        out_slow_bases[0] = in_slow_bases[0];
+        mem->tensor_ptrs[sout[0]] = out_slow_bases[0];
+    } else {
+        for (uint16_t i = 0; i < stage->outputs_count; i++) {
+            if (tigris_mem_alloc_slow(mem, sout[i],
+                                      plan->tensors[sout[i]].size_bytes)
+                    != TIGRIS_MEM_OK)
+                return TIGRIS_EXEC_ERR_MEM;
+            out_slow_bases[i] = mem->tensor_ptrs[sout[i]];
+        }
     }
 
     /* Largest band whose stage inputs and every op output fit together. Each
@@ -2379,6 +2532,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
         mem->tensor_ptrs[sin[i]] = in_slow_bases[i];
     for (uint16_t i = 0; i < stage->outputs_count; i++)
         mem->tensor_ptrs[sout[i]] = out_slow_bases[i];
+    /* The shared buffer now belongs to the output. Dropping the input's
+     * pointer keeps the caller's dead-tensor sweep from freeing it. */
+    if (aliased)
+        mem->tensor_ptrs[sin[0]] = NULL;
     /* Intermediates lived only inside a band. */
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         uint16_t tidx = tigris_op_outputs(plan, &plan->ops[sops[j]])[0];
@@ -2459,7 +2616,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
              * before any tile geometry is composed or executed. The compiler
              * never chains an (untileable) ConvTranspose; this defends against
              * forged or malformed plans. */
-            if (t == TIGRIS_OP_CONV_TRANSPOSE)
+            if (t == TIGRIS_OP_CONV_TRANSPOSE || is_height_upsample_op(t))
                 return TIGRIS_EXEC_ERR_TILE;
             if (is_height_spatial_op(t)) {
                 const tigris_spatial_attrs_t *sp = &plan->ops[sops[j]].spatial;
@@ -3454,7 +3611,7 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
             if (may_tile_rows) {
                 tigris_exec_error_t err = exec_stage_tiled_rows(
                     run_plan, stage, mem, kernel, user_ctx, workspace,
-                    band_rows);
+                    last_consumer, s, band_rows);
                 if (err != TIGRIS_EXEC_OK) {
                     TIGRIS_PLATFORM_DBG("S%u rows ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
                         s, (int)err, (unsigned long)total_io,

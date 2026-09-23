@@ -2,9 +2,10 @@
  * Model interface conversion.
  *
  * A plan executes on one dtype, which is not always the dtype the model file
- * declares for its inputs and outputs: an ONNX graph states float32 at the
- * boundary and quantizes inside itself, and the compiler folds that
- * quantization into the boundary tensor. These calls move data across that
+ * declares for its inputs and outputs: an ONNX graph states float32 or uint8 at
+ * the boundary and quantizes inside itself, and the compiler folds that
+ * quantization into the boundary tensor, which is int8. These calls move data
+ * across that
  * boundary, so an application hands over and reads back exactly what the model
  * declares. ``tensor->iface_dtype`` names the declared dtype; zero means the
  * plan already stores what the caller supplies.

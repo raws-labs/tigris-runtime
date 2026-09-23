@@ -442,6 +442,25 @@ static int kern_sigmoid(
     return 0;
 }
 
+/* HardSwish: x * relu6(x + 3) / 6. */
+static int kern_hardswish(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
+    for (uint32_t i = 0; i < n; i++) {
+        float gate = X[i] + 3.0f;
+        if (gate < 0.0f) gate = 0.0f;
+        if (gate > 6.0f) gate = 6.0f;
+        Y[i] = X[i] * gate / 6.0f;
+    }
+    return 0;
+}
+
 static int kern_erf(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -689,6 +708,7 @@ static int kern_binary_f32(
         return -1;
 
     const float *dynamic_b = NULL;
+    uint32_t dynamic_period = 0;
     const uint8_t *constant_b = NULL;
     uint32_t constant_count = 0;
     const int commutes = (operation == BINARY_ADD || operation == BINARY_MUL);
@@ -705,9 +725,27 @@ static int kern_binary_f32(
         if (b_idx >= plan->header->num_tensors || b_idx >= mem->num_tensors)
             return -1;
         const tigris_tensor_t *b_tensor = &plan->tensors[b_idx];
-        if (!tensor_is_f32(plan, b_tensor) ||
-            !tensor_shapes_equal(plan, a_tensor, b_tensor))
+        if (!tensor_is_f32(plan, b_tensor))
             return -1;
+        if (!tensor_shapes_equal(plan, a_tensor, b_tensor)) {
+            /* One value per channel, as a squeeze-and-excitation gate hands
+             * over: every axis but the innermost is 1. It repeats every
+             * `channels` elements wherever a band starts, so under a height
+             * tile it is loaded whole and never offset by rows. */
+            const int32_t *a_shape = tigris_tensor_shape(plan, a_tensor);
+            const int32_t *b_shape = tigris_tensor_shape(plan, b_tensor);
+            uint8_t last = (uint8_t)(a_tensor->ndim - 1u);
+            if (b_tensor->ndim != a_tensor->ndim ||
+                a_tensor->ndim == 0u || b_shape[last] != a_shape[last] ||
+                a_shape[last] <= 0 ||
+                b_tensor->size_bytes != (uint32_t)a_shape[last] * sizeof(float))
+                return -1;
+            for (uint8_t d = 0; d < last; d++) {
+                if (b_shape[d] != 1)
+                    return -1;
+            }
+            dynamic_period = (uint32_t)a_shape[last];
+        }
         dynamic_b = (const float *)tigris_mem_tensor_ptr(mem, b_idx);
         if (!dynamic_b)
             return -1;
@@ -752,12 +790,12 @@ static int kern_binary_f32(
         uint32_t row_elems = tile_row_elems(plan, a_idx, mem);
         A += (size_t)mem->tile.in_row_start * row_elems;
         Y += (size_t)mem->tile.out_row_start * row_elems;
-        if (dynamic_b)
+        if (dynamic_b && dynamic_period == 0u)
             dynamic_b += (size_t)mem->tile.in_row_start * row_elems;
     }
     for (uint32_t i = 0; i < n; i++) {
         float b = dynamic_b
-            ? dynamic_b[i]
+            ? dynamic_b[dynamic_period ? i % dynamic_period : i]
             : load_weight_f32(constant_b, i % constant_count);
         float v;
         switch (operation) {
@@ -1664,6 +1702,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_MATMUL:      return kern_matmul(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ERF:         return kern_erf(plan, op, mem);
+    case TIGRIS_OP_HARDSWISH:   return kern_hardswish(plan, op, mem);
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm(plan, op, op_index, mem);
     case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean(plan, op, op_index, mem);
     case TIGRIS_OP_SPLIT:       return kern_split(plan, op, mem);

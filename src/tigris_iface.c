@@ -6,12 +6,14 @@
 
 /* ONNX TensorProto.DataType values this runtime can present at a boundary. */
 #define IFACE_DTYPE_FLOAT32 1
+#define IFACE_DTYPE_UINT8   2
 #define IFACE_DTYPE_INT8    3
 
 static uint32_t dtype_size(uint8_t dtype)
 {
     if (dtype == IFACE_DTYPE_FLOAT32) return (uint32_t)sizeof(float);
     if (dtype == IFACE_DTYPE_INT8) return (uint32_t)sizeof(int8_t);
+    if (dtype == IFACE_DTYPE_UINT8) return (uint32_t)sizeof(uint8_t);
     return 0u;
 }
 
@@ -84,10 +86,13 @@ static tigris_error_t resolve(
 
     const tigris_quant_param_t *quant = tigris_tensor_quant(plan, tensor);
     if (declared != tensor->dtype) {
-        /* The only conversion this runtime performs is between a float
-         * interface and a quantized int8 plan tensor. Anything else is
-         * refused rather than approximated. */
-        if (declared != IFACE_DTYPE_FLOAT32 ||
+        /* The conversions this runtime performs are from a float or a uint8
+         * interface to a quantized int8 plan tensor. uint8 v and int8 v - 128
+         * are the same real value because the compiler moved the zero point
+         * by the same 128, so that one is exact. Anything else is refused
+         * rather than approximated. */
+        if ((declared != IFACE_DTYPE_FLOAT32 &&
+             declared != IFACE_DTYPE_UINT8) ||
             tensor->dtype != IFACE_DTYPE_INT8 || !quant ||
             !isfinite(quant->scale) || quant->scale <= 0.0f)
             return TIGRIS_ERR_BAD_INTERFACE;
@@ -121,6 +126,14 @@ tigris_error_t tigris_input_write(
 
     if (declared_dtype(tensor) == tensor->dtype) {
         memcpy(dst, src, src_bytes);
+        return TIGRIS_OK;
+    }
+
+    if (declared_dtype(tensor) == IFACE_DTYPE_UINT8) {
+        const uint8_t *u = (const uint8_t *)src;
+        int8_t *s = (int8_t *)dst;
+        for (uint32_t i = 0u; i < elements; i++)
+            s[i] = (int8_t)((int32_t)u[i] - 128);
         return TIGRIS_OK;
     }
 
@@ -158,6 +171,13 @@ tigris_error_t tigris_output_read(
     }
 
     const int8_t *in = (const int8_t *)src;
+    if (declared_dtype(tensor) == IFACE_DTYPE_UINT8) {
+        uint8_t *u = (uint8_t *)dst;
+        for (uint32_t i = 0u; i < elements; i++)
+            u[i] = (uint8_t)((int32_t)in[i] + 128);
+        return TIGRIS_OK;
+    }
+
     float *out = (float *)dst;
     for (uint32_t i = 0u; i < elements; i++)
         out[i] = ((float)in[i] - (float)quant->zero_point) * quant->scale;

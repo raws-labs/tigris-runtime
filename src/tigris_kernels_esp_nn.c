@@ -28,6 +28,7 @@
 
 #include "sdkconfig.h"   /* CONFIG_NN_OPTIMIZED, CONFIG_IDF_TARGET_ESP32S3 */
 #include <esp_nn.h>
+#include "esp_nn_multicore.h"   /* not pulled in by esp_nn.h */
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -143,6 +144,12 @@ void tigris_esp_nn_deinit(void)
 #ifdef __XTENSA__
     s_conv_sram = s_conv_psram = s_conv_fallback = 0;
 #endif
+}
+
+int tigris_esp_nn_enable_dual_core(void)
+{
+    esp_nn_dual_core_enable();
+    return esp_nn_dual_core_active() ? 1 : 0;
 }
 
 /* Max conv input rect (IH, IW) an op sees at inference. For an op in a tiled

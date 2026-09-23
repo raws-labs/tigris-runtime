@@ -48,6 +48,13 @@ typedef struct {
      * recomputing already-rolled overlap rows. */
     int32_t  out_row_start; /* rows already written before this call */
     int32_t  in_row_start;  /* rows already consumed before this call */
+    /* Where this tile sits in the whole tensor. A kernel that resamples has
+     * to know which output rows it is producing, because the source row is a
+     * function of the global index rather than of the position in the tile.
+     * Everything that maps rows one to one ignores these, and they are zero
+     * on the untiled path, so no existing kernel changes behavior. */
+    int32_t  out_row_origin; /* global index of this tile's first output row */
+    int32_t  in_row_origin;  /* global index of this tile's first input row */
     /* 2D (HW axis) tile geometry. Consulted only when width_tiled == 1;
      * default to 0 like every other field above, so 1D-height and
      * non-tiled paths stay byte-identical. */

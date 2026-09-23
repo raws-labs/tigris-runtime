@@ -1422,17 +1422,25 @@ static TIGRIS_KERNEL_NOINLINE int kern_concat_s8(
 
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
 
-    int N  = y_shape[0];
-    int H  = y_shape[1];
-    int W  = y_shape[2];
-
-    if (mem->tile.active) {
-        H = mem->tile.out_h;
-        W = mem->tile.out_w;
-    }
-
+    /* Concat along the last stored axis; see kern_concat for the shape of it.
+     * Rank 4 is an image's channel axis, rank 3 a sequence's feature axis. */
+    uint8_t rank = plan->tensors[outs[0]].ndim;
+    int positions = y_shape[0];
     int out_c_offset = 0;
-    int total_OC = y_shape[3];
+    int total_OC = y_shape[rank - 1u];
+
+    /* A constant operand carries no scale or zero point in the plan, so an
+     * int8 concatenation cannot place one. The compiler keeps these float. */
+    if (op->weight_idx != TIGRIS_NO_WEIGHT)
+        return -1;
+
+    if (rank == 4u) {
+        int H = mem->tile.active ? mem->tile.out_h : y_shape[1];
+        int W = mem->tile.active ? mem->tile.out_w : y_shape[2];
+        positions *= H * W;
+    } else {
+        positions *= mem->tile.active ? mem->tile.out_h : y_shape[1];
+    }
 
     const tigris_quant_param_t *qp_y =
         tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
@@ -1442,7 +1450,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_concat_s8(
     for (int i = 0; i < op->num_inputs; i++) {
         const int8_t *Xi = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[i]);
         const int32_t *xi_shape = tigris_tensor_shape(plan, &plan->tensors[ins[i]]);
-        int Ci = xi_shape[3];
+        int Ci = xi_shape[rank - 1u];
 
         const tigris_quant_param_t *qp_i =
             tigris_tensor_quant(plan, &plan->tensors[ins[i]]);
@@ -1452,20 +1460,18 @@ static TIGRIS_KERNEL_NOINLINE int kern_concat_s8(
         /* Fast path: identical quant params -> memcpy */
         int same_qp = (fabsf(in_scale - out_scale) < 1e-7f && in_zp == out_zp);
 
-        for (int n = 0; n < N; n++) {
-            for (int h = 0; h < H; h++) {
-                for (int w = 0; w < W; w++) {
-                    const int8_t *src = Xi + ((n * H + h) * W + w) * Ci;
-                    int8_t *dst = Y + ((n * H + h) * W + w) * total_OC + out_c_offset;
-                    if (same_qp) {
-                        memcpy(dst, src, (size_t)Ci);
-                    } else {
-                        float M = in_scale / out_scale;
-                        for (int c = 0; c < Ci; c++) {
-                            float real = M * (float)((int32_t)src[c] - in_zp);
-                            dst[c] = clamp_s8((int32_t)roundf(real) + out_zp);
-                        }
-                    }
+        if (Xi == NULL)
+            return -1;
+        for (int q = 0; q < positions; q++) {
+            const int8_t *src = Xi + (size_t)q * Ci;
+            int8_t *dst = Y + (size_t)q * total_OC + out_c_offset;
+            if (same_qp) {
+                memcpy(dst, src, (size_t)Ci);
+            } else {
+                float M = in_scale / out_scale;
+                for (int c = 0; c < Ci; c++) {
+                    float real = M * (float)((int32_t)src[c] - in_zp);
+                    dst[c] = clamp_s8((int32_t)roundf(real) + out_zp);
                 }
             }
         }
@@ -1496,11 +1502,18 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_nearest_s8(
     int scale_h = op->spatial.stride_h ? op->spatial.stride_h : 1;
     int scale_w = op->spatial.stride_w ? op->spatial.stride_w : 1;
 
+    /* Under a tile the buffers hold a band, and which source row an output
+     * row takes is a function of its global index, not of its position in
+     * the band. See kern_resize_nearest. */
+    int out_origin = 0;
+    int in_origin = 0;
     if (mem->tile.active) {
         IH = mem->tile.in_h;
         OH = mem->tile.out_h;
         IW = mem->tile.in_w;
         OW = mem->tile.out_w;
+        out_origin = mem->tile.out_row_origin;
+        in_origin = mem->tile.in_row_origin;
     }
 
     /* Nearest-neighbor picks a value, it does not compute one, so with
@@ -1510,8 +1523,9 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_nearest_s8(
 
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
-            int ih = oh / scale_h;
+            int ih = (oh + out_origin) / scale_h - in_origin;
             if (ih >= IH) ih = IH - 1;
+            if (ih < 0) ih = 0;
             for (int ow = 0; ow < OW; ow++) {
                 int iw = ow / scale_w;
                 if (iw >= IW) iw = IW - 1;

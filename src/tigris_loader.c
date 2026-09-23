@@ -518,12 +518,23 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                         plan, input, &plan->tensors[inputs[1]]))
                     return TIGRIS_ERR_BAD_OPERATOR;
             } else {
+                /* A constant operand is one value, one value per channel, or
+                 * one per element. Channels are stored innermost, so the
+                 * per-channel form repeats on its own without any shape
+                 * metadata in the wire format. */
+                uint32_t constant_bytes;
+                uint32_t channel_bytes;
                 if (dtype != 1 || op->weight_idx == TIGRIS_NO_WEIGHT ||
-                    !plan->weight_entries ||
-                    (plan->weight_entries[op->weight_idx].size_bytes !=
-                         sizeof(float) &&
-                     plan->weight_entries[op->weight_idx].size_bytes !=
-                         input->size_bytes))
+                    !plan->weight_entries || input->ndim == 0u)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                constant_bytes =
+                    plan->weight_entries[op->weight_idx].size_bytes;
+                channel_bytes = (uint32_t)
+                    tigris_tensor_shape(plan, input)[input->ndim - 1u] *
+                    (uint32_t)sizeof(float);
+                if (constant_bytes != sizeof(float) &&
+                    constant_bytes != channel_bytes &&
+                    constant_bytes != input->size_bytes)
                     return TIGRIS_ERR_BAD_OPERATOR;
             }
             break;
@@ -568,23 +579,57 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         }
 
         case TIGRIS_OP_CONCAT: {
+            /* Concatenation runs along the last stored axis, which every
+             * tensor carries innermost: an image's channel axis at rank 4, a
+             * sequence's feature axis at rank 3. The inputs have to agree on
+             * every other axis and add up along this one. */
+            const int32_t *out_shape;
+            uint64_t along = 0;
+            uint8_t last;
+            uint32_t covered = 0;
             if (op->num_inputs == 0 || op->num_outputs != 1 ||
-                op->weight_idx != TIGRIS_NO_WEIGHT ||
-                op->bias_idx != TIGRIS_NO_WEIGHT || output->ndim != 4)
+                op->bias_idx != TIGRIS_NO_WEIGHT ||
+                output->ndim < 3u || output->ndim > 4u)
                 return TIGRIS_ERR_BAD_OPERATOR;
-            const int32_t *out_shape = tigris_tensor_shape(plan, output);
-            uint64_t channels = 0;
+            last = (uint8_t)(output->ndim - 1u);
+            /* Rank 4 has always meant the channel axis and says so by its
+             * rank alone, so a plan from before the axis was recorded still
+             * loads. Rank 3 has to name it. */
+            if (output->ndim == 3u && op->spatial.kernel_h != (int32_t)last)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            out_shape = tigris_tensor_shape(plan, output);
             for (uint8_t i = 0; i < op->num_inputs; i++) {
                 const tigris_tensor_t *part = &plan->tensors[inputs[i]];
-                if (part->ndim != 4)
+                const int32_t *shape;
+                if (part->ndim != output->ndim)
                     return TIGRIS_ERR_BAD_OPERATOR;
-                const int32_t *shape = tigris_tensor_shape(plan, part);
-                if (shape[0] != out_shape[0] || shape[1] != out_shape[1] ||
-                    shape[2] != out_shape[2])
+                shape = tigris_tensor_shape(plan, part);
+                for (uint8_t j = 0; j < last; j++) {
+                    if (shape[j] != out_shape[j])
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                }
+                along += (uint32_t)shape[last];
+                if (covered > output->size_bytes - part->size_bytes)
                     return TIGRIS_ERR_BAD_OPERATOR;
-                channels += (uint32_t)shape[3];
+                covered += part->size_bytes;
             }
-            if (channels != (uint32_t)out_shape[3])
+            /* A constant leading part is named as the operator's weight. It
+             * has no shape of its own in the plan, so its extent is the one
+             * the inputs leave over and its bytes have to be exactly the rest
+             * of the output. */
+            if (op->weight_idx != TIGRIS_NO_WEIGHT) {
+                const tigris_weight_entry_t *constant;
+                if (op->weight_idx >= hdr->num_weights)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                constant = &plan->weight_entries[op->weight_idx];
+                if (along >= (uint64_t)out_shape[last] ||
+                    covered > output->size_bytes - constant->size_bytes ||
+                    covered + constant->size_bytes != output->size_bytes)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                break;
+            }
+            if (along != (uint64_t)out_shape[last] ||
+                covered != output->size_bytes)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
         }
@@ -652,7 +697,14 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             break;
         }
 
+        case TIGRIS_OP_RESIZE_LINEAR:
         case TIGRIS_OP_RESIZE: {
+            /* Both forms upsample by an integer factor and differ only in how
+             * they read the samples. Bilinear mixes neighbours, which the
+             * int8 dispatcher has no requantizing kernel for. */
+            if (op->op_type == TIGRIS_OP_RESIZE_LINEAR &&
+                (dtype != 1 || op->spatial.kernel_h > 1))
+                return TIGRIS_ERR_BAD_OPERATOR;
             if (!op_has_plain_io(op, 1, 1) ||
                 input->ndim != 4 || output->ndim != 4 ||
                 op->spatial.stride_h == 0 || op->spatial.stride_w == 0)
@@ -1738,6 +1790,18 @@ tigris_error_t tigris_plan_load_ex(
                             type == TIGRIS_OP_DEPTHWISE ||
                             type == TIGRIS_OP_MAX_POOL ||
                             type == TIGRIS_OP_AVG_POOL) {
+                            spatial_count++;
+                        } else if (type == TIGRIS_OP_RESIZE ||
+                                   type == TIGRIS_OP_RESIZE_LINEAR) {
+                            /* A resample carries the height the other way:
+                             * the tile loop divides to find its source band
+                             * instead of multiplying. It counts as the
+                             * stage's one spatial operator, and it may not
+                             * be chained, because the chain executor
+                             * composes a single receptive field across its
+                             * members and has no fractional stride. */
+                            if (stage->chain_len != 0)
+                                return TIGRIS_ERR_BAD_OPERATOR;
                             spatial_count++;
                         } else if (type != TIGRIS_OP_RELU &&
                                    type != TIGRIS_OP_RELU6 &&

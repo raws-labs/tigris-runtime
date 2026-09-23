@@ -724,8 +724,16 @@ static int kern_binary_f32(
 
         const tigris_weight_entry_t *weight =
             &plan->weight_entries[op->weight_idx];
+        uint32_t channels = (uint32_t)
+            tigris_tensor_shape(plan, a_tensor)[a_tensor->ndim - 1u];
         if (weight->size_bytes == sizeof(float)) {
             constant_count = 1;
+        } else if (weight->size_bytes == channels * sizeof(float)) {
+            /* One value per channel, which is what an input normalization or
+             * a learned per-channel scale is. Every tensor carries its
+             * channels innermost, so the operand repeats every `channels`
+             * elements wherever a tile starts: no offset metadata needed. */
+            constant_count = channels;
         } else if (weight->size_bytes == a_tensor->size_bytes &&
                    !mem->tile.active) {
             /* A full constant has no shape/tile-offset metadata. It is safe
@@ -750,7 +758,7 @@ static int kern_binary_f32(
     for (uint32_t i = 0; i < n; i++) {
         float b = dynamic_b
             ? dynamic_b[i]
-            : load_weight_f32(constant_b, constant_count == 1 ? 0 : i);
+            : load_weight_f32(constant_b, i % constant_count);
         float v;
         switch (operation) {
         case BINARY_MUL: v = A[i] * b; break;
@@ -1224,35 +1232,142 @@ static int kern_concat(
 
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
 
-    int N  = y_shape[0];
-    int H  = y_shape[1];
-    int W  = y_shape[2];
+    /* Concat along the last stored axis: every tensor carries it innermost,
+     * so each input contributes one run per position and the positions are
+     * the product of the axes ahead of it. Rank 4 is an image's channel axis
+     * and rank 3 a sequence's feature axis; the arithmetic is the same. */
+    uint8_t rank = plan->tensors[outs[0]].ndim;
+    int positions = y_shape[0];
+    int total_OC = y_shape[rank - 1u];
+    int out_c_offset = 0;
 
-    if (mem->tile.active) {
-        H = mem->tile.out_h;
-        W = mem->tile.out_w;
+    if (rank == 4u) {
+        int H = mem->tile.active ? mem->tile.out_h : y_shape[1];
+        int W = mem->tile.active ? mem->tile.out_w : y_shape[2];
+        positions *= H * W;
+    } else {
+        positions *= mem->tile.active ? mem->tile.out_h : y_shape[1];
     }
 
-    /* Channel-axis concat (axis=3 in NHWC).
-     * For each spatial position, memcpy each input's channel slice. */
-    int out_c_offset = 0;
-    int total_OC = y_shape[3];
+    /* A constant leading part, which is how a learned token is prepended to a
+     * sequence. The plan names it as the operator's weight and the loader has
+     * already checked that its bytes are the ones the inputs leave over, so
+     * its extent is whatever they do not cover. */
+    if (op->weight_idx != TIGRIS_NO_WEIGHT) {
+        const float *K = (const float *)tigris_op_weight(plan, op);
+        int leading = total_OC;
+        if (K == NULL || mem->tile.active)
+            return -1;
+        for (int i = 0; i < op->num_inputs; i++) {
+            const tigris_tensor_t *part = &plan->tensors[ins[i]];
+            leading -= tigris_tensor_shape(plan, part)[rank - 1u];
+        }
+        if (leading <= 0)
+            return -1;
+        for (int q = 0; q < positions; q++) {
+            memcpy(Y + (size_t)q * total_OC, K + (size_t)q * leading,
+                   (size_t)leading * sizeof(float));
+        }
+        out_c_offset = leading;
+    }
 
     for (int i = 0; i < op->num_inputs; i++) {
         const float *Xi = (const float *)tigris_mem_tensor_ptr(mem, ins[i]);
         const int32_t *xi_shape = tigris_tensor_shape(plan, &plan->tensors[ins[i]]);
-        int Ci = xi_shape[3];
+        int Ci = xi_shape[rank - 1u];
 
-        for (int n = 0; n < N; n++) {
-            for (int h = 0; h < H; h++) {
-                for (int w = 0; w < W; w++) {
-                    const float *src = Xi + ((n * H + h) * W + w) * Ci;
-                    float *dst = Y + ((n * H + h) * W + w) * total_OC + out_c_offset;
-                    memcpy(dst, src, (size_t)Ci * sizeof(float));
+        if (Xi == NULL)
+            return -1;
+        for (int q = 0; q < positions; q++) {
+            memcpy(Y + (size_t)q * total_OC + out_c_offset,
+                   Xi + (size_t)q * Ci, (size_t)Ci * sizeof(float));
+        }
+        out_c_offset += Ci;
+    }
+    return 0;
+}
+
+/**
+ * Bilinear upsample by an integer factor, half-pixel coordinates.
+ *
+ * ONNX Resize with mode "linear" mixes the two rows and two columns around
+ * the source coordinate. Which coordinate that is depends on the convention
+ * the graph was written in, and kernel_h says which: half-pixel places an
+ * output sample at (o + 0.5) / scale - 0.5, and asymmetric, which is what
+ * every opset before 11 meant, places it at o / scale. Coordinates outside
+ * the input are clamped at the border either way.
+ */
+static int kern_resize_linear(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins  = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+
+    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+
+    int N  = x_shape[0];
+    int IH = x_shape[1];
+    int IW = x_shape[2];
+    int C  = x_shape[3];
+    int OH = y_shape[1];
+    int OW = y_shape[2];
+    float scale_h = (float)(op->spatial.stride_h ? op->spatial.stride_h : 1);
+    float scale_w = (float)(op->spatial.stride_w ? op->spatial.stride_w : 1);
+    float shift = (op->spatial.kernel_h == 1) ? 0.0f : 0.5f;
+    int out_origin = 0;
+    int in_origin = 0;
+
+    if (X == NULL || Y == NULL || op->spatial.kernel_h > 1)
+        return -1;
+    if (mem->tile.active) {
+        IH = mem->tile.in_h;
+        OH = mem->tile.out_h;
+        IW = mem->tile.in_w;
+        OW = mem->tile.out_w;
+        out_origin = mem->tile.out_row_origin;
+        in_origin = mem->tile.in_row_origin;
+    }
+
+    for (int n = 0; n < N; n++) {
+        for (int oh = 0; oh < OH; oh++) {
+            float fy = ((float)(oh + out_origin) + shift) / scale_h - shift;
+            int y0, y1;
+            float wy;
+            if (fy < 0.0f) fy = 0.0f;
+            y0 = (int)fy - in_origin;
+            if (y0 < 0) y0 = 0;
+            if (y0 > IH - 1) y0 = IH - 1;
+            y1 = (y0 + 1 < IH) ? y0 + 1 : IH - 1;
+            wy = fy - (float)(y0 + in_origin);
+            for (int ow = 0; ow < OW; ow++) {
+                float fx = ((float)ow + shift) / scale_w - shift;
+                int x0, x1;
+                float wx;
+                const float *r0;
+                const float *r1;
+                float *dst;
+                if (fx < 0.0f) fx = 0.0f;
+                x0 = (int)fx;
+                if (x0 > IW - 1) x0 = IW - 1;
+                x1 = (x0 + 1 < IW) ? x0 + 1 : IW - 1;
+                wx = fx - (float)x0;
+                r0 = X + ((size_t)(n * IH + y0) * (size_t)IW) * (size_t)C;
+                r1 = X + ((size_t)(n * IH + y1) * (size_t)IW) * (size_t)C;
+                dst = Y + ((size_t)(n * OH + oh) * (size_t)OW + (size_t)ow) *
+                      (size_t)C;
+                for (int c = 0; c < C; c++) {
+                    float top = r0[(size_t)x0 * C + c] * (1.0f - wx) +
+                                r0[(size_t)x1 * C + c] * wx;
+                    float bot = r1[(size_t)x0 * C + c] * (1.0f - wx) +
+                                r1[(size_t)x1 * C + c] * wx;
+                    dst[c] = top * (1.0f - wy) + bot * wy;
                 }
             }
         }
-        out_c_offset += Ci;
     }
     return 0;
 }
@@ -1280,17 +1395,25 @@ static int kern_resize_nearest(
     int scale_h = op->spatial.stride_h ? op->spatial.stride_h : 1;
     int scale_w = op->spatial.stride_w ? op->spatial.stride_w : 1;
 
+    /* Under a tile the buffers hold a band, and which source row an output
+     * row takes is a function of its global index, not of its position in
+     * the band. The executor publishes where the band starts. */
+    int out_origin = 0;
+    int in_origin = 0;
     if (mem->tile.active) {
         IH = mem->tile.in_h;
         OH = mem->tile.out_h;
         IW = mem->tile.in_w;
         OW = mem->tile.out_w;
+        out_origin = mem->tile.out_row_origin;
+        in_origin = mem->tile.in_row_origin;
     }
 
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
-            int ih = oh / scale_h;
+            int ih = (oh + out_origin) / scale_h - in_origin;
             if (ih >= IH) ih = IH - 1;
+            if (ih < 0) ih = 0;
             for (int ow = 0; ow < OW; ow++) {
                 int iw = ow / scale_w;
                 if (iw >= IW) iw = IW - 1;
@@ -1534,6 +1657,8 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_AVG_POOL:    return kern_avg_pool(plan, op, mem);
     case TIGRIS_OP_CONCAT:      return kern_concat(plan, op, mem);
     case TIGRIS_OP_RESIZE:      return kern_resize_nearest(plan, op, mem);
+    case TIGRIS_OP_RESIZE_LINEAR:
+                                return kern_resize_linear(plan, op, mem);
     case TIGRIS_OP_SUB:         return kern_sub(plan, op, mem);
     case TIGRIS_OP_GLOBAL_MAX: return kern_global_max_pool(plan, op, mem);
     case TIGRIS_OP_MATMUL:      return kern_matmul(plan, op, mem);

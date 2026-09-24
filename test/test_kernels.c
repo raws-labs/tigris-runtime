@@ -1487,6 +1487,106 @@ static void test_concat(void)
         TEST_ASSERT_NEAR(out_buf[i], expected[i], EPS, "concat output");
 }
 
+/* HardSwish at -4, -1, 0, 2, 4: 0, -1/3, 0, 5/3, 4. */
+static void test_hardswish(void)
+{
+    printf("  test_hardswish...\n");
+    int32_t shape_pool[4] = {1, 5, 1, 1};
+    float X[5] = {-4.0f, -1.0f, 0.0f, 2.0f, 4.0f};
+    float Y[5];
+    const float expected[5] = {0.0f, -1.0f / 3.0f, 0.0f, 5.0f / 3.0f, 4.0f};
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    for (int i = 0; i < 2; i++) {
+        tensors[i].shape_off = 0; tensors[i].ndim = 2; tensors[i].dtype = 1;
+        tensors[i].size_bytes = sizeof(X);
+    }
+    uint16_t index_pool[2] = {0, 1};
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_HARDSWISH;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT; op.bias_idx = TIGRIS_NO_WEIGHT;
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header; plan.tensors = tensors; plan.ops = &op;
+    plan.index_pool = index_pool; plan.shape_pool = shape_pool; plan.strings = g_strings;
+    void *ptrs[2] = {X, Y};
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs; mem.num_tensors = 2;
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0, "hardswish runs");
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT_NEAR(Y[i], expected[i], EPS, "hardswish value");
+}
+
+/* A squeeze-and-excitation gate: one value per channel of the map it scales,
+ * repeating every C elements, whole under a height band. */
+static void test_per_channel_mul(void)
+{
+    printf("  test_per_channel_mul...\n");
+    /* NHWC map 1x2x2x2 and gate 1x1x1x2. */
+    int32_t shape_pool[12] = {1, 2, 2, 2,  1, 1, 1, 2,  1, 2, 2, 2};
+    float A[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    float B[2] = {10, -1};
+    float Y[8];
+    const float expected[8] = {10, -2, 30, -4, 50, -6, 70, -8};
+    tigris_tensor_t tensors[3];
+    memset(tensors, 0, sizeof(tensors));
+    const uint16_t offs[3] = {0, 4, 8};
+    const uint32_t sizes[3] = {sizeof(A), sizeof(B), sizeof(Y)};
+    for (int i = 0; i < 3; i++) {
+        tensors[i].shape_off = offs[i]; tensors[i].ndim = 4; tensors[i].dtype = 1;
+        tensors[i].size_bytes = sizes[i];
+    }
+    uint16_t index_pool[3] = {0, 1, 2};
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_MUL;
+    op.num_inputs = 2; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 2;
+    op.weight_idx = TIGRIS_NO_WEIGHT; op.bias_idx = TIGRIS_NO_WEIGHT;
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 3; header.num_ops = 1;
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header; plan.tensors = tensors; plan.ops = &op;
+    plan.index_pool = index_pool; plan.shape_pool = shape_pool; plan.strings = g_strings;
+    void *ptrs[3] = {A, B, Y};
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs; mem.num_tensors = 3;
+
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0, "per-channel Mul runs");
+    for (int i = 0; i < 8; i++)
+        TEST_ASSERT_NEAR(Y[i], expected[i], EPS, "per-channel Mul value");
+
+    /* The second row alone under a height band: the map is offset by the band's
+     * row, the gate is not. */
+    memset(Y, 0, sizeof(Y));
+    ptrs[0] = A + 4;
+    ptrs[2] = Y;
+    mem.tile.active = 1;
+    mem.tile.in_h = 1; mem.tile.out_h = 1;
+    mem.tile.in_w = 2; mem.tile.out_w = 2;
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "per-channel Mul runs in a band");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(Y[i], expected[4 + i], EPS, "per-channel Mul band value");
+    mem.tile.active = 0;
+    ptrs[0] = A;
+
+    /* A row-wise operand is neither full-shape nor per-channel. */
+    shape_pool[5] = 2; shape_pool[6] = 1; shape_pool[7] = 1;
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0,
+                "a row-wise operand is refused");
+}
+
 /* Concat on the last stored axis at rank 3, and with a constant leading part
  * (how a learned token is prepended to a sequence). */
 static void test_concat_last_axis_variants(void)
@@ -2748,6 +2848,8 @@ int main(void)
     test_max_pool();
     test_concat();
     test_concat_last_axis_variants();
+    test_hardswish();
+    test_per_channel_mul();
     test_resize_nearest();
     test_resize_linear();
     test_sigmoid();

@@ -348,8 +348,12 @@ int main(int argc, char **argv)
         tigris_exec_error_t error =
             tigris_run(&plan, &mem, dispatch, NULL, &stats);
         if (error != TIGRIS_EXEC_OK) {
-            fprintf(stderr, "inference failed: %s\n",
-                    tigris_exec_error_str(error));
+            fprintf(stderr, "inference failed: %s after %u stages "
+                    "(fast peak %u of %u)\n",
+                    tigris_exec_error_str(error),
+                    (unsigned)(stats.stages_normal + stats.stages_tiled +
+                               stats.stages_chain),
+                    (unsigned)mem.fast_peak, (unsigned)mem.fast_size);
             goto cleanup;
         }
     }

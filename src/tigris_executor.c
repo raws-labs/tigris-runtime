@@ -171,6 +171,7 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_TANH ||
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_LAYER_NORM ||
            type == TIGRIS_OP_ADD ||
            type == TIGRIS_OP_SUB ||
@@ -190,6 +191,7 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_TANH ||
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_LAYER_NORM;
 }
 
@@ -905,8 +907,20 @@ static tigris_exec_error_t exec_stage_tiled(
         plan->ops[sp_op_idx].op_type == TIGRIS_OP_CONV_TRANSPOSE)
         return TIGRIS_EXEC_ERR_TILE;
 
-    uint8_t rank = plan->tensors[sin[0]].ndim;
-    const int32_t *in_shape = tigris_tensor_shape(plan, &plan->tensors[sin[0]]);
+    /* The band runs over the first input that has rows to band. A rank-4
+     * input one row high is a per-channel operand broadcast over every band
+     * (see the LOAD step), so it does not set the extent while another does. */
+    uint16_t band_input = sin[0];
+    for (uint16_t i = 0; i < stage->inputs_count; i++) {
+        const tigris_tensor_t *candidate = &plan->tensors[sin[i]];
+        if (candidate->ndim != 4u ||
+            tigris_tensor_shape(plan, candidate)[1] != 1) {
+            band_input = sin[i];
+            break;
+        }
+    }
+    uint8_t rank = plan->tensors[band_input].ndim;
+    const int32_t *in_shape = tigris_tensor_shape(plan, &plan->tensors[band_input]);
     int32_t full_in_h = in_shape[1];
     int32_t full_in_w = rank == 4 ? in_shape[2] : 1;
     const int32_t *out_shape = tigris_tensor_shape(plan, &plan->tensors[sout[0]]);
@@ -923,15 +937,21 @@ static tigris_exec_error_t exec_stage_tiled(
         is_height_upsample_op(plan->ops[sp_op_idx].op_type);
     int32_t scale_h = 1;
     int32_t taps = 1;
+    /* Half-pixel bilinear places output row o at (o + 0.5) / s - 0.5, which
+     * is a row ahead of o / s whenever that is whole, so its band reaches one
+     * row further up than the other resamplers' and is sized for it. */
+    int half_pixel = 0;
     if (upsamples) {
         scale_h = sp_attrs && sp_attrs->stride_h > 0 ? sp_attrs->stride_h : 1;
         taps = upsample_taps(plan->ops[sp_op_idx].op_type);
+        half_pixel = plan->ops[sp_op_idx].op_type == TIGRIS_OP_RESIZE_LINEAR &&
+                     sp_attrs && sp_attrs->kernel_h == 0;
         if (scale_h < 1 ||
             (int64_t)full_in_h * scale_h != (int64_t)full_out_h)
             return TIGRIS_EXEC_ERR_TILE;
         orig_pad_top = 0;
         stride = -scale_h;
-        eff_kh = taps;
+        eff_kh = taps + half_pixel;
     }
 
     for (uint16_t i = 0; i < stage->outputs_count; i++) {
@@ -1020,11 +1040,19 @@ static tigris_exec_error_t exec_stage_tiled(
         if (upsamples) {
             /* Every source coordinate this tile reads lies between the one
              * its first output row takes and the one its last takes, so the
-             * range is the floor of each divided by the factor, widened by
-             * the taps the resampler mixes. Both conventions the kernels
-             * implement place the source no earlier than out / scale, so
-             * flooring that is the lower bound for either. */
-            in_start = out_start / scale_h;
+             * range is the floor of each, widened by the taps the resampler
+             * mixes. Nearest and asymmetric bilinear read from out / scale;
+             * half-pixel reads from (2 * out + 1 - scale) / (2 * scale),
+             * clamped at the first row, which is one row earlier whenever
+             * out / scale is whole. The end uses out / scale, which is never
+             * below either. */
+            if (half_pixel) {
+                int64_t lead = 2 * (int64_t)out_start + 1 - scale_h;
+                in_start = lead <= 0 ? 0
+                                     : (int32_t)(lead / (2 * (int64_t)scale_h));
+            } else {
+                in_start = out_start / scale_h;
+            }
             in_end = (out_end - 1) / scale_h + taps;
             if (in_end > full_in_h)
                 in_end = full_in_h;
@@ -1061,12 +1089,18 @@ static tigris_exec_error_t exec_stage_tiled(
         mem->tile.out_row_origin = out_start;
         mem->tile.in_row_origin = in_start;
 
-        /* d. LOAD: load tile for each stage input */
+        /* d. LOAD: load tile for each stage input. A rank-4 input one row
+         * high is a per-channel operand broadcast over every row, so each band
+         * takes it whole; the loader admits one only in this executor. */
         for (uint16_t i = 0; i < stage->inputs_count; i++) {
             uint16_t tidx = sin[i];
+            const tigris_tensor_t *in_tensor = &plan->tensors[tidx];
+            int broadcast = in_tensor->ndim == 4u && full_in_h > 1 &&
+                            tigris_tensor_shape(plan, in_tensor)[1] == 1;
             mem->tensor_ptrs[tidx] = in_slow_bases[i]; /* restore before load */
             tigris_mem_error_t merr = tigris_mem_load_tile(
-                mem, plan, tidx, in_start, in_end);
+                mem, plan, tidx, broadcast ? 0 : in_start,
+                broadcast ? 1 : in_end);
             if (merr != TIGRIS_MEM_OK)
                 return TIGRIS_EXEC_ERR_MEM;
         }
@@ -2168,6 +2202,7 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_SIGMOID ||
            type == TIGRIS_OP_TANH ||
            type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_LAYER_NORM ||
            type == TIGRIS_OP_RESHAPE ||

@@ -1878,6 +1878,168 @@ static void run_height_tiling_contract_case(
     }
 }
 
+/* One height-tiled stage run through the executor with the float kernels,
+ * once with room for a single band and once with room for a few rows. */
+typedef struct {
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[3];
+    tigris_op_t op;
+    tigris_stage_t stage;
+    tigris_tile_plan_t tile_plan;
+    uint16_t indices[12];
+    int32_t shapes[12];
+    tigris_plan_t plan;
+} band_fixture_t;
+
+static tigris_exec_error_t run_band_fixture(
+    band_fixture_t *fx, const float *const *inputs, float *output,
+    uint32_t fast_size, tigris_exec_stats_t *stats)
+{
+    void *ptrs[3];
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t fast[4096];
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[8192];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 2, 1, 0, 0)];
+    tigris_mem_t mem;
+    uint16_t n_in = fx->stage.inputs_count;
+    uint16_t out_idx = fx->indices[fx->stage.outputs_off];
+
+    memset(stats, 0, sizeof(*stats));
+    if (tigris_mem_init(&mem, ptrs, fx->header.num_tensors, fast, fast_size,
+                        slow, sizeof(slow)) != TIGRIS_MEM_OK)
+        return TIGRIS_EXEC_ERR_MEM;
+    for (uint16_t i = 0; i < n_in; i++) {
+        uint16_t t = fx->indices[fx->stage.inputs_off + i];
+        if (tigris_mem_alloc_slow(&mem, t, fx->tensors[t].size_bytes) != TIGRIS_MEM_OK)
+            return TIGRIS_EXEC_ERR_MEM;
+        memcpy(mem.tensor_ptrs[t], inputs[i], fx->tensors[t].size_bytes);
+    }
+    tigris_exec_error_t err = tigris_run_with_workspace_buffer(
+        &fx->plan, &mem, tigris_dispatch_kernel, NULL, stats,
+        workspace, sizeof(workspace));
+    if (err == TIGRIS_EXEC_OK)
+        memcpy(output, mem.tensor_ptrs[out_idx], fx->tensors[out_idx].size_bytes);
+    return err;
+}
+
+static void wire_band_fixture(band_fixture_t *fx, uint16_t n_inputs)
+{
+    fx->header.version = TIGRIS_SCHEMA_VERSION;
+    fx->header.num_ops = 1;
+    fx->header.num_stages = 1;
+    fx->header.num_tile_plans = 1;
+    fx->header.num_model_inputs = (uint8_t)n_inputs;
+    fx->header.num_model_outputs = 1;
+    fx->stage.ops_count = 1;
+    fx->stage.outputs_count = 1;
+    fx->stage.tile_plan_idx = 0;
+    fx->stage.chain_id = TIGRIS_NO_CHAIN;
+    fx->tile_plan.tileable = 1;
+    fx->tile_plan.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    fx->tile_plan.tile_height = 1;
+    fx->plan.header = &fx->header;
+    fx->plan.tensors = fx->tensors;
+    fx->plan.ops = &fx->op;
+    fx->plan.stages = &fx->stage;
+    fx->plan.tile_plans = &fx->tile_plan;
+    fx->plan.index_pool = fx->indices;
+    fx->plan.shape_pool = fx->shapes;
+}
+
+static void test_exec_half_pixel_bilinear_bands_match_one_band(void)
+{
+    /* Half-pixel output row o reads from (o + 0.5) / 2 - 0.5, a row ahead of
+     * o / 2 whenever that is whole: every band after the first must reach it. */
+    printf("  test_exec_half_pixel_bilinear_bands_match_one_band...\n");
+    band_fixture_t fx;
+    memset(&fx, 0, sizeof(fx));
+    const uint16_t idx[] = {0, 1, 0, 0, 1, 0, 1};  /* op in, op out, stage op, stage in, stage out, model in, model out */
+    memcpy(fx.indices, idx, sizeof(idx));
+    const int32_t shp[] = {1, 4, 4, 2, 1, 8, 8, 2};
+    memcpy(fx.shapes, shp, sizeof(shp));
+    fx.header.num_tensors = 2;
+    fx.tensors[0].shape_off = 0; fx.tensors[0].ndim = 4; fx.tensors[0].dtype = 1;
+    fx.tensors[0].size_bytes = 4 * 4 * 2 * sizeof(float);
+    fx.tensors[1].shape_off = 4; fx.tensors[1].ndim = 4; fx.tensors[1].dtype = 1;
+    fx.tensors[1].size_bytes = 8 * 8 * 2 * sizeof(float);
+    fx.op.op_type = TIGRIS_OP_RESIZE_LINEAR;
+    fx.op.num_inputs = 1; fx.op.num_outputs = 1;
+    fx.op.inputs_off = 0; fx.op.outputs_off = 1;
+    fx.op.spatial.stride_h = 2; fx.op.spatial.stride_w = 2;
+    fx.op.spatial.kernel_h = 0;  /* half-pixel */
+    fx.op.weight_idx = TIGRIS_NO_WEIGHT; fx.op.bias_idx = TIGRIS_NO_WEIGHT;
+    fx.stage.ops_off = 2; fx.stage.inputs_off = 3; fx.stage.inputs_count = 1;
+    fx.stage.outputs_off = 4;
+    fx.tile_plan.num_tiles = 4; fx.tile_plan.original_height = 4;
+    wire_band_fixture(&fx, 1);
+    fx.plan.model_inputs = &fx.indices[5];
+    fx.plan.model_outputs = &fx.indices[6];
+
+    float input[32];
+    for (int i = 0; i < 32; i++)
+        input[i] = (float)((i * 7) % 13) - 6.0f;
+    const float *inputs[1] = {input};
+    float whole[128], banded[128];
+    tigris_exec_stats_t stats;
+
+    TEST_ASSERT_EQ(run_band_fixture(&fx, inputs, whole, 4096, &stats),
+                   TIGRIS_EXEC_OK, "one band runs");
+    TEST_ASSERT_EQ(run_band_fixture(&fx, inputs, banded, 320, &stats),
+                   TIGRIS_EXEC_OK, "a few rows at a time runs");
+    TEST_ASSERT_EQ(stats.stages_tiled, 1, "the stage ran as a height band");
+    TEST_ASSERT(memcmp(whole, banded, sizeof(whole)) == 0,
+                "bands reproduce the one-band result exactly");
+}
+
+static void test_exec_per_channel_gate_bands_over_the_map(void)
+{
+    /* The gate is the stage's first input and one row high. The band runs over
+     * the map, and every band takes the gate whole. */
+    printf("  test_exec_per_channel_gate_bands_over_the_map...\n");
+    band_fixture_t fx;
+    memset(&fx, 0, sizeof(fx));
+    /* op inputs (map, gate), op out, stage op, stage inputs (gate, map), stage out, model ins, model out */
+    const uint16_t idx[] = {1, 0, 2, 0, 0, 1, 2, 0, 1, 2};
+    memcpy(fx.indices, idx, sizeof(idx));
+    const int32_t shp[] = {1, 1, 1, 3,  1, 6, 4, 3,  1, 6, 4, 3};
+    memcpy(fx.shapes, shp, sizeof(shp));
+    fx.header.num_tensors = 3;
+    const uint16_t offs[3] = {0, 4, 8};
+    const uint32_t sizes[3] = {3 * sizeof(float), 72 * sizeof(float), 72 * sizeof(float)};
+    for (int i = 0; i < 3; i++) {
+        fx.tensors[i].shape_off = offs[i]; fx.tensors[i].ndim = 4;
+        fx.tensors[i].dtype = 1; fx.tensors[i].size_bytes = sizes[i];
+    }
+    fx.op.op_type = TIGRIS_OP_MUL;
+    fx.op.num_inputs = 2; fx.op.num_outputs = 1;
+    fx.op.inputs_off = 0; fx.op.outputs_off = 2;
+    fx.op.weight_idx = TIGRIS_NO_WEIGHT; fx.op.bias_idx = TIGRIS_NO_WEIGHT;
+    fx.stage.ops_off = 3; fx.stage.inputs_off = 4; fx.stage.inputs_count = 2;
+    fx.stage.outputs_off = 6;
+    fx.tile_plan.num_tiles = 6; fx.tile_plan.original_height = 6;
+    wire_band_fixture(&fx, 2);
+    fx.plan.model_inputs = &fx.indices[7];
+    fx.plan.model_outputs = &fx.indices[9];
+
+    float gate[3] = {2.0f, -1.0f, 0.5f};
+    float map[72];
+    float expected[72];
+    for (int i = 0; i < 72; i++) {
+        map[i] = (float)(i % 11) - 5.0f;
+        expected[i] = map[i] * gate[i % 3];
+    }
+    const float *inputs[2] = {gate, map};
+    float out[72];
+    tigris_exec_stats_t stats;
+
+    TEST_ASSERT_EQ(run_band_fixture(&fx, inputs, out, 256, &stats),
+                   TIGRIS_EXEC_OK, "the gated stage runs in bands");
+    TEST_ASSERT_EQ(stats.stages_tiled, 1, "the stage ran as a height band");
+    int same = 1;
+    for (int i = 0; i < 72; i++)
+        same &= out[i] == expected[i];
+    TEST_ASSERT(same, "every band scales the map by the whole gate");
+}
+
 static void test_exec_height_tiling_contract(void)
 {
     printf("  test_exec_height_tiling_contract...\n");
@@ -2681,6 +2843,8 @@ int main(int argc, char *argv[])
     test_exec_chain_tiled_line_buffered_rolls_pointwise();
     test_exec_chain_tiled_line_buffered_rolls_pointwise_s8();
     test_exec_height_tiling_contract();
+    test_exec_half_pixel_bilinear_bands_match_one_band();
+    test_exec_per_channel_gate_bands_over_the_map();
     test_exec_convtranspose_2d_routing();
     test_exec_mixed_conv_convtranspose_not_tiled();
     test_exec_chained_convtranspose_fails_closed();

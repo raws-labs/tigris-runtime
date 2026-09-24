@@ -1464,6 +1464,177 @@ static void test_tanh_s8(void)
     TEST_ASSERT_EQ(out[2], -122, "tanh(-2.0) = -122");
 }
 
+/* HardSwish: x * relu6(x + 3) / 6 through the LUT. Real inputs -4, -1, 0, 2, 4
+ * at scale 0.1 give 0, -1/3, 0, 5/3, 4; at output scale 0.05 that is 0, -7,
+ * 0, 33, 80 (half away from zero). */
+static void test_hardswish_s8(void)
+{
+    printf("  test_hardswish_s8...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t in_qp = add_quant_param(0.1f, 0, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(0.05f, 0, 1, NULL, NULL);
+    int32_t shape[] = {1, 5};
+    uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, 5, in_qp);
+    uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, 5, out_qp);
+    test_ops[0].op_type = TIGRIS_OP_HARDSWISH;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in}; uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[1024], slow[1024];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    int8_t input_data[] = {-40, -10, 0, 20, 40};
+    tigris_mem_alloc_fast(&mem, t_in, 5);
+    memcpy(ptrs[t_in], input_data, 5);
+    tigris_mem_alloc_fast(&mem, t_out, 5);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "hardswish_s8 returns 0");
+    const int8_t expected[] = {0, -7, 0, 33, 80};
+    int8_t *out = (int8_t *)ptrs[t_out];
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT_EQ(out[i], expected[i], "hardswish_s8 value");
+}
+
+/* A per-channel second operand repeats every C elements of the first. */
+static void run_per_channel_binary_s8(uint8_t op_type, const int8_t *expected,
+                                      const char *what)
+{
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    int32_t full[] = {1, 1, 2, 3};
+    int32_t gate[] = {1, 1, 1, 3};
+    uint16_t t_a = add_tensor(&plan, "a", full, 4, 3, 6, qp);
+    uint16_t t_b = add_tensor(&plan, "b", gate, 4, 3, 3, qp);
+    uint16_t t_y = add_tensor(&plan, "y", full, 4, 3, 6, qp);
+    test_ops[0].op_type = op_type;
+    test_ops[0].num_inputs = 2;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_a, t_b}; uint16_t outp[] = {t_y};
+    test_ops[0].inputs_off = add_indices(inp, 2);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].act_min = -128;
+    test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[1024], slow[1024];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    const int8_t a[] = {1, 2, 3, 4, 5, 6};
+    const int8_t b[] = {2, -1, 3};
+    tigris_mem_alloc_fast(&mem, t_a, 6); memcpy(ptrs[t_a], a, 6);
+    tigris_mem_alloc_fast(&mem, t_b, 3); memcpy(ptrs[t_b], b, 3);
+    tigris_mem_alloc_fast(&mem, t_y, 6);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0, what);
+    int8_t *y = (int8_t *)ptrs[t_y];
+    for (int i = 0; i < 6; i++)
+        TEST_ASSERT_EQ(y[i], expected[i], what);
+
+    /* A second operand that is neither full-shape nor per-channel. */
+    test_shapes[test_tensors[t_b].shape_off + 2] = 2;
+    test_shapes[test_tensors[t_b].shape_off + 3] = 1;
+    test_tensors[t_b].size_bytes = 2;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "a row-wise operand is refused");
+}
+
+static void test_per_channel_binary_s8(void)
+{
+    printf("  test_per_channel_binary_s8...\n");
+    const int8_t product[] = {2, -2, 9, 8, -5, 18};
+    const int8_t sum[] = {3, 1, 6, 6, 4, 9};
+    run_per_channel_binary_s8(TIGRIS_OP_MUL, product, "per-channel Mul");
+    run_per_channel_binary_s8(TIGRIS_OP_ADD, sum, "per-channel Add");
+}
+
+/* Int8 bilinear, 2x2 -> 4x4, one channel, unit scale. Half-pixel places output
+ * row o at (o + 0.5) / 2 - 0.5 (clamped at 0), asymmetric at o / 2; worked by
+ * hand from the grid [[0, 10], [20, 30]] and rounded half away from zero. */
+static int run_resize_linear_s8(uint16_t convention, const tigris_tile_ctx_t *tile,
+                                const int8_t *input, int8_t *output, int with_quant)
+{
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t qp = with_quant ? add_quant_param(1.0f, 0, 1, NULL, NULL)
+                             : TIGRIS_NO_QUANT_PARAM;
+    int32_t in_shape[] = {1, 2, 2, 1};
+    int32_t out_shape[] = {1, 4, 4, 1};
+    uint16_t t_in = add_tensor(&plan, "in", in_shape, 4, 3, 4, qp);
+    uint16_t t_out = add_tensor(&plan, "out", out_shape, 4, 3, 16, qp);
+    test_ops[0].op_type = TIGRIS_OP_RESIZE_LINEAR;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in}; uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].spatial.stride_h = 2;
+    test_ops[0].spatial.stride_w = 2;
+    test_ops[0].spatial.kernel_h = convention;
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = test_header.num_tensors;
+    ptrs[t_in] = (void *)input;
+    ptrs[t_out] = output;
+    if (tile)
+        mem.tile = *tile;
+    return tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+}
+
+static void test_resize_linear_s8(void)
+{
+    printf("  test_resize_linear_s8...\n");
+    const int8_t grid[] = {0, 10, 20, 30};
+    const int8_t half_pixel[] = {0, 3, 8, 10, 5, 8, 13, 15,
+                                 15, 18, 23, 25, 20, 23, 28, 30};
+    const int8_t asymmetric[] = {0, 5, 10, 10, 10, 15, 20, 20,
+                                 20, 25, 30, 30, 20, 25, 30, 30};
+    int8_t out[16];
+
+    TEST_ASSERT_EQ(run_resize_linear_s8(0, NULL, grid, out, 1), 0, "half-pixel runs");
+    for (int i = 0; i < 16; i++)
+        TEST_ASSERT_EQ(out[i], half_pixel[i], "half-pixel bilinear value");
+    TEST_ASSERT_EQ(run_resize_linear_s8(1, NULL, grid, out, 1), 0, "asymmetric runs");
+    for (int i = 0; i < 16; i++)
+        TEST_ASSERT_EQ(out[i], asymmetric[i], "asymmetric bilinear value");
+
+    /* Output row 3 alone, from input row 1 alone: the origins place the band. */
+    tigris_tile_ctx_t tile;
+    memset(&tile, 0, sizeof(tile));
+    tile.active = 1;
+    tile.in_h = 1; tile.out_h = 1;
+    tile.in_w = 2; tile.out_w = 4;
+    tile.out_row_origin = 3;
+    tile.in_row_origin = 1;
+    TEST_ASSERT_EQ(run_resize_linear_s8(0, &tile, grid + 2, out, 1), 0, "a band runs");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_EQ(out[i], half_pixel[12 + i], "a band reproduces its row");
+
+    TEST_ASSERT(run_resize_linear_s8(0, NULL, grid, out, 0) != 0,
+                "int8 bilinear without quantization is refused");
+    TEST_ASSERT(run_resize_linear_s8(2, NULL, grid, out, 1) != 0,
+                "an unknown convention is refused");
+}
+
 /* Softmax is a terminal classifier operation and must be available through
  * the reference fallback used by accelerator backends. */
 static void test_softmax_s8(void)
@@ -1843,6 +2014,9 @@ int main(void)
     test_global_max_pool_s8();
     test_max_pool_s8_requantizes();
     test_matmul_s8_row_band();
+    test_hardswish_s8();
+    test_per_channel_binary_s8();
+    test_resize_linear_s8();
     test_tanh_s8();
     test_softmax_s8();
     test_conv1d_s8();

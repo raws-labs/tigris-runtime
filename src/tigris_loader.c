@@ -52,6 +52,26 @@ static int tensor_shapes_equal(
     return 1;
 }
 
+/* One value per channel of `map`: the same rank, every axis but the innermost
+ * 1. Channels are stored innermost, so such an operand repeats every
+ * `channels` elements of `map` with no further metadata. */
+static int tensor_is_per_channel_of(
+    const tigris_plan_t *plan, const tigris_tensor_t *operand,
+    const tigris_tensor_t *map)
+{
+    if (operand->ndim != map->ndim || map->ndim == 0u ||
+        operand->dtype != map->dtype)
+        return 0;
+    const int32_t *o = tigris_tensor_shape(plan, operand);
+    const int32_t *f = tigris_tensor_shape(plan, map);
+    uint8_t last = (uint8_t)(map->ndim - 1u);
+    for (uint8_t d = 0; d < last; d++) {
+        if (o[d] != 1)
+            return 0;
+    }
+    return o[last] == f[last] && f[last] > 0;
+}
+
 static uint32_t tensor_elements(const tigris_tensor_t *tensor)
 {
     return tensor->size_bytes / (tensor->dtype == 1 ? sizeof(float) : 1u);
@@ -117,6 +137,7 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_TANH ||
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_LAYER_NORM;
 }
 
@@ -172,6 +193,7 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_SIGMOID ||
            type == TIGRIS_OP_TANH ||
            type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_LAYER_NORM ||
            type == TIGRIS_OP_RESHAPE ||
@@ -373,6 +395,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
 
+        case TIGRIS_OP_HARDSWISH:
         case TIGRIS_OP_ERF:
             if (!op_has_plain_io(op, 1, 1) ||
                 input->ndim != output->ndim ||
@@ -513,9 +536,10 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 !tensor_shapes_equal(plan, input, output))
                 return TIGRIS_ERR_BAD_OPERATOR;
             if (op->num_inputs == 2) {
+                const tigris_tensor_t *second = &plan->tensors[inputs[1]];
                 if (op->weight_idx != TIGRIS_NO_WEIGHT ||
-                    !tensor_shapes_equal(
-                        plan, input, &plan->tensors[inputs[1]]))
+                    (!tensor_shapes_equal(plan, input, second) &&
+                     !tensor_is_per_channel_of(plan, second, input)))
                     return TIGRIS_ERR_BAD_OPERATOR;
             } else {
                 /* A constant operand is one value, one value per channel, or
@@ -700,10 +724,13 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         case TIGRIS_OP_RESIZE_LINEAR:
         case TIGRIS_OP_RESIZE: {
             /* Both forms upsample by an integer factor and differ only in how
-             * they read the samples. Bilinear mixes neighbours, which the
-             * int8 dispatcher has no requantizing kernel for. */
+             * they read the samples. Bilinear mixes neighbours, so its int8
+             * form needs both quantizations to requantize the mix. */
             if (op->op_type == TIGRIS_OP_RESIZE_LINEAR &&
-                (dtype != 1 || op->spatial.kernel_h > 1))
+                (op->spatial.kernel_h > 1 || (dtype != 1 && dtype != 3) ||
+                 (dtype == 3 &&
+                  (input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                   output->quant_param_idx == TIGRIS_NO_QUANT_PARAM))))
                 return TIGRIS_ERR_BAD_OPERATOR;
             if (!op_has_plain_io(op, 1, 1) ||
                 input->ndim != 4 || output->ndim != 4 ||
@@ -1135,11 +1162,13 @@ tigris_error_t tigris_plan_load_ex(
                                   TIGRIS_TENSOR_MODEL_OUTPUT)) == 0 ||
                 tensor->iface_dtype == tensor->dtype)
                 return TIGRIS_ERR_BAD_TENSOR;
-            /* The only conversion this runtime performs is between a float
-             * interface and a quantized int8 plan tensor, and tigris_iface.c
-             * refuses anything else. Saying so here refuses the plan when it
-             * is loaded rather than when a caller first writes an input. */
-            if (tensor->iface_dtype != 1u || tensor->dtype != 3u ||
+            /* The conversions this runtime performs are from a float or a
+             * uint8 interface to a quantized int8 plan tensor, and
+             * tigris_iface.c refuses anything else. Saying so here refuses
+             * the plan when it is loaded rather than when a caller first
+             * writes an input. */
+            if ((tensor->iface_dtype != 1u && tensor->iface_dtype != 2u) ||
+                tensor->dtype != 3u ||
                 tensor->quant_param_idx == TIGRIS_NO_QUANT_PARAM)
                 return TIGRIS_ERR_BAD_TENSOR;
         }
@@ -1713,6 +1742,27 @@ tigris_error_t tigris_plan_load_ex(
                  * with a strided Conv1D can expose different length
                  * resolutions. Rank-4 stages retain the existing audited
                  * height contract and are checked again by the executor. */
+                /* A per-channel operand is one row high, so a rank-4 height
+                 * stripe loads it whole for every band. The 2D, chain, row
+                 * band and rank-3 executors have no such rule, so there a
+                 * binary op may only take full-shape operands. */
+                for (uint16_t j = 0; j < stage->ops_count; j++) {
+                    const tigris_op_t *bop = &candidate.ops[
+                        candidate.index_pool[stage->ops_off + j]];
+                    if ((bop->op_type == TIGRIS_OP_ADD ||
+                         bop->op_type == TIGRIS_OP_SUB ||
+                         bop->op_type == TIGRIS_OP_MUL) &&
+                        bop->num_inputs == 2) {
+                        const uint16_t *bin = tigris_op_inputs(&candidate, bop);
+                        if (!tensor_shapes_equal(&candidate,
+                                                 &candidate.tensors[bin[0]],
+                                                 &candidate.tensors[bin[1]]) &&
+                            (stage->chain_len != 0 || tile->tile_width != 0 ||
+                             rank != 4 || row_banded))
+                            return TIGRIS_ERR_BAD_OPERATOR;
+                    }
+                }
+
                 if (row_banded) {
                     /* Already validated on its own terms above. */
                 } else if (stage->ops_count == 1 &&
@@ -1811,6 +1861,7 @@ tigris_error_t tigris_plan_load_ex(
                                     * reduced axis both tile axes are ahead
                                     * of: shape-preserving and halo-free. */
                                    type != TIGRIS_OP_ERF &&
+                                   type != TIGRIS_OP_HARDSWISH &&
                                    type != TIGRIS_OP_LAYER_NORM &&
                                    /* Softmax normalizes along the final
                                     * stored dimension, which a height stripe
@@ -1880,6 +1931,7 @@ tigris_error_t tigris_plan_load_ex(
                             * is that one. */
                            op_type != TIGRIS_OP_SOFTMAX &&
                            op_type != TIGRIS_OP_ERF &&
+                           op_type != TIGRIS_OP_HARDSWISH &&
                            op_type != TIGRIS_OP_LAYER_NORM &&
                            op_type != TIGRIS_OP_ADD &&
                            op_type != TIGRIS_OP_SUB &&

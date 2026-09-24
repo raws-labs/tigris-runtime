@@ -45,8 +45,8 @@ static const char *TAG = "tigris-example";
 
 /* The compiled plan and the golden output, embedded by the build (see the
  * EMBED_FILES entries in main/CMakeLists.txt). */
-extern const uint8_t unet_tgrs_start[] asm("_binary_unet_tgrs_start");
-extern const uint8_t unet_tgrs_end[]   asm("_binary_unet_tgrs_end");
+extern const uint8_t unet_tgrs_start[];  /* plan.S */
+extern const uint8_t unet_tgrs_end[];
 extern const uint8_t unet_ref_start[]  asm("_binary_unet_ref_bin_start");
 extern const uint8_t unet_ref_end[]    asm("_binary_unet_ref_bin_end");
 
@@ -170,7 +170,7 @@ void app_main(void) {
 #if defined(TIGRIS_HAS_ESP_NN)
     dispatch = tigris_dispatch_kernel_esp_nn;   /* accelerate the encoder convs */
     if (tigris_esp_nn_prepare(&plan, &mem) != 0) {
-        ESP_LOGE(TAG, "esp_nn_prepare failed (arena too small for scratch)");
+        ESP_LOGE(TAG, "esp_nn_prepare failed (misaligned plan or no scratch)");
         return;
     }
     /* Give the kernels the second core. Each core takes a disjoint half of the

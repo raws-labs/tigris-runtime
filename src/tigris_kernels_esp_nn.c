@@ -9,7 +9,9 @@
  * Data layout: NHWC (matches ESP-NN convention).
  *
  * ESP-NN calling convention (matches TFLM):
- *   - filter_dims.channels = 0 (not actual channel count)
+ *   - filter_dims.channels = the filter's input channels per group (Conv)
+ *     or its channel count (depthwise); ESP-NN reads a Conv whose value
+ *     differs from the input channels as grouped and runs it on the ANSI C path
  *   - dilation = {0, 0} encodes "no dilation" (NOT {1, 1})
  *   - Depthwise weights: [KH, KW, C] layout (HWC)
  *
@@ -239,6 +241,18 @@ int tigris_esp_nn_prepare(
             TIGRIS_ACCEL_ROUTE_S8_REF)
             continue;
 
+        /* The SIMD kernels read filters and biases in place and assume
+         * 16-byte alignment; a misaligned filter gives wrong output, not an
+         * error. Plan weights are aligned relative to the plan base, so this
+         * fails when the plan buffer itself is misaligned. Weights of a
+         * compressed plan are decompressed into the aligned fast arena. */
+        if (op->op_type == TIGRIS_OP_CONV || op->op_type == TIGRIS_OP_DEPTHWISE) {
+            const void *w = tigris_op_weight(plan, op);
+            const void *b = tigris_op_bias(plan, op);
+            if (((uintptr_t)w & 15u) != 0 || ((uintptr_t)b & 15u) != 0)
+                return -2;
+        }
+
         if (op->op_type == TIGRIS_OP_CONV) {
             const uint16_t *ins  = tigris_op_inputs(plan, op);
             const uint16_t *outs = tigris_op_outputs(plan, op);
@@ -296,8 +310,9 @@ int tigris_esp_nn_prepare(
 
             data_dims_t id = { .width = conv_IW, .height = conv_IH,
                                .channels = IC, .extra = 1 };
+            int groups = op->spatial.group > 1 ? (int)op->spatial.group : 1;
             data_dims_t fd = { .width = KW, .height = KH,
-                               .channels = 0, .extra = 0 };
+                               .channels = IC / groups, .extra = 0 };
             data_dims_t od = { .width = OW, .height = OH,
                                .channels = OC, .extra = 1 };
             conv_params_t cp = {
@@ -345,7 +360,7 @@ int tigris_esp_nn_prepare(
             data_dims_t id = { .width = IW, .height = IH,
                                .channels = C, .extra = 1 };
             data_dims_t fd = { .width = KW, .height = KH,
-                               .channels = 0, .extra = 0 };
+                               .channels = C, .extra = 0 };
             data_dims_t od = { .width = OW, .height = tile_oh,
                                .channels = C, .extra = 1 };
             dw_conv_params_t dp = {
@@ -574,7 +589,8 @@ static int adapt_conv2d(
 
     data_dims_t input_dims  = { .width = conv_IW, .height = conv_IH,
                                 .channels = IC, .extra = 1 };
-    data_dims_t filter_dims = { .width = KW, .height = KH, .channels = 0, .extra = 0 };
+    int groups = op->spatial.group > 1 ? (int)op->spatial.group : 1;
+    data_dims_t filter_dims = { .width = KW, .height = KH, .channels = IC / groups, .extra = 0 };
     data_dims_t output_dims = { .width = OW, .height = OH, .channels = OC, .extra = 1 };
 
     quant_data_t quant;
@@ -690,7 +706,7 @@ static int adapt_depthwise_conv2d(
     }
 
     data_dims_t input_dims  = { .width = IW, .height = IH, .channels = C, .extra = 1 };
-    data_dims_t filter_dims = { .width = KW, .height = KH, .channels = 0, .extra = 0 };
+    data_dims_t filter_dims = { .width = KW, .height = KH, .channels = C, .extra = 0 };
     data_dims_t output_dims = { .width = OW, .height = OH, .channels = C, .extra = 1 };
 
     quant_data_t quant;

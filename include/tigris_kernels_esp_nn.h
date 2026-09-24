@@ -39,8 +39,11 @@ extern "C" {
  *
  * @param plan  Loaded plan (read-only, used to scan op shapes).
  * @param mem   Initialized memory manager (read-only sizing input).
- * @return 0 after a valid scan/setup, or -1 for invalid/overflowing metadata
- *         or an unavailable mandatory depthwise output buffer.
+ * @return 0 after a valid scan/setup, -1 for invalid/overflowing metadata or
+ *         an unavailable mandatory depthwise output buffer, or -2 when a Conv
+ *         or Depthwise weight or bias is not 16-byte aligned. ESP-NN reads
+ *         filters in place and computes wrong results from misaligned ones;
+ *         the plan buffer has to start on a 16-byte boundary.
  */
 int tigris_esp_nn_prepare(
     const tigris_plan_t *plan,

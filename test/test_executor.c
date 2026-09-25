@@ -1878,6 +1878,168 @@ static void run_height_tiling_contract_case(
     }
 }
 
+/* One height-tiled stage run through the executor with the float kernels,
+ * once with room for a single band and once with room for a few rows. */
+typedef struct {
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[3];
+    tigris_op_t op;
+    tigris_stage_t stage;
+    tigris_tile_plan_t tile_plan;
+    uint16_t indices[12];
+    int32_t shapes[12];
+    tigris_plan_t plan;
+} band_fixture_t;
+
+static tigris_exec_error_t run_band_fixture(
+    band_fixture_t *fx, const float *const *inputs, float *output,
+    uint32_t fast_size, tigris_exec_stats_t *stats)
+{
+    void *ptrs[3];
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t fast[4096];
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[8192];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 2, 1, 0, 0)];
+    tigris_mem_t mem;
+    uint16_t n_in = fx->stage.inputs_count;
+    uint16_t out_idx = fx->indices[fx->stage.outputs_off];
+
+    memset(stats, 0, sizeof(*stats));
+    if (tigris_mem_init(&mem, ptrs, fx->header.num_tensors, fast, fast_size,
+                        slow, sizeof(slow)) != TIGRIS_MEM_OK)
+        return TIGRIS_EXEC_ERR_MEM;
+    for (uint16_t i = 0; i < n_in; i++) {
+        uint16_t t = fx->indices[fx->stage.inputs_off + i];
+        if (tigris_mem_alloc_slow(&mem, t, fx->tensors[t].size_bytes) != TIGRIS_MEM_OK)
+            return TIGRIS_EXEC_ERR_MEM;
+        memcpy(mem.tensor_ptrs[t], inputs[i], fx->tensors[t].size_bytes);
+    }
+    tigris_exec_error_t err = tigris_run_with_workspace_buffer(
+        &fx->plan, &mem, tigris_dispatch_kernel, NULL, stats,
+        workspace, sizeof(workspace));
+    if (err == TIGRIS_EXEC_OK)
+        memcpy(output, mem.tensor_ptrs[out_idx], fx->tensors[out_idx].size_bytes);
+    return err;
+}
+
+static void wire_band_fixture(band_fixture_t *fx, uint16_t n_inputs)
+{
+    fx->header.version = TIGRIS_SCHEMA_VERSION;
+    fx->header.num_ops = 1;
+    fx->header.num_stages = 1;
+    fx->header.num_tile_plans = 1;
+    fx->header.num_model_inputs = (uint8_t)n_inputs;
+    fx->header.num_model_outputs = 1;
+    fx->stage.ops_count = 1;
+    fx->stage.outputs_count = 1;
+    fx->stage.tile_plan_idx = 0;
+    fx->stage.chain_id = TIGRIS_NO_CHAIN;
+    fx->tile_plan.tileable = 1;
+    fx->tile_plan.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    fx->tile_plan.tile_height = 1;
+    fx->plan.header = &fx->header;
+    fx->plan.tensors = fx->tensors;
+    fx->plan.ops = &fx->op;
+    fx->plan.stages = &fx->stage;
+    fx->plan.tile_plans = &fx->tile_plan;
+    fx->plan.index_pool = fx->indices;
+    fx->plan.shape_pool = fx->shapes;
+}
+
+static void test_exec_half_pixel_bilinear_bands_match_one_band(void)
+{
+    /* Half-pixel output row o reads from (o + 0.5) / 2 - 0.5, a row ahead of
+     * o / 2 whenever that is whole: every band after the first must reach it. */
+    printf("  test_exec_half_pixel_bilinear_bands_match_one_band...\n");
+    band_fixture_t fx;
+    memset(&fx, 0, sizeof(fx));
+    const uint16_t idx[] = {0, 1, 0, 0, 1, 0, 1};  /* op in, op out, stage op, stage in, stage out, model in, model out */
+    memcpy(fx.indices, idx, sizeof(idx));
+    const int32_t shp[] = {1, 4, 4, 2, 1, 8, 8, 2};
+    memcpy(fx.shapes, shp, sizeof(shp));
+    fx.header.num_tensors = 2;
+    fx.tensors[0].shape_off = 0; fx.tensors[0].ndim = 4; fx.tensors[0].dtype = 1;
+    fx.tensors[0].size_bytes = 4 * 4 * 2 * sizeof(float);
+    fx.tensors[1].shape_off = 4; fx.tensors[1].ndim = 4; fx.tensors[1].dtype = 1;
+    fx.tensors[1].size_bytes = 8 * 8 * 2 * sizeof(float);
+    fx.op.op_type = TIGRIS_OP_RESIZE_LINEAR;
+    fx.op.num_inputs = 1; fx.op.num_outputs = 1;
+    fx.op.inputs_off = 0; fx.op.outputs_off = 1;
+    fx.op.spatial.stride_h = 2; fx.op.spatial.stride_w = 2;
+    fx.op.spatial.kernel_h = 0;  /* half-pixel */
+    fx.op.weight_idx = TIGRIS_NO_WEIGHT; fx.op.bias_idx = TIGRIS_NO_WEIGHT;
+    fx.stage.ops_off = 2; fx.stage.inputs_off = 3; fx.stage.inputs_count = 1;
+    fx.stage.outputs_off = 4;
+    fx.tile_plan.num_tiles = 4; fx.tile_plan.original_height = 4;
+    wire_band_fixture(&fx, 1);
+    fx.plan.model_inputs = &fx.indices[5];
+    fx.plan.model_outputs = &fx.indices[6];
+
+    float input[32];
+    for (int i = 0; i < 32; i++)
+        input[i] = (float)((i * 7) % 13) - 6.0f;
+    const float *inputs[1] = {input};
+    float whole[128], banded[128];
+    tigris_exec_stats_t stats;
+
+    TEST_ASSERT_EQ(run_band_fixture(&fx, inputs, whole, 4096, &stats),
+                   TIGRIS_EXEC_OK, "one band runs");
+    TEST_ASSERT_EQ(run_band_fixture(&fx, inputs, banded, 320, &stats),
+                   TIGRIS_EXEC_OK, "a few rows at a time runs");
+    TEST_ASSERT_EQ(stats.stages_tiled, 1, "the stage ran as a height band");
+    TEST_ASSERT(memcmp(whole, banded, sizeof(whole)) == 0,
+                "bands reproduce the one-band result exactly");
+}
+
+static void test_exec_per_channel_gate_bands_over_the_map(void)
+{
+    /* The gate is the stage's first input and one row high. The band runs over
+     * the map, and every band takes the gate whole. */
+    printf("  test_exec_per_channel_gate_bands_over_the_map...\n");
+    band_fixture_t fx;
+    memset(&fx, 0, sizeof(fx));
+    /* op inputs (map, gate), op out, stage op, stage inputs (gate, map), stage out, model ins, model out */
+    const uint16_t idx[] = {1, 0, 2, 0, 0, 1, 2, 0, 1, 2};
+    memcpy(fx.indices, idx, sizeof(idx));
+    const int32_t shp[] = {1, 1, 1, 3,  1, 6, 4, 3,  1, 6, 4, 3};
+    memcpy(fx.shapes, shp, sizeof(shp));
+    fx.header.num_tensors = 3;
+    const uint16_t offs[3] = {0, 4, 8};
+    const uint32_t sizes[3] = {3 * sizeof(float), 72 * sizeof(float), 72 * sizeof(float)};
+    for (int i = 0; i < 3; i++) {
+        fx.tensors[i].shape_off = offs[i]; fx.tensors[i].ndim = 4;
+        fx.tensors[i].dtype = 1; fx.tensors[i].size_bytes = sizes[i];
+    }
+    fx.op.op_type = TIGRIS_OP_MUL;
+    fx.op.num_inputs = 2; fx.op.num_outputs = 1;
+    fx.op.inputs_off = 0; fx.op.outputs_off = 2;
+    fx.op.weight_idx = TIGRIS_NO_WEIGHT; fx.op.bias_idx = TIGRIS_NO_WEIGHT;
+    fx.stage.ops_off = 3; fx.stage.inputs_off = 4; fx.stage.inputs_count = 2;
+    fx.stage.outputs_off = 6;
+    fx.tile_plan.num_tiles = 6; fx.tile_plan.original_height = 6;
+    wire_band_fixture(&fx, 2);
+    fx.plan.model_inputs = &fx.indices[7];
+    fx.plan.model_outputs = &fx.indices[9];
+
+    float gate[3] = {2.0f, -1.0f, 0.5f};
+    float map[72];
+    float expected[72];
+    for (int i = 0; i < 72; i++) {
+        map[i] = (float)(i % 11) - 5.0f;
+        expected[i] = map[i] * gate[i % 3];
+    }
+    const float *inputs[2] = {gate, map};
+    float out[72];
+    tigris_exec_stats_t stats;
+
+    TEST_ASSERT_EQ(run_band_fixture(&fx, inputs, out, 256, &stats),
+                   TIGRIS_EXEC_OK, "the gated stage runs in bands");
+    TEST_ASSERT_EQ(stats.stages_tiled, 1, "the stage ran as a height band");
+    int same = 1;
+    for (int i = 0; i < 72; i++)
+        same &= out[i] == expected[i];
+    TEST_ASSERT(same, "every band scales the map by the whole gate");
+}
+
 static void test_exec_height_tiling_contract(void)
 {
     printf("  test_exec_height_tiling_contract...\n");
@@ -1888,8 +2050,12 @@ static void test_exec_height_tiling_contract(void)
 
     run_height_tiling_contract_case(
         4, TIGRIS_OP_RELU, pointwise_shape, 128, TIGRIS_EXEC_OK);
+    /* A global reduction collapses the output height, so it takes the
+     * input-driven path rather than the output-driven stripe loop. Every
+     * call still carries a tile context, and the stage still counts as
+     * tiled, which is what the assertions below check. */
     run_height_tiling_contract_case(
-        4, TIGRIS_OP_GLOBAL_AVG, gap_shape, 128, TIGRIS_EXEC_ERR_TILE);
+        4, TIGRIS_OP_GLOBAL_AVG, gap_shape, 128, TIGRIS_EXEC_OK);
     run_height_tiling_contract_case(
         4, TIGRIS_OP_RESIZE, resize_shape, 128, TIGRIS_EXEC_ERR_TILE);
     run_height_tiling_contract_case(
@@ -1990,7 +2156,7 @@ static void run_convtranspose_tiling_case(
     tile_plan.tile_height = 8;
     tile_plan.num_tiles = 4;
     tile_plan.original_height = 16;
-    tile_plan._reserved = 8;  /* tile_width packed in low 16 bits (2D path) */
+    tile_plan.tile_width = 8;
 
     plan.header = &header;
     plan.tensors = tensors;
@@ -2426,6 +2592,223 @@ static void test_exec_compaction_preserves_data(void)
                 "output survives slow-arena compaction");
 }
 
+typedef struct {
+    uint8_t  flags;
+    uint8_t  ndim;
+    uint32_t size_bytes;
+    uint16_t quant_param_idx;
+    int32_t  shape[4];
+} alias_spec_t;
+
+typedef struct {
+    int calls;
+    int aliased;
+    int passthrough;
+} alias_ctx_t;
+
+static int alias_kernel(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem, void *user_ctx)
+{
+    alias_ctx_t *ctx = (alias_ctx_t *)user_ctx;
+    const uint16_t *inputs = tigris_op_inputs(plan, op);
+    const uint16_t *outputs = tigris_op_outputs(plan, op);
+    (void)op_index;
+    ctx->calls++;
+    if (op->op_type == TIGRIS_OP_RELU) {
+        /* The consumer is the only place the sharing is observable: a tensor
+         * released after its last use has a null pointer by the time the run
+         * returns. */
+        const uint8_t *in = (const uint8_t *)mem->tensor_ptrs[inputs[0]];
+        ctx->aliased = mem->tensor_ptrs[0] != NULL &&
+                       mem->tensor_ptrs[inputs[0]] == mem->tensor_ptrs[0];
+        ctx->passthrough = in != NULL && in[0] == 0x11u;
+    }
+    memset(mem->tensor_ptrs[outputs[0]], 0x5a,
+           plan->tensors[outputs[0]].size_bytes);
+    return 0;
+}
+
+/* Run [Reshape(t0 -> t1), Relu(t1 -> t2)] and report whether the reshape
+ * handed its input's buffer through instead of allocating and copying. */
+static int reshape_passes_buffer_through(
+    const alias_spec_t *src, const alias_spec_t *dst, alias_ctx_t *out)
+{
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[3];
+    tigris_op_t ops[2];
+    tigris_stage_t stage;
+    tigris_quant_param_t quant[3];
+    int32_t shape_pool[12];
+    const uint16_t indices[] = {0, 1, 1, 2, 0, 1, 0, 2};
+    tigris_plan_t plan;
+    void *ptrs[3];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[512];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[256];
+    tigris_mem_t mem;
+    uint8_t workspace[
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+    tigris_exec_stats_t stats;
+    alias_ctx_t ctx = {0};
+
+    memset(&header, 0, sizeof(header));
+    memset(tensors, 0, sizeof(tensors));
+    memset(ops, 0, sizeof(ops));
+    memset(&stage, 0, sizeof(stage));
+    memset(&plan, 0, sizeof(plan));
+    memset(shape_pool, 0, sizeof(shape_pool));
+
+    quant[0].scale = 0.5f;
+    quant[0].zero_point = -3;
+    quant[0].num_channels = 1;
+    quant[0].multiplier_off = 0;
+    quant[0].shift_off = 0;
+    quant[0]._pad = 0;
+    quant[1] = quant[0];
+    quant[1].scale = 0.25f;
+    quant[2] = quant[0];
+
+    header.num_tensors = 3;
+    header.num_ops = 2;
+    header.num_stages = 1;
+    header.num_model_inputs = 1;
+    header.num_model_outputs = 1;
+
+    tensors[0].size_bytes = src->size_bytes;
+    tensors[0].flags = src->flags;
+    tensors[0].ndim = src->ndim;
+    tensors[0].quant_param_idx = src->quant_param_idx;
+    tensors[0].shape_off = 0;
+    tensors[1].size_bytes = dst->size_bytes;
+    tensors[1].flags = dst->flags;
+    tensors[1].ndim = dst->ndim;
+    tensors[1].quant_param_idx = dst->quant_param_idx;
+    tensors[1].shape_off = 4;
+    tensors[2].size_bytes = dst->size_bytes;
+    tensors[2].flags = dst->flags;
+    tensors[2].ndim = dst->ndim;
+    tensors[2].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    tensors[2].shape_off = 8;
+    for (size_t i = 0; i < 4; i++) {
+        shape_pool[i] = src->shape[i];
+        shape_pool[4 + i] = dst->shape[i];
+        shape_pool[8 + i] = dst->shape[i];
+    }
+
+    ops[0].op_type = TIGRIS_OP_RESHAPE;
+    ops[0].num_inputs = 1;
+    ops[0].num_outputs = 1;
+    ops[0].inputs_off = 0;
+    ops[0].outputs_off = 1;
+    ops[1].op_type = TIGRIS_OP_RELU;
+    ops[1].num_inputs = 1;
+    ops[1].num_outputs = 1;
+    ops[1].inputs_off = 2;
+    ops[1].outputs_off = 3;
+
+    stage.ops_off = 4;
+    stage.ops_count = 2;
+    stage.inputs_off = 6;
+    stage.inputs_count = 1;
+    stage.outputs_off = 7;
+    stage.outputs_count = 1;
+    stage.tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage.chain_id = TIGRIS_NO_CHAIN;
+
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = ops;
+    plan.stages = &stage;
+    plan.index_pool = indices;
+    plan.shape_pool = shape_pool;
+    plan.quant_params = quant;
+    plan.model_inputs = &indices[6];
+    plan.model_outputs = &indices[7];
+
+    TEST_ASSERT_EQ(
+        tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), slow, sizeof(slow)),
+        TIGRIS_MEM_OK, "reshape-alias memory init");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes),
+                   TIGRIS_MEM_OK, "reshape-alias input allocation");
+    memset(mem.tensor_ptrs[0], 0x11, tensors[0].size_bytes);
+
+    TEST_ASSERT_EQ(
+        tigris_run_with_workspace_buffer(
+            &plan, &mem, alias_kernel, &ctx, &stats, workspace,
+            sizeof(workspace)),
+        TIGRIS_EXEC_OK, "reshape-alias execution");
+    *out = ctx;
+    return ctx.aliased;
+}
+
+static void test_exec_reshape_alias(void)
+{
+    printf("  test_exec_reshape_alias...\n");
+    /* Two tensors that each state their own axis order: regrouping the shape
+     * moves nothing, so the output is the input. */
+    const alias_spec_t linear_src = {
+        TIGRIS_TENSOR_LINEAR, 2u, 64u, TIGRIS_NO_QUANT_PARAM, {4, 16, 0, 0}};
+    const alias_spec_t linear_dst = {
+        TIGRIS_TENSOR_LINEAR, 3u, 64u, TIGRIS_NO_QUANT_PARAM, {4, 4, 4, 0}};
+    /* Two spatial tensors where only the spatial axes regroup and the channel
+     * axis stays last, which is what a vision transformer's unfold is. */
+    const alias_spec_t spatial_src = {
+        0u, 4u, 64u, TIGRIS_NO_QUANT_PARAM, {1, 4, 4, 4}};
+    const alias_spec_t spatial_dst = {
+        0u, 3u, 64u, TIGRIS_NO_QUANT_PARAM, {1, 16, 4, 0}};
+    /* Same rank-4 bytes regrouped across the channel axis: the stored order
+     * changes, so this one has to go through the kernel. */
+    const alias_spec_t channel_dst = {
+        0u, 3u, 64u, TIGRIS_NO_QUANT_PARAM, {1, 4, 16, 0}};
+    alias_ctx_t r;
+
+    TEST_ASSERT(reshape_passes_buffer_through(&linear_src, &linear_dst, &r),
+                "a reshape between own-order tensors shares its input");
+    TEST_ASSERT_EQ(r.calls, 1, "the shared reshape runs no kernel");
+    TEST_ASSERT(r.passthrough, "the consumer reads the input's own bytes");
+
+    TEST_ASSERT(
+        reshape_passes_buffer_through(&spatial_src, &spatial_dst, &r),
+        "a spatial reshape that keeps the channel axis last shares its input");
+    TEST_ASSERT_EQ(r.calls, 1, "the shared spatial reshape runs no kernel");
+
+    TEST_ASSERT(
+        !reshape_passes_buffer_through(&spatial_src, &channel_dst, &r),
+        "a reshape that moves channels does not share its input");
+    TEST_ASSERT_EQ(r.calls, 2, "the copying reshape runs its kernel");
+
+    /* One side states its own order and the other does not: the stored orders
+     * disagree even when the extents would line up. */
+    TEST_ASSERT(
+        !reshape_passes_buffer_through(&spatial_src, &linear_dst, &r),
+        "a reshape across the layout boundary does not share its input");
+    TEST_ASSERT_EQ(r.calls, 2, "the layout-crossing reshape runs its kernel");
+
+    /* Same stored bytes, different meaning: the reshape has to re-encode. */
+    alias_spec_t quantized_src = linear_src;
+    alias_spec_t quantized_dst = linear_dst;
+    quantized_src.quant_param_idx = 0u;
+    quantized_dst.quant_param_idx = 1u;
+    TEST_ASSERT(
+        !reshape_passes_buffer_through(&quantized_src, &quantized_dst, &r),
+        "a reshape that rescales does not share its input");
+    TEST_ASSERT_EQ(r.calls, 2, "the rescaling reshape runs its kernel");
+
+    TEST_ASSERT(
+        !reshape_passes_buffer_through(&quantized_src, &linear_dst, &r),
+        "a reshape that drops quantization does not share its input");
+    quantized_dst.quant_param_idx = 2u;
+    TEST_ASSERT(
+        reshape_passes_buffer_through(&quantized_src, &quantized_dst, &r),
+        "a reshape whose two quantizations agree shares its input");
+
+    /* Different byte counts are never the same bytes. */
+    alias_spec_t shorter = linear_dst;
+    shorter.size_bytes = 32u;
+    TEST_ASSERT(!reshape_passes_buffer_through(&linear_src, &shorter, &r),
+                "a reshape that changes size does not share its input");
+}
+
 /* Main */
 
 int main(int argc, char *argv[])
@@ -2460,10 +2843,13 @@ int main(int argc, char *argv[])
     test_exec_chain_tiled_line_buffered_rolls_pointwise();
     test_exec_chain_tiled_line_buffered_rolls_pointwise_s8();
     test_exec_height_tiling_contract();
+    test_exec_half_pixel_bilinear_bands_match_one_band();
+    test_exec_per_channel_gate_bands_over_the_map();
     test_exec_convtranspose_2d_routing();
     test_exec_mixed_conv_convtranspose_not_tiled();
     test_exec_chained_convtranspose_fails_closed();
     test_exec_compaction_preserves_data();
+    test_exec_reshape_alias();
     test_exec_error_strings();
 
     if (argc > 1) {

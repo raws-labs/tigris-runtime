@@ -39,8 +39,11 @@ extern "C" {
  *
  * @param plan  Loaded plan (read-only, used to scan op shapes).
  * @param mem   Initialized memory manager (read-only sizing input).
- * @return 0 after a valid scan/setup, or -1 for invalid/overflowing metadata
- *         or an unavailable mandatory depthwise output buffer.
+ * @return 0 after a valid scan/setup, -1 for invalid/overflowing metadata or
+ *         an unavailable mandatory depthwise output buffer, or -2 when a Conv
+ *         or Depthwise weight or bias is not 16-byte aligned. ESP-NN reads
+ *         filters in place and computes wrong results from misaligned ones;
+ *         the plan buffer has to start on a 16-byte boundary.
  */
 int tigris_esp_nn_prepare(
     const tigris_plan_t *plan,
@@ -52,6 +55,21 @@ int tigris_esp_nn_prepare(
  * no preparation succeeded.
  */
 void tigris_esp_nn_deinit(void);
+
+/**
+ * Opt in to ESP-NN dual-core kernel splitting.
+ *
+ * Kernels that support the split give each core a disjoint half of the output
+ * range, so results are identical to single-core execution. Enabling it spawns
+ * a worker task pinned to the other core, which is the embedding application's
+ * decision, so preparation never does it on its own.
+ *
+ * Call after tigris_esp_nn_prepare() and before tigris_run(). Repeated calls
+ * are harmless. The worker outlives tigris_esp_nn_deinit().
+ *
+ * @return 1 when the worker is running, 0 on a single-core target or build.
+ */
+int tigris_esp_nn_enable_dual_core(void);
 
 /**
  * Print Conv dispatch statistics (SRAM scratch vs PSRAM scratch vs fallback).

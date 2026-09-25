@@ -11,7 +11,10 @@ This example runs a real **256x256 int8 U-Net** (encoder-decoder segmentation,
   peak). The encoder convolutions run on the **ESP-NN accelerated** kernels.
 
 The compiled plan (`unet.tgrs`) and a golden output (`unet_ref.bin`) are embedded
-in the app, so there is nothing to flash separately.
+in the app, so there is nothing to flash separately. `main/plan.S` embeds the
+plan on a 16-byte boundary: ESP-NN reads filters in place, and
+`tigris_esp_nn_prepare()` refuses a plan whose weights are not 16-byte aligned.
+`EMBED_FILES` does not align.
 
 ## Requirements
 

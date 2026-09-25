@@ -45,8 +45,8 @@ static const char *TAG = "tigris-example";
 
 /* The compiled plan and the golden output, embedded by the build (see the
  * EMBED_FILES entries in main/CMakeLists.txt). */
-extern const uint8_t unet_tgrs_start[] asm("_binary_unet_tgrs_start");
-extern const uint8_t unet_tgrs_end[]   asm("_binary_unet_tgrs_end");
+extern const uint8_t unet_tgrs_start[];  /* plan.S */
+extern const uint8_t unet_tgrs_end[];
 extern const uint8_t unet_ref_start[]  asm("_binary_unet_ref_bin_start");
 extern const uint8_t unet_ref_end[]    asm("_binary_unet_ref_bin_end");
 
@@ -170,9 +170,14 @@ void app_main(void) {
 #if defined(TIGRIS_HAS_ESP_NN)
     dispatch = tigris_dispatch_kernel_esp_nn;   /* accelerate the encoder convs */
     if (tigris_esp_nn_prepare(&plan, &mem) != 0) {
-        ESP_LOGE(TAG, "esp_nn_prepare failed (arena too small for scratch)");
+        ESP_LOGE(TAG, "esp_nn_prepare failed (misaligned plan or no scratch)");
         return;
     }
+    /* Give the kernels the second core. Each core takes a disjoint half of the
+     * output range, so the result is unchanged. This spawns a task, so the
+     * runtime leaves the choice to the application. */
+    printf("Dual-core kernels: %s\n",
+           tigris_esp_nn_enable_dual_core() ? "on" : "unavailable");
 #endif
     printf("Fast (SRAM): %.0f KiB   Slow (PSRAM): %.0f KiB   Workspace: %u B\n\n",
            mem.fast_size / 1024.0f, slow_size / 1024.0f, (unsigned)ws_size);
@@ -183,7 +188,7 @@ void app_main(void) {
      *    inside itself, so the application never touches a scale or a zero
      *    point: tigris_input_write() applies them. INPUT_VALUE is the float
      *    that lands on the int8 code the golden reference was generated with.
-     *    The s8_ref decoder stages make the run take ~30 s. */
+     *    The s8_ref decoder stages make the run take ~20 s. */
     tigris_mem_init(&mem, mem.tensor_ptrs, mem.num_tensors,
                     mem.fast_base, mem.fast_size, mem.slow_base, mem.slow_size);
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {
@@ -212,7 +217,7 @@ void app_main(void) {
             return;
         }
     }
-    printf("Running inference (the s8_ref decoder takes ~30 s)...\n\n");
+    printf("Running inference (the s8_ref decoder takes ~20 s)...\n\n");
     tigris_exec_stats_t stats = {0};
     int64_t t0 = esp_timer_get_time();
     tigris_exec_error_t err = tigris_run_with_workspace_buffer(

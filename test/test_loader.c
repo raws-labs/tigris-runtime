@@ -878,6 +878,412 @@ static void build_transpose_plan(uint8_t *buf)
     buf[TRANSPOSE_ATTR_DATA_OFF + 1u] = 0;
 }
 
+/* A schema-v7 plan whose single stage carries a height tile plan. The tiled
+ * contract admits two stage shapes the stripe rules cannot express: a global
+ * reduction, which collapses the height, and a layout conversion, which
+ * permutes it. Both are validated here, where the executor is not reached. */
+#define TILED_PLAN_SIZE       308u
+#define TILED_TENSORS_OFF     120u
+#define TILED_OPS_OFF         152u
+#define TILED_STAGES_OFF      190u
+#define TILED_TILE_PLANS_OFF  218u
+#define TILED_INDEX_OFF       242u
+#define TILED_SHAPES_OFF      256u
+#define TILED_STRINGS_OFF     288u
+#define TILED_ATTRS_OFF       292u
+#define TILED_ATTR_DATA_OFF   304u
+
+/**
+ * Build the plan above. `op_type` selects the stage's single operator;
+ * `ndim` its tensor rank. Shapes are the conversion's by default and are
+ * overwritten by the caller for a reduction.
+ */
+static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
+{
+    memset(buf, 0, TILED_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = TILED_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 2;
+    hdr->num_ops = 1;
+    hdr->num_stages = 1;
+    hdr->num_tile_plans = 1;
+    hdr->model_io_off = 2;
+    hdr->num_model_inputs = 1;
+    hdr->num_model_outputs = 1;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, TILED_TENSORS_OFF};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, TILED_OPS_OFF};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, TILED_STAGES_OFF};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_TILE_PLANS,
+                                      TILED_TILE_PLANS_OFF};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, TILED_INDEX_OFF};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, TILED_SHAPES_OFF};
+    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, TILED_STRINGS_OFF};
+    /* The section exists only when it has a record: an empty one is not a
+     * shape the emitter produces. A Transpose carries its permutation and a
+     * reduction the axis it collapses. */
+    if (op_type == TIGRIS_OP_TRANSPOSE || op_type == TIGRIS_OP_REDUCE_MEAN)
+        dir[7] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES,
+                                          TILED_ATTRS_OFF};
+
+    int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    uint32_t elems;
+    if (ndim == 3u) {
+        shapes[0] = 1; shapes[1] = 4; shapes[2] = 8;
+        shapes[4] = 1; shapes[5] = 8; shapes[6] = 4;
+        elems = 32u;
+    } else {
+        shapes[0] = 1; shapes[1] = 2; shapes[2] = 4; shapes[3] = 8;
+        shapes[4] = 1; shapes[5] = 8; shapes[6] = 2; shapes[7] = 4;
+        elems = 64u;
+    }
+
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    for (uint16_t i = 0; i < 2u; i++) {
+        tensors[i].size_bytes = elems * (uint32_t)sizeof(float);
+        tensors[i].shape_off = (uint16_t)(i * 4u);
+        tensors[i].ndim = ndim;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+    tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    tensors[1].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+
+    tigris_op_t *op = (tigris_op_t *)(buf + TILED_OPS_OFF);
+    op->op_type = op_type;
+    op->num_inputs = 1;
+    op->num_outputs = 1;
+    op->inputs_off = 0;
+    op->outputs_off = 1;
+    op->weight_idx = TIGRIS_NO_WEIGHT;
+    op->bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + TILED_STAGES_OFF);
+    stage->ops_off = 4;
+    stage->ops_count = 1;
+    stage->inputs_off = 5;
+    stage->inputs_count = 1;
+    stage->outputs_off = 6;
+    stage->outputs_count = 1;
+    stage->tile_plan_idx = 0;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    tigris_tile_plan_t *tile =
+        (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+    tile->tileable = 1;
+    tile->axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    tile->tile_height = 1;
+    tile->num_tiles = 4;
+    tile->original_height = 4;
+
+    uint16_t *indices = (uint16_t *)(buf + TILED_INDEX_OFF);
+    indices[0] = 0;  /* op input */
+    indices[1] = 1;  /* op output */
+    indices[2] = 0;  /* model input */
+    indices[3] = 1;  /* model output */
+    indices[4] = 0;  /* stage op */
+    indices[5] = 0;  /* stage input */
+    indices[6] = 1;  /* stage output */
+
+    buf[TILED_STRINGS_OFF] = '\0';
+
+    uint16_t count = (op_type == TIGRIS_OP_TRANSPOSE ||
+                      op_type == TIGRIS_OP_REDUCE_MEAN) ? 1u : 0u;
+    memcpy(buf + TILED_ATTRS_OFF, &count, sizeof(count));
+    if (count == 0u)
+        return;
+
+    tigris_op_attribute_t *attr =
+        (tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u);
+    attr->op_index = 0;
+    attr->data_offset = 0;
+    if (op_type == TIGRIS_OP_REDUCE_MEAN) {
+        attr->type = TIGRIS_OP_ATTR_AXES;
+        attr->data_len = 1;
+        buf[TILED_ATTR_DATA_OFF] = 1;
+        return;
+    }
+    attr->type = TIGRIS_OP_ATTR_TRANSPOSE_PERM;
+    attr->data_len = ndim;
+    uint8_t *perm = buf + TILED_ATTR_DATA_OFF;
+    if (ndim == 3u) {
+        perm[0] = 0; perm[1] = 2; perm[2] = 1;
+    } else {
+        perm[0] = 0; perm[1] = 3; perm[2] = 1; perm[3] = 2;
+    }
+}
+
+/* A reduction states the one axis it collapses, and the result either keeps
+ * that axis at one or drops it. Everything else about the shape has to stay
+ * put, and a plan that does not say which axis it means is refused rather
+ * than defaulted, the way a normalization's variance floor is. */
+static void test_reduce_mean_contract(void)
+{
+    printf("  test_reduce_mean_contract...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    /* [1, 4, 8] with the middle axis collapsed, kept at one. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_REDUCE_MEAN, 3u);
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + TILED_STAGES_OFF);
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    shapes[4] = 1; shapes[5] = 1; shapes[6] = 8;
+    tensors[1].size_bytes = 8u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "kept reduced axis accepted");
+
+    /* The same result with the axis dropped instead. */
+    tensors[1].ndim = 2u;
+    shapes[4] = 1; shapes[5] = 8; shapes[6] = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "dropped reduced axis accepted");
+
+    /* A result that keeps the collapsed extent is not a reduction. Its byte
+     * count follows the shape, or the tensor check fires before the operator
+     * one and the test would prove nothing about the reduction. */
+    shapes[4] = 1; shapes[5] = 4; shapes[6] = 0;
+    tensors[1].size_bytes = 4u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "uncollapsed axis rejected");
+
+    /* An axis outside the rank names nothing. */
+    tensors[1].ndim = 3u;
+    shapes[4] = 1; shapes[5] = 1; shapes[6] = 8;
+    tensors[1].size_bytes = 8u * (uint32_t)sizeof(float);
+    buf[TILED_ATTR_DATA_OFF] = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "axis outside the rank rejected");
+
+    /* Two axes name a reduction this contract does not cover. */
+    buf[TILED_ATTR_DATA_OFF] = 0;
+    buf[TILED_ATTR_DATA_OFF + 1u] = 1;
+    tigris_op_attribute_t *attr =
+        (tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u);
+    attr->data_len = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "multi-axis reduction rejected");
+
+    /* And a plan that states no axis at all is refused on the section, the
+     * way a normalization with no variance floor is. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_REDUCE_MEAN, 3u);
+    stage = (tigris_stage_t *)(buf + TILED_STAGES_OFF);
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+    memset(&dir[7], 0, sizeof(dir[7]));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "attribute-free reduction rejected");
+}
+
+/**
+ * Schema 8 declares every attribute kind at once so the operators behind them
+ * land one at a time. Each kind is validated on load whether or not a kernel
+ * reads it yet, and belongs only to the operator that will.
+ */
+static void test_op_attribute_kinds(void)
+{
+    printf("  test_op_attribute_kinds...\n");
+    _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_op_attribute_t *attr;
+
+    /* Every kind other than the permutation belongs to another operator, so
+     * on a Transpose each one is refused. */
+    const uint8_t kinds[] = {
+        TIGRIS_OP_ATTR_EPSILON,
+        TIGRIS_OP_ATTR_ALPHA,
+        TIGRIS_OP_ATTR_CLIP_BOUNDS,
+        TIGRIS_OP_ATTR_PADS,
+        TIGRIS_OP_ATTR_AXES,
+    };
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        build_transpose_plan(buf);
+        attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+        attr->type = kinds[i];
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                       TIGRIS_ERR_BAD_SECTION,
+                       "a kind on the wrong operator is refused");
+    }
+
+    build_transpose_plan(buf);
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_MAX + 1u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "a kind beyond the set is refused");
+
+    /* A schema-7 plan carries no kind but the permutation, whatever the
+     * operator, because the loader that reads it knows no other. */
+    build_transpose_plan(buf);
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V7;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_EPSILON;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a schema-7 plan carries no kind beyond the permutation");
+}
+
+/**
+ * The payload checks each kind applies. The operator each belongs to has no
+ * kernel yet, so the plan is refused later for that; what these assert is the
+ * error the payload itself produces first.
+ */
+static void test_op_attribute_payloads(void)
+{
+    printf("  test_op_attribute_payloads...\n");
+    _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_op_attribute_t *attr;
+    float value;
+
+    /* A variance floor must be positive and finite. */
+    build_transpose_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_LAYER_NORM;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_EPSILON;
+    attr->data_len = (uint8_t)sizeof(float);
+    value = 0.0f;
+    memcpy(buf + TRANSPOSE_ATTR_DATA_OFF, &value, sizeof(value));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "a zero variance floor is refused");
+
+    /* The same record with a positive floor gets past the payload check and
+     * is refused for the operator instead, which is a different error. */
+    value = 1e-5f;
+    memcpy(buf + TRANSPOSE_ATTR_DATA_OFF, &value, sizeof(value));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "a positive variance floor passes the payload check");
+
+    /* A wrong payload width is refused whatever the value. */
+    build_transpose_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_LEAKY_RELU;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_ALPHA;
+    attr->data_len = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "a short slope payload is refused");
+
+    /* Clip bounds must be ordered. */
+    build_transpose_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_CLIP;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_CLIP_BOUNDS;
+    attr->data_len = (uint8_t)(2u * sizeof(float));
+    float bounds[2] = {1.0f, -1.0f};
+    memcpy(buf + TRANSPOSE_ATTR_DATA_OFF, bounds, sizeof(bounds));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "reversed clip bounds are refused");
+
+    /* Pads are two per axis and never negative. */
+    build_transpose_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_PAD;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_PADS;
+    attr->data_len = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a pad list that is not two per axis is refused");
+
+    /* Reduction axes are in range and strictly increasing. */
+    build_transpose_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type =
+        TIGRIS_OP_REDUCE_MEAN;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_AXES;
+    attr->data_len = 2;
+    buf[TRANSPOSE_ATTR_DATA_OFF] = 1;
+    buf[TRANSPOSE_ATTR_DATA_OFF + 1u] = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "repeated reduction axes refused");
+
+    buf[TRANSPOSE_ATTR_DATA_OFF] = 0;
+    buf[TRANSPOSE_ATTR_DATA_OFF + 1u] = 9;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a reduction axis past the rank is refused");
+}
+
+static void test_tiled_conversion_contract(void)
+{
+    printf("  test_tiled_conversion_contract...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 3);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "rank-3 conversion may carry a height tile plan");
+
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 4);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "rank-4 conversion may carry a height tile plan");
+
+    /* A permutation that also reorders the spatial pair is not a conversion. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 4);
+    buf[TILED_ATTR_DATA_OFF + 2u] = 2;
+    buf[TILED_ATTR_DATA_OFF + 3u] = 1;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[5] = 8;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[6] = 4;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[7] = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "a non-conversion permutation may not claim a tile plan");
+
+    /* Rank 2 has only the row band, and a Transpose does not keep rows
+     * independent, so the stage qualifies for no tiling contract at all. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 3);
+    ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[0].ndim = 2;
+    ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].ndim = 2;
+    ((tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u))->data_len = 2;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[0] = 4;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[1] = 8;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[4] = 8;
+    ((int32_t *)(buf + TILED_SHAPES_OFF))[5] = 4;
+    buf[TILED_ATTR_DATA_OFF] = 1;
+    buf[TILED_ATTR_DATA_OFF + 1u] = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a rank-2 transpose may not claim a tile plan");
+}
+
+static void test_tiled_reduction_contract(void)
+{
+    printf("  test_tiled_reduction_contract...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+    int32_t *shapes;
+
+    /* [1, 2, 4, 8] reduced to [1, 1, 1, 8]. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_GLOBAL_AVG, 4);
+    shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[4] = 1; shapes[5] = 1; shapes[6] = 1; shapes[7] = 8;
+    ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].size_bytes =
+        8u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "a collapsed reduction may carry a height tile plan");
+
+    /* An output that still has spatial extent is not a global reduction. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_GLOBAL_AVG, 4);
+    shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[4] = 1; shapes[5] = 1; shapes[6] = 2; shapes[7] = 8;
+    ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].size_bytes =
+        16u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "an uncollapsed reduction may not claim a tile plan");
+}
+
 static void test_transpose_attribute_guards(void)
 {
     printf("  test_transpose_attribute_guards...\n");
@@ -953,6 +1359,247 @@ static void test_transpose_attribute_guards(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_OPERATOR,
                    "v4 custom opcode remains fail-closed");
+
+    /* A normalization needs its variance floor as surely as a Transpose needs
+     * its permutation, and the arm taken when there is no attribute section
+     * at all has to say so too. This fixture carries no scale weight, so it
+     * would be refused either way; the error says which guard fired, and
+     * before the section arm covered normalizations it was the operator
+     * check. A plan whose normalization is otherwise well formed had nothing
+     * left to catch it and failed at inference instead. */
+    build_transpose_plan(buf);
+    dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+    memset(&dir[6], 0, sizeof(dir[6]));
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type =
+        TIGRIS_OP_LAYER_NORM;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "attribute-free normalization rejected");
+}
+
+
+/* A declared interface dtype is a promise the runtime converts on every call,
+ * and the only conversion it has is a float interface over a quantized int8
+ * tensor. Saying so on load refuses the plan once rather than on whichever
+ * call first reaches tigris_iface.c. */
+static void test_declared_interface_dtype_contract(void)
+{
+    printf("  test_declared_interface_dtype_contract...\n");
+    _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_tensor_t *tensors;
+
+    build_transpose_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "undeclared interface loads");
+
+    /* A dtype the runtime has no conversion for at all. */
+    build_transpose_plan(buf);
+    tensors = (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
+    tensors[0].iface_dtype = 11u;  /* float64 */
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_TENSOR,
+                   "unconvertible declared dtype rejected");
+
+    /* An int8 interface over a float tensor is the conversion in the
+     * direction the runtime does not perform. */
+    build_transpose_plan(buf);
+    tensors = (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
+    tensors[0].iface_dtype = 3u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_TENSOR,
+                   "int8 interface over a float tensor rejected");
+
+    /* A float interface over a tensor that carries no quantization has
+     * nothing to convert with. */
+    build_transpose_plan(buf);
+    tensors = (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
+    tensors[0].dtype = 3u;
+    tensors[0].size_bytes = 6u;
+    tensors[0].iface_dtype = 1u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_TENSOR,
+                   "float interface without quantization rejected");
+}
+
+
+/* A plan whose single stage splits one rank-3 input into two parts. */
+#define SPLIT_PLAN_SIZE     276u
+#define SPLIT_TENSORS_OFF   104u
+#define SPLIT_OPS_OFF       152u
+#define SPLIT_STAGES_OFF    190u
+#define SPLIT_INDEX_OFF     218u
+#define SPLIT_SHAPES_OFF    236u
+#define SPLIT_STRINGS_OFF   272u
+
+static void build_split_plan(uint8_t *buf)
+{
+    memset(buf, 0, SPLIT_PLAN_SIZE);
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->file_size = SPLIT_PLAN_SIZE;
+    hdr->section_dir_off = sizeof(*hdr);
+    hdr->num_tensors = 3;
+    hdr->num_ops = 1;
+    hdr->num_stages = 1;
+    hdr->model_io_off = 3;
+    hdr->num_model_inputs = 1;
+    hdr->num_model_outputs = 1;
+
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, SPLIT_TENSORS_OFF};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, SPLIT_OPS_OFF};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, SPLIT_STAGES_OFF};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, SPLIT_INDEX_OFF};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, SPLIT_SHAPES_OFF};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, SPLIT_STRINGS_OFF};
+
+    int32_t *shapes = (int32_t *)(buf + SPLIT_SHAPES_OFF);
+    shapes[0] = 4; shapes[1] = 2; shapes[2] = 8;   /* input  */
+    shapes[3] = 3; shapes[4] = 2; shapes[5] = 8;   /* part 0 */
+    shapes[6] = 1; shapes[7] = 2; shapes[8] = 8;   /* part 1 */
+
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SPLIT_TENSORS_OFF);
+    for (uint16_t i = 0; i < 3u; i++) {
+        tensors[i].shape_off = (uint16_t)(i * 3u);
+        tensors[i].ndim = 3;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        tensors[i].flags = TIGRIS_TENSOR_LINEAR;
+    }
+    tensors[0].size_bytes = 64u * (uint32_t)sizeof(float);
+    tensors[1].size_bytes = 48u * (uint32_t)sizeof(float);
+    tensors[2].size_bytes = 16u * (uint32_t)sizeof(float);
+    tensors[0].flags |= TIGRIS_TENSOR_MODEL_INPUT;
+    tensors[2].flags |= TIGRIS_TENSOR_MODEL_OUTPUT;
+
+    tigris_op_t *op = (tigris_op_t *)(buf + SPLIT_OPS_OFF);
+    op->op_type = TIGRIS_OP_SPLIT;
+    op->num_inputs = 1;
+    op->num_outputs = 2;
+    op->inputs_off = 0;
+    op->outputs_off = 1;
+    op->weight_idx = TIGRIS_NO_WEIGHT;
+    op->bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + SPLIT_STAGES_OFF);
+    stage->ops_off = 5;
+    stage->ops_count = 1;
+    stage->inputs_off = 6;
+    stage->inputs_count = 1;
+    stage->outputs_off = 7;
+    stage->outputs_count = 1;
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    uint16_t *indices = (uint16_t *)(buf + SPLIT_INDEX_OFF);
+    indices[0] = 0;  /* op input */
+    indices[1] = 1;  /* part 0 */
+    indices[2] = 2;  /* part 1 */
+    indices[3] = 0;  /* model input */
+    indices[4] = 2;  /* model output */
+    indices[5] = 0;  /* stage op */
+    indices[6] = 0;  /* stage input */
+    indices[7] = 2;  /* stage output */
+
+    buf[SPLIT_STRINGS_OFF] = '\0';
+}
+
+/* A split's parts are contiguous runs of its input, which is the only cut
+ * that needs no arithmetic. The loader has to say so: a part that differs
+ * anywhere but the outermost stored axis, or a set that does not cover the
+ * input exactly, would be copied wrongly rather than refused. */
+static void test_split_contract(void)
+{
+    printf("  test_split_contract...\n");
+    _Alignas(4) uint8_t buf[SPLIT_PLAN_SIZE];
+    tigris_plan_t plan;
+    int32_t *shapes;
+    tigris_tensor_t *tensors;
+
+    build_split_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "contiguous parts accepted");
+
+    /* Parts that do not cover the input are not a split of it. */
+    build_split_plan(buf);
+    shapes = (int32_t *)(buf + SPLIT_SHAPES_OFF);
+    tensors = (tigris_tensor_t *)(buf + SPLIT_TENSORS_OFF);
+    shapes[3] = 2;
+    tensors[1].size_bytes = 32u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "parts that leave a gap rejected");
+
+    /* A part that differs on an inner axis would be interleaved, not cut. */
+    build_split_plan(buf);
+    shapes = (int32_t *)(buf + SPLIT_SHAPES_OFF);
+    tensors = (tigris_tensor_t *)(buf + SPLIT_TENSORS_OFF);
+    shapes[5] = 4;
+    tensors[1].size_bytes = 24u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "a part cut on an inner axis rejected");
+
+    /* One part is not a split. */
+    build_split_plan(buf);
+    ((tigris_op_t *)(buf + SPLIT_OPS_OFF))->num_outputs = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "a single part rejected");
+}
+
+
+
+/* A build states its limits at compile time because they size fixed storage,
+ * and a plan carries what it needs in its own tables. When the two disagree
+ * the refusal has to name the build that would run the plan, or the only way
+ * forward is guessing. */
+static void test_a_refused_plan_names_the_build_it_wants(void)
+{
+    printf("  test_a_refused_plan_names_the_build_it_wants...\n");
+    _Alignas(4) uint8_t buf[STAGED_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_plan_limits_t required;
+    tigris_plan_limits_t build;
+
+    tigris_build_limits(&build);
+    TEST_ASSERT_EQ(build.tensors, TIGRIS_MAX_TENSORS,
+                   "the build reports its own tensor limit");
+    TEST_ASSERT_EQ(build.stage_inputs, TIGRIS_MAX_STAGE_INPUTS,
+                   "the build reports its own stage input limit");
+
+    /* A plan this build can run reports what it needed anyway, so a caller
+     * sizing a target from a plan has the number without failing first. */
+    build_staged_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load_ex(buf, sizeof(buf), &plan, &required),
+                   TIGRIS_OK, "an accepted plan still reports its needs");
+    TEST_ASSERT(required.tensors > 0u && required.tensors <= build.tensors,
+                "an accepted plan needs no more than the build allows");
+
+    /* One past what this build carries: refused, and the refusal says how
+     * many the plan wanted. */
+    build_staged_plan(buf);
+    ((tigris_stage_t *)(buf + STAGED_STAGES_OFF))->inputs_count =
+        (uint16_t)(TIGRIS_MAX_STAGE_INPUTS + 1u);
+    TEST_ASSERT_EQ(tigris_plan_load_ex(buf, sizeof(buf), &plan, &required),
+                   TIGRIS_ERR_PLAN_LIMITS, "over-limit stage inputs refused");
+    TEST_ASSERT_EQ(required.stage_inputs, TIGRIS_MAX_STAGE_INPUTS + 1u,
+                   "the refusal names the stage input count wanted");
+
+    /* The old entry point keeps its behaviour, and takes no reporting. A
+     * table too large for this build is refused the same way; reaching that
+     * check needs a real table of that size, so it is covered by the plans
+     * the cross-repository gate compiles rather than by an edited fixture,
+     * which the section bounds refuse first and rightly. */
+    build_staged_plan(buf);
+    ((tigris_stage_t *)(buf + STAGED_STAGES_OFF))->outputs_count =
+        (uint16_t)(TIGRIS_MAX_STAGE_OUTPUTS + 1u);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_PLAN_LIMITS, "the plain entry point is unchanged");
 }
 
 static void build_unary_plan(uint8_t *buf)
@@ -971,6 +1618,46 @@ static void build_unary_plan(uint8_t *buf)
     int32_t *shapes = (int32_t *)(buf + TRANSPOSE_SHAPES_OFF);
     shapes[2] = 2;
     shapes[3] = 3;
+}
+
+/* A row band cuts the second to last axis, so on a rank-4 tensor the leading
+ * axes are batch the band spans rather than cuts. The loader mirrors that
+ * because it decides whether the stage is row-banded before it applies the
+ * stripe contract, and a stage it accepts that the executor declines runs
+ * through the wrong path instead of being refused. */
+static void test_rank4_row_band_contract(void)
+{
+    printf("  test_rank4_row_band_contract...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    /* Both sides are the same [1, 2, 4, 8] matrix batch in the model's own
+     * axis order: batch 2, four rows of eight. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_ERF, 4);
+    int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[4] = 1; shapes[5] = 2; shapes[6] = 4; shapes[7] = 8;
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    tensors[0].flags |= TIGRIS_TENSOR_LINEAR;
+    tensors[1].flags |= TIGRIS_TENSOR_LINEAR;
+    tigris_tile_plan_t *tile =
+        (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+    tile->num_tiles = 2;
+    tile->tile_height = 2;
+    tile->original_height = 4;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "a rank-4 row band loads");
+
+    /* The same shapes held channels-last are not a matrix batch, so the band
+     * does not apply and the stripe contract decides instead. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_ERF, 4);
+    shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[4] = 1; shapes[5] = 2; shapes[6] = 4; shapes[7] = 8;
+    tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+    tile->num_tiles = 2;
+    tile->tile_height = 1;
+    tile->original_height = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "the spatial reading of the same shapes still loads");
 }
 
 static void test_operator_semantic_guards(void)
@@ -1762,6 +2449,60 @@ static void test_fixture(const char *path)
     free(buf);
 }
 
+/* The header states how many quantization parameters a plan has and so does
+ * the section that holds them. Everything downstream bounds an index against
+ * one and reads the array sized by the other, so a header claiming more than
+ * the section holds read past the plan: a four-byte out-of-bounds read inside
+ * tigris_plan_load, from input the loader exists to police. */
+static void test_quant_param_counts_are_reconciled(void)
+{
+    printf("  test_quant_param_counts_are_reconciled...\n");
+    char path[512];
+    int path_len = snprintf(path, sizeof(path), "%s/%s",
+                            TIGRIS_SCHEMA_COMPAT_DIR,
+                            "schema-v3-qdq-conv.tgrs");
+    if (path_len <= 0 || (size_t)path_len >= sizeof(path))
+        return;
+    uint32_t buf_len = 0;
+    uint8_t *buf = load_file(path, &buf_len);
+    TEST_ASSERT(buf != NULL, "quantized fixture is readable");
+    if (!buf)
+        return;
+
+    tigris_plan_t plan;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan), TIGRIS_OK,
+                   "the fixture loads as emitted");
+
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    uint16_t present = hdr->num_quant_params;
+    TEST_ASSERT(present > 0u, "the fixture carries quantization");
+    const tigris_section_entry_t *dir =
+        (const tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + dir[0].offset);
+
+    /* A header that claims more than the section holds, and a tensor naming
+     * an index inside the claim but outside the section. */
+    hdr->num_quant_params = 300;
+    for (uint16_t i = 0; i < hdr->num_tensors; i++) {
+        if (tensors[i].quant_param_idx != TIGRIS_NO_QUANT_PARAM) {
+            tensors[i].quant_param_idx = 200;
+            break;
+        }
+    }
+    TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a header claiming more quant params than the section "
+                   "holds is refused");
+
+    /* The reverse mismatch is no better founded. */
+    hdr->num_quant_params = (uint16_t)(present - 1u);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, buf_len, &plan),
+                   TIGRIS_ERR_BAD_SECTION,
+                   "a header claiming fewer is refused too");
+
+    free(buf);
+}
+
 static void test_schema_compatibility_fixtures(void)
 {
     /*
@@ -1773,6 +2514,9 @@ static void test_schema_compatibility_fixtures(void)
      *   v5 Conv1D:   explicit serialized length axis
      *   v6 QDQ Conv: a boundary tensor declaring its float model interface
      *   v7 MatMul:   tensors recording whether they are stored in model order
+     *   v8 LayerNorm:the typed attribute kinds
+     *   v9 QDQ Add:  a quantized sum stating the multipliers that scale its
+     *                two operands and its result
      */
     static const struct {
         const char *filename;
@@ -1789,6 +2533,8 @@ static void test_schema_compatibility_fixtures(void)
          TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH},
         {"schema-v6-interface-dtype.tgrs", TIGRIS_SCHEMA_VERSION_V6, 3, 0, 0, 0},
         {"schema-v7-tensor-layout.tgrs", TIGRIS_SCHEMA_VERSION_V7, 0, 2, 0, 0},
+        {"schema-v8-layer-norm.tgrs", TIGRIS_SCHEMA_VERSION_V8, 0, 3, 0, 0},
+        {"schema-v9-binary-requant.tgrs", TIGRIS_SCHEMA_VERSION_V9, 3, 1, 0, 0},
     };
     const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
 
@@ -1936,6 +2682,15 @@ int main(int argc, char *argv[])
     test_compressed_block_guards();
     test_cross_reference_guards();
     test_transpose_attribute_guards();
+    test_op_attribute_kinds();
+    test_declared_interface_dtype_contract();
+    test_a_refused_plan_names_the_build_it_wants();
+    test_split_contract();
+    test_reduce_mean_contract();
+    test_op_attribute_payloads();
+    test_tiled_conversion_contract();
+    test_tiled_reduction_contract();
+    test_rank4_row_band_contract();
     test_operator_semantic_guards();
     test_nonweighted_operator_semantics();
     test_convolution_semantic_guards();
@@ -1944,6 +2699,7 @@ int main(int argc, char *argv[])
 
     printf("\nSchema compatibility fixtures:\n");
     test_schema_compatibility_fixtures();
+    test_quant_param_counts_are_reconciled();
 
     printf("\nStruct size tests:\n");
     test_struct_sizes();

@@ -48,12 +48,46 @@ typedef struct {
      * recomputing already-rolled overlap rows. */
     int32_t  out_row_start; /* rows already written before this call */
     int32_t  in_row_start;  /* rows already consumed before this call */
+    /* Where this tile sits in the whole tensor. A kernel that resamples has
+     * to know which output rows it is producing, because the source row is a
+     * function of the global index rather than of the position in the tile.
+     * Everything that maps rows one to one ignores these, and they are zero
+     * on the untiled path, so no existing kernel changes behavior. */
+    int32_t  out_row_origin; /* global index of this tile's first output row */
+    int32_t  in_row_origin;  /* global index of this tile's first input row */
     /* 2D (HW axis) tile geometry. Consulted only when width_tiled == 1;
      * default to 0 like every other field above, so 1D-height and
      * non-tiled paths stay byte-identical. */
     uint16_t pad_left;      /* effective left padding for this tile */
     uint16_t pad_right;     /* effective right padding for this tile */
     uint8_t  width_tiled;   /* 0=height-only tile, 1=2D (HW) tile active */
+    /* Running accumulator for a reduction tiled along its input. A global
+     * reduction collapses the axis the output-driven tile loop walks, so the
+     * executor walks the input instead and hands the kernel one partial per
+     * (batch, channel): int32 for the int8 kernels, float for the float32
+     * ones. reduce_first selects initialization over continuation,
+     * reduce_last selects writing the output tensor. NULL and zero on every
+     * other path, where the kernel reduces the whole tensor as before. */
+    void    *reduce_acc;
+    uint8_t  reduce_first;
+    uint8_t  reduce_last;
+    /* A layout conversion tiled along its output rows. The kernel is handed a
+     * packed [N, in_h, in_w] input gathered from a column range and writes a
+     * packed [N, out_h, out_w] output, so it walks the tile extents above
+     * rather than the tensor's own. Zero on every other path. */
+    uint8_t  transposed_tile;
+    /* A rank-2 matrix tiled along its rows. Rank 2 has no batch or spatial
+     * axis, so the row axis is axis 0 rather than axis 1 and out_h counts the
+     * rows in this band. Zero on every other path. */
+    uint8_t  row_tiled;
+    /* The batch a banded transpose spans. A transpose the band path accepts
+     * swaps two adjacent groups of axes and leaves the rest in order, so the
+     * axes ahead of the swapped pair are a batch the band repeats over and the
+     * axes behind it are a block that travels with the element. in_h and in_w
+     * are the two swapped extents, and these are the batch and the block.
+     * Both zero on every other path. */
+    int32_t  transpose_outer;
+    int32_t  transpose_block;
 } tigris_tile_ctx_t;
 
 /* Tensor alignment */
@@ -72,7 +106,7 @@ typedef struct {
   #elif defined(__riscv_vector)
     #define TIGRIS_TENSOR_ALIGN 16   /* RVV */
   #elif defined(__XTENSA__)
-    #define TIGRIS_TENSOR_ALIGN 8    /* ESP32-S3 TIE (ee.vld.l.64.ip) */
+    #define TIGRIS_TENSOR_ALIGN 16   /* ESP-NN kernels read and write 16-byte vectors */
   #elif defined(__ARM_NEON)
     #define TIGRIS_TENSOR_ALIGN 16   /* 32-bit ARM with NEON */
   #elif defined(__ARM_FEATURE_DSP)

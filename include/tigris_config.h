@@ -10,6 +10,8 @@
 #ifndef TIGRIS_CONFIG_H
 #define TIGRIS_CONFIG_H
 
+#include <stdint.h>
+
 /** Maximum runtime tensors in one loaded plan. */
 #ifndef TIGRIS_MAX_TENSORS
 #define TIGRIS_MAX_TENSORS 512u
@@ -41,6 +43,21 @@
 #ifndef TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE
 #define TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE 1
 #endif
+
+/**
+ * What a plan asks of the build that loads it, in the same terms as the
+ * limits above. A build states these at compile time because they size fixed
+ * storage; a plan carries what it needs in its own tables. Where the two
+ * disagree the loader refuses, and reports this so the refusal names the
+ * build the plan wants rather than only that it was refused.
+ */
+typedef struct {
+    uint16_t tensors;
+    uint16_t stage_inputs;
+    uint16_t stage_outputs;
+    uint16_t chain_stages;
+    uint16_t spatial_ops_per_stage;
+} tigris_plan_limits_t;
 
 #if TIGRIS_MAX_TENSORS < 1u || TIGRIS_MAX_TENSORS > 65535u
 #error "TIGRIS_MAX_TENSORS must be in [1, 65535]"

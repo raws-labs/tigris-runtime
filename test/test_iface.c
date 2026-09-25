@@ -262,6 +262,68 @@ static void test_plain_interface_copies(void)
     free(buf);
 }
 
+static void test_uint8_boundary_moves_by_128(void)
+{
+    /* A uint8 boundary: the compiler moved the zero point by 128 with the
+     * values, so the conversion is exactly that shift, both ways. */
+    uint16_t in_idx = fixture_plan.model_inputs[0];
+    uint16_t out_idx = fixture_plan.model_outputs[0];
+    tigris_tensor_t *ti = (tigris_tensor_t *)&fixture_plan.tensors[in_idx];
+    tigris_tensor_t *to = (tigris_tensor_t *)&fixture_plan.tensors[out_idx];
+    uint8_t saved_in = ti->iface_dtype;
+    uint8_t saved_out = to->iface_dtype;
+    void **ptrs = (void **)calloc(fixture_plan.header->num_tensors,
+                                  sizeof(void *));
+    int8_t *in_storage = (int8_t *)calloc(ti->size_bytes, 1);
+    int8_t *out_storage = (int8_t *)calloc(to->size_bytes, 1);
+    uint8_t *bytes_in = (uint8_t *)calloc(ti->size_bytes, 1);
+    uint8_t *bytes_out = (uint8_t *)calloc(to->size_bytes, 1);
+    tigris_mem_t mem;
+
+    printf("  test_uint8_boundary_moves_by_128...\n");
+    if (!ptrs || !in_storage || !out_storage || !bytes_in || !bytes_out)
+        goto done;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = fixture_plan.header->num_tensors;
+    ptrs[in_idx] = in_storage;
+    ptrs[out_idx] = out_storage;
+
+    ti->iface_dtype = 2u;
+    to->iface_dtype = 2u;
+    TEST_ASSERT_EQ(tigris_iface_bytes(&fixture_plan, in_idx), ti->size_bytes,
+                   "a uint8 interface is one byte per element");
+
+    for (uint32_t i = 0; i < ti->size_bytes; i++)
+        bytes_in[i] = (uint8_t)(i * 37u);
+    TEST_ASSERT_EQ(tigris_input_write(&fixture_plan, &mem, in_idx, bytes_in,
+                                      ti->size_bytes),
+                   TIGRIS_OK, "a uint8 input is written");
+    int shifted = 1;
+    for (uint32_t i = 0; i < ti->size_bytes; i++)
+        shifted &= (int32_t)in_storage[i] == (int32_t)bytes_in[i] - 128;
+    TEST_ASSERT(shifted, "every input byte lands 128 lower");
+
+    for (uint32_t i = 0; i < to->size_bytes; i++)
+        out_storage[i] = (int8_t)((int32_t)(i * 29u % 256u) - 128);
+    TEST_ASSERT_EQ(tigris_output_read(&fixture_plan, &mem, out_idx, bytes_out,
+                                      to->size_bytes),
+                   TIGRIS_OK, "a uint8 output is read");
+    shifted = 1;
+    for (uint32_t i = 0; i < to->size_bytes; i++)
+        shifted &= (int32_t)bytes_out[i] == (int32_t)out_storage[i] + 128;
+    TEST_ASSERT(shifted, "every output byte reads 128 higher");
+
+done:
+    ti->iface_dtype = saved_in;
+    to->iface_dtype = saved_out;
+    free(bytes_out);
+    free(bytes_in);
+    free(out_storage);
+    free(in_storage);
+    free(ptrs);
+}
+
 static void test_unconvertible_interfaces_are_refused(void)
 {
     /* The plan validated on load, so an unsupported pair is produced here by
@@ -347,6 +409,7 @@ int main(void)
     test_output_is_read_back_in_the_declared_dtype();
     test_non_boundary_tensors_are_refused();
     test_plain_interface_copies();
+    test_uint8_boundary_moves_by_128();
     test_unconvertible_interfaces_are_refused();
 
     free(fixture_buf);

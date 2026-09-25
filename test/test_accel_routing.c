@@ -185,6 +185,22 @@ static int run_pre_route_rolled(const route_fixture_t *fx,
         backend, &fx->plan, &fx->op, 0, &mem, NULL, handled);
 }
 
+/* Route a row-banded op. Only row_tiled is set, so the test isolates that
+ * branch of the guard. */
+static int run_pre_route_row_tiled(const route_fixture_t *fx,
+                                   tigris_accel_backend_t backend,
+                                   int8_t *output, int *handled)
+{
+    tigris_mem_t mem;
+    void *ptrs[2];
+    init_mem(&mem, ptrs, output, fx, 1);
+    mem.tile.row_tiled = 1;
+    mem.tile.out_h = 1;
+    mem.tile.in_h = 1;
+    return tigris_accel_try_s8_ref(
+        backend, &fx->plan, &fx->op, 0, &mem, NULL, handled);
+}
+
 /* Route a 2D (width) tiled op. Only width_tiled is set here; row offsets stay
  * zero so the test isolates the width_tiled branch of the guard. */
 static int run_pre_route_width_tiled(const route_fixture_t *fx,
@@ -369,6 +385,114 @@ static void test_esp_asymmetric_pad_workspace_policy(void)
                    0, "padded byte-count overflow fails closed");
 }
 
+/* Column-reduced window op with the vendor padding convention: output row r
+ * reads input rows r*stride - pad_top + k, k < kernel; rows outside [0, in_h)
+ * are padding. Row sums are position-weighted so a shifted window cannot pass
+ * by accident. */
+static void window_rows(const int32_t *in, int32_t in_h, int32_t pad_top,
+                        int32_t stride, int32_t kernel, int32_t out_h,
+                        int32_t *out)
+{
+    for (int32_t r = 0; r < out_h; r++) {
+        int32_t acc = 0;
+        for (int32_t k = 0; k < kernel; k++) {
+            int32_t row = r * stride - pad_top + k;
+            if (row >= 0 && row < in_h)
+                acc += in[row] * (k + 1);
+        }
+        out[r] = acc;
+    }
+}
+
+static void test_row_band_matches_unsplit_op(void)
+{
+    printf("  test_row_band_matches_unsplit_op...\n");
+
+    enum { MAX_IN = 23, MAX_OUT = 24 };
+    int32_t in[MAX_IN];
+    for (int32_t i = 0; i < MAX_IN; i++)
+        in[i] = 3 * i + 1;
+
+    int32_t whole[MAX_OUT];
+    int32_t band_out[MAX_OUT];
+    int mismatches = 0;
+    int bands_run = 0;
+
+    for (int32_t in_h = 1; in_h <= MAX_IN; in_h += 2) {
+        for (uint16_t kernel = 1; kernel <= 5; kernel++) {
+            for (uint16_t stride = 1; stride <= 3; stride++) {
+                for (uint16_t pad_top = 0; pad_top < kernel; pad_top++) {
+                    for (int32_t pad_bottom = 0; pad_bottom < kernel;
+                         pad_bottom++) {
+                        int32_t span = in_h + pad_top + pad_bottom - kernel;
+                        if (span < 0)
+                            continue;
+                        int32_t out_h = span / stride + 1;
+                        if (out_h > MAX_OUT)
+                            continue;
+                        window_rows(in, in_h, pad_top, stride, kernel,
+                                    out_h, whole);
+
+                        for (int32_t band = 1; band <= out_h; band++) {
+                            for (int32_t o0 = 0; o0 < out_h; o0 += band) {
+                                int32_t rows = out_h - o0 < band
+                                             ? out_h - o0 : band;
+                                int32_t start = -1, count = -1;
+                                uint16_t bpad = 0xFFFFu;
+                                if (!tigris_accel_row_band(
+                                        in_h, pad_top, stride, kernel, o0,
+                                        rows, &start, &count, &bpad)) {
+                                    mismatches++;
+                                    continue;
+                                }
+                                window_rows(in + start, count, bpad, stride,
+                                            kernel, rows, band_out);
+                                bands_run++;
+                                for (int32_t r = 0; r < rows; r++) {
+                                    if (band_out[r] != whole[o0 + r])
+                                        mismatches++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    TEST_ASSERT(bands_run > 1000, "sweep ran a meaningful number of bands");
+    TEST_ASSERT_EQ(mismatches, 0,
+                   "every band reproduces its rows of the unsplit op");
+
+    int32_t start = 0, count = 0;
+    uint16_t bpad = 0;
+    /* in_h 10, pad_top 2, stride 2, kernel 5: rows 3..4 read input 4..10. */
+    TEST_ASSERT_EQ(tigris_accel_row_band(10, 2, 2, 5, 3, 2,
+                                         &start, &count, &bpad), 1,
+                   "interior band resolves");
+    TEST_ASSERT_EQ(start, 4, "interior band input start");
+    TEST_ASSERT_EQ(count, 6, "interior band input rows clip at in_h");
+    TEST_ASSERT_EQ(bpad, 0, "interior band has no leading padding");
+
+    TEST_ASSERT_EQ(tigris_accel_row_band(10, 2, 2, 5, 0, 1,
+                                         &start, &count, &bpad), 1,
+                   "first band resolves");
+    TEST_ASSERT_EQ(bpad, 2, "first band keeps the leading padding");
+
+    /* Windows entirely below the input: nothing to read. */
+    TEST_ASSERT_EQ(tigris_accel_row_band(4, 0, 1, 3, 6, 1,
+                                         &start, &count, &bpad), 0,
+                   "band past the input is refused");
+    TEST_ASSERT_EQ(tigris_accel_row_band(4, 0, 0, 3, 0, 1,
+                                         &start, &count, &bpad), 0,
+                   "zero stride is refused");
+    TEST_ASSERT_EQ(tigris_accel_row_band(4, 0, 1, 3, 0, 0,
+                                         &start, &count, &bpad), 0,
+                   "empty band is refused");
+    TEST_ASSERT_EQ(tigris_accel_row_band(4, 0, 1, 3, 0, 1,
+                                         NULL, &count, &bpad), 0,
+                   "missing output is refused");
+}
+
 /* A line-buffered chain sets mem->tile.out_row_start / in_row_start on rolled
  * interior tiles. 1.5b: the ESP-NN/CMSIS-NN Conv/Depthwise adapters now honor
  * those offsets natively, so a rolled conv/depthwise stays on the vendor path;
@@ -496,6 +620,44 @@ static void test_width_tiled_routing(void)
     TEST_ASSERT_EQ(handled, 1, "2D-tiled max-pool still routes ESP to s8_ref");
 }
 
+/* A row band says how many rows the buffer holds in mem->tile, not in the
+ * tensor shape. The vendor FullyConnected kernels read the row count from the
+ * tensor, so they would read and write the whole matrix through a band-sized
+ * allocation. Every backend must route a row band to the reference kernel,
+ * which honors it. */
+static void test_row_banded_ops_route_to_reference(void)
+{
+    printf("  test_row_banded_ops_route_to_reference...\n");
+
+    route_fixture_t fx;
+    int8_t out[8];
+    int handled;
+
+    build_fixture(&fx, TIGRIS_OP_FULLY_CONN, 0);
+    memset(out, 0, sizeof(out));
+    handled = 0;
+    run_pre_route_row_tiled(&fx, TIGRIS_ACCEL_CMSIS_NN, out, &handled);
+    TEST_ASSERT_EQ(handled, 1,
+                   "a row-banded fully-connected routes CMSIS to s8_ref");
+
+    memset(out, 0, sizeof(out));
+    handled = 0;
+    run_pre_route_row_tiled(&fx, TIGRIS_ACCEL_ESP_NN, out, &handled);
+    TEST_ASSERT_EQ(handled, 1,
+                   "a row-banded fully-connected routes ESP to s8_ref");
+
+    /* Conv is not a row-banding operator, but the guard is on the tile mode
+     * rather than the operator, so it routes too rather than relying on the
+     * compiler never to emit it. */
+    build_fixture(&fx, TIGRIS_OP_CONV, 0);
+    fx.op.spatial.dilation_h = 1;
+    fx.op.spatial.dilation_w = 1;
+    memset(out, 0, sizeof(out));
+    handled = 0;
+    run_pre_route_row_tiled(&fx, TIGRIS_ACCEL_CMSIS_NN, out, &handled);
+    TEST_ASSERT_EQ(handled, 1, "a row band routes whatever the operator");
+}
+
 /* 1.5a: a plain-height tile (tile.active, no roll offset, not width_tiled) with
  * unit dilation now runs on the CMSIS-NN Conv/Depthwise adapter, matching what
  * the ESP-NN adapter already does. Dilated, rolled, and 2D-width tiles still
@@ -549,7 +711,9 @@ int main(void)
     test_unit_dilation_keeps_esp_adapter();
     test_rolled_tile_routing();
     test_width_tiled_routing();
+    test_row_banded_ops_route_to_reference();
     test_esp_asymmetric_pad_workspace_policy();
+    test_row_band_matches_unsplit_op();
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);

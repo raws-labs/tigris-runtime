@@ -109,7 +109,9 @@ static inline void compute_mean_quant_mult(
 {
     compute_quant_mult(scale, mult, shift);
     if (count > 1) {
-        int s = 63 - __builtin_clzll((unsigned long long)count);
+        int s = 0;
+        for (uint32_t remaining = (uint32_t)count; remaining > 1u; remaining >>= 1)
+            ++s;
         if (s > 32) s = 32;
         int max_s = 31 + *shift;
         if (max_s < 0) max_s = 0;

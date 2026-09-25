@@ -152,6 +152,30 @@ it into git from the repo root with:
 ln -s ../../scripts/local_ci.sh .git/hooks/pre-push
 ```
 
+## Host shared library
+
+The optional host library provides an allocating, opaque C session API in
+[tigris_host.h](host/tigris_host.h). It copies the plan, allocates aligned arenas
+and per-session executor workspace, and executes float32 or int8 reference
+kernels. Repeated inference performs no allocation in the host wrapper.
+This checks plan execution on the portable reference path. It does not validate
+ESP-NN or CMSIS-NN numerics or measure on-device latency.
+
+```bash
+cmake -S . -B build-host -DTIGRIS_BUILD_HOST=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-host --target test_host host_archive
+ctest --test-dir build-host -R host_library --output-on-failure
+```
+
+Inputs and outputs use stored axis order and the model's declared interface
+dtype. Sessions are independent; serialize calls on each session. The default
+slow arena is a conservative host allocation, not a compiled memory requirement.
+Reported peaks cover the arenas, not total process memory.
+
+The archive contains the shared library, C header, license, and a manifest with
+the runtime version, host ABI, platform, source revision, and library checksum.
+No Python package is produced by this build.
+
 ## Install for CMake consumers
 
 Install the runtime to a prefix:

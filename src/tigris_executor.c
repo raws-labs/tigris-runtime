@@ -2586,6 +2586,47 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
 
 /* Chained tiled execution */
 
+static TIGRIS_NOINLINE tigris_exec_error_t chain_kernel(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_idx,
+    tigris_mem_t *mem, tigris_kernel_fn kernel, void *user_ctx,
+    const executor_workspace_impl_t *workspace, int32_t gs, int32_t ge)
+{
+    int binary = op->num_inputs == 2 &&
+        (op->op_type == TIGRIS_OP_ADD || op->op_type == TIGRIS_OP_MUL ||
+         op->op_type == TIGRIS_OP_SUB);
+    if (!binary)
+        return kernel(plan, op, op_idx, mem, user_ctx) != 0
+            ? TIGRIS_EXEC_ERR_KERNEL : TIGRIS_EXEC_OK;
+
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    void *bases[2] = { mem->tensor_ptrs[ins[0]], mem->tensor_ptrs[ins[1]] };
+    size_t offsets[2] = { 0, 0 };
+    for (unsigned k = 0; k < 2; k++) {
+        uint16_t tidx = ins[k];
+        const tigris_tensor_t *t = &plan->tensors[tidx];
+        const int32_t *sh = tigris_tensor_shape(plan, t);
+        if (t->ndim != 4 || (t->flags & TIGRIS_TENSOR_LINEAR) ||
+            sh[0] != 1 || sh[1] <= 1 ||
+            workspace->out_ge[tidx] <= workspace->out_gs[tidx])
+            continue;
+        if (!bases[k] || gs < workspace->out_gs[tidx] ||
+            ge > workspace->out_ge[tidx]) {
+            return TIGRIS_EXEC_ERR_TILE;
+        }
+        offsets[k] = (size_t)(gs - workspace->out_gs[tidx]) *
+            (t->size_bytes / (uint32_t)sh[1]);
+    }
+    /* A residual operand can retain halo rows that the main path consumed. */
+    for (unsigned k = 0; k < 2; k++) {
+        if (offsets[k])
+            mem->tensor_ptrs[ins[k]] = (uint8_t *)bases[k] + offsets[k];
+    }
+    int result = kernel(plan, op, op_idx, mem, user_ctx);
+    for (unsigned k = 0; k < 2; k++)
+        mem->tensor_ptrs[ins[k]] = bases[k];
+    return result != 0 ? TIGRIS_EXEC_ERR_KERNEL : TIGRIS_EXEC_OK;
+}
+
 /**
  * Execute a chain of stages with tile-through streaming.
  *
@@ -2983,12 +3024,12 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
 
         /* These buffers must survive tigris_mem_reset_fast between tiles. */
         mem->fast_reserved = mem->fast_used;
+    }
 
-        /* Nothing rolled yet: clear the previous-tile bookkeeping. */
-        for (uint16_t i = 0; i < mem->num_tensors; i++) {
-            workspace->out_gs[i] = 0;
-            workspace->out_ge[i] = 0;
-        }
+    /* Row ranges belong to this chain, including when buffers are recomputed. */
+    for (uint16_t i = 0; i < mem->num_tensors; i++) {
+        workspace->out_gs[i] = 0;
+        workspace->out_ge[i] = 0;
     }
 
     /* 4. Tile loop - iterate over last stage's output tiles */
@@ -3072,6 +3113,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                     (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
                 return TIGRIS_EXEC_ERR_MEM;
             }
+            workspace->out_gs[tidx] = in_starts[0];
+            workspace->out_ge[tidx] = in_ends[0];
         }
 
         /* d. Run each stage in the chain */
@@ -3300,9 +3343,11 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                     workspace->out_ge[outs[k]] = op_ge;
                 }
 
-                int kret = kernel(cplan, op, op_idx, mem, user_ctx);
-                if (kret != 0)
-                    return TIGRIS_EXEC_ERR_KERNEL;
+                tigris_exec_error_t kernel_error = chain_kernel(
+                    cplan, op, op_idx, mem, kernel, user_ctx,
+                    workspace, op_gs, op_ge);
+                if (kernel_error != TIGRIS_EXEC_OK)
+                    return kernel_error;
 
                 /* Undo any roll narrowing so the next op sees this op's full
                  * height and offsets 0 (a following pointwise op inherits this

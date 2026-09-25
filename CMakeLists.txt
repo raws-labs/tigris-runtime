@@ -28,7 +28,11 @@ endif()
 project(tigris_runtime VERSION 0.10.2 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wvla)
+if(MSVC AND CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+    add_compile_options(/W4 /WX)
+else()
+    add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wvla)
+endif()
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -43,7 +47,9 @@ target_include_directories(tigris_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-target_link_libraries(tigris_runtime PUBLIC m)
+if(NOT WIN32)
+    target_link_libraries(tigris_runtime PUBLIC m)
+endif()
 if(TIGRIS_STACK_USAGE)
     if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
         target_compile_options(tigris_runtime PRIVATE -fstack-usage)
@@ -105,6 +111,11 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
 endif()
 
 # Tests (only when built as top-level project)
+option(TIGRIS_BUILD_HOST "Build the allocating host shared library and its tests" OFF)
+if(TIGRIS_BUILD_HOST)
+    add_subdirectory(host)
+endif()
+
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     enable_testing()
 

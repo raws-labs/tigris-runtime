@@ -19,15 +19,17 @@ jobs:
           path: tigris-compiler
           ref: develop
       - name: Use matching compiler ref when available
-        # On a release tag the counterpart is the released compiler, which is
-        # the tip of its main. The two version independently and have never
-        # shared a tag name, so requiring one could only ever fail.
+        # Runtime releases first; until the compiler tag exists, check develop.
         env:
           COMPILER_REF: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
           COMPILER_REF_TYPE: ${{ github.ref_type }}
         run: |
           if [ "$COMPILER_REF_TYPE" = "tag" ]; then
-            remote_ref="refs/heads/main"
+            case "$COMPILER_REF" in
+              v[0-9]*) python3 scripts/check_version_sources.py --expect "${COMPILER_REF#v}" ;;
+              *) echo "Runtime release tags must use vX.Y.Z" >&2; exit 1 ;;
+            esac
+            remote_ref="refs/tags/$COMPILER_REF"
           else
             remote_ref="refs/heads/$COMPILER_REF"
           fi
@@ -35,8 +37,7 @@ jobs:
             git -C tigris-compiler fetch --depth=1 origin "$remote_ref"
             git -C tigris-compiler checkout --detach FETCH_HEAD
           elif [ "$COMPILER_REF_TYPE" = "tag" ]; then
-            echo "Compiler main must exist to pair with a runtime release tag" >&2
-            exit 1
+            echo "Matching compiler tag is not published yet; checking develop"
           fi
       - name: Compare runtime dispatch with the canonical matrix
         env:
@@ -59,6 +60,7 @@ jobs:
       - run: >-
           cmake -S . -B build-${{ matrix.compiler }}
           -DCMAKE_BUILD_TYPE=Release
+          -DTIGRIS_BUILD_HOST=ON
           -DCMAKE_C_COMPILER=${{ matrix.compiler }}
       - run: cmake --build build-${{ matrix.compiler }} --parallel
       - run: ctest --test-dir build-${{ matrix.compiler }} --output-on-failure
@@ -84,6 +86,7 @@ jobs:
       - run: >-
           cmake -S . -B build-sanitize
           -DCMAKE_BUILD_TYPE=Debug
+          -DTIGRIS_BUILD_HOST=ON
           -DCMAKE_C_COMPILER=clang
           -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
           -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"

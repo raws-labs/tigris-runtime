@@ -2339,6 +2339,165 @@ static void test_exec_mixed_conv_convtranspose_not_tiled(void)
     TEST_ASSERT_EQ(stats.stages_tiled, 0, "mixed stage not counted as tiled");
 }
 
+typedef struct {
+    tigris_kernel_fn dispatch;
+    unsigned tiled_calls;
+} residual_kernel_ctx_t;
+
+static int residual_kernel(const tigris_plan_t *plan, const tigris_op_t *op,
+                           uint16_t op_index, tigris_mem_t *mem, void *user_ctx)
+{
+    residual_kernel_ctx_t *ctx = user_ctx;
+    if (mem->tile.active) ctx->tiled_calls++;
+    return ctx->dispatch(plan, op, op_index, mem, NULL);
+}
+
+static void run_chain_residual_rows(uint8_t binary_op, int s8,
+                                    int swap_inputs, int input_residual)
+{
+    printf("  chain residual op=%u s8=%d swap=%d input=%d...\n",
+           binary_op, s8, swap_inputs, input_residual);
+    enum { H = 17, W = 4, C = 3, NT = 9, NO = 8, NS = 4, ELEMENTS = H * W * C };
+    tigris_file_header_t header = {0};
+    tigris_tensor_t tensors[NT] = {{0}};
+    tigris_op_t ops[NO] = {{0}};
+    tigris_stage_t stages[NS] = {{0}};
+    tigris_quant_param_t quant = {0};
+    quant.scale = 0.125f;
+    quant.num_channels = 1;
+    uint16_t indices[64];
+    int32_t shapes[NT * 4];
+    uint16_t model_input = 0, model_output = NT - 1;
+    unsigned used = 0;
+    header.num_tensors = NT;
+    header.num_ops = NO;
+    header.num_stages = NS;
+    header.num_quant_params = s8 ? 1 : 0;
+    header.num_model_inputs = header.num_model_outputs = 1;
+    for (unsigned t = 0; t < NT; t++) {
+        tensors[t].ndim = 4;
+        tensors[t].dtype = s8 ? 3 : 1;
+        tensors[t].size_bytes = ELEMENTS * (s8 ? 1 : sizeof(float));
+        tensors[t].quant_param_idx = s8 ? 0 : TIGRIS_NO_QUANT_PARAM;
+        tensors[t].shape_off = (uint16_t)(t * 4);
+        shapes[t * 4] = 1; shapes[t * 4 + 1] = H;
+        shapes[t * 4 + 2] = W; shapes[t * 4 + 3] = C;
+    }
+    tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    tensors[NT - 1].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+    for (unsigned i = 0; i < NO; i++) {
+        unsigned local = i % 4;
+        ops[i].op_type = local == 2 ? TIGRIS_OP_MAX_POOL :
+            local == 3 ? binary_op : TIGRIS_OP_RELU;
+        ops[i].num_inputs = local == 3 ? 2 : 1;
+        ops[i].num_outputs = 1;
+        ops[i].weight_idx = ops[i].bias_idx = TIGRIS_NO_WEIGHT;
+        ops[i].inputs_off = (uint16_t)used;
+        uint16_t residual = (uint16_t)(input_residual ? (i / 4) * 4 : i - 1);
+        indices[used++] = local == 3 && swap_inputs ? residual : (uint16_t)i;
+        if (local == 3) indices[used++] = swap_inputs ? (uint16_t)i : residual;
+        ops[i].outputs_off = (uint16_t)used;
+        indices[used++] = (uint16_t)(i + 1);
+        if (local == 2) {
+            ops[i].spatial.kernel_h = 3;
+            ops[i].spatial.kernel_w = 1;
+            ops[i].spatial.stride_h = ops[i].spatial.stride_w = 1;
+            ops[i].spatial.dilation_h = ops[i].spatial.dilation_w = 1;
+            ops[i].spatial.pad_top = ops[i].spatial.pad_bottom = 1;
+        }
+    }
+    for (unsigned s = 0; s < NS; s++) {
+        unsigned start = (s / 2) * 4 + s % 2;
+        stages[s].ops_off = (uint16_t)used;
+        stages[s].ops_count = s % 2 ? 3 : 1;
+        for (unsigned j = 0; j < stages[s].ops_count; j++) {
+            indices[used++] = (uint16_t)(start + j);
+            ops[start + j].stage = (uint8_t)s;
+        }
+        stages[s].inputs_off = (uint16_t)used;
+        stages[s].inputs_count = 1;
+        indices[used++] = (uint16_t)start;
+        if (input_residual && s % 2) {
+            stages[s].inputs_count++;
+            indices[used++] = (uint16_t)(start - 1);
+        }
+        stages[s].outputs_off = (uint16_t)used;
+        stages[s].outputs_count = 1;
+        indices[used++] = (uint16_t)(start + stages[s].ops_count);
+        stages[s].chain_id = (uint16_t)(s - s % 2);
+        stages[s].chain_len = 2;
+        stages[s].chain_tile_h = s % 2 ? 0 : 3;
+    }
+    tigris_plan_t plan = {0};
+    plan.header = &header; plan.tensors = tensors; plan.ops = ops;
+    plan.stages = stages; plan.index_pool = indices; plan.shape_pool = shapes;
+    plan.model_inputs = &model_input; plan.model_outputs = &model_output;
+    plan.quant_params = &quant;
+    plan.num_quant_params = header.num_quant_params;
+    tigris_stage_t full_stage = {0};
+    full_stage.ops_off = (uint16_t)used;
+    full_stage.ops_count = NO;
+    for (unsigned i = 0; i < NO; i++) indices[used++] = (uint16_t)i;
+    full_stage.inputs_off = (uint16_t)used;
+    full_stage.inputs_count = 1;
+    indices[used++] = model_input;
+    full_stage.outputs_off = (uint16_t)used;
+    full_stage.outputs_count = 1;
+    indices[used++] = model_output;
+    uint8_t expected[ELEMENTS * sizeof(float)];
+    tigris_kernel_fn dispatch = s8 ? tigris_dispatch_kernel_s8 : tigris_dispatch_kernel;
+    for (unsigned mode = 0; mode < 3; mode++) {
+        void *ptrs[NT];
+        _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[16384], slow[8192];
+        tigris_mem_t mem;
+        header.num_stages = mode == 0 ? 1 : NS;
+        plan.stages = mode == 0 ? &full_stage : stages;
+        void *workspace = malloc(tigris_executor_workspace_required(&plan));
+        TEST_ASSERT(workspace != NULL, "workspace allocates");
+        if (!workspace) return;
+        for (unsigned s = 0; s < NS; s += 2)
+            stages[s]._reserved1 = mode == 2 ? TIGRIS_STAGE_FLAG_LINE_BUFFERED : 0;
+        TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, NT, fast, mode == 0 ? sizeof(fast) : 2048,
+            slow, sizeof(slow)), TIGRIS_MEM_OK, "residual arenas initialize");
+        TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes),
+            TIGRIS_MEM_OK, "residual input allocates");
+        for (unsigned i = 0; i < ELEMENTS; i++) {
+            if (s8) ((int8_t *)ptrs[0])[i] = (int8_t)(2 + (i * 7) % 19);
+            else ((float *)ptrs[0])[i] = (float)(2 + (i * 7) % 19) / 16.0f;
+        }
+        tigris_exec_stats_t stats;
+        residual_kernel_ctx_t ctx = { dispatch, 0 };
+        tigris_exec_error_t result = tigris_run_with_workspace_buffer(&plan,
+            &mem, residual_kernel, &ctx, &stats, workspace,
+            tigris_executor_workspace_required(&plan));
+        TEST_ASSERT_EQ(result, TIGRIS_EXEC_OK, "residual graph executes");
+        if (result == TIGRIS_EXEC_OK) {
+            TEST_ASSERT_EQ(stats.stages_chain, mode == 0 ? 0 : NS,
+                           "execution uses the requested schedule");
+            if (mode != 0) TEST_ASSERT(ctx.tiled_calls > NO, "kernels execute multiple tiles");
+            else TEST_ASSERT_EQ(ctx.tiled_calls, 0, "baseline kernels execute whole tensors");
+            if (mode == 0) memcpy(expected, ptrs[model_output], tensors[model_output].size_bytes);
+            else TEST_ASSERT(memcmp(ptrs[model_output], expected, tensors[model_output].size_bytes) == 0,
+                             "haloed residuals match untiled execution across chains");
+        }
+        free(workspace);
+        if (result != TIGRIS_EXEC_OK) return;
+    }
+}
+
+static void test_exec_chain_residual_rows(void)
+{
+    const uint8_t binary_ops[] = { TIGRIS_OP_ADD, TIGRIS_OP_MUL, TIGRIS_OP_SUB };
+    for (unsigned op = 0; op < sizeof(binary_ops); op++) {
+        for (int s8 = 0; s8 < 2; s8++) {
+            for (int swap = 0; swap < 2; swap++) {
+                for (int input = 0; input < 2; input++)
+                    run_chain_residual_rows(binary_ops[op], s8, swap, input);
+            }
+        }
+    }
+}
+
 /* Fail-closed guard (final whole-branch review): is_height_tiling_op admits
  * ConvTranspose (the standalone 2D route needs it), so a forged/malformed plan
  * could place a ConvTranspose inside a tiled chain. exec_chain_tiled's composer
@@ -2847,6 +3006,7 @@ int main(int argc, char *argv[])
     test_exec_per_channel_gate_bands_over_the_map();
     test_exec_convtranspose_2d_routing();
     test_exec_mixed_conv_convtranspose_not_tiled();
+    test_exec_chain_residual_rows();
     test_exec_chained_convtranspose_fails_closed();
     test_exec_compaction_preserves_data();
     test_exec_reshape_alias();

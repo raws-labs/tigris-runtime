@@ -9,24 +9,9 @@
 
 #include <string.h>
 
-/* Platform hooks - override in platform header or compiler flags */
-#ifndef TIGRIS_PLATFORM_FEED_WDT
-#  ifdef ESP_PLATFORM
-#    include "freertos/FreeRTOS.h"
-#    include "freertos/task.h"
-#    if CONFIG_ESP_TASK_WDT_EN
-#      include "esp_task_wdt.h"
-#      define TIGRIS_PLATFORM_FEED_WDT() do { esp_task_wdt_reset(); vTaskDelay(1); } while(0)
-#    else
-#      define TIGRIS_PLATFORM_FEED_WDT() vTaskDelay(1)
-#    endif
-#  else
-#    define TIGRIS_PLATFORM_FEED_WDT() ((void)0)
-#  endif
-#endif
-
 #ifndef TIGRIS_PLATFORM_DBG
 #  ifdef CONFIG_IDF_TARGET_ESP32S3
+#    include <stdio.h>
 #    define TIGRIS_PLATFORM_DBG(fmt, ...) printf(fmt, ##__VA_ARGS__)
 #  else
 #    define TIGRIS_PLATFORM_DBG(fmt, ...) ((void)0)
@@ -1199,8 +1184,6 @@ static tigris_exec_error_t exec_stage_tiled(
 
         /* g. Reset fast arena for next tile */
         tigris_mem_reset_fast(mem);
-
-        TIGRIS_PLATFORM_FEED_WDT();
     }
 
     /* 4. Verify every output row was covered */
@@ -1587,8 +1570,6 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_2d(
 
             /* Reset fast arena for next tile. */
             tigris_mem_reset_fast(mem);
-
-            TIGRIS_PLATFORM_FEED_WDT();
         }
     }
 
@@ -1810,7 +1791,6 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_by_input(
         }
 
         tigris_mem_reset_fast(mem);
-        TIGRIS_PLATFORM_FEED_WDT();
     }
 
     memset(&mem->tile, 0, sizeof(mem->tile));
@@ -2095,7 +2075,6 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
         }
 
         tigris_mem_reset_fast(mem);
-        TIGRIS_PLATFORM_FEED_WDT();
     }
 
     memset(&mem->tile, 0, sizeof(mem->tile));
@@ -2558,7 +2537,6 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
         if (result != TIGRIS_EXEC_OK)
             break;
         tigris_mem_reset_fast(mem);
-        TIGRIS_PLATFORM_FEED_WDT();
     }
 
     memset(&mem->tile, 0, sizeof(mem->tile));
@@ -2917,10 +2895,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
      *
      * Preconditions the roll relies on (documented, not just asserted):
      *  - chain_tile_h is constant across the run (a single value below);
-     *  - the fast arena is single-owner across the TIGRIS_PLATFORM_FEED_WDT()
-     *    yield between tiles, because the roll now depends on the persistent
-     *    buffers' BYTES surviving from one tile to the next, not merely on the
-     *    bump allocator handing back the same address;
+     *  - the fast arena is single-owner between tiles, because the roll
+     *    depends on the persistent buffers' BYTES surviving from one tile to
+     *    the next, not merely on the bump allocator handing back the same
+     *    address;
      *  - backend weight-decompression scratch is carved once, before the loop.
      * Roll is only applied to rank-4, batch-1 op outputs (height tiling). */
     int line_buffered =
@@ -3414,8 +3392,6 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
 
         /* f. Reset fast arena for next tile */
         tigris_mem_reset_fast(mem);
-
-        TIGRIS_PLATFORM_FEED_WDT();
     }
 
     /* 5. Verify every output row was covered */
@@ -3788,8 +3764,6 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
          * retaining the caller's in-run reset floor. */
         mem->fast_used = caller_fast_used;
         mem->fast_reserved = caller_fast_used;
-
-        TIGRIS_PLATFORM_FEED_WDT();
     }
 
 restore_fast_arena:

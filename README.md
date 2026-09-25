@@ -193,6 +193,10 @@ arena from internal SRAM and the slow arena from PSRAM when available. When
 using ESP-NN, call `tigris_esp_nn_prepare()` and check its return value before
 `tigris_run()`, then call `tigris_esp_nn_deinit()` after the final inference.
 
+`tigris_run()` does not yield: an inference runs to completion on the calling
+task. If an inference outlasts the task watchdog timeout, feed the watchdog from
+a wrapper around the kernel dispatch function or disable the idle-task check.
+
 ## Further reading
 
 - [Getting started](https://tigris-ml.dev/getting-started/quickstart/)

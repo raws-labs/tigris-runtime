@@ -36,6 +36,13 @@ retain their separate compatibility meanings.
    release `vX.Y.Z` with its tag on that commit. Its tag, setuptools-scm version,
    and runtime pin must agree; the release-wheel build checks this equality.
 
+`scripts/release.sh X.Y.Z --notes NOTES.md` in each repository runs its steps up to
+a draft GitHub release: it lands the version change (runtime) or the runtime pin
+(compiler) through a pull request once CI passes, promotes the merged commit
+with a dry run first, and creates the draft on it. Publishing the draft tags
+the release and starts the release workflows. Run it in the runtime first, and
+in the compiler after the runtime release is published.
+
 A compiler-only change still releases the runtime and ESP component with the
 same new version. The runtime release note says: "No runtime implementation
 changes; released with the matching compiler version."

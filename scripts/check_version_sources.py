@@ -8,9 +8,10 @@ had not moved in three releases. A stale component version is the expensive
 one, because the registry refuses a version it already has and CONTRIBUTING
 says that is fixed with a new patch release rather than a re-tag.
 
-Run with a tag to check the release itself:
+Run with a tag to check the release itself, or set a new release's version:
 
     python3 scripts/check_version_sources.py --expect 0.9.0
+    python3 scripts/check_version_sources.py --set 0.12.0
 """
 
 from __future__ import annotations
@@ -47,10 +48,35 @@ def _read(relative: str, pattern: str) -> tuple[str, str | None]:
     return relative, found.group(1) if found else None
 
 
+def _set(relative: str, pattern: str, value: str) -> None:
+    path = ROOT / relative
+    text = path.read_text()
+    found = re.search(pattern, text, re.MULTILINE)
+    if found is None:
+        raise ValueError(f"{relative}: no version found")
+    path.write_text(text[:found.start(1)] + value + text[found.end(1):])
+
+
+def set_version(version: str) -> None:
+    """Write VERSION into every source, and its major.minor into the floors."""
+    floor = ".".join(version.split(".")[:2])
+    for name, pattern in (*SOURCES, EXAMPLE):
+        _set(name, pattern, version)
+    for name, pattern in (CONSUMER, README):
+        _set(name, pattern, floor)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--expect", help="version the release tag states")
+    parser.add_argument("--set", metavar="VERSION",
+                        help="write VERSION into every source, then check them")
     args = parser.parse_args()
+    if args.set:
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.set):
+            parser.error("--set takes a version X.Y.Z")
+        set_version(args.set)
+        args.expect = args.set
 
     versions = dict(_read(name, pattern) for name, pattern in SOURCES)
     errors = [f"{name}: no version found" for name, v in versions.items() if v is None]

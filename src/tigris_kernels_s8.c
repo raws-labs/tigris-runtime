@@ -2000,6 +2000,7 @@ static int softmax_params(float in_scale, softmax_params_t *p)
     double real = (double)in_scale * (double)(1L << (31 - SOFTMAX_DIFF_INT_BITS));
     if (real > 2147483647.0) real = 2147483647.0;
     compute_quant_mult(real, &p->multiplier, &p->left_shift);
+    p->diff_min = 0;
     if (p->left_shift < 0 || p->left_shift > 30)
         return 0;
     double radius = ((double)((1 << SOFTMAX_DIFF_INT_BITS) - 1) *
@@ -2106,8 +2107,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_softmax_s8(
      * kernel. Other output quantizations have no TFLite counterpart and are
      * computed in float. */
     softmax_params_t fixed;
-    const int use_fixed = out_scale == 1.0f / 256.0f && out_zp == -128 &&
-                          softmax_params(in_scale, &fixed);
+    const int fixed_valid = softmax_params(in_scale, &fixed);
+    const int use_fixed = fixed_valid && out_scale == 1.0f / 256.0f && out_zp == -128;
 
     for (uint32_t row = 0; row < (uint32_t)count / classes; row++) {
         const int8_t *x = X + (size_t)row * classes;

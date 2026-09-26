@@ -21,6 +21,12 @@ Compiler and runtime release as a pair with the same version, starting with
 accepted schema range, host ABI, `compatibility.json`, and zoo runtime ranges
 retain their separate compatibility meanings.
 
+A plan schema version changes only with the plan layout. A fix or addition that
+needs information the existing encoding lacks adds an operator attribute kind
+instead: the loader refuses kinds it does not know, so an older runtime rejects
+such a plan rather than running it with different semantics, and the change can
+ship in a patch release.
+
 1. Prepare and test both components with the same release number. Run
    `scripts/check_version_sources.py --expect X.Y.Z` to verify the runtime's
    CMake, ESP component, example, and consumer version sources.

@@ -1173,6 +1173,70 @@ static void test_global_avg_pool_s8(void)
     TEST_ASSERT_EQ(out[0], 5, "avg(2,4,6,8) = 5");
 }
 
+/* A whole-map AveragePool lowered to a global pool keeps TFLite
+ * AVERAGE_POOL_2D rounding through TIGRIS_OP_ATTR_POOL_ROUNDING: the sum over
+ * the 25x5 map divided by 125, ties away from zero. Without the attribute the
+ * pool is a TFLite MEAN, whose folded multiplier rounds some sums differently. */
+static void test_global_avg_pool_s8_average_rounding(void)
+{
+    printf("  test_global_avg_pool_s8_average_rounding...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t in_qp = add_quant_param(0.25f, -3, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(0.25f, -3, 1, NULL, NULL);
+    int32_t x_shape[] = {1, 25, 5, 1};
+    int32_t y_shape[] = {1, 1, 1, 1};
+    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 125, in_qp);
+    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 1, out_qp);
+    uint16_t ins[] = {t_in}, outs[] = {t_out};
+    test_ops[0].op_type = TIGRIS_OP_GLOBAL_AVG;
+    test_ops[0].num_inputs = 1; test_ops[0].num_outputs = 1;
+    test_ops[0].inputs_off = add_indices(ins, 1);
+    test_ops[0].outputs_off = add_indices(outs, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].act_min = -128;
+    test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_POOL_ROUNDING, 1, 0};
+    const uint8_t average[] = {TIGRIS_POOL_ROUNDING_AVERAGE};
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[4096], slow[4096]; tigris_mem_t mem;
+    int mismatches = 0, mean_differs = 0;
+    for (int32_t target = -15000; target <= 15000; target += 7) {
+        int8_t values[125];
+        int32_t remaining = target;
+        for (int i = 0; i < 125; i++) {
+            int32_t v = remaining / (125 - i);
+            values[i] = (int8_t)v;
+            remaining -= v;
+        }
+        int32_t expected = target > 0 ? (target + 62) / 125 : (target - 62) / 125;
+        int8_t results[2];
+        for (int with_attr = 0; with_attr < 2; with_attr++) {
+            plan.op_attributes = with_attr ? &attr : NULL;
+            plan.op_attribute_data = with_attr ? average : NULL;
+            plan.num_op_attributes = with_attr ? 1 : 0;
+            tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
+                            slow, sizeof(slow));
+            tigris_mem_alloc_fast(&mem, t_in, sizeof(values));
+            memcpy(ptrs[t_in], values, sizeof(values));
+            tigris_mem_alloc_fast(&mem, t_out, 1);
+            if (tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0)
+                mismatches++;
+            results[with_attr] = *(int8_t *)ptrs[t_out];
+        }
+        if (results[1] != expected)
+            mismatches++;
+        if (results[0] != results[1])
+            mean_differs++;
+    }
+    TEST_ASSERT_EQ(mismatches, 0, "average rounding matches sum/125 with ties away from zero");
+    TEST_ASSERT(mean_differs > 0, "mean rounding differs from average rounding on some sums");
+}
+
 static void test_global_max_pool_s8(void)
 {
     printf("  test_global_max_pool_s8...\n");
@@ -2011,6 +2075,7 @@ int main(void)
     test_conv_transpose_s8_tile_2d();
     test_fc_s8();
     test_global_avg_pool_s8();
+    test_global_avg_pool_s8_average_rounding();
     test_global_max_pool_s8();
     test_max_pool_s8_requantizes();
     test_matmul_s8_row_band();

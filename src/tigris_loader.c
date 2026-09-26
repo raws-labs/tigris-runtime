@@ -226,6 +226,7 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     case TIGRIS_OP_ATTR_CLIP_BOUNDS:    return op_type == TIGRIS_OP_CLIP;
     case TIGRIS_OP_ATTR_PADS:           return op_type == TIGRIS_OP_PAD;
     case TIGRIS_OP_ATTR_AXES:           return op_type == TIGRIS_OP_REDUCE_MEAN;
+    case TIGRIS_OP_ATTR_POOL_ROUNDING:  return op_type == TIGRIS_OP_GLOBAL_AVG;
     case TIGRIS_OP_ATTR_BINARY_REQUANT: return op_type == TIGRIS_OP_ADD ||
                                                op_type == TIGRIS_OP_SUB;
     default:                            return 0;
@@ -1385,6 +1386,13 @@ tigris_error_t tigris_plan_load_ex(
                     if (multiplier < 0 || shift < -31 || shift > 31)
                         return TIGRIS_ERR_BAD_SECTION;
                 }
+                break;
+            }
+            case TIGRIS_OP_ATTR_POOL_ROUNDING: {
+                if (attr->data_len != 1u ||
+                    candidate.op_attribute_data[attr->data_offset] !=
+                        TIGRIS_POOL_ROUNDING_AVERAGE)
+                    return TIGRIS_ERR_BAD_SECTION;
                 break;
             }
             case TIGRIS_OP_ATTR_AXES: {

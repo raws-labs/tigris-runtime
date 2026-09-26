@@ -403,6 +403,15 @@ static int adapt_avg_pool(
     const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
 
+    /* arm_avgpool_s8 rounds like TFLite AVERAGE_POOL_2D. A global pool without
+     * TIGRIS_OP_ATTR_POOL_ROUNDING is a mean, which rounds differently, so it
+     * runs on the reference kernel. */
+    uint8_t rounding_len = 0u;
+    if ((tigris_op_type_t)op->op_type == TIGRIS_OP_GLOBAL_AVG &&
+        tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_POOL_ROUNDING,
+                                 &rounding_len) == NULL)
+        return tigris_dispatch_kernel_s8(plan, op, op_index, mem, user_ctx);
+
     /* arm_avgpool_s8 preserves the input scale/zero-point - it does not
      * requantize. If the op rescales (in/out quant differ), fall back to the
      * reference kernel which requantizes. */

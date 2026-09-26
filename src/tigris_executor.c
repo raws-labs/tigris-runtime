@@ -1109,12 +1109,15 @@ static tigris_exec_error_t exec_stage_tiled(
             int is_spatial = ((int)op_idx == sp_op_idx);
 
             if (is_spatial) {
+                if (eff_pad_top < 0 || eff_pad_top > UINT16_MAX ||
+                    eff_pad_bottom < 0 || eff_pad_bottom > UINT16_MAX)
+                    return TIGRIS_EXEC_ERR_TILE;
                 mem->tile.in_h       = cur_h;          /* = tile_in_h */
                 mem->tile.out_h      = tile_out_h;
                 mem->tile.in_w       = full_in_w;
                 mem->tile.out_w      = full_out_w;
-                mem->tile.pad_top    = eff_pad_top;
-                mem->tile.pad_bottom = eff_pad_bottom;
+                mem->tile.pad_top    = (uint16_t)eff_pad_top;
+                mem->tile.pad_bottom = (uint16_t)eff_pad_bottom;
             } else {
                 /* Pointwise op: height/width preserved, no padding. */
                 mem->tile.in_h       = cur_h;
@@ -3119,8 +3122,13 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
             mem->tile.out_w      = info[c].full_out_w;
             if (info[c].sp_count > 0) {
                 size_t spi = spatial_index(workspace, c, 0);
-                mem->tile.pad_top    = workspace->sp_tile_pt[spi];
-                mem->tile.pad_bottom = workspace->sp_tile_pb[spi];
+                if (workspace->sp_tile_pt[spi] < 0 ||
+                    workspace->sp_tile_pt[spi] > UINT16_MAX ||
+                    workspace->sp_tile_pb[spi] < 0 ||
+                    workspace->sp_tile_pb[spi] > UINT16_MAX)
+                    return TIGRIS_EXEC_ERR_TILE;
+                mem->tile.pad_top    = (uint16_t)workspace->sp_tile_pt[spi];
+                mem->tile.pad_bottom = (uint16_t)workspace->sp_tile_pb[spi];
             } else {
                 mem->tile.pad_top    = 0;
                 mem->tile.pad_bottom = 0;
@@ -3186,10 +3194,15 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                 int is_spatial = (sp_j < info[c].sp_count &&
                     (int32_t)op_idx == workspace->sp_op_indices[spi]);
                 if (is_spatial) {
+                    if (workspace->sp_tile_pt[spi] < 0 ||
+                        workspace->sp_tile_pt[spi] > UINT16_MAX ||
+                        workspace->sp_tile_pb[spi] < 0 ||
+                        workspace->sp_tile_pb[spi] > UINT16_MAX)
+                        return TIGRIS_EXEC_ERR_TILE;
                     mem->tile.in_h       = workspace->sp_tile_in_h[spi];
                     mem->tile.out_h      = workspace->sp_tile_out_h[spi];
-                    mem->tile.pad_top    = workspace->sp_tile_pt[spi];
-                    mem->tile.pad_bottom = workspace->sp_tile_pb[spi];
+                    mem->tile.pad_top    = (uint16_t)workspace->sp_tile_pt[spi];
+                    mem->tile.pad_bottom = (uint16_t)workspace->sp_tile_pb[spi];
                     mem->tile.in_w       = workspace->sp_full_in_ws[spi];
                     mem->tile.out_w      = workspace->sp_full_out_ws[spi];
                 } else {
@@ -3349,8 +3362,13 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                     if (sp_j < info[c].sp_count) {
                         spi = spatial_index(
                             workspace, c, (uint16_t)sp_j);
-                        mem->tile.pad_top = workspace->sp_tile_pt[spi];
-                        mem->tile.pad_bottom = workspace->sp_tile_pb[spi];
+                        if (workspace->sp_tile_pt[spi] < 0 ||
+                            workspace->sp_tile_pt[spi] > UINT16_MAX ||
+                            workspace->sp_tile_pb[spi] < 0 ||
+                            workspace->sp_tile_pb[spi] > UINT16_MAX)
+                            return TIGRIS_EXEC_ERR_TILE;
+                        mem->tile.pad_top = (uint16_t)workspace->sp_tile_pt[spi];
+                        mem->tile.pad_bottom = (uint16_t)workspace->sp_tile_pb[spi];
                     }
                 }
             }

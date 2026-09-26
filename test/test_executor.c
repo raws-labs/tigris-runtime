@@ -1760,6 +1760,102 @@ static int tile_probe_kernel(
     return 0;
 }
 
+static void test_exec_padding_range(void)
+{
+    printf("  test_exec_padding_range...\n");
+    /* A three-tap dilated kernel spans 131071 rows. Removing its top
+     * padding makes the effective bottom pad exceed the tile field. */
+    for (int chained = 0; chained <= 1; chained++) {
+        for (int invalid = 0; invalid <= 1; invalid++) {
+            tigris_file_header_t header = {0};
+            tigris_tensor_t tensors[3] = {0};
+            tigris_op_t ops[2] = {0};
+            tigris_stage_t stages[2] = {0};
+            tigris_tile_plan_t tile_plan = {0};
+            const uint16_t indices[] = {0, 1, 1, 2, 0, 1, 0, 1, 1, 2};
+            const int32_t shapes[] = {1, 128, 1, 1};
+            const uint16_t model_input = 0;
+            const uint16_t model_output = chained ? 2 : 1;
+            tigris_plan_t plan = {0};
+            void *ptrs[3];
+            _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t fast[1048576];
+            _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[1024];
+            uint8_t workspace[
+                TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 2, 1)];
+            tigris_mem_t mem;
+            tile_probe_ctx_t ctx = {0};
+
+            header.version = TIGRIS_SCHEMA_VERSION;
+            header.num_tensors = chained ? 3 : 2;
+            header.num_ops = chained ? 2 : 1;
+            header.num_stages = chained ? 2 : 1;
+            header.num_tile_plans = 1;
+            header.num_model_inputs = 1;
+            header.num_model_outputs = 1;
+            for (uint16_t i = 0; i < header.num_tensors; i++) {
+                tensors[i].ndim = 4;
+                tensors[i].dtype = 3;
+                tensors[i].size_bytes = 128;
+            }
+            for (uint16_t i = 0; i < header.num_ops; i++) {
+                ops[i].op_type = i == 0 ? TIGRIS_OP_CONV : TIGRIS_OP_RELU;
+                ops[i].num_inputs = 1;
+                ops[i].num_outputs = 1;
+                ops[i].inputs_off = 2u * i;
+                ops[i].outputs_off = 2u * i + 1u;
+                ops[i].weight_idx = TIGRIS_NO_WEIGHT;
+                ops[i].bias_idx = TIGRIS_NO_WEIGHT;
+                stages[i].ops_off = 4u + i;
+                stages[i].ops_count = 1;
+                stages[i].inputs_off = 6u + 2u * i;
+                stages[i].inputs_count = 1;
+                stages[i].outputs_off = 7u + 2u * i;
+                stages[i].outputs_count = 1;
+                stages[i].chain_id = chained ? 0 : TIGRIS_NO_CHAIN;
+                stages[i].chain_len = chained ? 2 : 0;
+            }
+            ops[0].spatial.kernel_h = 3;
+            ops[0].spatial.kernel_w = 1;
+            ops[0].spatial.stride_h = 1;
+            ops[0].spatial.stride_w = 1;
+            ops[0].spatial.dilation_h = UINT16_MAX;
+            ops[0].spatial.dilation_w = 1;
+            ops[0].spatial.pad_top = invalid ? 0 : UINT16_MAX;
+            ops[0].spatial.pad_bottom = UINT16_MAX;
+            stages[0].chain_tile_h = 64;
+            tile_plan.tileable = 1;
+            tile_plan.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+            tile_plan.tile_height = 64;
+            tile_plan.num_tiles = 2;
+            tile_plan.original_height = 128;
+            plan.header = &header;
+            plan.tensors = tensors;
+            plan.ops = ops;
+            plan.stages = stages;
+            plan.tile_plans = &tile_plan;
+            plan.index_pool = indices;
+            plan.shape_pool = shapes;
+            plan.model_inputs = &model_input;
+            plan.model_outputs = &model_output;
+
+            TEST_ASSERT_EQ(tigris_mem_init(
+                &mem, ptrs, header.num_tensors, fast,
+                chained ? (uint32_t)sizeof(fast) : 192u, slow, sizeof(slow)),
+                TIGRIS_MEM_OK, "padding-range memory init");
+            TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes),
+                           TIGRIS_MEM_OK, "padding-range input allocation");
+            memset(ptrs[0], 0, tensors[0].size_bytes);
+            tigris_exec_error_t result = tigris_run_with_workspace_buffer(
+                &plan, &mem, tile_probe_kernel, &ctx, NULL,
+                workspace, sizeof(workspace));
+            TEST_ASSERT_EQ(result, invalid ? TIGRIS_EXEC_ERR_TILE : TIGRIS_EXEC_OK,
+                           "padding must fit uint16 without wrapping");
+            TEST_ASSERT(invalid ? ctx.calls == 0 : ctx.tiled_calls > 0,
+                        "oversized padding rejected before kernel dispatch");
+        }
+    }
+}
+
 static void run_height_tiling_contract_case(
     uint8_t rank, uint8_t op_type, const int32_t output_shape[4],
     uint32_t fast_size, tigris_exec_error_t expected)
@@ -3001,6 +3097,7 @@ int main(int argc, char *argv[])
     test_exec_chain_tiled_line_buffered_rolls();
     test_exec_chain_tiled_line_buffered_rolls_pointwise();
     test_exec_chain_tiled_line_buffered_rolls_pointwise_s8();
+    test_exec_padding_range();
     test_exec_height_tiling_contract();
     test_exec_half_pixel_bilinear_bands_match_one_band();
     test_exec_per_channel_gate_bands_over_the_map();

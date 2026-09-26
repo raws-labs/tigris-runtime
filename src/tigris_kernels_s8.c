@@ -1910,6 +1910,145 @@ static TIGRIS_KERNEL_NOINLINE int kern_tanh_s8(
  * use ONNX's default/final-axis form.  Keep this scalar reference path for
  * terminal classifiers (and as the accelerator fallback), where correctness
  * matters more than throughput. */
+/* Fixed-point int8 Softmax, bit-exact with the TFLite reference kernel and
+ * CMSIS-NN arm_softmax_s8. Input differences are Q5.26, exponentials and the
+ * reciprocal Q0.31, the sum of exponentials Q12.19 (gemmlowp FixedPoint). */
+#define SOFTMAX_DIFF_INT_BITS 5
+#define SOFTMAX_ACCUM_INT_BITS 12
+
+/* gemmlowp SaturatingRoundingMultiplyByPOT for a positive exponent. */
+static inline int32_t sat_shift_left(int32_t x, int exponent)
+{
+    int32_t threshold = (int32_t)(((uint32_t)1u << (31 - exponent)) - 1u);
+    if (x > threshold) return INT32_MAX;
+    if (x < -threshold) return INT32_MIN;
+    return (int32_t)((uint32_t)x << exponent);
+}
+
+static inline int32_t wrapping_add(int32_t a, int32_t b)
+{
+    return (int32_t)((uint32_t)a + (uint32_t)b);
+}
+
+/* exp(a) for a in [-1/4, 0), Q0.31 in and out: Taylor series around -1/8. */
+static int32_t softmax_exp_quarter(int32_t a)
+{
+    const int32_t exp_minus_one_eighth = 1895147668;
+    const int32_t one_third = 715827883;
+    int32_t x = wrapping_add(a, (int32_t)1 << 28);
+    int32_t x2 = sat_round_dbl_high_mul(x, x);
+    int32_t x3 = sat_round_dbl_high_mul(x2, x);
+    int32_t x4 = sat_round_dbl_high_mul(x2, x2);
+    int32_t x4_over_4 = round_div_by_pot(x4, 2);
+    int32_t poly = round_div_by_pot(
+        wrapping_add(sat_round_dbl_high_mul(wrapping_add(x4_over_4, x3), one_third), x2), 1);
+    return wrapping_add(exp_minus_one_eighth,
+                        sat_round_dbl_high_mul(exp_minus_one_eighth, wrapping_add(x, poly)));
+}
+
+/* exp(a) for a <= 0, a in Q5.26, result in Q0.31 (gemmlowp exp_on_negative_values). */
+static int32_t softmax_exp_negative(int32_t a)
+{
+    static const int32_t multipliers[7] = {
+        1672461947, 1302514674, 790015084, 290630308, 39332535, 720401, 242
+    };
+    const int32_t one_quarter = (int32_t)1 << 24;
+    int32_t a_mod_quarter_minus_quarter = (a & (one_quarter - 1)) - one_quarter;
+    int32_t result = softmax_exp_quarter(sat_shift_left(a_mod_quarter_minus_quarter, SOFTMAX_DIFF_INT_BITS));
+    int32_t remainder = a_mod_quarter_minus_quarter - a;
+    for (int k = 0; k < 7; k++) {
+        /* Bit 24 + k of the remainder stands for exp(-2^(k-2)). */
+        if ((remainder & ((int32_t)1 << (24 + k))) != 0)
+            result = sat_round_dbl_high_mul(result, multipliers[k]);
+    }
+    return (a == 0) ? INT32_MAX : result;
+}
+
+/* 1 / (1 + x) for x in [0, 1), Q0.31 in and out: Newton-Raphson in Q2.29. */
+static int32_t softmax_one_over_one_plus_x(int32_t x)
+{
+    int64_t sum = (int64_t)x + INT32_MAX;
+    int32_t half_denominator = (int32_t)((sum + (sum >= 0 ? 1 : -1)) / 2);
+    int32_t estimate = wrapping_add(1515870810, sat_round_dbl_high_mul(half_denominator, -1010580540));
+    for (int i = 0; i < 3; i++) {
+        int32_t product = sat_round_dbl_high_mul(half_denominator, estimate);
+        int32_t one_minus_product = wrapping_add((int32_t)1 << 29, -product);
+        estimate = wrapping_add(estimate,
+            sat_shift_left(sat_round_dbl_high_mul(estimate, one_minus_product), 2));
+    }
+    return sat_shift_left(estimate, 1);
+}
+
+static inline int count_leading_zeros(uint32_t x)
+{
+    int n = 0;
+    if (x == 0u) return 32;
+    while ((x & (0x80000000u >> n)) == 0u) n++;
+    return n;
+}
+
+typedef struct {
+    int32_t multiplier;
+    int left_shift;
+    int32_t diff_min;
+} softmax_params_t;
+
+/* TFLite PreprocessSoftmaxScaling and CalculateInputRadius for beta = 1.
+ * Returns 0 when the input scale is too small for a non-negative shift. */
+static int softmax_params(float in_scale, softmax_params_t *p)
+{
+    double real = (double)in_scale * (double)(1L << (31 - SOFTMAX_DIFF_INT_BITS));
+    if (real > 2147483647.0) real = 2147483647.0;
+    compute_quant_mult(real, &p->multiplier, &p->left_shift);
+    if (p->left_shift < 0 || p->left_shift > 30)
+        return 0;
+    double radius = ((double)((1 << SOFTMAX_DIFF_INT_BITS) - 1) *
+                     (double)(1L << (31 - SOFTMAX_DIFF_INT_BITS))) /
+                    (double)(1L << p->left_shift);
+    p->diff_min = -(int32_t)floor(radius);
+    return 1;
+}
+
+static inline int32_t softmax_scaled_diff(int32_t diff, const softmax_params_t *p)
+{
+    return sat_round_dbl_high_mul(diff * ((int32_t)1 << p->left_shift), p->multiplier);
+}
+
+/* One row with output scale 1/256 and zero point -128. */
+static void softmax_row_fixed_point(
+    const int8_t *x, int8_t *y, uint32_t classes, const softmax_params_t *p)
+{
+    int32_t max_q = x[0];
+    for (uint32_t c = 1; c < classes; c++)
+        if (x[c] > max_q) max_q = x[c];
+
+    int32_t sum = 0;
+    for (uint32_t c = 0; c < classes; c++) {
+        int32_t diff = (int32_t)x[c] - max_q;
+        if (diff >= p->diff_min)
+            sum = wrapping_add(sum, round_div_by_pot(
+                softmax_exp_negative(softmax_scaled_diff(diff, p)), SOFTMAX_ACCUM_INT_BITS));
+    }
+
+    int headroom = count_leading_zeros((uint32_t)sum);
+    int bits_over_unit = SOFTMAX_ACCUM_INT_BITS - headroom;
+    int32_t shifted_sum_minus_one =
+        (int32_t)(((uint32_t)sum << headroom) - 0x80000000u);
+    int32_t reciprocal = softmax_one_over_one_plus_x(shifted_sum_minus_one);
+
+    for (uint32_t c = 0; c < classes; c++) {
+        int32_t diff = (int32_t)x[c] - max_q;
+        if (diff >= p->diff_min) {
+            int32_t e = softmax_exp_negative(softmax_scaled_diff(diff, p));
+            int32_t q = round_div_by_pot(sat_round_dbl_high_mul(reciprocal, e),
+                                         bits_over_unit + 31 - 8);
+            y[c] = clamp_s8(q - 128);
+        } else {
+            y[c] = (int8_t)-128;
+        }
+    }
+}
+
 static TIGRIS_KERNEL_NOINLINE int kern_softmax_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1963,9 +2102,20 @@ static TIGRIS_KERNEL_NOINLINE int kern_softmax_s8(
     if (in_scale <= 0.0f || out_scale <= 0.0f)
         return -1;
 
+    /* TFLite's int8 Softmax output quantization selects its fixed-point
+     * kernel. Other output quantizations have no TFLite counterpart and are
+     * computed in float. */
+    softmax_params_t fixed;
+    const int use_fixed = out_scale == 1.0f / 256.0f && out_zp == -128 &&
+                          softmax_params(in_scale, &fixed);
+
     for (uint32_t row = 0; row < (uint32_t)count / classes; row++) {
         const int8_t *x = X + (size_t)row * classes;
         int8_t *y = Y + (size_t)row * classes;
+        if (use_fixed) {
+            softmax_row_fixed_point(x, y, classes, &fixed);
+            continue;
+        }
         int32_t max_q = x[0];
         for (uint32_t c = 1; c < classes; c++)
             if (x[c] > max_q) max_q = x[c];

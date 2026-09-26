@@ -175,6 +175,7 @@ Reported peaks cover the arenas, not total process memory.
 The archive contains the shared library, C header, license, and a manifest with
 the runtime version, host ABI, platform, source revision, and library checksum.
 No Python package is produced by this build.
+Set `TIGRIS_HOST_LIBRARY` to the built shared library to use `tigris run` with a pure Python wheel.
 
 ## Install for CMake consumers
 

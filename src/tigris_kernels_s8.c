@@ -129,6 +129,37 @@ static inline int32_t round_divide_away_from_zero(int32_t value, int32_t divisor
                      : (value - half) / divisor;
 }
 
+/**
+ * The int8 result of averaging `count` samples that sum to `sum`, with TFLite
+ * AVERAGE_POOL_2D rounding. With equal input and output quantization this is
+ * TFLite's integer division with ties away from zero. TFLite rejects differing
+ * quantization for this op, so that case is defined as dequantize, mean and
+ * requantize with round(), which keeps ties away from zero as the native
+ * ESP/CMSIS pool kernels do.
+ */
+static inline int32_t average_pool_quantize(
+    int32_t sum, int32_t count, int same_quant, int32_t input_zp,
+    float in_scale, float out_scale, int32_t output_zp,
+    int8_t act_min, int8_t act_max)
+{
+    int32_t q;
+    if (same_quant) {
+        q = round_divide_away_from_zero(sum, count);
+    } else {
+        int32_t centered = sum - input_zp * count;
+        double scaled = ((double)centered * (double)in_scale) /
+                        ((double)count * (double)out_scale);
+        double quantized = round(scaled) + (double)output_zp;
+        if (quantized < (double)act_min)
+            q = act_min;
+        else if (quantized > (double)act_max)
+            q = act_max;
+        else
+            q = (int32_t)quantized;
+    }
+    return clamp_act(q, act_min, act_max);
+}
+
 /** Get multiplier from quant data (works for both per-tensor and per-channel). */
 static inline int32_t get_multiplier(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
@@ -935,7 +966,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_sub_s8(
 }
 
 static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
@@ -965,6 +997,13 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
         out_scale = in_scale;
         output_zp = input_zp;
     }
+
+    /* TIGRIS_OP_ATTR_POOL_ROUNDING selects TFLite AVERAGE_POOL_2D rounding for
+     * a pool that was a whole-map AveragePool; without it the pool is a mean. */
+    uint8_t rounding_len = 0u;
+    int average = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_POOL_ROUNDING, &rounding_len) != NULL;
+    int same_quant = in_scale == out_scale && input_zp == output_zp;
 
     /* TFLite QuantizedMeanOrSum (reference/reduce.h), bit-exact:
      *   - requant multiplier/shift from (in_scale / out_scale)
@@ -997,6 +1036,12 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
                 acc[n * C + c] = sum;
                 if (!mem->tile.reduce_last)
                     continue;
+            }
+            if (average) {
+                Y[n * C + c] = (int8_t)average_pool_quantize(
+                    sum, HW, same_quant, input_zp, in_scale, out_scale,
+                    output_zp, op->act_min, op->act_max);
+                continue;
             }
             int32_t shifted = sum - input_zp * HW;
             int32_t q = multiply_by_quantized_multiplier(shifted, mult, shift0) + output_zp;
@@ -1199,30 +1244,9 @@ static TIGRIS_KERNEL_NOINLINE int kern_avg_pool_s8(
                         }
                     }
 
-                    int32_t q;
-                    if (same_quant) {
-                        q = round_divide_away_from_zero(sum, count);
-                    } else {
-                        /* TFLite rejects mismatched input/output quantization
-                         * for int8 AveragePool, so there is no canonical
-                         * integer-kernel result for this extension. Define it
-                         * as dequantize -> valid-sample mean -> requantize,
-                         * using round() so half ties follow the away-from-zero
-                         * convention of the native ESP/CMSIS pool kernels. */
-                        int32_t centered = sum - input_zp * count;
-                        double scaled =
-                            ((double)centered * (double)in_scale) /
-                            ((double)count * (double)out_scale);
-                        double quantized = round(scaled) + (double)output_zp;
-                        if (quantized < (double)op->act_min)
-                            q = op->act_min;
-                        else if (quantized > (double)op->act_max)
-                            q = op->act_max;
-                        else
-                            q = (int32_t)quantized;
-                    }
-                    Y[((n * OH + oh_g) * OW + ow) * C + c] =
-                        clamp_act(q, op->act_min, op->act_max);
+                    Y[((n * OH + oh_g) * OW + ow) * C + c] = (int8_t)average_pool_quantize(
+                        sum, count, same_quant, input_zp, in_scale, out_scale,
+                        output_zp, op->act_min, op->act_max);
                 }
             }
         }
@@ -2031,7 +2055,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_RELU:        return kern_relu_s8(plan, op, mem);
     case TIGRIS_OP_RELU6:       return kern_relu6_s8(plan, op, mem);
     case TIGRIS_OP_ADD:         return kern_add_s8(plan, op, op_index, mem);
-    case TIGRIS_OP_GLOBAL_AVG:  return kern_global_avg_pool_s8(plan, op, mem);
+    case TIGRIS_OP_GLOBAL_AVG:  return kern_global_avg_pool_s8(plan, op, op_index, mem);
     case TIGRIS_OP_AVG_POOL:     return kern_avg_pool_s8(plan, op, mem);
     case TIGRIS_OP_RESHAPE:     return kern_reshape_s8(plan, op, mem);
     case TIGRIS_OP_FLATTEN:     return kern_reshape_s8(plan, op, mem);

@@ -1107,6 +1107,7 @@ static void test_op_attribute_kinds(void)
         TIGRIS_OP_ATTR_CLIP_BOUNDS,
         TIGRIS_OP_ATTR_PADS,
         TIGRIS_OP_ATTR_AXES,
+        TIGRIS_OP_ATTR_POOL_ROUNDING,
     };
     for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
         build_transpose_plan(buf);
@@ -1165,6 +1166,22 @@ static void test_op_attribute_payloads(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_OPERATOR,
                    "a positive variance floor passes the payload check");
+
+    /* The pool rounding kind carries exactly one byte, the average value. */
+    build_transpose_plan(buf);
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_GLOBAL_AVG;
+    attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_POOL_ROUNDING;
+    attr->data_len = 1;
+    buf[TRANSPOSE_ATTR_DATA_OFF] = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "an unknown pool rounding is refused");
+    buf[TRANSPOSE_ATTR_DATA_OFF] = TIGRIS_POOL_ROUNDING_AVERAGE;
+    TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_ERR_BAD_SECTION,
+                "average pool rounding passes the payload check");
+    attr->data_len = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_SECTION, "a two-byte pool rounding is refused");
 
     /* A wrong payload width is refused whatever the value. */
     build_transpose_plan(buf);

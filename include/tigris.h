@@ -76,9 +76,10 @@ extern "C" {
 #define TIGRIS_SEC_MAX            12  /* one past the last valid section */
 
 /* Typed payloads stored in TIGRIS_SEC_OP_ATTRIBUTES. The loader refuses a kind
- * it does not know, so the whole set is declared at the schema version that
- * introduces the mechanism for them rather than one kind per version. Payloads
- * are little-endian and their length is the record's data_len. */
+ * it does not know, so a plan carrying a newer kind fails to load on an older
+ * runtime instead of running with different semantics; a kind can therefore be
+ * added without a schema version. Payloads are little-endian and their length
+ * is the record's data_len. */
 #define TIGRIS_OP_ATTR_TRANSPOSE_PERM 1  /* uint8[rank], axis permutation */
 #define TIGRIS_OP_ATTR_EPSILON        2  /* float32, variance floor */
 #define TIGRIS_OP_ATTR_ALPHA          3  /* float32, negative slope */
@@ -86,11 +87,18 @@ extern "C" {
 #define TIGRIS_OP_ATTR_PADS           5  /* int32[2*rank], leading, trailing */
 #define TIGRIS_OP_ATTR_AXES           6  /* uint8[n], axes a reduction takes */
 #define TIGRIS_OP_ATTR_BINARY_REQUANT 7  /* int32[6], see below */
-#define TIGRIS_OP_ATTR_MAX            7
+#define TIGRIS_OP_ATTR_POOL_ROUNDING  8  /* uint8[1], see below */
+#define TIGRIS_OP_ATTR_MAX            8
 
 /* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
  * first operand's, the second operand's, and the result's. */
 #define TIGRIS_OP_ATTR_BINARY_REQUANT_LEN 24u
+
+/* An int8 global average pool rounds like TFLite MEAN by default: the 1/HW
+ * factor is folded into a fixed-point multiplier. With this attribute it rounds
+ * like TFLite AVERAGE_POOL_2D instead: the integer sum is divided by HW with
+ * ties away from zero. The only valid payload is this value. */
+#define TIGRIS_POOL_ROUNDING_AVERAGE 1u
 
 /* Compression types */
 #define TIGRIS_COMPRESS_NONE  0

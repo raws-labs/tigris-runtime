@@ -1747,6 +1747,72 @@ static void test_softmax_s8(void)
     TEST_ASSERT_EQ(out[5], -43, "softmax row 1 class 2");
 }
 
+/* Rows where the float softmax rounds differently from TFLite's fixed-point
+ * kernel. Expected values are the TFLite reference and CMSIS-NN
+ * arm_softmax_s8 results; a non-TFLite output quantization keeps float. */
+static int run_softmax_row_s8(float in_scale, float out_scale, int32_t out_zp,
+                              const int8_t *row, uint32_t classes, int8_t *result)
+{
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t in_qp = add_quant_param(in_scale, 0, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(out_scale, out_zp, 1, NULL, NULL);
+    int32_t shape[] = {1, (int32_t)classes};
+    uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, classes, in_qp);
+    uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, classes, out_qp);
+    test_ops[0].op_type = TIGRIS_OP_SOFTMAX;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in}; uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[256], slow[64];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, t_in, classes);
+    memcpy(ptrs[t_in], row, classes);
+    tigris_mem_alloc_fast(&mem, t_out, classes);
+    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    memcpy(result, ptrs[t_out], classes);
+    return ret;
+}
+
+static void test_softmax_s8_fixed_point(void)
+{
+    printf("  test_softmax_s8_fixed_point...\n");
+    static const struct {
+        float scale;
+        uint32_t classes;
+        int8_t row[6];
+        int8_t expected[6];
+    } cases[] = {
+        {0.053988829255104065f, 6, {-21, -37, 19, -9, 39, -11}, {-121, -125, -71, -116, 38, -117}},
+        {0.01572207175195217f, 4, {33, -7, -39, 7}, {-26, -74, -95, -61}},
+        {0.1154790073633194f, 6, {-37, 34, -25, 4, 4, -32}, {-128, 113, -128, -120, -120, -128}},
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        int8_t out[6];
+        TEST_ASSERT_EQ(run_softmax_row_s8(cases[k].scale, 1.0f / 256.0f, -128,
+                                          cases[k].row, cases[k].classes, out), 0,
+                       "fixed-point softmax returns 0");
+        TEST_ASSERT(memcmp(out, cases[k].expected, cases[k].classes) == 0,
+                    "fixed-point softmax matches TFLite");
+    }
+
+    /* Output zero point -127 is not TFLite's: float, round half away. */
+    int8_t out[6];
+    TEST_ASSERT_EQ(run_softmax_row_s8(0.053988829255104065f, 1.0f / 256.0f, -127,
+                                      cases[0].row, 6, out), 0, "float softmax returns 0");
+    static const int8_t float_expected[6] = {-120, -124, -70, -115, 40, -116};
+    TEST_ASSERT(memcmp(out, float_expected, 6) == 0, "float softmax keeps its rounding");
+}
+
 /* INT8 Conv1D (regression: s8 dispatch must handle TIGRIS_OP_CONV1D). NLC input
  * [1,3,2], weights [OC=1,K=2,IC=2] all ones, identity requant -> output = acc. */
 static void test_conv1d_s8(void)
@@ -2084,6 +2150,7 @@ int main(void)
     test_resize_linear_s8();
     test_tanh_s8();
     test_softmax_s8();
+    test_softmax_s8_fixed_point();
     test_conv1d_s8();
     test_transpose_s8();
     test_reduce_mean_s8();

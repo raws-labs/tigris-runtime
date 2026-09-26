@@ -13,6 +13,8 @@ CI enforces beyond `ctest`.
 
 ## Releasing
 
+- `main` only fast-forwards to a tested `develop` commit, through the "Promote to
+  main" workflow; there are no release or back-merge pull requests.
 - A release is a `vX.Y.Z` tag on `main`. The `version` field in `idf_component.yml`
   must equal the tag without the `v`.
 - Pushing the tag runs `.github/workflows/publish-component.yml`, which uploads this

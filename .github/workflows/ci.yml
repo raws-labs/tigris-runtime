@@ -48,11 +48,15 @@ jobs:
 
   native:
     name: Native ${{ matrix.compiler }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        compiler: [gcc, clang]
+        include:
+          - {compiler: gcc, os: ubuntu-latest}
+          - {compiler: clang, os: ubuntu-latest}
+          # GCC 11 reports maybe-uninitialized cases at -O3 that newer GCC does not.
+          - {compiler: gcc-11, os: ubuntu-22.04}
     steps:
       - uses: actions/checkout@v4
       - name: Check the version sources agree

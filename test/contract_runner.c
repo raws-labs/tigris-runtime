@@ -243,6 +243,11 @@ int main(int argc, char **argv)
     tigris_kernel_fn dispatch = NULL;
     int result = 1;
     int no_linebuffer = 0;
+    /* Workspace limits as generated code states them, or all zero to run
+     * with the executor's own global workspace. */
+    unsigned long limits[5] = {0, 0, 0, 0, 0};
+    int have_limits = 0;
+    void *workspace = NULL;
     char *pos_argv[5];
     int pos_argc = 1;
     int arg_index;
@@ -255,6 +260,13 @@ int main(int argc, char **argv)
     for (arg_index = 1; arg_index < argc; ++arg_index) {
         if (strcmp(argv[arg_index], "--no-linebuffer") == 0) {
             no_linebuffer = 1;
+        } else if (strncmp(argv[arg_index], "--workspace-limits=", 19) == 0) {
+            if (sscanf(argv[arg_index] + 19, "%lu,%lu,%lu,%lu,%lu", &limits[0],
+                       &limits[1], &limits[2], &limits[3], &limits[4]) != 5) {
+                fprintf(stderr, "invalid workspace limits: %s\n", argv[arg_index]);
+                return 2;
+            }
+            have_limits = 1;
         } else if (pos_argc < (int)(sizeof(pos_argv) / sizeof(pos_argv[0]))) {
             pos_argv[pos_argc++] = argv[arg_index];
         } else {
@@ -266,7 +278,7 @@ int main(int argc, char **argv)
     if (pos_argc != 4 && pos_argc != 5) {
         fprintf(stderr,
                 "usage: %s plan.tgrs inputs.bin outputs.bin [activation-limit] "
-                "[--no-linebuffer]\n",
+                "[--no-linebuffer] [--workspace-limits=T,I,O,C,S]\n",
                 pos_argv[0]);
         return 2;
     }
@@ -344,9 +356,23 @@ int main(int argc, char **argv)
 #ifdef TIGRIS_COUNT_KERNEL_ROWS
     g_tigris_kernel_rows = 0;
 #endif
+    memset(&stats, 0, sizeof(stats));
     {
-        tigris_exec_error_t error =
-            tigris_run(&plan, &mem, dispatch, NULL, &stats);
+        tigris_exec_error_t error;
+        if (have_limits) {
+            /* Exactly what generated code reserves for these limits. */
+            size_t workspace_size = TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(
+                limits[0], limits[1], limits[2], limits[3], limits[4]);
+            workspace = malloc(workspace_size);
+            if (!workspace) {
+                fprintf(stderr, "could not allocate the executor workspace\n");
+                goto cleanup;
+            }
+            error = tigris_run_with_workspace_buffer(
+                &plan, &mem, dispatch, NULL, &stats, workspace, workspace_size);
+        } else {
+            error = tigris_run(&plan, &mem, dispatch, NULL, &stats);
+        }
         if (error != TIGRIS_EXEC_OK) {
             fprintf(stderr, "inference failed: %s after %u stages "
                     "(fast peak %u of %u)\n",
@@ -377,6 +403,7 @@ int main(int argc, char **argv)
     result = 0;
 
 cleanup:
+    free(workspace);
     free(slow_buf);
     free(fast_buf);
     free(tensor_ptrs);

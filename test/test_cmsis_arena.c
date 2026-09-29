@@ -60,9 +60,14 @@ SUCCESS_STUB(arm_fully_connected_per_channel_s8)
 SUCCESS_STUB(arm_fully_connected_s8)
 SUCCESS_STUB(arm_avgpool_s8)
 
-void arm_vector_sum_s8(int32_t *output, ...)
+arm_cmsis_nn_status arm_vector_sum_s8(int32_t *vector_sum_buf, const int32_t vector_cols,
+                                      const int32_t vector_rows, const int8_t *vector_data,
+                                      const int32_t lhs_offset, const int32_t rhs_offset,
+                                      const int32_t *bias_data)
 {
-    (void)output;
+    (void)vector_sum_buf; (void)vector_cols; (void)vector_rows; (void)vector_data;
+    (void)lhs_offset; (void)rhs_offset; (void)bias_data;
+    return ARM_CMSIS_NN_SUCCESS;
 }
 
 typedef struct {

@@ -233,12 +233,49 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     }
 }
 
+/* Schemas v2/v3 let a custom dispatcher implement Transpose, MatMul and
+ * opcodes the built-in table did not define yet, so only the built-in
+ * operators whose meaning those schemas already fixed are validated there. */
+static int legacy_semantics_are_builtin(uint8_t op_type)
+{
+    switch ((tigris_op_type_t)op_type) {
+    case TIGRIS_OP_CONV:
+    case TIGRIS_OP_DEPTHWISE:
+    case TIGRIS_OP_CONV1D:
+    case TIGRIS_OP_FULLY_CONN:
+    case TIGRIS_OP_CONV_TRANSPOSE:
+    case TIGRIS_OP_RELU:
+    case TIGRIS_OP_RELU6:
+    case TIGRIS_OP_SIGMOID:
+    case TIGRIS_OP_TANH:
+    case TIGRIS_OP_SOFTMAX:
+    case TIGRIS_OP_RESHAPE:
+    case TIGRIS_OP_FLATTEN:
+    case TIGRIS_OP_REDUCE_MEAN:
+    case TIGRIS_OP_ADD:
+    case TIGRIS_OP_SUB:
+    case TIGRIS_OP_MUL:
+    case TIGRIS_OP_MAX_POOL:
+    case TIGRIS_OP_AVG_POOL:
+    case TIGRIS_OP_GLOBAL_MAX:
+    case TIGRIS_OP_GLOBAL_AVG:
+    case TIGRIS_OP_CONCAT:
+    case TIGRIS_OP_RESIZE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     const tigris_file_header_t *hdr = plan->header;
+    const int legacy = hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES;
 
     for (uint16_t op_index = 0; op_index < hdr->num_ops; op_index++) {
         const tigris_op_t *op = &plan->ops[op_index];
+        if (legacy && !legacy_semantics_are_builtin(op->op_type))
+            continue;
         if (op->num_inputs == 0 || op->num_outputs == 0 ||
             op->fused_act > TIGRIS_ACT_RELU6 || op->_pad1 != 0)
             return TIGRIS_ERR_BAD_OPERATOR;
@@ -1250,10 +1287,10 @@ tigris_error_t tigris_plan_load_ex(
     /* Attribute records are ordered and typed.  Validate their payloads
      * against the referenced operators before any kernel can use them.
      *
-     * Schemas v2/v3 predate typed attributes and intentionally allowed custom
-     * dispatch callbacks to implement operators such as legacy Transpose,
-     * MatMul, and application opcodes. Preserve that structural-loader
-     * contract; schema v4 introduced the strict built-in semantic contract. */
+     * Schemas v2/v3 predate typed attributes and allowed custom dispatch
+     * callbacks to implement operators such as legacy Transpose, MatMul, and
+     * application opcodes; semantic validation leaves exactly those open
+     * there (legacy_semantics_are_builtin). */
     if (candidate.op_attributes) {
         uint32_t attrs_off = section_offsets[TIGRIS_SEC_OP_ATTRIBUTES];
         uint32_t attrs_data_off = attrs_off + 4u +
@@ -1984,7 +2021,7 @@ tigris_error_t tigris_plan_load_ex(
         }
     }
 
-    if (hdr->version >= TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES) {
+    {
         tigris_error_t semantic_error = validate_operator_semantics(&candidate);
         if (semantic_error != TIGRIS_OK)
             return semantic_error;

@@ -92,6 +92,8 @@ static int esp_per_channel_quant(
     if (qp && qp->num_channels == channels) {
         uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2
             ? 0u : qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
+        /* MISRA 11.8 deviation: ESP-NN declares these fields non-const but
+         * only reads them, so the plan's read-only arrays are passed as is. */
         quant->mult = (int32_t *)&plan->quant_data[
             page + qp->multiplier_off];
         quant->shift = (int32_t *)&plan->quant_data[page + qp->shift_off];
@@ -120,6 +122,8 @@ static void esp_nn_workspace_free(void *ptr)
 #ifdef __XTENSA__
     heap_caps_free(ptr);
 #else
+    /* MISRA 21.3 deviation: host builds release the workspace that init
+     * allocated with the C library; inference itself never allocates. */
     free(ptr);
 #endif
 }

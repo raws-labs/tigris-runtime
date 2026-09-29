@@ -92,6 +92,8 @@ static int cmsis_per_channel_quant(
     if (qp && qp->num_channels == channels) {
         uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2
             ? 0u : qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
+        /* MISRA 11.8 deviation: CMSIS-NN declares these fields non-const but
+         * only reads them, so the plan's read-only arrays are passed as is. */
         quant->multiplier = (int32_t *)&plan->quant_data[
             page + qp->multiplier_off];
         quant->shift = (int32_t *)&plan->quant_data[page + qp->shift_off];
@@ -373,6 +375,7 @@ static int adapt_fully_connected(
 
     arm_cmsis_nn_status status;
     if (per_channel) {
+        /* MISRA 11.8 deviation: read-only plan arrays, see cmsis_per_channel_quant. */
         cmsis_nn_per_channel_quant_params quant = {
             .multiplier = (int32_t *)&plan->quant_data[(plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS) + out_qp->multiplier_off],
             .shift      = (int32_t *)&plan->quant_data[(plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS) + out_qp->shift_off] };

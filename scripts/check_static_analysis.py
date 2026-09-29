@@ -29,6 +29,16 @@ SOURCES = (
     "src/tigris_kernels_s8.c",
     "src/tigris_lz4.c",
 )
+# Each accelerator adapter compiles only with its vendor define, so it is
+# scanned separately with that define; the CMSIS-NN stub stands in for the
+# vendor header, and ESP-NN's own headers are simply absent.
+ADAPTER_SCANS = (
+    (("src/tigris_kernels_cmsis_nn.c",),
+     ("-DTIGRIS_HAS_CMSIS_NN", "-Itest/cmsis_stub",
+      "--suppress=*:test/cmsis_stub/arm_nnfunctions.h")),
+    (("src/tigris_kernels_esp_nn.c",), ("-DTIGRIS_HAS_ESP_NN",)),
+)
+SCANS = ((SOURCES, ()),) + ADAPTER_SCANS
 ACCEPTED_PATH = Path(__file__).with_name("static_analysis_accepted.txt")
 
 
@@ -144,7 +154,8 @@ def write_accepted(path: Path, pairs: set[tuple[str, str]]) -> None:
     path.write_text(ACCEPTED_HEADER + body, encoding="utf-8")
 
 
-def run_cppcheck(cppcheck: Path, root: Path, output: Path, mode: str) -> None:
+def run_cppcheck(cppcheck: Path, root: Path, output: Path, mode: str,
+                 sources: tuple[str, ...], extra: tuple[str, ...]) -> None:
     common = [
         str(cppcheck),
         "--std=c11",
@@ -163,7 +174,7 @@ def run_cppcheck(cppcheck: Path, root: Path, output: Path, mode: str) -> None:
         raise ValueError(f"unknown analysis mode: {mode}")
     try:
         completed = subprocess.run(
-            common + options + list(SOURCES),
+            common + options + list(extra) + list(sources),
             cwd=root,
             check=False,
             capture_output=True,
@@ -255,15 +266,17 @@ def main() -> int:
             directory = Path(temp)
             reports: dict[str, list[Diagnostic]] = {}
             for mode in ("correctness", "misra"):
-                report = directory / f"{mode}.xml"
-                run_cppcheck(cppcheck, root, report, mode)
-                version, diagnostics = parse_report(report, root)
-                if version != CPPCHECK_VERSION:
-                    raise ValueError(
-                        f"{mode} report identifies Cppcheck {version}, expected "
-                        f"{CPPCHECK_VERSION}"
-                    )
-                reports[mode] = diagnostics
+                reports[mode] = []
+                for index, (sources, extra) in enumerate(SCANS):
+                    report = directory / f"{mode}-{index}.xml"
+                    run_cppcheck(cppcheck, root, report, mode, sources, extra)
+                    version, diagnostics = parse_report(report, root)
+                    if version != CPPCHECK_VERSION:
+                        raise ValueError(
+                            f"{mode} report identifies Cppcheck {version}, "
+                            f"expected {CPPCHECK_VERSION}"
+                        )
+                    reports[mode].extend(diagnostics)
 
         correctness = reports["correctness"]
         misra = reports["misra"]

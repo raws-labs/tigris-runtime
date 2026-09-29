@@ -66,6 +66,9 @@ arm_cmsis_nn_status arm_fully_connected_per_channel_s8(
 arm_cmsis_nn_status arm_fully_connected_s8(
     const cmsis_nn_context *, ...);
 arm_cmsis_nn_status arm_avgpool_s8(const cmsis_nn_context *, ...);
-void arm_vector_sum_s8(int32_t *, ...);
+arm_cmsis_nn_status arm_vector_sum_s8(int32_t *vector_sum_buf, const int32_t vector_cols,
+                                      const int32_t vector_rows, const int8_t *vector_data,
+                                      const int32_t lhs_offset, const int32_t rhs_offset,
+                                      const int32_t *bias_data);
 
 #endif

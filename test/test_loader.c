@@ -2520,6 +2520,48 @@ static void test_quant_param_counts_are_reconciled(void)
     free(buf);
 }
 
+/* Schema v3 predates typed attributes, but its built-in operators already had
+ * their current meaning, so a record that no kernel can execute is refused.
+ * An opcode the v3 table did not define stays open to custom dispatch. */
+static void test_legacy_schema_validates_builtin_operators(void)
+{
+    printf("  test_legacy_schema_validates_builtin_operators...\n");
+    char path[512];
+    int path_len = snprintf(path, sizeof(path), "%s/%s", TIGRIS_SCHEMA_COMPAT_DIR,
+                            "schema-v3-qdq-conv.tgrs");
+    TEST_ASSERT(path_len > 0 && (size_t)path_len < sizeof(path), "fixture path fits");
+    uint32_t len = 0;
+    uint8_t *buf = load_file(path, &len);
+    TEST_ASSERT(buf != NULL, "v3 fixture is readable");
+    if (!buf)
+        return;
+
+    tigris_plan_t plan;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_OK, "v3 fixture loads");
+    tigris_op_t *conv = NULL;
+    for (uint16_t i = 0; i < plan.header->num_ops; i++) {
+        if (plan.ops[i].op_type == TIGRIS_OP_CONV)
+            conv = (tigris_op_t *)&plan.ops[i];
+    }
+    TEST_ASSERT(conv != NULL, "v3 fixture has a Conv");
+    if (conv) {
+        uint16_t group = conv->spatial.group;
+        conv->spatial.group = 2;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "v3 Conv with a group no kernel runs is refused");
+        conv->spatial.group = group;
+
+        uint8_t op_type = conv->op_type;
+        conv->op_type = 200;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_OK,
+                       "v3 opcode outside the built-in table is left to dispatch");
+        conv->op_type = op_type;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_OK,
+                       "restored v3 fixture loads");
+    }
+    free(buf);
+}
+
 static void test_schema_compatibility_fixtures(void)
 {
     /*
@@ -2716,6 +2758,7 @@ int main(int argc, char *argv[])
 
     printf("\nSchema compatibility fixtures:\n");
     test_schema_compatibility_fixtures();
+    test_legacy_schema_validates_builtin_operators();
     test_quant_param_counts_are_reconciled();
 
     printf("\nStruct size tests:\n");

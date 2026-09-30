@@ -1608,12 +1608,22 @@ static void run_per_channel_binary_s8(uint8_t op_type, const int8_t *expected,
     for (int i = 0; i < 6; i++)
         TEST_ASSERT_EQ(y[i], expected[i], what);
 
-    /* A second operand that is neither full-shape nor per-channel. */
+    /* One value per column: a broadcast inside the operand, read by output
+     * coordinate and never tiled. */
     test_shapes[test_tensors[t_b].shape_off + 2] = 2;
     test_shapes[test_tensors[t_b].shape_off + 3] = 1;
     test_tensors[t_b].size_bytes = 2;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "a column-wise operand runs");
+    const int8_t columns_product[] = {2, 4, 6, -4, -5, -6};
+    const int8_t columns_sum[] = {3, 4, 5, 3, 4, 5};
+    const int8_t *columns = (op_type == TIGRIS_OP_MUL) ? columns_product : columns_sum;
+    for (int i = 0; i < 6; i++)
+        TEST_ASSERT_EQ(y[i], columns[i], "column-wise operand value");
+    mem.tile.active = 1;
     TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
-                "a row-wise operand is refused");
+                "a column-wise operand is refused under a tile");
+    mem.tile.active = 0;
 }
 
 static void test_per_channel_binary_s8(void)
@@ -2428,6 +2438,71 @@ static void test_binary_s8_constant_operand(void)
                 "an int8 constant without the attribute is refused");
 }
 
+/* Both operands broadcast: [1,2,1,2] + [1,1,3,2] -> [1,2,3,2]. The first
+ * varies along height and channels, the second along width and channels. */
+static void test_binary_s8_both_broadcast(void)
+{
+    printf("  test_binary_s8_both_broadcast...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    int32_t a_shape[] = {1, 2, 1, 2}, b_shape[] = {1, 1, 3, 2}, y_shape[] = {1, 2, 3, 2};
+    uint16_t t_a = add_tensor(&plan, "a", a_shape, 4, 3, 4, qp);
+    uint16_t t_b = add_tensor(&plan, "b", b_shape, 4, 3, 6, qp);
+    uint16_t t_y = add_tensor(&plan, "y", y_shape, 4, 3, 12, qp);
+    uint16_t ins[] = {t_a, t_b}, outs[] = {t_y};
+    one_op_s8(&plan, TIGRIS_OP_ADD, ins, 2, outs, 1, TIGRIS_NO_WEIGHT);
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    const int8_t a[] = {10, 20, 30, 40}, b[] = {1, 2, 3, 4, 5, 6};
+    tigris_mem_alloc_fast(&mem, t_a, 4); memcpy(ptrs[t_a], a, 4);
+    tigris_mem_alloc_fast(&mem, t_b, 6); memcpy(ptrs[t_b], b, 6);
+    tigris_mem_alloc_fast(&mem, t_y, 12);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "both-broadcast Add runs");
+    const int8_t expected[] = {11, 22, 13, 24, 15, 26, 31, 42, 33, 44, 35, 46};
+    for (int i = 0; i < 12; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], expected[i], "both-broadcast Add value");
+}
+
+/* A constant that states its shape in the long attribute form: one value per
+ * row of a [1,2,2,1] map. */
+static void test_binary_s8_constant_shape(void)
+{
+    printf("  test_binary_s8_constant_shape...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    int32_t shape[] = {1, 2, 2, 1};
+    uint16_t t_x = add_tensor(&plan, "x", shape, 4, 3, 4, qp);
+    uint16_t t_y = add_tensor(&plan, "y", shape, 4, 3, 4, qp);
+    const int8_t rows[] = {5, -3};
+    uint16_t ins[] = {t_x}, outs[] = {t_y};
+    one_op_s8(&plan, TIGRIS_OP_SUB, ins, 1, outs, 1, add_weight(rows, 2, "rows"));
+    uint8_t payload[20] = {1, 0, (uint8_t)qp, 0};
+    const int32_t constant_shape[4] = {1, 2, 1, 1};
+    memcpy(payload + 4, constant_shape, sizeof(constant_shape));
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_CONSTANT_OPERAND, 20u, 0};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = payload;
+    plan.num_op_attributes = 1;
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    const int8_t x[] = {1, 2, 3, 4};
+    tigris_mem_alloc_fast(&mem, t_x, 4); memcpy(ptrs[t_x], x, 4);
+    tigris_mem_alloc_fast(&mem, t_y, 4);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "shaped constant runs");
+    const int8_t expected[] = {-4, -3, 6, 7};
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], expected[i], "shaped constant value");
+    memcpy(payload + 8, &(int32_t){3}, sizeof(int32_t));
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "a constant shape that does not broadcast is refused");
+}
+
 /* Main */
 
 int main(void)
@@ -2468,6 +2543,8 @@ int main(void)
     test_concat_s8_height();
     test_depthwise_multiplier_s8();
     test_binary_s8_constant_operand();
+    test_binary_s8_both_broadcast();
+    test_binary_s8_constant_shape();
     test_unsupported_op_s8();
     test_elementwise_reference_goldens();
 

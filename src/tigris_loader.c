@@ -52,26 +52,6 @@ static int tensor_shapes_equal(
     return 1;
 }
 
-/* One value per channel of `map`: the same rank, every axis but the innermost
- * 1. Channels are stored innermost, so such an operand repeats every
- * `channels` elements of `map` with no further metadata. */
-static int tensor_is_per_channel_of(
-    const tigris_plan_t *plan, const tigris_tensor_t *operand,
-    const tigris_tensor_t *map)
-{
-    if (operand->ndim != map->ndim || map->ndim == 0u ||
-        operand->dtype != map->dtype)
-        return 0;
-    const int32_t *o = tigris_tensor_shape(plan, operand);
-    const int32_t *f = tigris_tensor_shape(plan, map);
-    uint8_t last = (uint8_t)(map->ndim - 1u);
-    for (uint8_t d = 0; d < last; d++) {
-        if (o[d] != 1)
-            return 0;
-    }
-    return o[last] == f[last] && f[last] > 0;
-}
-
 static uint32_t tensor_elements(const tigris_tensor_t *tensor)
 {
     return tensor->size_bytes / (tensor->dtype == 1 ? sizeof(float) : 1u);
@@ -134,13 +114,34 @@ static int is_binary_op(uint8_t type)
            type == TIGRIS_OP_FLOOR_DIV || type == TIGRIS_OP_FLOOR_MOD;
 }
 
+/* Whether a binary operand of this shape broadcasts to the output: its rank
+ * at most the output's, and each axis, aligned from the innermost, either 1
+ * or the output's extent. */
+static int shape_broadcasts_to(const int32_t *shape, uint8_t ndim,
+                               const tigris_plan_t *plan, const tigris_tensor_t *output)
+{
+    const int32_t *out_shape = tigris_tensor_shape(plan, output);
+    if (ndim == 0u || ndim > output->ndim)
+        return 0;
+    for (uint8_t d = 0; d < ndim; d++) {
+        int32_t extent = shape[d];
+        int32_t target = out_shape[d + (uint8_t)(output->ndim - ndim)];
+        if (extent <= 0 || (extent != 1 && extent != target))
+            return 0;
+    }
+    return 1;
+}
+
+#define TIGRIS_MAX_TENSOR_RANK_FOR_ATTR 8u
+
 /* A binary operator's constant operand, held in its weight: one value, one
- * per channel, or one per element of `input`. An int8 constant carries its
+ * per channel, or one per element of `output`, or the shape the long form of
+ * the attribute states. An int8 constant carries its
  * quantization in the constant-operand attribute; without the attribute only
  * a float Add or Mul takes a constant, as its second operand. */
 static int constant_operand_is_valid(
     const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
-    const tigris_tensor_t *input, uint8_t dtype,
+    const tigris_tensor_t *output, uint8_t dtype,
     const tigris_quant_param_t **quant)
 {
     uint8_t len = 0u;
@@ -152,7 +153,7 @@ static int constant_operand_is_valid(
         op->bias_idx != TIGRIS_NO_WEIGHT ||
         op->weight_idx == TIGRIS_NO_WEIGHT ||
         op->weight_idx >= plan->header->num_weights ||
-        !plan->weight_entries || input->ndim == 0u ||
+        !plan->weight_entries || output->ndim == 0u ||
         (dtype != 1u && dtype != 3u))
         return 0;
     if (attr) {
@@ -170,9 +171,24 @@ static int constant_operand_is_valid(
         return 0;
     }
     const uint32_t bytes = plan->weight_entries[op->weight_idx].size_bytes;
+    if (attr != NULL && len != TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN) {
+        /* The long form states the constant's shape in stored axis order. */
+        int32_t shape[TIGRIS_MAX_TENSOR_RANK_FOR_ATTR];
+        uint64_t count = 1u;
+        if (len != TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN + 4u * output->ndim ||
+            output->ndim > TIGRIS_MAX_TENSOR_RANK_FOR_ATTR)
+            return 0;
+        memcpy(shape, attr + TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN,
+               sizeof(int32_t) * output->ndim);
+        if (!shape_broadcasts_to(shape, output->ndim, plan, output))
+            return 0;
+        for (uint8_t d = 0; d < output->ndim; d++)
+            count *= (uint64_t)shape[d];
+        return count * element == bytes;
+    }
     const uint32_t channels = (uint32_t)
-        tigris_tensor_shape(plan, input)[input->ndim - 1u] * element;
-    return bytes == element || bytes == channels || bytes == input->size_bytes;
+        tigris_tensor_shape(plan, output)[output->ndim - 1u] * element;
+    return bytes == element || bytes == channels || bytes == output->size_bytes;
 }
 
 static int is_axis1_unary_pointwise_op(uint8_t type)
@@ -568,14 +584,17 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         case TIGRIS_OP_FLOOR_MOD:
         {
             const tigris_quant_param_t *second_quant = NULL;
-            if (!tensor_shapes_equal(plan, input, output))
+            if (!shape_broadcasts_to(tigris_tensor_shape(plan, input), input->ndim,
+                                     plan, output))
                 return TIGRIS_ERR_BAD_OPERATOR;
             if (op->num_inputs == 1u) {
-                if (!constant_operand_is_valid(plan, op, op_index, input, dtype, &second_quant))
+                if (!constant_operand_is_valid(plan, op, op_index, output, dtype, &second_quant))
                     return TIGRIS_ERR_BAD_OPERATOR;
             } else {
+                const tigris_tensor_t *other = &plan->tensors[inputs[1]];
                 if (!op_has_plain_io(op, 2, 1) ||
-                    !tensor_shapes_equal(plan, input, &plan->tensors[inputs[1]]))
+                    !shape_broadcasts_to(tigris_tensor_shape(plan, other), other->ndim,
+                                         plan, output))
                     return TIGRIS_ERR_BAD_OPERATOR;
                 if (dtype == 3u) {
                     const tigris_tensor_t *second = &plan->tensors[inputs[1]];
@@ -732,22 +751,24 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         case TIGRIS_OP_ADD:
         case TIGRIS_OP_SUB:
         case TIGRIS_OP_MUL:
+            /* Each operand has the output's shape or broadcasts to it. */
             if (op->num_outputs != 1 ||
                 (op->num_inputs != 1 && op->num_inputs != 2) ||
                 op->bias_idx != TIGRIS_NO_WEIGHT ||
-                !tensor_shapes_equal(plan, input, output))
+                !shape_broadcasts_to(tigris_tensor_shape(plan, input), input->ndim,
+                                     plan, output))
                 return TIGRIS_ERR_BAD_OPERATOR;
             if (op->num_inputs == 2) {
                 const tigris_tensor_t *second = &plan->tensors[inputs[1]];
                 if (op->weight_idx != TIGRIS_NO_WEIGHT ||
-                    (!tensor_shapes_equal(plan, input, second) &&
-                     !tensor_is_per_channel_of(plan, second, input)))
+                    !shape_broadcasts_to(tigris_tensor_shape(plan, second), second->ndim,
+                                         plan, output))
                     return TIGRIS_ERR_BAD_OPERATOR;
             } else {
                 /* Channels are stored innermost, so a per-channel constant
                  * repeats on its own without shape metadata. */
                 const tigris_quant_param_t *constant_quant;
-                if (!constant_operand_is_valid(plan, op, op_index, input, dtype,
+                if (!constant_operand_is_valid(plan, op, op_index, output, dtype,
                                                &constant_quant) ||
                     (dtype == 3u && (input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                                      output->quant_param_idx == TIGRIS_NO_QUANT_PARAM)))
@@ -1584,10 +1605,12 @@ tigris_error_t tigris_plan_load_ex(
                 break;
             }
             case TIGRIS_OP_ATTR_CONSTANT_OPERAND: {
-                /* Operand position, a zero byte, and a quant param index the
-                 * operator's own validation resolves. */
+                /* Operand position, a zero byte, a quant param index and
+                 * optionally a shape, which the operator's own validation
+                 * resolves. */
                 const uint8_t *payload = candidate.op_attribute_data + attr->data_offset;
-                if (attr->data_len != TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN ||
+                if (attr->data_len < TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN ||
+                    (attr->data_len - TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN) % 4u != 0u ||
                     payload[0] > 1u || payload[1] != 0u)
                     return TIGRIS_ERR_BAD_SECTION;
                 break;

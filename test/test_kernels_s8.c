@@ -2503,6 +2503,56 @@ static void test_binary_s8_constant_shape(void)
                 "a constant shape that does not broadcast is refused");
 }
 
+/* A [1,2,2,1] map padded by one row above and one column on the right:
+ * the fill is the output zero point, or the weight when one is stated. */
+static void test_pad_s8(void)
+{
+    printf("  test_pad_s8...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t qp = add_quant_param(0.5f, -3, 1, NULL, NULL);
+    int32_t in_shape[] = {1, 2, 2, 1}, out_shape[] = {1, 3, 3, 1};
+    uint16_t t_x = add_tensor(&plan, "x", in_shape, 4, 3, 4, qp);
+    uint16_t t_y = add_tensor(&plan, "y", out_shape, 4, 3, 9, qp);
+    uint16_t ins[] = {t_x}, outs[] = {t_y};
+    one_op_s8(&plan, TIGRIS_OP_PAD, ins, 1, outs, 1, TIGRIS_NO_WEIGHT);
+    const int32_t pads[8] = {0, 0, 1, 0, 0, 1, 0, 0};
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_PADS, (uint8_t)sizeof(pads), 0};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = (const uint8_t *)pads;
+    plan.num_op_attributes = 1;
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    const int8_t x[] = {1, 2, 3, 4};
+    tigris_mem_alloc_fast(&mem, t_x, 4); memcpy(ptrs[t_x], x, 4);
+    tigris_mem_alloc_fast(&mem, t_y, 9);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0, "pad runs");
+    const int8_t zero_fill[] = {-3, -3, -3, 1, 2, -3, 3, 4, -3};
+    for (int i = 0; i < 9; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], zero_fill[i], "pad with the zero point");
+
+    const int8_t seven = 7;
+    test_ops[0].weight_idx = add_weight(&seven, 1, "fill");
+    build_plan(&plan);
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = (const uint8_t *)pads;
+    plan.num_op_attributes = 1;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "pad with a fill runs");
+    const int8_t stated_fill[] = {7, 7, 7, 1, 2, 7, 3, 4, 7};
+    for (int i = 0; i < 9; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], stated_fill[i], "pad with a stated fill");
+
+    mem.tile.active = 1;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "pad refuses a tile");
+    mem.tile.active = 0;
+    plan.num_op_attributes = 0;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "pad without its widths is refused");
+}
+
 /* Main */
 
 int main(void)
@@ -2542,6 +2592,7 @@ int main(void)
     test_split_s8_inner_axis();
     test_concat_s8_height();
     test_depthwise_multiplier_s8();
+    test_pad_s8();
     test_binary_s8_constant_operand();
     test_binary_s8_both_broadcast();
     test_binary_s8_constant_shape();

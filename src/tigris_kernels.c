@@ -1137,6 +1137,83 @@ static int kern_reduce_mean(
  * output is that many bytes taken in order. Nothing is interleaved and no
  * shape arithmetic is needed; the parts differ only in how much they take.
  */
+/* Declared in tigris_binary_operands.h, shared with the int8 kernels. */
+int tigris_pad(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+               const tigris_mem_t *mem, uint32_t element, const uint8_t *fill)
+{
+    uint8_t len = 0u;
+    const uint8_t *pads = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_PADS, &len);
+    if ((pads == NULL) || (op->num_inputs != 1u) || (op->num_outputs != 1u) ||
+        mem->tile.active || (fill == NULL))
+        return -1;
+    const uint16_t x_index = tigris_op_inputs(plan, op)[0];
+    const uint16_t y_index = tigris_op_outputs(plan, op)[0];
+    const tigris_tensor_t *x = &plan->tensors[x_index];
+    const tigris_tensor_t *y = &plan->tensors[y_index];
+    const uint8_t rank = x->ndim;
+    const uint8_t *src = (const uint8_t *)tigris_mem_tensor_ptr(mem, x_index);
+    uint8_t *dst = (uint8_t *)tigris_mem_tensor_ptr(mem, y_index);
+    if ((src == NULL) || (dst == NULL) || (rank == 0u) || (rank != y->ndim) ||
+        (rank > 8u) || ((uint32_t)len != 8u * rank))
+        return -1;
+    const int32_t *in_shape = tigris_tensor_shape(plan, x);
+    const int32_t *out_shape = tigris_tensor_shape(plan, y);
+    int32_t lead[8];
+    uint64_t out_count = 1u;
+    for (uint8_t d = 0; d < rank; d++) {
+        int32_t trail;
+        memcpy(&lead[d], pads + 8u * d, sizeof(int32_t));
+        memcpy(&trail, pads + 8u * d + 4u, sizeof(int32_t));
+        if ((lead[d] < 0) || (trail < 0) || (in_shape[d] <= 0) ||
+            ((int64_t)in_shape[d] + lead[d] + trail != (int64_t)out_shape[d]))
+            return -1;
+        out_count *= (uint64_t)out_shape[d];
+    }
+    if (out_count * element != y->size_bytes)
+        return -1;
+    for (uint64_t i = 0; i < out_count; i++)
+        memcpy(dst + i * element, fill, element);
+    /* Copy one innermost run per position of the outer input axes. */
+    const size_t run = (size_t)in_shape[rank - 1u] * element;
+    int32_t position[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (;;) {
+        uint64_t in_offset = 0u;
+        uint64_t out_offset = 0u;
+        for (uint8_t d = 0; d < rank; d++) {
+            in_offset = in_offset * (uint64_t)in_shape[d] + (uint64_t)position[d];
+            out_offset = out_offset * (uint64_t)out_shape[d] +
+                         (uint64_t)(position[d] + lead[d]);
+        }
+        memcpy(dst + out_offset * element, src + in_offset * element, run);
+        uint8_t axis = (uint8_t)(rank - 1u);
+        while (axis > 0u) {
+            axis--;
+            position[axis]++;
+            if (position[axis] < in_shape[axis])
+                break;
+            position[axis] = 0;
+            if (axis == 0u)
+                return 0;
+        }
+        if (rank == 1u)
+            return 0;
+    }
+}
+
+static int kern_pad(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+                    tigris_mem_t *mem)
+{
+    /* The fill is the operator's weight when the model states one, else 0. */
+    const float zero = 0.0f;
+    const uint8_t *fill = (const uint8_t *)&zero;
+    if (op->weight_idx != TIGRIS_NO_WEIGHT) {
+        if (plan->weight_entries[op->weight_idx].size_bytes != sizeof(float))
+            return -1;
+        fill = (const uint8_t *)tigris_op_weight(plan, op);
+    }
+    return tigris_pad(plan, op, op_index, mem, sizeof(float), fill);
+}
+
 static int kern_split(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -2055,6 +2132,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm(plan, op, op_index, mem);
     case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean(plan, op, op_index, mem);
     case TIGRIS_OP_SPLIT:       return kern_split(plan, op, mem);
+    case TIGRIS_OP_PAD:         return kern_pad(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */
     }

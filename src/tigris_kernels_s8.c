@@ -1088,6 +1088,23 @@ static TIGRIS_KERNEL_NOINLINE int kern_reduce_mean_s8(
  * output is that many bytes taken in order. Nothing is interleaved and no
  * shape arithmetic is needed; the parts differ only in how much they take.
  */
+static TIGRIS_KERNEL_NOINLINE int kern_pad_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index, tigris_mem_t *mem)
+{
+    /* The fill is the operator's weight, already quantized to the output,
+     * when the model states one; else the output's zero point, a real 0. */
+    const tigris_quant_param_t *out_qp =
+        tigris_tensor_quant(plan, &plan->tensors[tigris_op_outputs(plan, op)[0]]);
+    int8_t zero = (int8_t)(out_qp ? out_qp->zero_point : 0);
+    const uint8_t *fill = (const uint8_t *)&zero;
+    if (op->weight_idx != TIGRIS_NO_WEIGHT) {
+        if (plan->weight_entries[op->weight_idx].size_bytes != 1u)
+            return -1;
+        fill = (const uint8_t *)tigris_op_weight(plan, op);
+    }
+    return tigris_pad(plan, op, op_index, mem, 1u, fill);
+}
+
 static TIGRIS_KERNEL_NOINLINE int kern_split_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -2472,6 +2489,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm_s8(plan, op, op_index, mem);
     case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean_s8(plan, op, op_index, mem);
     case TIGRIS_OP_SPLIT:       return kern_split_s8(plan, op, mem);
+    case TIGRIS_OP_PAD:         return kern_pad_s8(plan, op, op_index, mem);
     default:
         return -1;  /* unsupported op type */
     }

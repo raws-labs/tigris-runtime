@@ -626,6 +626,37 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             break;
         }
 
+        case TIGRIS_OP_PAD: {
+            /* A byte copy into a filled frame: the pads attribute places the
+             * input, the optional weight is one element of fill, and int8
+             * keeps its quantization. */
+            uint8_t pads_len = 0u;
+            const uint8_t *pads = tigris_op_attribute_data(
+                plan, op_index, TIGRIS_OP_ATTR_PADS, &pads_len);
+            const uint32_t element = (dtype == 1u) ? (uint32_t)sizeof(float) : 1u;
+            if (op->num_inputs != 1u || op->num_outputs != 1u ||
+                op->bias_idx != TIGRIS_NO_WEIGHT || pads == NULL ||
+                input->ndim == 0u || input->ndim != output->ndim ||
+                (dtype != 1u && dtype != 3u) ||
+                (op->weight_idx != TIGRIS_NO_WEIGHT &&
+                 (op->weight_idx >= hdr->num_weights || !plan->weight_entries ||
+                  plan->weight_entries[op->weight_idx].size_bytes != element)) ||
+                (dtype == 3u && !same_quantization(tigris_tensor_quant(plan, input),
+                                                   tigris_tensor_quant(plan, output))))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *in_shape = tigris_tensor_shape(plan, input);
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            for (uint8_t d = 0; d < input->ndim; d++) {
+                int32_t lead;
+                int32_t trail;
+                memcpy(&lead, pads + 8u * d, sizeof(lead));
+                memcpy(&trail, pads + 8u * d + 4u, sizeof(trail));
+                if ((int64_t)in_shape[d] + lead + trail != (int64_t)out_shape[d])
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
+            break;
+        }
+
         case TIGRIS_OP_HARDSWISH:
         case TIGRIS_OP_ERF:
             if (!op_has_plain_io(op, 1, 1) ||

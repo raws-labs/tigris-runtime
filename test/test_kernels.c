@@ -1812,6 +1812,47 @@ static void test_depthwise_multiplier(void)
         TEST_ASSERT_NEAR(Y[i], expected[i], EPS, "depthwise multiplier value");
 }
 
+static void test_binary_constant_first(void)
+{
+    printf("  test_binary_constant_first...\n");
+    /* 2 / x: the constant is the first operand. */
+    const int32_t x_shape[] = {1, 1, 1, 4};
+    const int32_t *shapes[] = {x_shape, x_shape};
+    const uint8_t ndims[] = {4, 4};
+    one_op_f32_t t;
+    one_op_f32(&t, TIGRIS_OP_DIV, 1, 1, shapes, ndims);
+    float two = 2.0f;
+    tigris_weight_entry_t weight;
+    memset(&weight, 0, sizeof(weight));
+    weight.size_bytes = sizeof(two);
+    t.plan.weight_entries = &weight;
+    t.plan.weight_blob = (const uint8_t *)&two;
+    t.header.num_weights = 1;
+    t.op.weight_idx = 0;
+    uint8_t payload[4] = {0, 0, 0xFF, 0xFF};
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_CONSTANT_OPERAND,
+                                  (uint8_t)TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN, 0};
+    t.plan.op_attributes = &attr;
+    t.plan.op_attribute_data = payload;
+    t.plan.num_op_attributes = 1;
+    float X[4] = {1.0f, 2.0f, 4.0f, -8.0f}, Y[4];
+    void *ptrs[2] = {X, Y};
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs; mem.num_tensors = 2;
+    TEST_ASSERT(tigris_dispatch_kernel(&t.plan, &t.op, 0, &mem, NULL) == 0,
+                "constant dividend runs");
+    const float expected[4] = {2.0f, 1.0f, 0.5f, -0.25f};
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(Y[i], expected[i], EPS, "constant dividend value");
+    payload[2] = 0;
+    TEST_ASSERT(tigris_dispatch_kernel(&t.plan, &t.op, 0, &mem, NULL) != 0,
+                "a float constant with a quant index is refused");
+    t.plan.num_op_attributes = 0;
+    TEST_ASSERT(tigris_dispatch_kernel(&t.plan, &t.op, 0, &mem, NULL) != 0,
+                "a constant Div operand without the attribute is refused");
+}
+
 /* Bilinear Resize, checked against ONNX Runtime (opset 13, mode linear) on an
  * NHWC 1x2x3x2 input holding 1..12, scale 2 on both spatial axes. */
 static const float k_linear_half_pixel[48] = {
@@ -3062,6 +3103,7 @@ int main(void)
     test_concat_inner_axis();
     test_split_inner_axis();
     test_depthwise_multiplier();
+    test_binary_constant_first();
     test_softmax();
     test_mul();
     test_constant_binary_f32();

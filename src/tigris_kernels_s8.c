@@ -14,6 +14,7 @@
 #include "tigris_kernels.h"
 #include "tigris_accel_policy.h"
 #include "tigris_kernel_window.h"
+#include "tigris_binary_operands.h"
 
 #include <math.h>
 #include <string.h>
@@ -343,69 +344,35 @@ static void apply_pointwise_row_offset_s8(
     *y += (size_t)mem->tile.out_row_start * row_elems;
 }
 
-/** Validate exact-shape, two-dynamic-input int8 elementwise operands. */
-/* Operands of a dynamic int8 binary op. The first operand and the result
- * share one shape; the second either has it too (*b_period = 0) or holds one
- * value per channel, repeating every *b_period elements because channels are
- * stored innermost. Under a height tile the per-channel operand is loaded
- * whole and never offset by rows. */
-static int binary_s8_io_is_valid(
-    const tigris_plan_t *plan, const tigris_op_t *op, const tigris_mem_t *mem,
-    uint32_t *b_period)
+/* The operands of an int8 binary operator and its output, advanced to the
+ * tile's rows. An operand that repeats (one value, or one per channel) is
+ * read whole; see tigris_binary_operands. */
+static int binary_s8_begin(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    const tigris_mem_t *mem, tigris_binary_operands_t *operands,
+    int8_t **y, uint32_t *count)
 {
-    *b_period = 0u;
-    if (!plan || !op || !mem || !plan->header || !plan->tensors ||
-        !plan->index_pool || !plan->shape_pool || !mem->tensor_ptrs ||
-        op->num_inputs != 2 || op->num_outputs != 1 ||
-        op->weight_idx != TIGRIS_NO_WEIGHT ||
-        op->bias_idx != TIGRIS_NO_WEIGHT)
+    if (!tigris_binary_operands(plan, op, op_index, mem, 3u, operands))
         return 0;
-
-    const uint16_t *ins = tigris_op_inputs(plan, op);
-    const uint16_t *outs = tigris_op_outputs(plan, op);
-    uint16_t indices[3] = {ins[0], ins[1], outs[0]};
-    for (uint8_t i = 0; i < 3; i++) {
-        if (indices[i] >= plan->header->num_tensors ||
-            indices[i] >= mem->num_tensors ||
-            !tigris_mem_tensor_ptr(mem, indices[i]))
-            return 0;
+    const uint16_t x = tigris_op_inputs(plan, op)[0];
+    *y = (int8_t *)tigris_mem_tensor_ptr(mem, tigris_op_outputs(plan, op)[0]);
+    *count = tile_aware_numel(plan, x, mem);
+    if (mem->tile.active) {
+        uint32_t row_elems = tile_row_elems(plan, x, mem);
+        for (uint8_t k = 0; k < 2u; k++) {
+            if (operands->period[k] == 0u)
+                operands->data[k] += (size_t)mem->tile.in_row_start * row_elems;
+        }
+        *y += (size_t)mem->tile.out_row_start * row_elems;
     }
-
-    const tigris_tensor_t *a = &plan->tensors[indices[0]];
-    const tigris_tensor_t *b = &plan->tensors[indices[1]];
-    const tigris_tensor_t *y = &plan->tensors[indices[2]];
-    if (a->dtype != 3 || b->dtype != 3 || y->dtype != 3 || a->ndim == 0u ||
-        a->ndim != b->ndim || a->ndim != y->ndim ||
-        a->size_bytes != y->size_bytes ||
-        (mem->tile.active && a->ndim != 3 && a->ndim != 4))
-        return 0;
-
-    uint64_t numel = 1;
-    const int32_t *a_shape = tigris_tensor_shape(plan, a);
-    const int32_t *b_shape = tigris_tensor_shape(plan, b);
-    const int32_t *y_shape = tigris_tensor_shape(plan, y);
-    int same = 1;
-    int per_channel = 1;
-    uint8_t last = (uint8_t)(a->ndim - 1u);
-    for (uint8_t i = 0; i < a->ndim; i++) {
-        if (a_shape[i] <= 0 || a_shape[i] != y_shape[i])
-            return 0;
-        if (b_shape[i] != a_shape[i])
-            same = 0;
-        if (b_shape[i] != ((i == last) ? a_shape[i] : 1))
-            per_channel = 0;
-        numel *= (uint32_t)a_shape[i];
-        if (numel > UINT32_MAX)
-            return 0;
-    }
-    if ((uint32_t)numel != a->size_bytes)
-        return 0;
-    if (same)
-        return b->size_bytes == a->size_bytes;
-    if (!per_channel || b->size_bytes != (uint32_t)a_shape[last])
-        return 0;
-    *b_period = (uint32_t)a_shape[last];
     return 1;
+}
+
+/* Element i of an operand that repeats every `period` elements, or of a
+ * dense one when period is 0. */
+static inline int32_t binary_s8_at(const uint8_t *data, uint32_t period, uint32_t i)
+{
+    return (int32_t)((const int8_t *)data)[period ? i % period : i];
 }
 
 /* Int8 Kernels */
@@ -873,23 +840,16 @@ static TIGRIS_KERNEL_NOINLINE int kern_addsub_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
     tigris_mem_t *mem, int subtract)
 {
-    /* Constants are absent from the tensor/quant tables in the current wire
-     * format. Without their scale and zero point, one-input + weight_idx Add
-     * cannot be interpreted safely, so fail closed before reading ins[1]. */
-    uint32_t b_period;
-    if (!binary_s8_io_is_valid(plan, op, mem, &b_period))
+    tigris_binary_operands_t operands;
+    int8_t *Y;
+    uint32_t n;
+    if (!binary_s8_begin(plan, op, op_index, mem, &operands, &Y, &n))
         return -1;
 
-    const uint16_t *ins  = tigris_op_inputs(plan, op);
-    const uint16_t *outs = tigris_op_outputs(plan, op);
-
-    const int8_t *A = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    const int8_t *B_ptr = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[1]);
-    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
-
-    const tigris_quant_param_t *qp_a = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
-    const tigris_quant_param_t *qp_b = tigris_tensor_quant(plan, &plan->tensors[ins[1]]);
-    const tigris_quant_param_t *qp_y = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    const tigris_quant_param_t *qp_a = operands.quant[0];
+    const tigris_quant_param_t *qp_b = operands.quant[1];
+    const tigris_quant_param_t *qp_y = tigris_tensor_quant(
+        plan, &plan->tensors[tigris_op_outputs(plan, op)[0]]);
 
     float sa = qp_a ? qp_a->scale : 1.0f;
     int32_t za = qp_a ? qp_a->zero_point : 0;
@@ -929,17 +889,10 @@ static TIGRIS_KERNEL_NOINLINE int kern_addsub_s8(
             &y_mult, &y_shift);
     }
 
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
-    if (mem->tile.active) {
-        uint32_t row_elems = tile_row_elems(plan, ins[0], mem);
-        A += (size_t)mem->tile.in_row_start * row_elems;
-        if (b_period == 0u)
-            B_ptr += (size_t)mem->tile.in_row_start * row_elems;
-        Y += (size_t)mem->tile.out_row_start * row_elems;
-    }
     for (uint32_t i = 0; i < n; i++) {
-        int32_t av = ((int32_t)A[i] - za) * (1 << LEFT_SHIFT);
-        int32_t bv = ((int32_t)B_ptr[b_period ? i % b_period : i] - zb) *
+        int32_t av = (binary_s8_at(operands.data[0], operands.period[0], i) - za) *
+                     (1 << LEFT_SHIFT);
+        int32_t bv = (binary_s8_at(operands.data[1], operands.period[1], i) - zb) *
                      (1 << LEFT_SHIFT);
         int32_t scaled_b = multiply_by_quantized_multiplier(bv, b_mult, b_shift);
         int32_t scaled = multiply_by_quantized_multiplier(av, a_mult, a_shift)
@@ -2080,14 +2033,16 @@ static TIGRIS_KERNEL_NOINLINE int kern_elementwise_unary_s8(
 }
 
 static TIGRIS_KERNEL_NOINLINE int kern_elementwise_binary_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
 {
-    uint32_t period;
-    if (!binary_s8_io_is_valid(plan, op, mem, &period)) return -1;
-    const uint16_t *ins = tigris_op_inputs(plan, op);
+    tigris_binary_operands_t operands;
+    int8_t *y;
+    uint32_t count;
+    if (!binary_s8_begin(plan, op, op_index, mem, &operands, &y, &count)) return -1;
     uint16_t out = tigris_op_outputs(plan, op)[0];
-    const tigris_quant_param_t *aq = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
-    const tigris_quant_param_t *bq = tigris_tensor_quant(plan, &plan->tensors[ins[1]]);
+    const tigris_quant_param_t *aq = operands.quant[0];
+    const tigris_quant_param_t *bq = operands.quant[1];
     const tigris_quant_param_t *yq = tigris_tensor_quant(plan, &plan->tensors[out]);
     if (!aq || !bq || !yq || aq->scale <= 0.0f || bq->scale <= 0.0f || yq->scale <= 0.0f)
         return -1;
@@ -2112,16 +2067,9 @@ static TIGRIS_KERNEL_NOINLINE int kern_elementwise_binary_s8(
                aq->zero_point != bq->zero_point || aq->zero_point != yq->zero_point) {
         return -1;
     }
-    const int8_t *a = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    const int8_t *b = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[1]);
-    int8_t *y = (int8_t *)tigris_mem_tensor_ptr(mem, out);
-    uint32_t count = tile_aware_numel(plan, ins[0], mem);
-    if (mem->tile.active && period == 0u)
-        b += (size_t)mem->tile.in_row_start * tile_row_elems(plan, ins[0], mem);
-    apply_pointwise_row_offset_s8(plan, ins[0], mem, &a, &y);
     for (uint32_t i = 0; i < count; i++) {
-        int32_t av = (int32_t)a[i];
-        int32_t bv = (int32_t)b[period ? i % period : i];
+        int32_t av = binary_s8_at(operands.data[0], operands.period[0], i);
+        int32_t bv = binary_s8_at(operands.data[1], operands.period[1], i);
         if (op->op_type == TIGRIS_OP_MAXIMUM || op->op_type == TIGRIS_OP_MINIMUM) {
             int32_t result = op->op_type == TIGRIS_OP_MAXIMUM ? (av > bv ? av : bv) : (av < bv ? av : bv);
             y[i] = (int8_t)result;
@@ -2450,23 +2398,19 @@ static TIGRIS_KERNEL_NOINLINE int kern_softmax_s8(
 }
 
 static TIGRIS_KERNEL_NOINLINE int kern_mul_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
 {
-    /* See kern_add_s8: constant quantization is not recoverable from weight_idx. */
-    uint32_t b_period;
-    if (!binary_s8_io_is_valid(plan, op, mem, &b_period))
+    tigris_binary_operands_t operands;
+    int8_t *Y;
+    uint32_t n;
+    if (!binary_s8_begin(plan, op, op_index, mem, &operands, &Y, &n))
         return -1;
 
-    const uint16_t *ins  = tigris_op_inputs(plan, op);
-    const uint16_t *outs = tigris_op_outputs(plan, op);
-
-    const int8_t *A = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    const int8_t *B_ptr = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[1]);
-    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
-
-    const tigris_quant_param_t *qp_a = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
-    const tigris_quant_param_t *qp_b = tigris_tensor_quant(plan, &plan->tensors[ins[1]]);
-    const tigris_quant_param_t *qp_y = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    const tigris_quant_param_t *qp_a = operands.quant[0];
+    const tigris_quant_param_t *qp_b = operands.quant[1];
+    const tigris_quant_param_t *qp_y = tigris_tensor_quant(
+        plan, &plan->tensors[tigris_op_outputs(plan, op)[0]]);
 
     float sa = qp_a ? qp_a->scale : 1.0f;
     int32_t za = qp_a ? qp_a->zero_point : 0;
@@ -2482,17 +2426,9 @@ static TIGRIS_KERNEL_NOINLINE int kern_mul_s8(
     int y_shift;
     compute_quant_mult((double)sa * (double)sb / (double)sy, &y_mult, &y_shift);
 
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
-    if (mem->tile.active) {
-        uint32_t row_elems = tile_row_elems(plan, ins[0], mem);
-        A += (size_t)mem->tile.in_row_start * row_elems;
-        if (b_period == 0u)
-            B_ptr += (size_t)mem->tile.in_row_start * row_elems;
-        Y += (size_t)mem->tile.out_row_start * row_elems;
-    }
     for (uint32_t i = 0; i < n; i++) {
-        int32_t product = ((int32_t)A[i] - za) *
-                          ((int32_t)B_ptr[b_period ? i % b_period : i] - zb);
+        int32_t product = (binary_s8_at(operands.data[0], operands.period[0], i) - za) *
+                          (binary_s8_at(operands.data[1], operands.period[1], i) - zb);
         int32_t q = multiply_by_quantized_multiplier(product, y_mult, y_shift) + zy;
         Y[i] = (op->fused_act == TIGRIS_ACT_NONE)
              ? clamp_s8(q)
@@ -2535,7 +2471,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_SIGMOID:     return kern_sigmoid_s8(plan, op, mem);
     case TIGRIS_OP_TANH:        return kern_tanh_s8(plan, op, mem);
     case TIGRIS_OP_SOFTMAX:     return kern_softmax_s8(plan, op, mem);
-    case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, mem);
+    case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, op_index, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
     case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose_s8(plan, op, mem);
     case TIGRIS_OP_SUB:         return kern_sub_s8(plan, op, op_index, mem);
@@ -2546,10 +2482,10 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_HARDSWISH:   return kern_hardswish_s8(plan, op, mem);
     case TIGRIS_OP_ABS:        return kern_elementwise_unary_s8(plan, op, mem);
     case TIGRIS_OP_RSQRT:      return kern_elementwise_unary_s8(plan, op, mem);
-    case TIGRIS_OP_DIV:        return kern_elementwise_binary_s8(plan, op, mem);
-    case TIGRIS_OP_SQUARED_DIFFERENCE: return kern_elementwise_binary_s8(plan, op, mem);
-    case TIGRIS_OP_MAXIMUM:    return kern_elementwise_binary_s8(plan, op, mem);
-    case TIGRIS_OP_MINIMUM:    return kern_elementwise_binary_s8(plan, op, mem);
+    case TIGRIS_OP_DIV:        return kern_elementwise_binary_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_SQUARED_DIFFERENCE: return kern_elementwise_binary_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_MAXIMUM:    return kern_elementwise_binary_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_MINIMUM:    return kern_elementwise_binary_s8(plan, op, op_index, mem);
     case TIGRIS_OP_RESIZE_LINEAR: return kern_resize_linear_s8(plan, op, mem);
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm_s8(plan, op, op_index, mem);
     case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean_s8(plan, op, op_index, mem);

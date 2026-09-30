@@ -88,11 +88,20 @@ extern "C" {
 #define TIGRIS_OP_ATTR_AXES           6  /* uint8[n], axes a reduction takes */
 #define TIGRIS_OP_ATTR_BINARY_REQUANT 7  /* int32[6], see below */
 #define TIGRIS_OP_ATTR_POOL_ROUNDING  8  /* uint8[1], see below */
-#define TIGRIS_OP_ATTR_MAX            8
+#define TIGRIS_OP_ATTR_CONSTANT_OPERAND 9 /* uint8[4], see below */
+#define TIGRIS_OP_ATTR_MAX            9
 
 /* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
  * first operand's, the second operand's, and the result's. */
 #define TIGRIS_OP_ATTR_BINARY_REQUANT_LEN 24u
+
+/* A binary operator with one tensor input takes its other operand from its
+ * weight: one value, one per channel, or one per element. This payload says
+ * which operand the constant is (byte 0: 0 first, 1 second; byte 1: zero) and,
+ * for int8, its quantization (bytes 2-3: quant param index, little endian;
+ * TIGRIS_NO_QUANT_PARAM for float). Without it, only a float Add or Mul takes
+ * a constant, as its second operand. */
+#define TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN 4u
 
 /* An int8 global average pool rounds like TFLite MEAN by default: the 1/HW
  * factor is folded into a fixed-point multiplier. With this attribute it rounds

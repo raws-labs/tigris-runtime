@@ -354,11 +354,11 @@ static int binary_s8_begin(
 {
     if (!tigris_binary_operands(plan, op, op_index, mem, 3u, operands))
         return 0;
-    const uint16_t x = tigris_op_inputs(plan, op)[0];
-    *y = (int8_t *)tigris_mem_tensor_ptr(mem, tigris_op_outputs(plan, op)[0]);
-    *count = tile_aware_numel(plan, x, mem);
+    const uint16_t result = operands->output;
+    *y = (int8_t *)tigris_mem_tensor_ptr(mem, result);
+    *count = tile_aware_numel(plan, result, mem);
     if (mem->tile.active) {
-        uint32_t row_elems = tile_row_elems(plan, x, mem);
+        uint32_t row_elems = tile_row_elems(plan, result, mem);
         for (uint8_t k = 0; k < 2u; k++) {
             if (operands->period[k] == 0u)
                 operands->data[k] += (size_t)mem->tile.in_row_start * row_elems;
@@ -368,11 +368,13 @@ static int binary_s8_begin(
     return 1;
 }
 
-/* Element i of an operand that repeats every `period` elements, or of a
- * dense one when period is 0. */
-static inline int32_t binary_s8_at(const uint8_t *data, uint32_t period, uint32_t i)
+/* The element of operand k that output element i reads. */
+static inline int32_t binary_s8_at(const tigris_binary_operands_t *operands, uint8_t k,
+                                   uint32_t i)
 {
-    return (int32_t)((const int8_t *)data)[period ? i % period : i];
+    uint32_t index = operands->general[k] ? tigris_binary_general_index(operands, k, i)
+                   : operands->period[k] ? i % operands->period[k] : i;
+    return (int32_t)((const int8_t *)operands->data[k])[index];
 }
 
 /* Int8 Kernels */
@@ -890,9 +892,9 @@ static TIGRIS_KERNEL_NOINLINE int kern_addsub_s8(
     }
 
     for (uint32_t i = 0; i < n; i++) {
-        int32_t av = (binary_s8_at(operands.data[0], operands.period[0], i) - za) *
+        int32_t av = (binary_s8_at(&operands, 0u, i) - za) *
                      (1 << LEFT_SHIFT);
-        int32_t bv = (binary_s8_at(operands.data[1], operands.period[1], i) - zb) *
+        int32_t bv = (binary_s8_at(&operands, 1u, i) - zb) *
                      (1 << LEFT_SHIFT);
         int32_t scaled_b = multiply_by_quantized_multiplier(bv, b_mult, b_shift);
         int32_t scaled = multiply_by_quantized_multiplier(av, a_mult, a_shift)
@@ -2068,8 +2070,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_elementwise_binary_s8(
         return -1;
     }
     for (uint32_t i = 0; i < count; i++) {
-        int32_t av = binary_s8_at(operands.data[0], operands.period[0], i);
-        int32_t bv = binary_s8_at(operands.data[1], operands.period[1], i);
+        int32_t av = binary_s8_at(&operands, 0u, i);
+        int32_t bv = binary_s8_at(&operands, 1u, i);
         if (op->op_type == TIGRIS_OP_MAXIMUM || op->op_type == TIGRIS_OP_MINIMUM) {
             int32_t result = op->op_type == TIGRIS_OP_MAXIMUM ? (av > bv ? av : bv) : (av < bv ? av : bv);
             y[i] = (int8_t)result;
@@ -2427,8 +2429,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_mul_s8(
     compute_quant_mult((double)sa * (double)sb / (double)sy, &y_mult, &y_shift);
 
     for (uint32_t i = 0; i < n; i++) {
-        int32_t product = (binary_s8_at(operands.data[0], operands.period[0], i) - za) *
-                          (binary_s8_at(operands.data[1], operands.period[1], i) - zb);
+        int32_t product = (binary_s8_at(&operands, 0u, i) - za) *
+                          (binary_s8_at(&operands, 1u, i) - zb);
         int32_t q = multiply_by_quantized_multiplier(product, y_mult, y_shift) + zy;
         Y[i] = (op->fused_act == TIGRIS_ACT_NONE)
              ? clamp_s8(q)

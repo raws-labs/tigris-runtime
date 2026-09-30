@@ -1582,10 +1582,18 @@ static void test_per_channel_mul(void)
     mem.tile.active = 0;
     ptrs[0] = A;
 
-    /* A row-wise operand is neither full-shape nor per-channel. */
+    /* One value per row: a broadcast inside the operand, read by output
+     * coordinate and never tiled. */
     shape_pool[5] = 2; shape_pool[6] = 1; shape_pool[7] = 1;
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "a row-wise operand runs");
+    const float rows[8] = {10, 20, 30, 40, -5, -6, -7, -8};
+    for (int i = 0; i < 8; i++)
+        TEST_ASSERT_NEAR(Y[i], rows[i], EPS, "row-wise operand value");
+    mem.tile.active = 1;
     TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0,
-                "a row-wise operand is refused");
+                "a row-wise operand is refused under a tile");
+    mem.tile.active = 0;
 }
 
 /* Concat on the last stored axis at rank 3, and with a constant leading part

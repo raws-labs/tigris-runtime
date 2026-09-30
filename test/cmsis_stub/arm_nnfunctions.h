@@ -66,6 +66,12 @@ arm_cmsis_nn_status arm_fully_connected_per_channel_s8(
 arm_cmsis_nn_status arm_fully_connected_s8(
     const cmsis_nn_context *, ...);
 arm_cmsis_nn_status arm_avgpool_s8(const cmsis_nn_context *, ...);
+arm_cmsis_nn_status arm_elementwise_mul_s8(const int8_t *, const int8_t *, int32_t, int32_t,
+                                           int8_t *, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
+arm_cmsis_nn_status arm_maximum_s8(const cmsis_nn_context *, const int8_t *, const cmsis_nn_dims *,
+                                  const int8_t *, const cmsis_nn_dims *, int8_t *, const cmsis_nn_dims *);
+arm_cmsis_nn_status arm_minimum_s8(const cmsis_nn_context *, const int8_t *, const cmsis_nn_dims *,
+                                  const int8_t *, const cmsis_nn_dims *, int8_t *, const cmsis_nn_dims *);
 arm_cmsis_nn_status arm_vector_sum_s8(int32_t *vector_sum_buf, const int32_t vector_cols,
                                       const int32_t vector_rows, const int8_t *vector_data,
                                       const int32_t lhs_offset, const int32_t rhs_offset,

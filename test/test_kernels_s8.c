@@ -2360,6 +2360,74 @@ static void test_elementwise_reference_goldens(void)
     }
 }
 
+/* A binary operator whose other operand is a constant from the weight table,
+ * placed and quantized by the constant-operand attribute. */
+static void test_binary_s8_constant_operand(void)
+{
+    printf("  test_binary_s8_constant_operand...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t qp = add_quant_param(0.1f, 0, 1, NULL, NULL);
+    uint16_t constant_qp = add_quant_param(0.1f, 0, 1, NULL, NULL);
+    int32_t shape[] = {1, 1, 1, 4};
+    uint16_t t_x = add_tensor(&plan, "x", shape, 4, 3, 4, qp);
+    uint16_t t_y = add_tensor(&plan, "y", shape, 4, 3, 4, qp);
+    const int8_t ten = 10;
+    uint16_t ins[] = {t_x}, outs[] = {t_y};
+    one_op_s8(&plan, TIGRIS_OP_SUB, ins, 1, outs, 1, add_weight(&ten, 1, "c"));
+    build_plan(&plan);
+
+    uint8_t payload[4] = {0, 0, (uint8_t)constant_qp, 0};
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_CONSTANT_OPERAND,
+                                  (uint8_t)TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN, 0};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = payload;
+    plan.num_op_attributes = 1;
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    const int8_t x[] = {0, 3, -4, 7};
+    tigris_mem_alloc_fast(&mem, t_x, 4); memcpy(ptrs[t_x], x, 4);
+    tigris_mem_alloc_fast(&mem, t_y, 4);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "constant minuend runs");
+    const int8_t minuend[] = {10, 7, 14, 3};
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], minuend[i], "constant minuend value");
+
+    payload[0] = 1;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "constant subtrahend runs");
+    const int8_t subtrahend[] = {-10, -7, -14, -3};
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], subtrahend[i], "constant subtrahend value");
+
+    /* One value per channel, repeated for every position. */
+    const int8_t per_channel[] = {1, 2, 3, 4};
+    test_ops[0].op_type = TIGRIS_OP_MUL;
+    test_ops[0].weight_idx = add_weight(per_channel, 4, "per_channel");
+    build_plan(&plan);
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = payload;
+    plan.num_op_attributes = 1;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "per-channel constant product runs");
+    const int8_t product[] = {0, 1, -1, 3};
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], product[i], "per-channel constant product");
+
+    payload[0] = 2;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "a third operand position is refused");
+    payload[0] = 1;
+    payload[2] = 0xFF; payload[3] = 0xFF;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "an int8 constant without quantization is refused");
+    plan.num_op_attributes = 0;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "an int8 constant without the attribute is refused");
+}
+
 /* Main */
 
 int main(void)
@@ -2399,6 +2467,7 @@ int main(void)
     test_split_s8_inner_axis();
     test_concat_s8_height();
     test_depthwise_multiplier_s8();
+    test_binary_s8_constant_operand();
     test_unsupported_op_s8();
     test_elementwise_reference_goldens();
 

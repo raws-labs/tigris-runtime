@@ -125,6 +125,56 @@ static int op_has_plain_io(
            op->bias_idx == TIGRIS_NO_WEIGHT;
 }
 
+static int is_binary_op(uint8_t type)
+{
+    return type == TIGRIS_OP_ADD || type == TIGRIS_OP_SUB ||
+           type == TIGRIS_OP_MUL || type == TIGRIS_OP_DIV ||
+           type == TIGRIS_OP_SQUARED_DIFFERENCE ||
+           type == TIGRIS_OP_MAXIMUM || type == TIGRIS_OP_MINIMUM ||
+           type == TIGRIS_OP_FLOOR_DIV || type == TIGRIS_OP_FLOOR_MOD;
+}
+
+/* A binary operator's constant operand, held in its weight: one value, one
+ * per channel, or one per element of `input`. An int8 constant carries its
+ * quantization in the constant-operand attribute; without the attribute only
+ * a float Add or Mul takes a constant, as its second operand. */
+static int constant_operand_is_valid(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    const tigris_tensor_t *input, uint8_t dtype,
+    const tigris_quant_param_t **quant)
+{
+    uint8_t len = 0u;
+    const uint8_t *attr = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_CONSTANT_OPERAND, &len);
+    const uint32_t element = (dtype == 1u) ? (uint32_t)sizeof(float) : 1u;
+    *quant = NULL;
+    if (op->num_inputs != 1u || op->num_outputs != 1u ||
+        op->bias_idx != TIGRIS_NO_WEIGHT ||
+        op->weight_idx == TIGRIS_NO_WEIGHT ||
+        op->weight_idx >= plan->header->num_weights ||
+        !plan->weight_entries || input->ndim == 0u ||
+        (dtype != 1u && dtype != 3u))
+        return 0;
+    if (attr) {
+        uint16_t index = (uint16_t)((uint16_t)attr[2] | (uint16_t)((uint16_t)attr[3] << 8));
+        if (dtype == 3u) {
+            if (index >= plan->num_quant_params ||
+                plan->quant_params[index].num_channels != 1u)
+                return 0;
+            *quant = &plan->quant_params[index];
+        } else if (index != TIGRIS_NO_QUANT_PARAM) {
+            return 0;
+        }
+    } else if (dtype != 1u ||
+               (op->op_type != TIGRIS_OP_ADD && op->op_type != TIGRIS_OP_MUL)) {
+        return 0;
+    }
+    const uint32_t bytes = plan->weight_entries[op->weight_idx].size_bytes;
+    const uint32_t channels = (uint32_t)
+        tigris_tensor_shape(plan, input)[input->ndim - 1u] * element;
+    return bytes == element || bytes == channels || bytes == input->size_bytes;
+}
+
 static int is_axis1_unary_pointwise_op(uint8_t type)
 {
     /* Softmax is a reduction, but along the final stored dimension, which is
@@ -265,6 +315,7 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     case TIGRIS_OP_ATTR_POOL_ROUNDING:  return op_type == TIGRIS_OP_GLOBAL_AVG;
     case TIGRIS_OP_ATTR_BINARY_REQUANT: return op_type == TIGRIS_OP_ADD ||
                                                op_type == TIGRIS_OP_SUB;
+    case TIGRIS_OP_ATTR_CONSTANT_OPERAND: return is_binary_op(op_type);
     default:                            return 0;
     }
 }
@@ -515,24 +566,36 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         case TIGRIS_OP_MINIMUM:
         case TIGRIS_OP_FLOOR_DIV:
         case TIGRIS_OP_FLOOR_MOD:
-            if (!op_has_plain_io(op, 2, 1) ||
-                !tensor_shapes_equal(plan, input, output) ||
-                !tensor_shapes_equal(plan, input, &plan->tensors[inputs[1]]))
+        {
+            const tigris_quant_param_t *second_quant = NULL;
+            if (!tensor_shapes_equal(plan, input, output))
                 return TIGRIS_ERR_BAD_OPERATOR;
+            if (op->num_inputs == 1u) {
+                if (!constant_operand_is_valid(plan, op, op_index, input, dtype, &second_quant))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            } else {
+                if (!op_has_plain_io(op, 2, 1) ||
+                    !tensor_shapes_equal(plan, input, &plan->tensors[inputs[1]]))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                if (dtype == 3u) {
+                    const tigris_tensor_t *second = &plan->tensors[inputs[1]];
+                    if (second->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                        !quant_channels_fit(plan, second, 1))
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                    second_quant = &plan->quant_params[second->quant_param_idx];
+                }
+            }
             if (dtype == 3) {
-                const tigris_tensor_t *second = &plan->tensors[inputs[1]];
                 if ((op->op_type != TIGRIS_OP_DIV && op->op_type != TIGRIS_OP_SQUARED_DIFFERENCE &&
                      op->op_type != TIGRIS_OP_MAXIMUM && op->op_type != TIGRIS_OP_MINIMUM) ||
                     input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
-                    second->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                     output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                     !quant_channels_fit(plan, input, 1) ||
-                    !quant_channels_fit(plan, second, 1) ||
                     !quant_channels_fit(plan, output, 1))
                     return TIGRIS_ERR_BAD_OPERATOR;
                 if (op->op_type == TIGRIS_OP_MAXIMUM || op->op_type == TIGRIS_OP_MINIMUM) {
                     const tigris_quant_param_t *a = &plan->quant_params[input->quant_param_idx];
-                    const tigris_quant_param_t *b = &plan->quant_params[second->quant_param_idx];
+                    const tigris_quant_param_t *b = second_quant;
                     const tigris_quant_param_t *y = &plan->quant_params[output->quant_param_idx];
                     if (a->scale != b->scale || a->scale != y->scale ||
                         a->zero_point != b->zero_point || a->zero_point != y->zero_point)
@@ -540,6 +603,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 }
             }
             break;
+        }
 
         case TIGRIS_OP_HARDSWISH:
         case TIGRIS_OP_ERF:
@@ -665,17 +729,8 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             break;
         }
 
-        case TIGRIS_OP_SUB:
-            /* Sub does not commute, and the wire format records only that an
-             * operand is constant, not which side it was on. Two tensor
-             * operands are the only unambiguous form. */
-            if (!op_has_plain_io(op, 2, 1) ||
-                !tensor_shapes_equal(plan, input, output) ||
-                !tensor_shapes_equal(plan, input, &plan->tensors[inputs[1]]))
-                return TIGRIS_ERR_BAD_OPERATOR;
-            break;
-
         case TIGRIS_OP_ADD:
+        case TIGRIS_OP_SUB:
         case TIGRIS_OP_MUL:
             if (op->num_outputs != 1 ||
                 (op->num_inputs != 1 && op->num_inputs != 2) ||
@@ -689,23 +744,13 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                      !tensor_is_per_channel_of(plan, second, input)))
                     return TIGRIS_ERR_BAD_OPERATOR;
             } else {
-                /* A constant operand is one value, one value per channel, or
-                 * one per element. Channels are stored innermost, so the
-                 * per-channel form repeats on its own without any shape
-                 * metadata in the wire format. */
-                uint32_t constant_bytes;
-                uint32_t channel_bytes;
-                if (dtype != 1 || op->weight_idx == TIGRIS_NO_WEIGHT ||
-                    !plan->weight_entries || input->ndim == 0u)
-                    return TIGRIS_ERR_BAD_OPERATOR;
-                constant_bytes =
-                    plan->weight_entries[op->weight_idx].size_bytes;
-                channel_bytes = (uint32_t)
-                    tigris_tensor_shape(plan, input)[input->ndim - 1u] *
-                    (uint32_t)sizeof(float);
-                if (constant_bytes != sizeof(float) &&
-                    constant_bytes != channel_bytes &&
-                    constant_bytes != input->size_bytes)
+                /* Channels are stored innermost, so a per-channel constant
+                 * repeats on its own without shape metadata. */
+                const tigris_quant_param_t *constant_quant;
+                if (!constant_operand_is_valid(plan, op, op_index, input, dtype,
+                                               &constant_quant) ||
+                    (dtype == 3u && (input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                                     output->quant_param_idx == TIGRIS_NO_QUANT_PARAM)))
                     return TIGRIS_ERR_BAD_OPERATOR;
             }
             break;
@@ -1536,6 +1581,15 @@ tigris_error_t tigris_plan_load_ex(
                     if (multiplier < 0 || shift < -31 || shift > 31)
                         return TIGRIS_ERR_BAD_SECTION;
                 }
+                break;
+            }
+            case TIGRIS_OP_ATTR_CONSTANT_OPERAND: {
+                /* Operand position, a zero byte, and a quant param index the
+                 * operator's own validation resolves. */
+                const uint8_t *payload = candidate.op_attribute_data + attr->data_offset;
+                if (attr->data_len != TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN ||
+                    payload[0] > 1u || payload[1] != 0u)
+                    return TIGRIS_ERR_BAD_SECTION;
                 break;
             }
             case TIGRIS_OP_ATTR_POOL_ROUNDING: {

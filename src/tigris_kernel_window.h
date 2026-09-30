@@ -18,7 +18,7 @@ int32_t tigris_resize_scale_s8(int input, int output, int convention, float expl
 int tigris_resize_position_s8(int index, int input, int convention, int32_t scale,
                               int32_t *position, int32_t *lower, int32_t *upper);
 int tigris_resize_source_rows(const tigris_plan_t *plan, const tigris_op_t *op,
-                              int first, int end, int *source_first);
+                              int first, int end, int32_t *source_first);
 int tigris_resize_max_rows(const tigris_plan_t *plan, const tigris_op_t *op, int rows);
 
 /** The half-open range of tap indices whose input coordinate is inside the

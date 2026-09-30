@@ -329,6 +329,8 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     case TIGRIS_OP_ATTR_PADS:           return op_type == TIGRIS_OP_PAD;
     case TIGRIS_OP_ATTR_AXES:           return op_type == TIGRIS_OP_REDUCE_MEAN;
     case TIGRIS_OP_ATTR_POOL_ROUNDING:  return op_type == TIGRIS_OP_GLOBAL_AVG;
+    case TIGRIS_OP_ATTR_RESIZE_SCALES:  return op_type == TIGRIS_OP_RESIZE ||
+                                             op_type == TIGRIS_OP_RESIZE_LINEAR;
     case TIGRIS_OP_ATTR_BINARY_REQUANT: return op_type == TIGRIS_OP_ADD ||
                                                op_type == TIGRIS_OP_SUB;
     case TIGRIS_OP_ATTR_CONSTANT_OPERAND: return is_binary_op(op_type);
@@ -940,27 +942,51 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 
         case TIGRIS_OP_RESIZE_LINEAR:
         case TIGRIS_OP_RESIZE: {
-            /* Both forms upsample by an integer factor and differ only in how
-             * they read the samples. Bilinear mixes neighbours, so its int8
-             * form needs both quantizations to requantize the mix. */
+            if (op->spatial.kernel_h > (op->op_type == TIGRIS_OP_RESIZE_LINEAR ? 2u : 3u))
+                return TIGRIS_ERR_BAD_OPERATOR;
             if (op->op_type == TIGRIS_OP_RESIZE_LINEAR &&
-                (op->spatial.kernel_h > 1 || (dtype != 1 && dtype != 3) ||
+                ((dtype != 1 && dtype != 3) ||
                  (dtype == 3 &&
                   (input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                    output->quant_param_idx == TIGRIS_NO_QUANT_PARAM))))
                 return TIGRIS_ERR_BAD_OPERATOR;
             if (!op_has_plain_io(op, 1, 1) ||
-                input->ndim != 4 || output->ndim != 4 ||
-                op->spatial.stride_h == 0 || op->spatial.stride_w == 0)
+                input->ndim != 4 || output->ndim != 4)
                 return TIGRIS_ERR_BAD_OPERATOR;
             const int32_t *in_shape = tigris_tensor_shape(plan, input);
             const int32_t *out_shape = tigris_tensor_shape(plan, output);
             if (in_shape[0] != out_shape[0] || in_shape[3] != out_shape[3] ||
-                (uint64_t)in_shape[1] * op->spatial.stride_h !=
-                    (uint32_t)out_shape[1] ||
-                (uint64_t)in_shape[2] * op->spatial.stride_w !=
-                    (uint32_t)out_shape[2])
+                (op->spatial.stride_h != 0u && (uint64_t)in_shape[1] * op->spatial.stride_h !=
+                    (uint32_t)out_shape[1]) ||
+                (op->spatial.stride_w != 0u && (uint64_t)in_shape[2] * op->spatial.stride_w !=
+                    (uint32_t)out_shape[2]))
                 return TIGRIS_ERR_BAD_OPERATOR;
+            if (op->op_type == TIGRIS_OP_RESIZE_LINEAR && dtype == 3) {
+                const tigris_quant_param_t *iq = tigris_tensor_quant(plan, input);
+                const tigris_quant_param_t *oq = tigris_tensor_quant(plan, output);
+                if (iq->scale == oq->scale && iq->zero_point == oq->zero_point) {
+                    float scales[2] = {0.0f, 0.0f};
+                    const uint8_t *data = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_RESIZE_SCALES, NULL);
+                    if (data != NULL) memcpy(scales, data, sizeof(scales));
+                    for (int axis = 0; axis < 2; axis++) {
+                        int64_t ni = in_shape[axis + 1], no = out_shape[axis + 1];
+                        if (1024 * ni + no / 2 > INT32_MAX) return TIGRIS_ERR_BAD_OPERATOR;
+                        if (op->spatial.kernel_h == 2 && no > 1) { ni--; no--; }
+                        int64_t scale = (1024 * ni + no / 2) / no;
+                        if (scales[axis] > 0.0f && op->spatial.kernel_h != 2) {
+                            double ratio = floor(1024.0 / (double)scales[axis] + 0.5);
+                            if (ratio > (double)INT32_MAX) return TIGRIS_ERR_BAD_OPERATOR;
+                            scale = (int64_t)ratio;
+                        }
+                        int64_t last = (int64_t)(out_shape[axis + 1] - 1) * scale;
+                        if (op->spatial.kernel_h == 0) last += scale / 2;
+                        if (last > INT32_MAX) return TIGRIS_ERR_BAD_OPERATOR;
+                        int64_t pos = last - (op->spatial.kernel_h == 0 ? 512 : 0);
+                        if (pos > INT32_MAX - 1023 || pos / 1024 >= in_shape[axis + 1])
+                            return TIGRIS_ERR_BAD_OPERATOR;
+                    }
+                }
+            }
             break;
         }
 
@@ -1546,6 +1572,21 @@ tigris_error_t tigris_plan_load_ex(
                 if (!isfinite(value) ||
                     (attr->type == TIGRIS_OP_ATTR_EPSILON && value <= 0.0f))
                     return TIGRIS_ERR_BAD_SECTION;
+                break;
+            }
+            case TIGRIS_OP_ATTR_RESIZE_SCALES: {
+                float scales[2];
+                if (attr->data_len != sizeof(scales) || input->ndim != 4u || output->ndim != 4u)
+                    return TIGRIS_ERR_BAD_SECTION;
+                memcpy(scales, candidate.op_attribute_data + attr->data_offset, sizeof(scales));
+                const int32_t *in_shape = tigris_tensor_shape(&candidate, input);
+                const int32_t *out_shape = tigris_tensor_shape(&candidate, output);
+                for (int axis = 0; axis < 2; axis++) {
+                    if (!isfinite(scales[axis]) || scales[axis] <= 0.0f ||
+                        floorf((float)in_shape[axis + 1] * scales[axis]) !=
+                            (float)out_shape[axis + 1])
+                        return TIGRIS_ERR_BAD_SECTION;
+                }
                 break;
             }
             case TIGRIS_OP_ATTR_CLIP_BOUNDS: {

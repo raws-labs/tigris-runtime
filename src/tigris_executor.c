@@ -6,6 +6,7 @@
 #include "tigris_executor.h"
 #include "tigris_lz4.h"
 #include "tigris_transpose_band.h"
+#include "tigris_kernel_window.h"
 
 #include <string.h>
 
@@ -129,20 +130,10 @@ static int is_height_spatial_op(uint8_t type)
            type == TIGRIS_OP_AVG_POOL;
 }
 
-/* An upsample is a spatial operator that runs the geometry the other way:
- * its output has more rows than its input, so the tile loop back-computes a
- * source range by dividing rather than multiplying. The factor is in
- * stride_h, where the compiler writes it for Resize. */
+/* Resize computes its source band from the full input and output extents. */
 static int is_height_upsample_op(uint8_t type)
 {
     return type == TIGRIS_OP_RESIZE || type == TIGRIS_OP_RESIZE_LINEAR;
-}
-
-/* Input rows a resampling operator reads per output row: one for nearest,
- * the pair it interpolates between for bilinear. */
-static int32_t upsample_taps(uint8_t type)
-{
-    return (type == TIGRIS_OP_RESIZE_LINEAR) ? 2 : 1;
 }
 
 static int is_height_tiling_op(uint8_t type)
@@ -847,14 +838,9 @@ static int stage_axis1_fast_bytes(
 {
     const uint16_t *stage_inputs = tigris_stage_inputs(plan, stage);
     const uint16_t *stage_ops = tigris_stage_ops(plan, stage);
-    /* An upsample is handed its factor as a negative stride, because its
-     * source band is the output band divided rather than multiplied. The
-     * effective kernel then counts the rows the resampler mixes. */
     int64_t input_extent_wide;
-    if (spatial_op_idx >= 0 && stride < 0) {
-        int32_t factor = -stride;
-        input_extent_wide =
-            ((int64_t)output_extent - 1) / factor + effective_kernel;
+    if (spatial_op_idx >= 0 && is_height_upsample_op(plan->ops[spatial_op_idx].op_type)) {
+        input_extent_wide = tigris_resize_max_rows(plan, &plan->ops[spatial_op_idx], output_extent);
     } else {
         input_extent_wide = spatial_op_idx >= 0
             ? ((int64_t)output_extent - 1) * stride + effective_kernel
@@ -951,28 +937,15 @@ static tigris_exec_error_t exec_stage_tiled(
     int32_t stride = sp_attrs ? sp_attrs->stride_h : 1;
     int32_t dh = (sp_attrs && sp_attrs->dilation_h) ? sp_attrs->dilation_h : 1;
     int32_t eff_kh = sp_attrs ? ((sp_attrs->kernel_h - 1) * dh + 1) : 1;
-    /* An upsample runs the geometry the other way: rows multiply instead of
-     * divide, so the tile loop takes its own branch below and the band
-     * sizing is told about it through a negative stride. */
     int upsamples = (sp_op_idx >= 0) &&
         is_height_upsample_op(plan->ops[sp_op_idx].op_type);
-    int32_t scale_h = 1;
-    int32_t taps = 1;
-    /* Half-pixel bilinear places output row o at (o + 0.5) / s - 0.5, which
-     * is a row ahead of o / s whenever that is whole, so its band reaches one
-     * row further up than the other resamplers' and is sized for it. */
-    int half_pixel = 0;
     if (upsamples) {
-        scale_h = sp_attrs && sp_attrs->stride_h > 0 ? sp_attrs->stride_h : 1;
-        taps = upsample_taps(plan->ops[sp_op_idx].op_type);
-        half_pixel = plan->ops[sp_op_idx].op_type == TIGRIS_OP_RESIZE_LINEAR &&
-                     sp_attrs && sp_attrs->kernel_h == 0;
-        if (scale_h < 1 ||
-            (int64_t)full_in_h * scale_h != (int64_t)full_out_h)
+        if ((sp_attrs->stride_h != 0u && (int64_t)full_in_h * sp_attrs->stride_h != full_out_h) ||
+            (sp_attrs->stride_w != 0u && (int64_t)full_in_w * sp_attrs->stride_w != full_out_w))
             return TIGRIS_EXEC_ERR_TILE;
         orig_pad_top = 0;
-        stride = -scale_h;
-        eff_kh = taps + half_pixel;
+        stride = 0;
+        eff_kh = 1;
     }
 
     for (uint16_t i = 0; i < stage->outputs_count; i++) {
@@ -1059,26 +1032,10 @@ static tigris_exec_error_t exec_stage_tiled(
         int32_t eff_pad_bottom = 0;
 
         if (upsamples) {
-            /* Every source coordinate this tile reads lies between the one
-             * its first output row takes and the one its last takes, so the
-             * range is the floor of each, widened by the taps the resampler
-             * mixes. Nearest and asymmetric bilinear read from out / scale;
-             * half-pixel reads from (2 * out + 1 - scale) / (2 * scale),
-             * clamped at the first row, which is one row earlier whenever
-             * out / scale is whole. The end uses out / scale, which is never
-             * below either. */
-            if (half_pixel) {
-                int64_t lead = 2 * (int64_t)out_start + 1 - scale_h;
-                in_start = lead <= 0 ? 0
-                                     : (int32_t)(lead / (2 * (int64_t)scale_h));
-            } else {
-                in_start = out_start / scale_h;
-            }
-            in_end = (out_end - 1) / scale_h + taps;
-            if (in_end > full_in_h)
-                in_end = full_in_h;
-            if (in_start > in_end - 1)
-                in_start = in_end - 1;
+            int source_rows = tigris_resize_source_rows(
+                plan, &plan->ops[sp_op_idx], out_start, out_end, &in_start);
+            if (source_rows <= 0) return TIGRIS_EXEC_ERR_TILE;
+            in_end = in_start + source_rows;
         } else if (sp_attrs) {
             /* First input row needed: out_start * stride - pad_top */
             in_start = out_start * stride - orig_pad_top;

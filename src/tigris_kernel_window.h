@@ -7,6 +7,20 @@
 #ifndef TIGRIS_KERNEL_WINDOW_H
 #define TIGRIS_KERNEL_WINDOW_H
 
+#include "tigris.h"
+
+float tigris_resize_explicit_scale(const tigris_plan_t *plan, const tigris_op_t *op, int axis);
+float tigris_resize_scale(int input, int output, int convention);
+void tigris_resize_position(int index, int input, int output, int convention, float explicit_scale,
+                            float *position, int *lower, int *upper);
+int tigris_resize_nearest(int index, int input, int output, int convention, float explicit_scale);
+int32_t tigris_resize_scale_s8(int input, int output, int convention, float explicit_scale);
+int tigris_resize_position_s8(int index, int input, int convention, int32_t scale,
+                              int32_t *position, int32_t *lower, int32_t *upper);
+int tigris_resize_source_rows(const tigris_plan_t *plan, const tigris_op_t *op,
+                              int first, int end, int *source_first);
+int tigris_resize_max_rows(const tigris_plan_t *plan, const tigris_op_t *op, int rows);
+
 /** The half-open range of tap indices whose input coordinate is inside the
  * tensor.
  *

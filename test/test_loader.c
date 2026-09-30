@@ -1879,6 +1879,63 @@ static void build_elementwise_quant_plan(
     op->act_max = 127;
 }
 
+static void test_resize_scale_guards(void)
+{
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE + 4u];
+    tigris_plan_t plan;
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 4);
+    ((tigris_file_header_t *)buf)->file_size = sizeof(buf);
+    tigris_op_t *op = (tigris_op_t *)(buf + TILED_OPS_OFF);
+    op->op_type = TIGRIS_OP_RESIZE_LINEAR;
+    int32_t shapes[8] = {1, 10, 7, 4, 1, 7, 4, 4};
+    memcpy(buf + TILED_SHAPES_OFF, shapes, sizeof(shapes));
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    tensors[0].size_bytes = 10u * 7u * 4u * 4u;
+    tensors[1].size_bytes = 7u * 4u * 4u * 4u;
+    tigris_tile_plan_t *tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+    tile->num_tiles = 7;
+    tile->original_height = 7;
+    tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_RESIZE_SCALES;
+    attr->data_len = 8;
+    float scales[2] = {0.7f, 0.6f};
+    memcpy(buf + TILED_ATTR_DATA_OFF, scales, sizeof(scales));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "noninteger scales preserve float32 output shape rounding");
+    scales[0] = 0.8f;
+    memcpy(buf + TILED_ATTR_DATA_OFF, scales, sizeof(scales));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                   "scale/output disagreement rejected");
+    scales[0] = 0.0f;
+    memcpy(buf + TILED_ATTR_DATA_OFF, scales, sizeof(scales));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                   "zero scale rejected");
+    attr->data_len = 4;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                   "short scales payload rejected");
+
+    _Alignas(4) uint8_t quant_buf[ELEMENTWISE_PLAN_SIZE];
+    build_elementwise_quant_plan(quant_buf, TIGRIS_OP_RESIZE_LINEAR, 1);
+    tensors = (tigris_tensor_t *)(quant_buf + SEMANTIC_TENSORS_OFF + 8u);
+    int32_t *dims = (int32_t *)(quant_buf + SEMANTIC_SHAPES_OFF + 8u);
+    for (int i = 0; i < 2; i++) {
+        dims[4 * i] = 1; dims[4 * i + 1] = i == 0 ? 3 : 4096;
+        dims[4 * i + 2] = 1; dims[4 * i + 3] = 1;
+        tensors[i].ndim = 4;
+        tensors[i].size_bytes = (uint32_t)dims[4 * i + 1];
+    }
+    op = (tigris_op_t *)(quant_buf + SEMANTIC_OPS_OFF + 8u);
+    op->spatial.kernel_h = 2;
+    op->spatial.stride_h = 0;
+    op->spatial.stride_w = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(quant_buf, sizeof(quant_buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "undefined reference coordinates rejected");
+    dims[5] = 2049;
+    tensors[1].size_bytes = 2049;
+    TEST_ASSERT_EQ(tigris_plan_load(quant_buf, sizeof(quant_buf), &plan), TIGRIS_OK,
+                   "defined neighboring coordinates accepted");
+}
+
 static void test_elementwise_semantics(void)
 {
     static const tigris_op_type_t kinds[] = {
@@ -2082,7 +2139,10 @@ static void test_nonweighted_operator_semantics(void)
 
     op->spatial.stride_h = 0;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
-                   TIGRIS_ERR_BAD_OPERATOR, "zero Resize scale rejected");
+                   TIGRIS_OK, "Resize derives a zero-stride axis from tensor shapes");
+    op->spatial.kernel_h = 4;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "unknown Resize coordinate convention rejected");
 
     build_semantic_plan(buf, TIGRIS_OP_RESIZE, 1);
     semantic_set_shape(buf, 0, 4, 1, 2, 3, 2);
@@ -2880,6 +2940,7 @@ int main(int argc, char *argv[])
     test_split_contract();
     test_reduce_mean_contract();
     test_op_attribute_payloads();
+    test_resize_scale_guards();
     test_tiled_conversion_contract();
     test_tiled_reduction_contract();
     test_rank4_row_band_contract();

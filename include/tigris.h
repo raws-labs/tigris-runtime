@@ -89,7 +89,8 @@ extern "C" {
 #define TIGRIS_OP_ATTR_BINARY_REQUANT 7  /* int32[6], see below */
 #define TIGRIS_OP_ATTR_POOL_ROUNDING  8  /* uint8[1], see below */
 #define TIGRIS_OP_ATTR_CONSTANT_OPERAND 9 /* uint8[4], see below */
-#define TIGRIS_OP_ATTR_MAX            9
+#define TIGRIS_OP_ATTR_RESIZE_SCALES  10 /* float32[2], output/input H/W scales */
+#define TIGRIS_OP_ATTR_MAX            10
 
 /* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
  * first operand's, the second operand's, and the result's. */

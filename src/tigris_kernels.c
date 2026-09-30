@@ -1537,16 +1537,140 @@ static int kern_concat(
     return 0;
 }
 
-/**
- * Bilinear upsample by an integer factor, half-pixel coordinates.
- *
- * ONNX Resize with mode "linear" mixes the two rows and two columns around
- * the source coordinate. Which coordinate that is depends on the convention
- * the graph was written in, and kernel_h says which: half-pixel places an
- * output sample at (o + 0.5) / scale - 0.5, and asymmetric, which is what
- * every opset before 11 meant, places it at o / scale. Coordinates outside
- * the input are clamped at the border either way.
- */
+float tigris_resize_explicit_scale(const tigris_plan_t *plan, const tigris_op_t *op, int axis)
+{
+    float scale = 0.0f;
+    if (plan->num_op_attributes > 0u) {
+        const uint8_t *data = tigris_op_attribute_data(
+            plan, (uint16_t)(op - plan->ops), TIGRIS_OP_ATTR_RESIZE_SCALES, NULL);
+        if (data != NULL) memcpy(&scale, data + (size_t)axis * sizeof(float), sizeof(scale));
+    }
+    return op->spatial.kernel_h == 2 ? 0.0f : scale;
+}
+
+float tigris_resize_scale(int input, int output, int convention)
+{
+    return convention == 2 && output > 1
+        ? (float)(input - 1) / (float)(output - 1)
+        : (float)input / (float)output;
+}
+
+void tigris_resize_position(int index, int input, int output, int convention, float explicit_scale,
+                            float *position, int *lower, int *upper)
+{
+    float scale = explicit_scale > 0.0f ? 1.0f / explicit_scale
+                                         : tigris_resize_scale(input, output, convention);
+    *position = convention == 0 ? ((float)index + 0.5f) * scale - 0.5f
+                               : (float)index * scale;
+    int lo = (int)floorf(*position);
+    int hi = (int)ceilf(*position);
+    *lower = lo > 0 ? lo : 0;
+    *upper = hi < input - 1 ? hi : input - 1;
+}
+
+int tigris_resize_nearest(int index, int input, int output, int convention, float explicit_scale)
+{
+    float offset = convention == 3 ? 0.5f : 0.0f;
+    float scale = explicit_scale > 0.0f ? 1.0f / explicit_scale
+                                         : tigris_resize_scale(input, output, convention);
+    float position = ((float)index + offset) * scale;
+    int sample = (int)(convention == 2 ? roundf(position) : floorf(position));
+    return sample < input ? sample : input - 1;
+}
+
+int32_t tigris_resize_scale_s8(int input, int output, int convention, float explicit_scale)
+{
+    int in_extent = convention == 2 && output > 1 ? input - 1 : input;
+    int out_extent = convention == 2 && output > 1 ? output - 1 : output;
+    int64_t numerator = (int64_t)1024 * in_extent + (int64_t)out_extent / 2;
+    if ((int64_t)1024 * input + (int64_t)output / 2 > INT32_MAX || numerator > INT32_MAX) return -1;
+    int64_t scale = numerator / out_extent;
+    if (explicit_scale > 0.0f) {
+        double scaled_ratio = floor(1024.0 / (double)explicit_scale + 0.5);
+        if (scaled_ratio > (double)INT32_MAX) return -1;
+        scale = (int64_t)scaled_ratio;
+    }
+    return (int32_t)scale;
+}
+
+int tigris_resize_position_s8(int index, int input, int convention, int32_t scale,
+                              int32_t *position, int32_t *lower, int32_t *upper)
+{
+    if (scale < 0) return 0;
+    int64_t scaled = (int64_t)index * scale + (convention == 0 ? (int64_t)scale / 2 : 0);
+    if (scaled > INT32_MAX) return 0;
+    int64_t pos = scaled - (convention == 0 ? 512 : 0);
+    if (pos > INT32_MAX - 1023) return 0;
+    int32_t lo = (int32_t)(pos / 1024);
+    int32_t hi = (int32_t)((pos + 1023) / 1024);
+    *position = (int32_t)pos;
+    *lower = lo > 0 ? lo : 0;
+    *upper = hi < input - 1 ? hi : input - 1;
+    return *lower < input && *upper >= 0;
+}
+
+static int resize_uses_integer_coordinates(const tigris_plan_t *plan, const tigris_op_t *op)
+{
+    const tigris_tensor_t *input = &plan->tensors[tigris_op_inputs(plan, op)[0]];
+    const tigris_quant_param_t *iq = tigris_tensor_quant(plan, input);
+    const tigris_quant_param_t *oq = tigris_tensor_quant(
+        plan, &plan->tensors[tigris_op_outputs(plan, op)[0]]);
+    return op->op_type == TIGRIS_OP_RESIZE_LINEAR && input->dtype == 3 &&
+        iq != NULL && oq != NULL && iq->scale == oq->scale && iq->zero_point == oq->zero_point;
+}
+
+int tigris_resize_source_rows(const tigris_plan_t *plan, const tigris_op_t *op,
+                              int first, int end, int *source_first)
+{
+    int input = tigris_tensor_shape(plan, &plan->tensors[tigris_op_inputs(plan, op)[0]])[1];
+    int output = tigris_tensor_shape(plan, &plan->tensors[tigris_op_outputs(plan, op)[0]])[1];
+    int mode = op->spatial.kernel_h;
+    float explicit_scale = tigris_resize_explicit_scale(plan, op, 0);
+    int lo, hi;
+    if (op->op_type == TIGRIS_OP_RESIZE) {
+        lo = tigris_resize_nearest(first, input, output, mode, explicit_scale);
+        hi = tigris_resize_nearest(end - 1, input, output, mode, explicit_scale);
+    } else if (resize_uses_integer_coordinates(plan, op)) {
+        int32_t position, lower, upper;
+        int32_t scale = tigris_resize_scale_s8(input, output, mode, explicit_scale);
+        if (!tigris_resize_position_s8(first, input, mode, scale, &position, &lower, &upper))
+            return 0;
+        lo = lower;
+        if (!tigris_resize_position_s8(end - 1, input, mode, scale, &position, &lower, &upper))
+            return 0;
+        hi = upper;
+    } else {
+        float position;
+        int unused;
+        tigris_resize_position(first, input, output, mode, explicit_scale, &position, &lo, &unused);
+        tigris_resize_position(end - 1, input, output, mode, explicit_scale, &position, &unused, &hi);
+    }
+    *source_first = lo;
+    return hi - lo + 1;
+}
+
+int tigris_resize_max_rows(const tigris_plan_t *plan, const tigris_op_t *op, int rows)
+{
+    int input = tigris_tensor_shape(plan, &plan->tensors[tigris_op_inputs(plan, op)[0]])[1];
+    int output = tigris_tensor_shape(plan, &plan->tensors[tigris_op_outputs(plan, op)[0]])[1];
+    float explicit_scale = tigris_resize_explicit_scale(plan, op, 0);
+    int taps = op->op_type == TIGRIS_OP_RESIZE_LINEAR ? 2 : 1;
+    int64_t span = taps;
+    if (rows > 1 && resize_uses_integer_coordinates(plan, op)) {
+        int in_extent = op->spatial.kernel_h == 2 && output > 1 ? input - 1 : input;
+        int out_extent = op->spatial.kernel_h == 2 && output > 1 ? output - 1 : output;
+        int64_t scale = ((int64_t)1024 * in_extent + (int64_t)out_extent / 2) / out_extent;
+        if (explicit_scale > 0.0f) scale = (int64_t)floor(1024.0 / (double)explicit_scale + 0.5);
+        span += ((int64_t)(rows - 1) * scale + 1023) / 1024;
+    } else if (rows > 1) {
+        /* One extra row covers float rounding at the two band endpoints. */
+        float scale = explicit_scale > 0.0f ? 1.0f / explicit_scale
+            : tigris_resize_scale(input, output, op->spatial.kernel_h);
+        span += (int64_t)ceil((double)(rows - 1) * (double)scale) + 1;
+    }
+    return span < input ? (int)span : input;
+}
+
 static int kern_resize_linear(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1565,13 +1689,12 @@ static int kern_resize_linear(
     int C  = x_shape[3];
     int OH = y_shape[1];
     int OW = y_shape[2];
-    float scale_h = (float)(op->spatial.stride_h ? op->spatial.stride_h : 1);
-    float scale_w = (float)(op->spatial.stride_w ? op->spatial.stride_w : 1);
-    float shift = (op->spatial.kernel_h == 1) ? 0.0f : 0.5f;
+    float scale_h = tigris_resize_explicit_scale(plan, op, 0);
+    float scale_w = tigris_resize_explicit_scale(plan, op, 1);
     int out_origin = 0;
     int in_origin = 0;
 
-    if (X == NULL || Y == NULL || op->spatial.kernel_h > 1)
+    if (X == NULL || Y == NULL || op->spatial.kernel_h > 2)
         return -1;
     if (mem->tile.active) {
         IH = mem->tile.in_h;
@@ -1584,37 +1707,34 @@ static int kern_resize_linear(
 
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
-            float fy = ((float)(oh + out_origin) + shift) / scale_h - shift;
+            float fy;
             int y0, y1;
             float wy;
-            if (fy < 0.0f) fy = 0.0f;
-            y0 = (int)fy - in_origin;
-            if (y0 < 0) y0 = 0;
-            if (y0 > IH - 1) y0 = IH - 1;
-            y1 = (y0 + 1 < IH) ? y0 + 1 : IH - 1;
-            wy = fy - (float)(y0 + in_origin);
+            tigris_resize_position(oh + out_origin, x_shape[1], y_shape[1],
+                                   op->spatial.kernel_h, scale_h, &fy, &y0, &y1);
+            wy = fy - (float)y0;
+            y0 -= in_origin;
+            y1 -= in_origin;
+            if (y0 < 0 || y1 >= IH) return -1;
             for (int ow = 0; ow < OW; ow++) {
-                float fx = ((float)ow + shift) / scale_w - shift;
+                float fx;
                 int x0, x1;
                 float wx;
                 const float *r0;
                 const float *r1;
                 float *dst;
-                if (fx < 0.0f) fx = 0.0f;
-                x0 = (int)fx;
-                if (x0 > IW - 1) x0 = IW - 1;
-                x1 = (x0 + 1 < IW) ? x0 + 1 : IW - 1;
+                tigris_resize_position(ow, x_shape[2], y_shape[2],
+                                       op->spatial.kernel_h, scale_w, &fx, &x0, &x1);
                 wx = fx - (float)x0;
                 r0 = X + ((size_t)(n * IH + y0) * (size_t)IW) * (size_t)C;
                 r1 = X + ((size_t)(n * IH + y1) * (size_t)IW) * (size_t)C;
                 dst = Y + ((size_t)(n * OH + oh) * (size_t)OW + (size_t)ow) *
                       (size_t)C;
                 for (int c = 0; c < C; c++) {
-                    float top = r0[(size_t)x0 * C + c] * (1.0f - wx) +
-                                r0[(size_t)x1 * C + c] * wx;
-                    float bot = r1[(size_t)x0 * C + c] * (1.0f - wx) +
-                                r1[(size_t)x1 * C + c] * wx;
-                    dst[c] = top * (1.0f - wy) + bot * wy;
+                    dst[c] = r0[(size_t)x0 * C + c] * (1.0f - wy) * (1.0f - wx) +
+                             r1[(size_t)x0 * C + c] * wy * (1.0f - wx) +
+                             r0[(size_t)x1 * C + c] * (1.0f - wy) * wx +
+                             r1[(size_t)x1 * C + c] * wy * wx;
                 }
             }
         }
@@ -1641,13 +1761,13 @@ static int kern_resize_nearest(
     int OH = y_shape[1];
     int OW = y_shape[2];
 
-    /* Integer scale factors stored in stride_h/w by the compiler */
-    int scale_h = op->spatial.stride_h ? op->spatial.stride_h : 1;
-    int scale_w = op->spatial.stride_w ? op->spatial.stride_w : 1;
+    if (X == NULL || Y == NULL || op->spatial.kernel_h > 3) return -1;
 
     /* Under a tile the buffers hold a band, and which source row an output
      * row takes is a function of its global index, not of its position in
      * the band. The executor publishes where the band starts. */
+    float scale_h = tigris_resize_explicit_scale(plan, op, 0);
+    float scale_w = tigris_resize_explicit_scale(plan, op, 1);
     int out_origin = 0;
     int in_origin = 0;
     if (mem->tile.active) {
@@ -1661,12 +1781,11 @@ static int kern_resize_nearest(
 
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
-            int ih = (oh + out_origin) / scale_h - in_origin;
-            if (ih >= IH) ih = IH - 1;
-            if (ih < 0) ih = 0;
+            int ih = tigris_resize_nearest(oh + out_origin, x_shape[1], y_shape[1],
+                                           op->spatial.kernel_h, scale_h) - in_origin;
+            if (ih < 0 || ih >= IH) return -1;
             for (int ow = 0; ow < OW; ow++) {
-                int iw = ow / scale_w;
-                if (iw >= IW) iw = IW - 1;
+                int iw = tigris_resize_nearest(ow, x_shape[2], y_shape[2], op->spatial.kernel_h, scale_w);
                 const float *src = X + ((n * IH + ih) * IW + iw) * C;
                 float *dst = Y + ((n * OH + oh) * OW + ow) * C;
                 memcpy(dst, src, (size_t)C * sizeof(float));

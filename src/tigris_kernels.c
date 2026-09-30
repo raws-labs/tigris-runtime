@@ -285,20 +285,22 @@ static int kern_conv_transpose(
             PL = mem->tile.pad_left;
     }
 
-    /* Weight layout: [OC, KH, KW, IC] (OHWI) */
+    /* Weight layout: [OC, KH, KW, IC] (OHWI). The contributions are summed
+     * in TFLite's scatter order, by input row, column and channel ascending,
+     * and the bias added last, so float results match its reference. */
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             for (int ow = 0; ow < OW; ow++) {
                 for (int oc = 0; oc < OC; oc++) {
-                    float sum = B ? B[oc] : 0.0f;
-                    for (int kh = 0; kh < KH; kh++) {
+                    float sum = 0.0f;
+                    for (int kh = KH - 1; kh >= 0; kh--) {
                         int num_h = oh + PT - kh;
                         if (num_h % SH != 0)
                             continue;
                         int ih = num_h / SH;
                         if (ih < 0 || ih >= IH)
                             continue;
-                        for (int kw = 0; kw < KW; kw++) {
+                        for (int kw = KW - 1; kw >= 0; kw--) {
                             int num_w = ow + PL - kw;
                             if (num_w % SW != 0)
                                 continue;
@@ -312,6 +314,8 @@ static int kern_conv_transpose(
                             }
                         }
                     }
+                    if (B)
+                        sum += B[oc];
                     Y[((n * OH + oh) * OW + ow) * OC + oc] = apply_fused_act_f32(sum, op->fused_act);
                 }
             }

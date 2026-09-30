@@ -1620,7 +1620,7 @@ static int resize_uses_integer_coordinates(const tigris_plan_t *plan, const tigr
 }
 
 int tigris_resize_source_rows(const tigris_plan_t *plan, const tigris_op_t *op,
-                              int first, int end, int *source_first)
+                              int first, int end, int32_t *source_first)
 {
     int input = tigris_tensor_shape(plan, &plan->tensors[tigris_op_inputs(plan, op)[0]])[1];
     int output = tigris_tensor_shape(plan, &plan->tensors[tigris_op_outputs(plan, op)[0]])[1];

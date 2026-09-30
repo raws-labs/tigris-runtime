@@ -1,6 +1,6 @@
 /**
  * @file tigris_binary_operands.h
- * @brief Where a binary operator's two operands come from, shared by the
+ * @brief Operand resolution for binary operators and padding, shared by the
  * float and int8 kernels.
  *
  * Internal to src/. Not installed and not part of the public API. Defined
@@ -50,5 +50,12 @@ int tigris_binary_operands(
  * broadcast. */
 uint32_t tigris_binary_general_index(const tigris_binary_operands_t *operands,
                                      uint8_t k, uint32_t i);
+
+/** Pads `op`'s input into its output: the output is filled with `fill`
+ * (one element of `element` bytes), then the input is copied in at the
+ * leading pad of every axis, from the pads attribute in stored axis order.
+ * Returns 0 on success, -1 for anything it cannot place. */
+int tigris_pad(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+               const tigris_mem_t *mem, uint32_t element, const uint8_t *fill);
 
 #endif /* TIGRIS_BINARY_OPERANDS_H */

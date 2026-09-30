@@ -232,7 +232,7 @@ static int adapt_depthwise_conv2d(
 
     int N  = x_shape[0];
     int IH = x_shape[1], IW = x_shape[2], C = x_shape[3];
-    int OH = y_shape[1], OW = y_shape[2];
+    int OH = y_shape[1], OW = y_shape[2], OC = y_shape[3];
     int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
     int pad_top = op->spatial.pad_top;
     int pad_left = op->spatial.pad_left;
@@ -260,17 +260,16 @@ static int adapt_depthwise_conv2d(
         int delta = mem->tile.out_row_start * op->spatial.stride_h
                   - mem->tile.in_row_start;
         X  += delta * IW * C;
-        Y  += mem->tile.out_row_start * OW * C;
+        Y  += mem->tile.out_row_start * OW * OC;
         IH -= delta;
     }
 
-    /* Weight layout: [KH, KW, C] (HWC) from compiler.
-     * CMSIS-NN expects [1, KH, KW, C] via filter_dims.n=1 - same data. */
+    /* Depthwise weights use [KH, KW, OC], with adjacent channels for each multiplier. */
 
     cmsis_nn_dw_conv_params dw_params = {
         .input_offset  = in_qp  ? -in_qp->zero_point  : 0,
         .output_offset = out_qp ? out_qp->zero_point : 0,
-        .ch_mult = 1,
+        .ch_mult = OC / C,
         .stride   = { .w = op->spatial.stride_w,  .h = op->spatial.stride_h },
         .padding  = { .w = pad_left,   .h = pad_top },
         .dilation = { .w = op->spatial.dilation_w ? op->spatial.dilation_w : 1,
@@ -280,13 +279,13 @@ static int adapt_depthwise_conv2d(
 
     cmsis_nn_per_channel_quant_params quant;
     if (C <= 0 || cmsis_per_channel_quant(
-            plan, out_qp, (uint32_t)C, &quant) != 0)
+            plan, out_qp, (uint32_t)OC, &quant) != 0)
         return -1;
 
     cmsis_nn_dims input_dims  = { .n = N, .h = IH, .w = IW, .c = C };
-    cmsis_nn_dims filter_dims = { .n = 1, .h = KH, .w = KW, .c = C };
-    cmsis_nn_dims bias_dims   = { .n = 1, .h = 1, .w = 1, .c = C };
-    cmsis_nn_dims output_dims = { .n = N, .h = OH, .w = OW, .c = C };
+    cmsis_nn_dims filter_dims = { .n = 1, .h = KH, .w = KW, .c = OC };
+    cmsis_nn_dims bias_dims   = { .n = 1, .h = 1, .w = 1, .c = OC };
+    cmsis_nn_dims output_dims = { .n = N, .h = OH, .w = OW, .c = OC };
 
     /* Wrapper picks the optimized depthwise kernel (DSP/MVE SIMD) for the
      * common 3x3 / stride-1 / ch_mult-1 case. The opt kernel reads weights/bias
@@ -516,19 +515,19 @@ static uint32_t cmsis_workspace_required(
         case TIGRIS_OP_DEPTHWISE: {
             cmsis_nn_dims id = { .n = xs[0], .h = xs[1], .w = xs[2], .c = xs[3] };
             cmsis_nn_dims fd = { .n = 1, .h = op->spatial.kernel_h,
-                                 .w = op->spatial.kernel_w, .c = xs[3] };
-            cmsis_nn_dims od = { .n = ys[0], .h = ys[1], .w = ys[2], .c = xs[3] };
+                                 .w = op->spatial.kernel_w, .c = ys[3] };
+            cmsis_nn_dims od = { .n = ys[0], .h = ys[1], .w = ys[2], .c = ys[3] };
             cmsis_nn_dw_conv_params dp = {
-                .ch_mult  = 1,
+                .ch_mult  = ys[3] / xs[3],
                 .stride   = { .w = op->spatial.stride_w, .h = op->spatial.stride_h },
                 .padding  = { .w = op->spatial.pad_left, .h = op->spatial.pad_top },
                 .dilation = { .w = op->spatial.dilation_w ? op->spatial.dilation_w : 1,
                               .h = op->spatial.dilation_h ? op->spatial.dilation_h : 1 },
             };
             s = arm_depthwise_conv_wrapper_s8_get_buffer_size(&dp, &id, &fd, &od);
-            if ((!out_qp || out_qp->num_channels == 1u) && xs[3] > 0 &&
-                (uint32_t)xs[3] > max_broadcast_channels)
-                max_broadcast_channels = (uint32_t)xs[3];
+            if ((!out_qp || out_qp->num_channels == 1u) && ys[3] > 0 &&
+                (uint32_t)ys[3] > max_broadcast_channels)
+                max_broadcast_channels = (uint32_t)ys[3];
             break;
         }
         case TIGRIS_OP_FULLY_CONN: {
@@ -645,6 +644,30 @@ int tigris_cmsis_nn_deinit(tigris_mem_t *mem)
     return 0;
 }
 
+static int adapt_binary(const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    tigris_accel_binary_t params;
+    if (!tigris_accel_binary_params(plan, op, mem, &params)) return -1;
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const int8_t *a = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    const int8_t *b = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[1]);
+    int8_t *y = (int8_t *)tigris_mem_tensor_ptr(mem, tigris_op_outputs(plan, op)[0]);
+    if (!a || !b || !y) return -1;
+    arm_cmsis_nn_status status;
+    if (op->op_type == TIGRIS_OP_MUL) {
+        status = arm_elementwise_mul_s8(a, b, params.input1_offset, params.input2_offset, y,
+                    params.output_offset, params.multiplier, params.shift,
+                    params.activation_min, params.activation_max, params.count);
+    } else {
+        cmsis_nn_context ctx = { .buf = NULL, .size = 0 };
+        cmsis_nn_dims dims = { .n = 1, .h = 1, .w = 1, .c = params.count };
+        status = op->op_type == TIGRIS_OP_MAXIMUM
+            ? arm_maximum_s8(&ctx, a, &dims, b, &dims, y, &dims)
+            : arm_minimum_s8(&ctx, a, &dims, b, &dims, y, &dims);
+    }
+    return status == ARM_CMSIS_NN_SUCCESS ? 0 : -1;
+}
+
 /* Dispatch */
 
 int tigris_dispatch_kernel_cmsis_nn(
@@ -664,12 +687,23 @@ int tigris_dispatch_kernel_cmsis_nn(
     if (handled)
         return route_rc;
 
+#ifdef CMSIS_NN_USE_SINGLE_ROUNDING
+    if (op->op_type == TIGRIS_OP_MUL ||
+        (op->op_type == TIGRIS_OP_DEPTHWISE &&
+         tigris_tensor_shape(plan, &plan->tensors[tigris_op_inputs(plan, op)[0]])[3] !=
+         tigris_tensor_shape(plan, &plan->tensors[tigris_op_outputs(plan, op)[0]])[3]))
+        return tigris_dispatch_kernel_s8(plan, op, op_index, mem, user_ctx);
+#endif
+
     switch ((tigris_op_type_t)op->op_type) {
     case TIGRIS_OP_CONV:        return adapt_conv2d(plan, op, mem);
     case TIGRIS_OP_DEPTHWISE:   return adapt_depthwise_conv2d(plan, op, mem);
     case TIGRIS_OP_FULLY_CONN:  return adapt_fully_connected(plan, op, mem);
     case TIGRIS_OP_AVG_POOL:    return adapt_avg_pool(plan, op, op_index, mem, user_ctx);
     case TIGRIS_OP_GLOBAL_AVG:  return adapt_avg_pool(plan, op, op_index, mem, user_ctx);
+    case TIGRIS_OP_MUL:         return adapt_binary(plan, op, mem);
+    case TIGRIS_OP_MAXIMUM:     return adapt_binary(plan, op, mem);
+    case TIGRIS_OP_MINIMUM:     return adapt_binary(plan, op, mem);
 
     /* Ops without CMSIS-NN equivalent: fall back to reference s8 kernels */
     default:

@@ -18,6 +18,20 @@ typedef enum {
     TIGRIS_ACCEL_ROUTE_S8_REF,
 } tigris_accel_route_t;
 
+typedef struct {
+    int32_t input1_offset;
+    int32_t input2_offset;
+    int32_t output_offset;
+    int32_t multiplier;
+    int32_t shift;
+    int32_t count;
+    int32_t activation_min;
+    int32_t activation_max;
+} tigris_accel_binary_t;
+
+int tigris_accel_binary_params(const tigris_plan_t *plan, const tigris_op_t *op,
+                               const tigris_mem_t *mem, tigris_accel_binary_t *params);
+
 /**
  * Decide whether an op must bypass an accelerated adapter.
  *

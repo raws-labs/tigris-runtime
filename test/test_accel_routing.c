@@ -349,11 +349,9 @@ static void test_unit_dilation_keeps_esp_adapter(void)
                    "explicit unit dilation keeps ESP-NN adapter");
 }
 
-/* Both adapters pass a channel multiplier of 1, so a depthwise convolution
- * that writes more channels than it reads runs on s8_ref. */
-static void test_depthwise_multiplier_routes_reference(void)
+static void test_depthwise_multiplier_routes_adapter(void)
 {
-    printf("  test_depthwise_multiplier_routes_reference...\n");
+    printf("  test_depthwise_multiplier_routes_adapter...\n");
     route_fixture_t fx;
     build_fixture(&fx, TIGRIS_OP_DEPTHWISE, 1);
     fx.op.spatial.dilation_w = 1;
@@ -363,9 +361,12 @@ static void test_depthwise_multiplier_routes_reference(void)
                    TIGRIS_ACCEL_ROUTE_ADAPTER, "CMSIS-NN keeps a unit multiplier");
     fx.shapes[7] = 2;
     TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
-                   TIGRIS_ACCEL_ROUTE_S8_REF, "ESP-NN routes a multiplier to s8_ref");
+                   TIGRIS_ACCEL_ROUTE_ADAPTER, "ESP-NN handles a channel multiplier");
     TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0),
-                   TIGRIS_ACCEL_ROUTE_S8_REF, "CMSIS-NN routes a multiplier to s8_ref");
+                   TIGRIS_ACCEL_ROUTE_ADAPTER, "CMSIS-NN handles a channel multiplier");
+    fx.shapes[0] = 2;
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+                   TIGRIS_ACCEL_ROUTE_S8_REF, "ESP-NN multiplier batch stays on reference");
 }
 
 static void test_esp_asymmetric_pad_workspace_policy(void)
@@ -720,6 +721,84 @@ static void test_cmsis_plain_height_tile_routes_adapter(void)
                    "CMSIS-NN dilated tiled Conv still routes to s8_ref");
 }
 
+static void test_binary_routes(void)
+{
+    tigris_file_header_t header = { .num_tensors = 3, .num_ops = 1 };
+    tigris_tensor_t tensors[3] = {0};
+    tigris_quant_param_t quant[3] = {0};
+    uint16_t indices[3] = {0, 1, 2};
+    int32_t shapes[12] = {1, 2, 2, 2, 1, 2, 2, 2, 1, 2, 2, 2};
+    tigris_op_t op = { .op_type = TIGRIS_OP_MUL, .num_inputs = 2, .num_outputs = 1,
+                       .outputs_off = 2, .weight_idx = TIGRIS_NO_WEIGHT,
+                       .bias_idx = TIGRIS_NO_WEIGHT };
+    tigris_plan_t plan = { .header = &header, .tensors = tensors, .ops = &op,
+                          .index_pool = indices, .shape_pool = shapes,
+                          .quant_params = quant, .num_quant_params = 3 };
+    for (uint16_t i = 0; i < 3; i++) {
+        tensors[i].dtype = 3; tensors[i].ndim = 4; tensors[i].shape_off = i * 4u;
+        tensors[i].size_bytes = 8; tensors[i].quant_param_idx = i;
+        quant[i].scale = 0.125f; quant[i].zero_point = -17; quant[i].num_channels = 1;
+    }
+    tigris_accel_binary_t params;
+    TEST_ASSERT(tigris_accel_binary_params(&plan, &op, NULL, &params), "same-shape Mul is native");
+    TEST_ASSERT_EQ(params.count, 8, "untiled count");
+    tensors[1].flags = TIGRIS_TENSOR_CONSTANT;
+    TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "constant stays on reference");
+    tensors[1].flags = 0;
+    shapes[5] = 1; shapes[6] = 4;
+    TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "equal byte counts do not imply equal shapes");
+    shapes[5] = 2; shapes[6] = 2;
+    tensors[1].size_bytes = 2;
+    TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "channel broadcast stays on reference");
+    tensors[1].size_bytes = 8;
+    quant[1].num_channels = 2;
+    TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "per-channel quantization stays on reference");
+    quant[1].num_channels = 1;
+    quant[2].scale = 0x1p-21f;
+    TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "unsafe left shift stays on reference");
+    quant[2].scale = 0x1p27f;
+    TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "out-of-range right shift stays on reference");
+    quant[2].scale = 0.125f;
+    const uint8_t kinds[] = {TIGRIS_OP_MUL, TIGRIS_OP_MAXIMUM, TIGRIS_OP_MINIMUM};
+    for (unsigned k = 0; k < sizeof(kinds); k++) {
+        op.op_type = kinds[k];
+        TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &plan, &op, 1),
+                       TIGRIS_ACCEL_ROUTE_ADAPTER, "CMSIS binary has an adapter");
+        TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &plan, &op, 1),
+                       k == 0 ? TIGRIS_ACCEL_ROUTE_ADAPTER : TIGRIS_ACCEL_ROUTE_S8_REF,
+                       "ESP only has a Mul adapter");
+        if (k != 0) {
+            quant[1].scale = 0.25f;
+            TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "comparison requires equal scales");
+            quant[1].scale = 0.125f;
+            quant[2].zero_point++;
+            TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "comparison requires equal zero points");
+            quant[2].zero_point--;
+        }
+        int8_t a[8] = {-128, -3, 17, 127, 1, 3, -8, 31};
+        int8_t b[8] = {127, 5, -128, 17, 3, 1, 31, -8};
+        int8_t output[8] = {0};
+        void *ptrs[3] = {a, b, output};
+        tigris_mem_t mem = { .tensor_ptrs = ptrs, .num_tensors = 3 };
+        mem.tile.active = 1; mem.tile.in_h = 1; mem.tile.out_h = 1;
+        mem.tile.in_w = 2; mem.tile.out_w = 2;
+        TEST_ASSERT(tigris_accel_binary_params(&plan, &op, &mem, &params), "plain height band is native");
+        TEST_ASSERT_EQ(params.count, 4, "height band count");
+        for (int mode = 0; mode < 3; mode++) {
+            mem.tile.width_tiled = (uint8_t)(mode == 0);
+            mem.tile.row_tiled = (uint8_t)(mode == 1);
+            mem.tile.in_row_start = mode == 2 ? 1 : 0;
+            mem.tile.out_row_start = mode == 2 ? 1 : 0;
+            for (int backend = TIGRIS_ACCEL_ESP_NN; backend <= TIGRIS_ACCEL_CMSIS_NN; backend++) {
+                int handled = 0;
+                TEST_ASSERT_EQ(tigris_accel_try_s8_ref((tigris_accel_backend_t)backend,
+                    &plan, &op, 0, &mem, NULL, &handled), 0, "binary fallback executes");
+                TEST_ASSERT_EQ(handled, 1, "width, row and rolled binary tiles stay on reference");
+            }
+        }
+    }
+}
+
 int main(void)
 {
     printf("TiGrIS Accelerator Routing Tests\n\n");
@@ -728,7 +807,8 @@ int main(void)
     test_cmsis_dilation_and_tile_routes();
     test_cmsis_plain_height_tile_routes_adapter();
     test_unit_dilation_keeps_esp_adapter();
-    test_depthwise_multiplier_routes_reference();
+    test_depthwise_multiplier_routes_adapter();
+    test_binary_routes();
     test_rolled_tile_routing();
     test_width_tiled_routing();
     test_row_banded_ops_route_to_reference();

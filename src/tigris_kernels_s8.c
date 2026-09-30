@@ -2619,6 +2619,56 @@ int tigris_accel_row_band(
     return 1;
 }
 
+int tigris_accel_binary_params(const tigris_plan_t *plan, const tigris_op_t *op,
+                               const tigris_mem_t *mem, tigris_accel_binary_t *params)
+{
+    if (!plan || !op || !params || op->num_inputs != 2 || op->num_outputs != 1 ||
+        op->weight_idx != TIGRIS_NO_WEIGHT || op->bias_idx != TIGRIS_NO_WEIGHT)
+        return 0;
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const tigris_tensor_t *a = &plan->tensors[ins[0]];
+    const tigris_tensor_t *b = &plan->tensors[ins[1]];
+    const tigris_tensor_t *y = &plan->tensors[tigris_op_outputs(plan, op)[0]];
+    if (a->dtype != 3 || b->dtype != 3 || y->dtype != 3 ||
+        a->ndim != b->ndim || a->ndim != y->ndim || a->size_bytes > INT32_MAX ||
+        a->size_bytes != b->size_bytes || a->size_bytes != y->size_bytes ||
+        ((a->flags | b->flags) & TIGRIS_TENSOR_CONSTANT) != 0)
+        return 0;
+    const int32_t *as = tigris_tensor_shape(plan, a);
+    const int32_t *bs = tigris_tensor_shape(plan, b);
+    const int32_t *ys = tigris_tensor_shape(plan, y);
+    for (uint8_t i = 0; i < a->ndim; i++)
+        if (as[i] != bs[i] || as[i] != ys[i]) return 0;
+    const tigris_quant_param_t *aq = tigris_tensor_quant(plan, a);
+    const tigris_quant_param_t *bq = tigris_tensor_quant(plan, b);
+    const tigris_quant_param_t *yq = tigris_tensor_quant(plan, y);
+    if (!aq || !bq || !yq || aq->num_channels != 1 || bq->num_channels != 1 || yq->num_channels != 1)
+        return 0;
+    if (op->op_type == TIGRIS_OP_MUL) {
+        double scale = (double)aq->scale * (double)bq->scale / (double)yq->scale;
+        if (!isfinite(scale) || scale <= 0.0) return 0;
+        int shift;
+        compute_quant_mult(scale, &params->multiplier, &shift);
+        if (shift < -31 || shift > 15) return 0;
+        params->shift = shift;
+    } else if (op->op_type == TIGRIS_OP_MAXIMUM || op->op_type == TIGRIS_OP_MINIMUM) {
+        if (aq->scale != bq->scale || aq->scale != yq->scale ||
+            aq->zero_point != bq->zero_point || aq->zero_point != yq->zero_point)
+            return 0;
+        params->multiplier = 0;
+        params->shift = 0;
+    } else {
+        return 0;
+    }
+    params->input1_offset = -aq->zero_point;
+    params->input2_offset = -bq->zero_point;
+    params->output_offset = yq->zero_point;
+    params->activation_min = op->fused_act == TIGRIS_ACT_NONE ? -128 : op->act_min;
+    params->activation_max = op->fused_act == TIGRIS_ACT_NONE ? 127 : op->act_max;
+    params->count = (int32_t)(mem ? tile_aware_numel(plan, ins[0], mem) : a->size_bytes);
+    return 1;
+}
+
 tigris_accel_route_t tigris_accel_pre_route(
     tigris_accel_backend_t backend,
     const tigris_plan_t   *plan,
@@ -2647,11 +2697,21 @@ tigris_accel_route_t tigris_accel_pre_route(
          effective_dilation(op->spatial.dilation_w) != 1u))
         return TIGRIS_ACCEL_ROUTE_S8_REF;
 
-    /* Both adapters pass a channel multiplier of 1. */
+    /* ESP-NN depthwise has no batch dimension. */
     if ((backend == TIGRIS_ACCEL_ESP_NN || backend == TIGRIS_ACCEL_CMSIS_NN) &&
         op && op->op_type == TIGRIS_OP_DEPTHWISE && plan &&
-        depthwise_multiplier(plan, op) != 1)
+        (depthwise_multiplier(plan, op) < 1 ||
+         (backend == TIGRIS_ACCEL_ESP_NN && depthwise_multiplier(plan, op) > 1 &&
+          tigris_tensor_shape(plan, &plan->tensors[tigris_op_inputs(plan, op)[0]])[0] != 1)))
         return TIGRIS_ACCEL_ROUTE_S8_REF;
+
+    if (op && (op->op_type == TIGRIS_OP_MUL || op->op_type == TIGRIS_OP_MAXIMUM ||
+               op->op_type == TIGRIS_OP_MINIMUM)) {
+        tigris_accel_binary_t params;
+        if ((backend == TIGRIS_ACCEL_ESP_NN && op->op_type != TIGRIS_OP_MUL) ||
+            !tigris_accel_binary_params(plan, op, NULL, &params))
+            return TIGRIS_ACCEL_ROUTE_S8_REF;
+    }
 
     return TIGRIS_ACCEL_ROUTE_ADAPTER;
 }

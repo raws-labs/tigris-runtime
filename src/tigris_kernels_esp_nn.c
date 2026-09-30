@@ -342,7 +342,7 @@ int tigris_esp_nn_prepare(
             const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
 
             int IH = x_shape[1], IW = x_shape[2], C = x_shape[3];
-            int OH = y_shape[1], OW = y_shape[2];
+            int OH = y_shape[1], OW = y_shape[2], OC = y_shape[3];
             int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
 
             /* Band height the bounce buffer is sized for. adapt_depthwise
@@ -351,9 +351,8 @@ int tigris_esp_nn_prepare(
              * executor passes: a spilling stage still runs at full height. */
             int tile_oh = OH;
             if (plan->header->num_stages > 1 && OH > 1) {
-                /* One output row is OW * C bytes; take the rows a fast arena
-                 * of this size could hold with an input band beside it. */
-                int row_cost = OW * C * 2;
+                /* Size an output band beside its input using their separate channel counts. */
+                int row_cost = OW * (C + OC);
                 if (row_cost > 0) {
                     int max_h = (int)(mem->fast_size / (uint32_t)row_cost);
                     if (max_h < 1) max_h = 1;
@@ -364,11 +363,11 @@ int tigris_esp_nn_prepare(
             data_dims_t id = { .width = IW, .height = IH,
                                .channels = C, .extra = 1 };
             data_dims_t fd = { .width = KW, .height = KH,
-                               .channels = C, .extra = 0 };
+                               .channels = OC, .extra = 0 };
             data_dims_t od = { .width = OW, .height = tile_oh,
-                               .channels = C, .extra = 1 };
+                               .channels = OC, .extra = 1 };
             dw_conv_params_t dp = {
-                .ch_mult  = 1,
+                .ch_mult  = OC / C,
                 .stride   = { .width = op->spatial.stride_w,
                               .height = op->spatial.stride_h },
                 .padding  = { .width = op->spatial.pad_left,
@@ -378,11 +377,11 @@ int tigris_esp_nn_prepare(
 
             int s = esp_nn_get_depthwise_conv_scratch_size(&id, &fd, &od, &dp);
             max_scratch = MAX(max_scratch, s);
-            max_quant_channels = MAX(max_quant_channels, C);
+            max_quant_channels = MAX(max_quant_channels, OC);
 
             /* DW output bounce buffer: ee.vst.128.xp needs 16-byte alignment.
              * At least one full-width row of every depthwise op. */
-            max_dw_out = MAX(max_dw_out, tile_oh * OW * C);
+            max_dw_out = MAX(max_dw_out, tile_oh * OW * OC);
         }
     }
 
@@ -640,7 +639,7 @@ static int adapt_conv2d(
 
 /* 1 when every band of `band` output rows has an input window and a vendor
  * scratch requirement within the prepared scratch. */
-static int dw_bands_fit(int IH, int IW, int C, int OH, int OW, int band,
+static int dw_bands_fit(int IH, int IW, int C, int OC, int OH, int OW, int band,
                         const data_dims_t *filter_dims,
                         const dw_conv_params_t *params)
 {
@@ -656,7 +655,7 @@ static int dw_bands_fit(int IH, int IW, int C, int OH, int OW, int band,
         data_dims_t id = { .width = IW, .height = in_rows,
                            .channels = C, .extra = 1 };
         data_dims_t od = { .width = OW, .height = rows,
-                           .channels = C, .extra = 1 };
+                           .channels = OC, .extra = 1 };
         dw_conv_params_t bp = *params;
         bp.padding.height = band_pad;
         if (esp_nn_get_depthwise_conv_scratch_size(&id, filter_dims, &od, &bp)
@@ -684,7 +683,7 @@ static int adapt_depthwise_conv2d(
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
 
     int IH = x_shape[1], IW = x_shape[2], C = x_shape[3];
-    int OH = y_shape[1], OW = y_shape[2];
+    int OH = y_shape[1], OW = y_shape[2], OC = y_shape[3];
     int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
 
     /* Use tile dimensions when tiling is active */
@@ -705,21 +704,20 @@ static int adapt_depthwise_conv2d(
         int delta = mem->tile.out_row_start * op->spatial.stride_h
                   - mem->tile.in_row_start;
         X  += delta * IW * C;
-        Y  += mem->tile.out_row_start * OW * C;
+        Y  += mem->tile.out_row_start * OW * OC;
         IH -= delta;
     }
 
     data_dims_t input_dims  = { .width = IW, .height = IH, .channels = C, .extra = 1 };
-    data_dims_t filter_dims = { .width = KW, .height = KH, .channels = C, .extra = 0 };
-    data_dims_t output_dims = { .width = OW, .height = OH, .channels = C, .extra = 1 };
+    data_dims_t filter_dims = { .width = KW, .height = KH, .channels = OC, .extra = 0 };
+    data_dims_t output_dims = { .width = OW, .height = OH, .channels = OC, .extra = 1 };
 
     quant_data_t quant;
     if (C <= 0 || esp_per_channel_quant(
-            plan, out_qp, (uint32_t)C, &quant) != 0)
+            plan, out_qp, (uint32_t)OC, &quant) != 0)
         return -99;
 
-    /* Depthwise weights are already in [KH, KW, C] (HWC) layout from
-     * the compiler - matches ESP-NN's expected layout. */
+    /* Depthwise weights use [KH, KW, OC], with adjacent channels for each multiplier. */
 
     int32_t in_offset = in_qp  ? -in_qp->zero_point  : 0;
     int32_t out_offset = out_qp ? out_qp->zero_point : 0;
@@ -727,14 +725,14 @@ static int adapt_depthwise_conv2d(
     dw_conv_params_t params = {
         .in_offset  = in_offset,
         .out_offset = out_offset,
-        .ch_mult    = 1,
+        .ch_mult    = OC / C,
         .stride     = { .width = op->spatial.stride_w,  .height = op->spatial.stride_h },
         .padding    = { .width = (mem->tile.active && mem->tile.width_tiled) ? mem->tile.pad_left : op->spatial.pad_left,   .height = mem->tile.active ? mem->tile.pad_top : op->spatial.pad_top },
         .dilation   = { .width = 0, .height = 0 },
         .activation = { .min = op->act_min, .max = op->act_max },
     };
 
-    if (!s_scratch_buf || !s_dw_out_buf || OH <= 0 || OW <= 0)
+    if (!s_dw_out_buf || OH <= 0 || OW <= 0)
         return -99;
 
     /* The output goes through the 16-byte-aligned bounce buffer, and the
@@ -742,11 +740,11 @@ static int adapt_depthwise_conv2d(
      * into row bands that fit both, halving the band until they do; every
      * band is checked before the first write, and if a single row does not
      * fit, s8_ref runs the op instead. */
-    const int row_bytes = OW * C;
+    const int row_bytes = OW * OC;
     int band = s_dw_out_size / row_bytes;
     if (band > OH)
         band = OH;
-    while (band > 0 && !dw_bands_fit(IH, IW, C, OH, OW, band,
+    while (band > 0 && !dw_bands_fit(IH, IW, C, OC, OH, OW, band,
                                      &filter_dims, &params))
         band = (band > 1) ? band / 2 : 0;
     if (band <= 0)
@@ -871,6 +869,21 @@ static int adapt_avg_pool(
     return 0;
 }
 
+static int adapt_mul(const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    tigris_accel_binary_t params;
+    if (!tigris_accel_binary_params(plan, op, mem, &params)) return -99;
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const int8_t *a = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    const int8_t *b = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[1]);
+    int8_t *y = (int8_t *)tigris_mem_tensor_ptr(mem, tigris_op_outputs(plan, op)[0]);
+    if (!a || !b || !y) return -1;
+    esp_nn_mul_elementwise_s8(a, b, params.input1_offset, params.input2_offset, y,
+                              params.output_offset, params.multiplier, params.shift,
+                              params.activation_min, params.activation_max, params.count);
+    return 0;
+}
+
 /* Stats */
 
 void tigris_esp_nn_print_conv_stats(void)
@@ -912,6 +925,7 @@ int tigris_dispatch_kernel_esp_nn(
     case TIGRIS_OP_DEPTHWISE:   rc = adapt_depthwise_conv2d(plan, op, mem); break;
     case TIGRIS_OP_FULLY_CONN:  rc = adapt_fully_connected(plan, op, mem); break;
     case TIGRIS_OP_AVG_POOL:    rc = adapt_avg_pool(plan, op, mem); break;
+    case TIGRIS_OP_MUL:         rc = adapt_mul(plan, op, mem); break;
     /* Global avg pool: s8_ref uses float rescale (in_scale/out_scale)
      * that esp_nn_avg_pool_s8 doesn't support - fall back. */
     case TIGRIS_OP_GLOBAL_AVG:  rc = -99; break;

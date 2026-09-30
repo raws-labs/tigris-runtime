@@ -157,9 +157,27 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_ERF ||
            type == TIGRIS_OP_HARDSWISH ||
+           type == TIGRIS_OP_ABS ||
+           type == TIGRIS_OP_RSQRT ||
+           type == TIGRIS_OP_NEG ||
+           type == TIGRIS_OP_EXP ||
+           type == TIGRIS_OP_LOG ||
+           type == TIGRIS_OP_SQRT ||
+           type == TIGRIS_OP_SQUARE ||
+           type == TIGRIS_OP_FLOOR ||
+           type == TIGRIS_OP_CEIL ||
+           type == TIGRIS_OP_ROUND ||
+           type == TIGRIS_OP_SIN ||
+           type == TIGRIS_OP_COS ||
            type == TIGRIS_OP_LAYER_NORM ||
            type == TIGRIS_OP_ADD ||
            type == TIGRIS_OP_SUB ||
+           type == TIGRIS_OP_DIV ||
+           type == TIGRIS_OP_SQUARED_DIFFERENCE ||
+           type == TIGRIS_OP_MAXIMUM ||
+           type == TIGRIS_OP_MINIMUM ||
+           type == TIGRIS_OP_FLOOR_DIV ||
+           type == TIGRIS_OP_FLOOR_MOD ||
            type == TIGRIS_OP_MUL ||
            type == TIGRIS_OP_CONCAT;
 }
@@ -177,12 +195,30 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_ERF ||
            type == TIGRIS_OP_HARDSWISH ||
+           type == TIGRIS_OP_ABS ||
+           type == TIGRIS_OP_RSQRT ||
+           type == TIGRIS_OP_NEG ||
+           type == TIGRIS_OP_EXP ||
+           type == TIGRIS_OP_LOG ||
+           type == TIGRIS_OP_SQRT ||
+           type == TIGRIS_OP_SQUARE ||
+           type == TIGRIS_OP_FLOOR ||
+           type == TIGRIS_OP_CEIL ||
+           type == TIGRIS_OP_ROUND ||
+           type == TIGRIS_OP_SIN ||
+           type == TIGRIS_OP_COS ||
            type == TIGRIS_OP_LAYER_NORM;
 }
 
 static int is_axis1_binary_pointwise_op(uint8_t type)
 {
     return type == TIGRIS_OP_ADD || type == TIGRIS_OP_SUB ||
+           type == TIGRIS_OP_DIV ||
+           type == TIGRIS_OP_SQUARED_DIFFERENCE ||
+           type == TIGRIS_OP_MAXIMUM ||
+           type == TIGRIS_OP_MINIMUM ||
+           type == TIGRIS_OP_FLOOR_DIV ||
+           type == TIGRIS_OP_FLOOR_MOD ||
            type == TIGRIS_OP_MUL;
 }
 
@@ -2185,6 +2221,18 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_TANH ||
            type == TIGRIS_OP_ERF ||
            type == TIGRIS_OP_HARDSWISH ||
+           type == TIGRIS_OP_ABS ||
+           type == TIGRIS_OP_RSQRT ||
+           type == TIGRIS_OP_NEG ||
+           type == TIGRIS_OP_EXP ||
+           type == TIGRIS_OP_LOG ||
+           type == TIGRIS_OP_SQRT ||
+           type == TIGRIS_OP_SQUARE ||
+           type == TIGRIS_OP_FLOOR ||
+           type == TIGRIS_OP_CEIL ||
+           type == TIGRIS_OP_ROUND ||
+           type == TIGRIS_OP_SIN ||
+           type == TIGRIS_OP_COS ||
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_LAYER_NORM ||
            type == TIGRIS_OP_RESHAPE ||
@@ -2192,6 +2240,12 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_MATMUL ||
            type == TIGRIS_OP_ADD ||
            type == TIGRIS_OP_SUB ||
+           type == TIGRIS_OP_DIV ||
+           type == TIGRIS_OP_SQUARED_DIFFERENCE ||
+           type == TIGRIS_OP_MAXIMUM ||
+           type == TIGRIS_OP_MINIMUM ||
+           type == TIGRIS_OP_FLOOR_DIV ||
+           type == TIGRIS_OP_FLOOR_MOD ||
            type == TIGRIS_OP_MUL;
 }
 
@@ -2573,8 +2627,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t chain_kernel(
     const executor_workspace_impl_t *workspace, int32_t gs, int32_t ge)
 {
     int binary = op->num_inputs == 2 &&
-        (op->op_type == TIGRIS_OP_ADD || op->op_type == TIGRIS_OP_MUL ||
-         op->op_type == TIGRIS_OP_SUB);
+        is_axis1_binary_pointwise_op(op->op_type);
     if (!binary)
         return kernel(plan, op, op_idx, mem, user_ctx) != 0
             ? TIGRIS_EXEC_ERR_KERNEL : TIGRIS_EXEC_OK;

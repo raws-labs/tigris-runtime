@@ -138,6 +138,18 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_ERF ||
            type == TIGRIS_OP_HARDSWISH ||
+           type == TIGRIS_OP_ABS ||
+           type == TIGRIS_OP_RSQRT ||
+           type == TIGRIS_OP_NEG ||
+           type == TIGRIS_OP_EXP ||
+           type == TIGRIS_OP_LOG ||
+           type == TIGRIS_OP_SQRT ||
+           type == TIGRIS_OP_SQUARE ||
+           type == TIGRIS_OP_FLOOR ||
+           type == TIGRIS_OP_CEIL ||
+           type == TIGRIS_OP_ROUND ||
+           type == TIGRIS_OP_SIN ||
+           type == TIGRIS_OP_COS ||
            type == TIGRIS_OP_LAYER_NORM;
 }
 
@@ -194,6 +206,18 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_TANH ||
            type == TIGRIS_OP_ERF ||
            type == TIGRIS_OP_HARDSWISH ||
+           type == TIGRIS_OP_ABS ||
+           type == TIGRIS_OP_RSQRT ||
+           type == TIGRIS_OP_NEG ||
+           type == TIGRIS_OP_EXP ||
+           type == TIGRIS_OP_LOG ||
+           type == TIGRIS_OP_SQRT ||
+           type == TIGRIS_OP_SQUARE ||
+           type == TIGRIS_OP_FLOOR ||
+           type == TIGRIS_OP_CEIL ||
+           type == TIGRIS_OP_ROUND ||
+           type == TIGRIS_OP_SIN ||
+           type == TIGRIS_OP_COS ||
            type == TIGRIS_OP_SOFTMAX ||
            type == TIGRIS_OP_LAYER_NORM ||
            type == TIGRIS_OP_RESHAPE ||
@@ -201,12 +225,24 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_MATMUL ||
            type == TIGRIS_OP_ADD ||
            type == TIGRIS_OP_SUB ||
+           type == TIGRIS_OP_DIV ||
+           type == TIGRIS_OP_SQUARED_DIFFERENCE ||
+           type == TIGRIS_OP_MAXIMUM ||
+           type == TIGRIS_OP_MINIMUM ||
+           type == TIGRIS_OP_FLOOR_DIV ||
+           type == TIGRIS_OP_FLOOR_MOD ||
            type == TIGRIS_OP_MUL;
 }
 
 static int is_axis1_binary_pointwise_op(uint8_t type)
 {
     return type == TIGRIS_OP_ADD || type == TIGRIS_OP_SUB ||
+           type == TIGRIS_OP_DIV ||
+           type == TIGRIS_OP_SQUARED_DIFFERENCE ||
+           type == TIGRIS_OP_MAXIMUM ||
+           type == TIGRIS_OP_MINIMUM ||
+           type == TIGRIS_OP_FLOOR_DIV ||
+           type == TIGRIS_OP_FLOOR_MOD ||
            type == TIGRIS_OP_MUL;
 }
 
@@ -446,6 +482,63 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             if (!op_has_plain_io(op, 1, 1) ||
                 input->size_bytes != output->size_bytes)
                 return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+
+        case TIGRIS_OP_ABS:
+        case TIGRIS_OP_RSQRT:
+        case TIGRIS_OP_NEG:
+        case TIGRIS_OP_EXP:
+        case TIGRIS_OP_LOG:
+        case TIGRIS_OP_SQRT:
+        case TIGRIS_OP_SQUARE:
+        case TIGRIS_OP_FLOOR:
+        case TIGRIS_OP_CEIL:
+        case TIGRIS_OP_ROUND:
+        case TIGRIS_OP_SIN:
+        case TIGRIS_OP_COS:
+            if (!op_has_plain_io(op, 1, 1) ||
+                !tensor_shapes_equal(plan, input, output))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            if (dtype == 3) {
+                if ((op->op_type != TIGRIS_OP_ABS && op->op_type != TIGRIS_OP_RSQRT) ||
+                    input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                    output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                    !quant_channels_fit(plan, input, 1) ||
+                    !quant_channels_fit(plan, output, 1))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
+            break;
+
+        case TIGRIS_OP_DIV:
+        case TIGRIS_OP_SQUARED_DIFFERENCE:
+        case TIGRIS_OP_MAXIMUM:
+        case TIGRIS_OP_MINIMUM:
+        case TIGRIS_OP_FLOOR_DIV:
+        case TIGRIS_OP_FLOOR_MOD:
+            if (!op_has_plain_io(op, 2, 1) ||
+                !tensor_shapes_equal(plan, input, output) ||
+                !tensor_shapes_equal(plan, input, &plan->tensors[inputs[1]]))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            if (dtype == 3) {
+                const tigris_tensor_t *second = &plan->tensors[inputs[1]];
+                if ((op->op_type != TIGRIS_OP_SQUARED_DIFFERENCE &&
+                     op->op_type != TIGRIS_OP_MAXIMUM && op->op_type != TIGRIS_OP_MINIMUM) ||
+                    input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                    second->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                    output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                    !quant_channels_fit(plan, input, 1) ||
+                    !quant_channels_fit(plan, second, 1) ||
+                    !quant_channels_fit(plan, output, 1))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                if (op->op_type != TIGRIS_OP_SQUARED_DIFFERENCE) {
+                    const tigris_quant_param_t *a = &plan->quant_params[input->quant_param_idx];
+                    const tigris_quant_param_t *b = &plan->quant_params[second->quant_param_idx];
+                    const tigris_quant_param_t *y = &plan->quant_params[output->quant_param_idx];
+                    if (a->scale != b->scale || a->scale != y->scale ||
+                        a->zero_point != b->zero_point || a->zero_point != y->zero_point)
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                }
+            }
             break;
 
         case TIGRIS_OP_HARDSWISH:
@@ -1814,9 +1907,7 @@ tigris_error_t tigris_plan_load_ex(
                 for (uint16_t j = 0; j < stage->ops_count; j++) {
                     const tigris_op_t *bop = &candidate.ops[
                         candidate.index_pool[stage->ops_off + j]];
-                    if ((bop->op_type == TIGRIS_OP_ADD ||
-                         bop->op_type == TIGRIS_OP_SUB ||
-                         bop->op_type == TIGRIS_OP_MUL) &&
+                    if (is_axis1_binary_pointwise_op(bop->op_type) &&
                         bop->num_inputs == 2) {
                         const uint16_t *bin = tigris_op_inputs(&candidate, bop);
                         if (!tensor_shapes_equal(&candidate,
@@ -1927,6 +2018,24 @@ tigris_error_t tigris_plan_load_ex(
                                     * of: shape-preserving and halo-free. */
                                    type != TIGRIS_OP_ERF &&
                                    type != TIGRIS_OP_HARDSWISH &&
+                                   type != TIGRIS_OP_ABS &&
+                                   type != TIGRIS_OP_RSQRT &&
+                                   type != TIGRIS_OP_NEG &&
+                                   type != TIGRIS_OP_EXP &&
+                                   type != TIGRIS_OP_LOG &&
+                                   type != TIGRIS_OP_SQRT &&
+                                   type != TIGRIS_OP_SQUARE &&
+                                   type != TIGRIS_OP_FLOOR &&
+                                   type != TIGRIS_OP_CEIL &&
+                                   type != TIGRIS_OP_ROUND &&
+                                   type != TIGRIS_OP_SIN &&
+                                   type != TIGRIS_OP_COS &&
+                                   type != TIGRIS_OP_DIV &&
+                                   type != TIGRIS_OP_SQUARED_DIFFERENCE &&
+                                   type != TIGRIS_OP_MAXIMUM &&
+                                   type != TIGRIS_OP_MINIMUM &&
+                                   type != TIGRIS_OP_FLOOR_DIV &&
+                                   type != TIGRIS_OP_FLOOR_MOD &&
                                    type != TIGRIS_OP_LAYER_NORM &&
                                    /* Softmax normalizes along the final
                                     * stored dimension, which a height stripe
@@ -1997,6 +2106,24 @@ tigris_error_t tigris_plan_load_ex(
                            op_type != TIGRIS_OP_SOFTMAX &&
                            op_type != TIGRIS_OP_ERF &&
                            op_type != TIGRIS_OP_HARDSWISH &&
+                           op_type != TIGRIS_OP_ABS &&
+                           op_type != TIGRIS_OP_RSQRT &&
+                           op_type != TIGRIS_OP_NEG &&
+                           op_type != TIGRIS_OP_EXP &&
+                           op_type != TIGRIS_OP_LOG &&
+                           op_type != TIGRIS_OP_SQRT &&
+                           op_type != TIGRIS_OP_SQUARE &&
+                           op_type != TIGRIS_OP_FLOOR &&
+                           op_type != TIGRIS_OP_CEIL &&
+                           op_type != TIGRIS_OP_ROUND &&
+                           op_type != TIGRIS_OP_SIN &&
+                           op_type != TIGRIS_OP_COS &&
+                           op_type != TIGRIS_OP_DIV &&
+                           op_type != TIGRIS_OP_SQUARED_DIFFERENCE &&
+                           op_type != TIGRIS_OP_MAXIMUM &&
+                           op_type != TIGRIS_OP_MINIMUM &&
+                           op_type != TIGRIS_OP_FLOOR_DIV &&
+                           op_type != TIGRIS_OP_FLOOR_MOD &&
                            op_type != TIGRIS_OP_LAYER_NORM &&
                            op_type != TIGRIS_OP_ADD &&
                            op_type != TIGRIS_OP_SUB &&

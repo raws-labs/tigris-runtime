@@ -1987,6 +1987,52 @@ static int32_t elementwise_inverse_sqrt(int32_t value, int *output_shift)
     return estimate;
 }
 
+static int32_t elementwise_reciprocal(int32_t value, int *shift)
+{
+    int leading = elementwise_leading_zeros((uint32_t)value);
+    uint32_t normalized = ((uint32_t)value << leading) - 0x80000000u;
+    int32_t half = (int32_t)(((int64_t)normalized + INT32_MAX + 1) / 2);
+    int32_t estimate = 1515870810 + sat_round_dbl_high_mul(half, -1010580540);
+    for (int step = 0; step < 3; step++) {
+        int32_t error = 536870912 - sat_round_dbl_high_mul(half, estimate);
+        estimate += elementwise_shift_left(sat_round_dbl_high_mul(estimate, error), 2);
+    }
+    *shift = 31 - leading;
+    return elementwise_shift_left(estimate, 1);
+}
+
+static int32_t div_round_by_pot(int32_t value, int exponent)
+{
+    /* An int32 value is strictly below half a unit for exponents >= 63. */
+    if (exponent >= 63) return 0;
+    uint64_t mask = ((uint64_t)1u << exponent) - 1u;
+    uint64_t remainder = (uint64_t)(int64_t)value & mask;
+    uint64_t threshold = (mask >> 1) + (value < 0 ? 1u : 0u);
+    return (int32_t)((int64_t)value >> exponent) + (remainder > threshold ? 1 : 0);
+}
+
+static int elementwise_divide(
+    int32_t numerator, int32_t denominator, int32_t multiplier, int shift,
+    int32_t zero, int8_t *output)
+{
+    if (denominator == 0) return 0;
+    int32_t a = denominator < 0 ? -numerator : numerator;
+    int32_t b = denominator < 0 ? -denominator : denominator;
+    int reciprocal_shift;
+    int32_t inverse = elementwise_reciprocal(b, &reciprocal_shift);
+    uint32_t sign_bits = a < 0 ? ~(uint32_t)a : (uint32_t)a;
+    int headroom = elementwise_leading_zeros(sign_bits) - 1;
+    int32_t scaled = (int32_t)((int64_t)a * ((int64_t)1 << headroom));
+    int32_t quotient = sat_round_dbl_high_mul(scaled, inverse);
+    int exponent = reciprocal_shift + headroom - shift;
+    if (exponent < 0) return 0;
+    int32_t result = div_round_by_pot(sat_round_dbl_high_mul(quotient, multiplier), exponent);
+    if (result > 127 - zero) *output = 127;
+    else if (result < -128 - zero) *output = -128;
+    else *output = (int8_t)(result + zero);
+    return 1;
+}
+
 static TIGRIS_KERNEL_NOINLINE int kern_elementwise_unary_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -2054,6 +2100,14 @@ static TIGRIS_KERNEL_NOINLINE int kern_elementwise_binary_s8(
             !elementwise_multiplier(twice_max * twice_max / (double)(16384.0f * yq->scale),
                                     &multipliers[2], &shifts[2]))
             return -1;
+    } else if (op->op_type == TIGRIS_OP_DIV) {
+        double scale = (double)(aq->scale / (bq->scale * yq->scale));
+        if (!isfinite(scale) || scale < 0.0) return -1;
+        compute_quant_mult(scale, &multipliers[2], &shifts[2]);
+        if (shifts[2] < -31) {
+            multipliers[2] = 0;
+            shifts[2] = 0;
+        }
     } else if (aq->scale != bq->scale || aq->scale != yq->scale ||
                aq->zero_point != bq->zero_point || aq->zero_point != yq->zero_point) {
         return -1;
@@ -2075,6 +2129,11 @@ static TIGRIS_KERNEL_NOINLINE int kern_elementwise_binary_s8(
         }
         av -= aq->zero_point;
         bv -= bq->zero_point;
+        if (op->op_type == TIGRIS_OP_DIV) {
+            if (!elementwise_divide(av, bv, multipliers[2], shifts[2], yq->zero_point, &y[i]))
+                return -1;
+            continue;
+        }
         av = elementwise_multiply(av * 128, multipliers[0], shifts[0]);
         bv = elementwise_multiply(bv * 128, multipliers[1], shifts[1]);
         int32_t difference = av - bv;
@@ -2487,6 +2546,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_HARDSWISH:   return kern_hardswish_s8(plan, op, mem);
     case TIGRIS_OP_ABS:        return kern_elementwise_unary_s8(plan, op, mem);
     case TIGRIS_OP_RSQRT:      return kern_elementwise_unary_s8(plan, op, mem);
+    case TIGRIS_OP_DIV:        return kern_elementwise_binary_s8(plan, op, mem);
     case TIGRIS_OP_SQUARED_DIFFERENCE: return kern_elementwise_binary_s8(plan, op, mem);
     case TIGRIS_OP_MAXIMUM:    return kern_elementwise_binary_s8(plan, op, mem);
     case TIGRIS_OP_MINIMUM:    return kern_elementwise_binary_s8(plan, op, mem);

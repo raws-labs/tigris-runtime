@@ -1904,6 +1904,7 @@ static void test_elementwise_semantics(void)
 
         build_elementwise_quant_plan(buf, kinds[i], inputs);
         int quantized = kinds[i] == TIGRIS_OP_ABS || kinds[i] == TIGRIS_OP_RSQRT ||
+            kinds[i] == TIGRIS_OP_DIV ||
             kinds[i] == TIGRIS_OP_SQUARED_DIFFERENCE || kinds[i] == TIGRIS_OP_MAXIMUM ||
             kinds[i] == TIGRIS_OP_MINIMUM;
         TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
@@ -1916,6 +1917,14 @@ static void test_elementwise_semantics(void)
         TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
                        "elementwise per-channel quantization rejected");
         quant[0].num_channels = 1;
+        if (kinds[i] == TIGRIS_OP_DIV) {
+            quant[1].scale = 0.25f;
+            quant[1].zero_point = 31;
+            quant[2].scale = 0.0625f;
+            quant[2].zero_point = -63;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                           "division accepts distinct input and output quantization");
+        }
         if (kinds[i] == TIGRIS_OP_MAXIMUM || kinds[i] == TIGRIS_OP_MINIMUM) {
             quant[2].scale = 0.25f;
             TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,

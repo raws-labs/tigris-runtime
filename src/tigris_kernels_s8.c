@@ -1522,12 +1522,13 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_nearest_s8(
     int OH = y_shape[1];
     int OW = y_shape[2];
 
-    int scale_h = op->spatial.stride_h ? op->spatial.stride_h : 1;
-    int scale_w = op->spatial.stride_w ? op->spatial.stride_w : 1;
+    if (X == NULL || Y == NULL || op->spatial.kernel_h > 3) return -1;
 
     /* Under a tile the buffers hold a band, and which source row an output
      * row takes is a function of its global index, not of its position in
      * the band. See kern_resize_nearest. */
+    float scale_h = tigris_resize_explicit_scale(plan, op, 0);
+    float scale_w = tigris_resize_explicit_scale(plan, op, 1);
     int out_origin = 0;
     int in_origin = 0;
     if (mem->tile.active) {
@@ -1546,12 +1547,11 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_nearest_s8(
 
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
-            int ih = (oh + out_origin) / scale_h - in_origin;
-            if (ih >= IH) ih = IH - 1;
-            if (ih < 0) ih = 0;
+            int ih = tigris_resize_nearest(oh + out_origin, x_shape[1], y_shape[1],
+                                           op->spatial.kernel_h, scale_h) - in_origin;
+            if (ih < 0 || ih >= IH) return -1;
             for (int ow = 0; ow < OW; ow++) {
-                int iw = ow / scale_w;
-                if (iw >= IW) iw = IW - 1;
+                int iw = tigris_resize_nearest(ow, x_shape[2], y_shape[2], op->spatial.kernel_h, scale_w);
                 const int8_t *src = X + ((n * IH + ih) * IW + iw) * C;
                 int8_t *dst = Y + ((n * OH + oh) * OW + ow) * C;
                 if (q.same) {
@@ -1568,26 +1568,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_nearest_s8(
     return 0;
 }
 
-/* One axis of TFLite's integer bilinear coordinate (reference_ops.h,
- * ComputeInterpolationValuesInteger): the source position in 1/1024 steps
- * and the two rows or columns it lies between. */
-static void resize_linear_position_s8(int32_t out_index, int32_t scale_10, int half_pixel,
-                                      int32_t in_size, int32_t *pos, int32_t *lo, int32_t *hi)
-{
-    *pos = half_pixel ? out_index * scale_10 + scale_10 / 2 - (1 << 9)
-                      : out_index * scale_10;
-    *lo = (*pos / (1 << 10) > 0) ? *pos / (1 << 10) : 0;
-    *hi = ((*pos + (1 << 10) - 1) / (1 << 10) < in_size - 1)
-        ? (*pos + (1 << 10) - 1) / (1 << 10) : in_size - 1;
-}
-
-/* Bilinear upsample by an integer factor, int8. Mirrors kern_resize_linear:
- * the same source coordinate (half-pixel, or asymmetric when kernel_h is 1)
- * and the same tile origins. With matching input and output quantization it
- * is TFLite's integer kernel (ResizeBilinearInteger): 10-bit coordinates,
- * raw int8 samples, one rounding at 2^20. Otherwise the four samples are
- * dequantized, mixed, and requantized to the output, which is what a
- * quantized graph that dequantizes, resizes and quantizes again computes. */
+/* Matching quantization uses TFLite's 10-bit coordinates and one rounding at 2^20. */
 static TIGRIS_KERNEL_NOINLINE int kern_resize_linear_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1608,25 +1589,19 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_linear_s8(
     int C  = x_shape[3];
     int OH = y_shape[1];
     int OW = y_shape[2];
-    float scale_h = (float)(op->spatial.stride_h ? op->spatial.stride_h : 1);
-    float scale_w = (float)(op->spatial.stride_w ? op->spatial.stride_w : 1);
-    float shift = (op->spatial.kernel_h == 1) ? 0.0f : 0.5f;
+    float scale_h = tigris_resize_explicit_scale(plan, op, 0);
+    float scale_w = tigris_resize_explicit_scale(plan, op, 1);
     int out_origin = 0;
     int in_origin = 0;
 
     if (X == NULL || Y == NULL || in_qp == NULL || out_qp == NULL ||
-        op->spatial.kernel_h > 1 || !(out_qp->scale > 0.0f))
+        op->spatial.kernel_h > 2 || !(out_qp->scale > 0.0f))
         return -1;
     float in_scale = in_qp->scale;
     float in_zp = (float)in_qp->zero_point;
     float inv_out = 1.0f / out_qp->scale;
     int32_t out_zp = out_qp->zero_point;
     int integer = in_qp->scale == out_qp->scale && in_qp->zero_point == out_qp->zero_point;
-    int half_pixel = op->spatial.kernel_h != 1;
-    int32_t scale_h_10 = ((1 << 10) * IH + OH / 2) / OH;
-    int32_t scale_w_10 = ((1 << 10) * IW + OW / 2) / OW;
-    int32_t full_ih = IH;
-    int32_t full_iw = IW;
     if (mem->tile.active) {
         IH = mem->tile.in_h;
         OH = mem->tile.out_h;
@@ -1637,11 +1612,14 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_linear_s8(
     }
 
     if (integer) {
+        int32_t scale_h_10 = tigris_resize_scale_s8(x_shape[1], y_shape[1], op->spatial.kernel_h, scale_h);
+        int32_t scale_w_10 = tigris_resize_scale_s8(x_shape[2], y_shape[2], op->spatial.kernel_h, scale_w);
         for (int n = 0; n < N; n++) {
             for (int oh = 0; oh < OH; oh++) {
                 int32_t py, gy0, gy1;
-                resize_linear_position_s8(oh + out_origin, scale_h_10, half_pixel, full_ih,
-                                          &py, &gy0, &gy1);
+                if (!tigris_resize_position_s8(oh + out_origin, x_shape[1],
+                                               op->spatial.kernel_h, scale_h_10, &py, &gy0, &gy1))
+                    return -1;
                 int32_t y0 = gy0 - in_origin;
                 int32_t y1 = gy1 - in_origin;
                 if (y0 < 0 || y1 > IH - 1)
@@ -1649,7 +1627,9 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_linear_s8(
                 int32_t dy = py - (1 << 10) * gy0;
                 for (int ow = 0; ow < OW; ow++) {
                     int32_t px, x0, x1;
-                    resize_linear_position_s8(ow, scale_w_10, half_pixel, full_iw, &px, &x0, &x1);
+                    if (!tigris_resize_position_s8(ow, x_shape[2],
+                                                   op->spatial.kernel_h, scale_w_10, &px, &x0, &x1))
+                        return -1;
                     int32_t dx = px - (1 << 10) * x0;
                     const int8_t *r0 = X + ((size_t)(n * IH + y0) * (size_t)IW) * (size_t)C;
                     const int8_t *r1 = X + ((size_t)(n * IH + y1) * (size_t)IW) * (size_t)C;
@@ -1672,19 +1652,19 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_linear_s8(
 
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
-            float fy = ((float)(oh + out_origin) + shift) / scale_h - shift;
-            if (fy < 0.0f) fy = 0.0f;
-            int y0 = (int)fy - in_origin;
-            if (y0 < 0) y0 = 0;
-            if (y0 > IH - 1) y0 = IH - 1;
-            int y1 = (y0 + 1 < IH) ? y0 + 1 : IH - 1;
-            float wy = fy - (float)(y0 + in_origin);
+            float fy;
+            int y0, y1;
+            tigris_resize_position(oh + out_origin, x_shape[1], y_shape[1],
+                                   op->spatial.kernel_h, scale_h, &fy, &y0, &y1);
+            float wy = fy - (float)y0;
+            y0 -= in_origin;
+            y1 -= in_origin;
+            if (y0 < 0 || y1 >= IH) return -1;
             for (int ow = 0; ow < OW; ow++) {
-                float fx = ((float)ow + shift) / scale_w - shift;
-                if (fx < 0.0f) fx = 0.0f;
-                int x0 = (int)fx;
-                if (x0 > IW - 1) x0 = IW - 1;
-                int x1 = (x0 + 1 < IW) ? x0 + 1 : IW - 1;
+                float fx;
+                int x0, x1;
+                tigris_resize_position(ow, x_shape[2], y_shape[2],
+                                       op->spatial.kernel_h, scale_w, &fx, &x0, &x1);
                 float wx = fx - (float)x0;
                 const int8_t *r0 = X + ((size_t)(n * IH + y0) * (size_t)IW) * (size_t)C;
                 const int8_t *r1 = X + ((size_t)(n * IH + y1) * (size_t)IW) * (size_t)C;

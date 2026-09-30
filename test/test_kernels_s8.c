@@ -1706,7 +1706,7 @@ static void test_resize_linear_s8(void)
 
     TEST_ASSERT(run_resize_linear_s8(0, NULL, grid, out, 0) != 0,
                 "int8 bilinear without quantization is refused");
-    TEST_ASSERT(run_resize_linear_s8(2, NULL, grid, out, 1) != 0,
+    TEST_ASSERT(run_resize_linear_s8(3, NULL, grid, out, 1) != 0,
                 "an unknown convention is refused");
 }
 

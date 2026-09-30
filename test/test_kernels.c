@@ -16,7 +16,9 @@
 #include "tigris.h"
 #include "tigris_mem.h"
 #include "tigris_kernels.h"
+#include "tigris_kernels_s8.h"
 #include "elementwise_f32_golden.h"
+#include "resize_golden.h"
 
 /* Test infrastructure */
 
@@ -1958,11 +1960,100 @@ static void test_resize_linear(void)
         TEST_ASSERT_NEAR(Y[i], k_linear_half_pixel[36 + i], EPS,
                          "tiled bilinear reproduces its rows");
 
-    TEST_ASSERT(run_resize_linear(2, X, Y, NULL) != 0,
+    TEST_ASSERT(run_resize_linear(3, X, Y, NULL) != 0,
                 "unknown coordinate convention is refused");
 }
 
 /* Resize nearest test */
+
+static void test_resize_reference_goldens(void)
+{
+    printf("  test_resize_reference_goldens...\n");
+    for (size_t g = 0; g < sizeof(resize_goldens) / sizeof(resize_goldens[0]); g++) {
+        const resize_golden_t *gold = &resize_goldens[g];
+        tigris_file_header_t header = {0};
+        tigris_tensor_t tensors[2] = {0};
+        tigris_op_t op = {0};
+        tigris_plan_t plan = {0};
+        tigris_mem_t mem = {0};
+        tigris_quant_param_t quant = {0};
+        uint16_t indices[] = {0, 1};
+        _Alignas(4) uint8_t output[4096], band[2048];
+        void *pointers[] = {(void *)gold->input, output};
+        uint32_t element = gold->dtype == 3 ? 1u : 4u;
+        header.num_tensors = 2;
+        header.num_ops = 1;
+        header.num_quant_params = 1;
+        quant.scale = 0.125f;
+        quant.zero_point = -17;
+        quant.num_channels = 1;
+        for (int i = 0; i < 2; i++) {
+            tensors[i].shape_off = (uint32_t)i * 4u;
+            tensors[i].ndim = 4;
+            tensors[i].dtype = gold->dtype;
+            tensors[i].size_bytes = (i == 0 ? gold->input_count : gold->output_count) * element;
+        }
+        op.op_type = gold->linear ? TIGRIS_OP_RESIZE_LINEAR : TIGRIS_OP_RESIZE;
+        op.spatial.kernel_h = gold->convention;
+        op.num_inputs = 1;
+        op.num_outputs = 1;
+        op.outputs_off = 1;
+        op.weight_idx = TIGRIS_NO_WEIGHT;
+        op.bias_idx = TIGRIS_NO_WEIGHT;
+        plan.header = &header;
+        plan.tensors = tensors;
+        plan.ops = &op;
+        plan.shape_pool = gold->shapes;
+        plan.index_pool = indices;
+        plan.quant_params = &quant;
+        mem.tensor_ptrs = pointers;
+        mem.num_tensors = 2;
+        tigris_kernel_fn kernel = gold->dtype == 3 ? tigris_dispatch_kernel_s8 : tigris_dispatch_kernel;
+        TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) == 0, "resize golden runs");
+        for (uint32_t i = 0; i < gold->output_count; i++) {
+            if (gold->dtype == 3) {
+                TEST_ASSERT(((int8_t *)output)[i] == ((const int8_t *)gold->output)[i],
+                            "resize byte equals TFLM");
+            } else {
+                TEST_ASSERT_NEAR(((float *)output)[i], ((const float *)gold->output)[i], EPS,
+                                 "resize float equals TFLM");
+            }
+        }
+        int ih = gold->shapes[1], iw = gold->shapes[2], channels = gold->shapes[3];
+        int oh = gold->shapes[5], ow = gold->shapes[6];
+        for (int row = 0; row < oh; row++) {
+            int rows = gold->ends[row] - gold->starts[row];
+            size_t row_bytes = (size_t)iw * (size_t)channels * element;
+            for (int n = 0; n < gold->shapes[0]; n++)
+                memcpy(band + (size_t)n * (size_t)rows * row_bytes,
+                       (const uint8_t *)gold->input + (size_t)(n * ih + gold->starts[row]) * row_bytes,
+                       (size_t)rows * row_bytes);
+            pointers[0] = band;
+            memset(output, 85, sizeof(output));
+            mem.tile.active = 1;
+            mem.tile.in_h = rows;
+            mem.tile.in_w = iw;
+            mem.tile.out_h = 1;
+            mem.tile.out_w = ow;
+            mem.tile.in_row_origin = gold->starts[row];
+            mem.tile.out_row_origin = row;
+            TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) == 0, "resize source band runs");
+            for (int n = 0; n < gold->shapes[0]; n++) {
+                for (int j = 0; j < ow * channels; j++) {
+                    int actual = n * ow * channels + j;
+                    int expected = (n * oh + row) * ow * channels + j;
+                    if (gold->dtype == 3) {
+                        TEST_ASSERT(((int8_t *)output)[actual] == ((const int8_t *)gold->output)[expected],
+                                    "band byte equals TFLM");
+                    } else {
+                        TEST_ASSERT_NEAR(((float *)output)[actual], ((const float *)gold->output)[expected], EPS,
+                                         "band float equals TFLM");
+                    }
+                }
+            }
+        }
+    }
+}
 
 static void test_resize_nearest(void)
 {
@@ -3102,6 +3193,7 @@ int main(void)
     test_elementwise_reference_goldens();
     test_per_channel_mul();
     test_resize_nearest();
+    test_resize_reference_goldens();
     test_resize_linear();
     test_sigmoid();
     test_erf();

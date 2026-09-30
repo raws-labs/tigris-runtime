@@ -14,6 +14,7 @@
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "tigris_kernels_s8.h"
+#include "elementwise_s8_golden.h"
 
 /* Test infrastructure */
 
@@ -2258,6 +2259,94 @@ static void test_depthwise_multiplier_s8(void)
         TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], expected[i], "depthwise multiplier value");
 }
 
+static void test_elementwise_reference_goldens(void)
+{
+    printf("  test_elementwise_reference_goldens...\n");
+    for (size_t c = 0; c < sizeof(elementwise_goldens) / sizeof(elementwise_goldens[0]); c++) {
+        const elementwise_golden_t *gold = &elementwise_goldens[c];
+        plan_reset();
+        tigris_plan_t plan;
+        uint16_t quant[3];
+        for (int q = 0; q < 3; q++)
+            quant[q] = add_quant_param(gold->scales[q], gold->zeros[q], 1, NULL, NULL);
+        int32_t shape[] = {1, (int32_t)gold->count / 16, 16, 1};
+        uint16_t a = add_tensor(&plan, "a", shape, 4, 3, gold->count, quant[0]);
+        uint16_t b = add_tensor(&plan, "b", shape, 4, 3, gold->count, quant[1]);
+        uint16_t y = add_tensor(&plan, "y", shape, 4, 3, gold->count, quant[2]);
+        uint16_t inputs[] = {a, b};
+        uint16_t outputs[] = {y};
+        test_ops[0].op_type = gold->operation;
+        test_ops[0].num_inputs = gold->input_b ? 2 : 1;
+        test_ops[0].num_outputs = 1;
+        test_ops[0].inputs_off = add_indices(inputs, test_ops[0].num_inputs);
+        test_ops[0].outputs_off = add_indices(outputs, 1);
+        test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+        test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+        test_ops[0].act_min = -128;
+        test_ops[0].act_max = 127;
+        test_header.num_ops = 1;
+        build_plan(&plan);
+        int8_t actual[768];
+        void *pointers[MAX_TENSORS] = {0};
+        pointers[a] = (void *)gold->input_a;
+        pointers[b] = (void *)gold->input_b;
+        pointers[y] = actual;
+        tigris_mem_t mem;
+        memset(&mem, 0, sizeof(mem));
+        mem.tensor_ptrs = pointers;
+        mem.num_tensors = test_header.num_tensors;
+        memset(actual, 85, sizeof(actual));
+        TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                       0, "elementwise reference runs");
+        for (uint32_t i = 0; i < gold->count; i++) {
+            if (actual[i] != gold->output[i])
+                fprintf(stderr, "    golden case %zu, element %u\n", c, i);
+            TEST_ASSERT_EQ(actual[i], gold->output[i], "TFLM reference byte");
+        }
+        memset(actual, 85, sizeof(actual));
+        mem.tile.active = 1;
+        mem.tile.in_h = 2;
+        mem.tile.out_h = 2;
+        mem.tile.in_w = 16;
+        mem.tile.out_w = 16;
+        mem.tile.in_row_start = 1;
+        mem.tile.out_row_start = 1;
+        TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                       0, "elementwise band runs");
+        for (uint32_t i = 0; i < gold->count; i++) {
+            int8_t expected = i >= 16u && i < 48u ? gold->output[i] : 85;
+            TEST_ASSERT_EQ(actual[i], expected, "band matches TFLM and preserves surrounding bytes");
+        }
+        mem.tile.active = 0;
+        if (gold->operation == TIGRIS_OP_RSQRT) {
+            int8_t invalid[256];
+            memcpy(invalid, gold->input_a, sizeof(invalid));
+            invalid[0] = (int8_t)(gold->zeros[0] - 1);
+            pointers[a] = invalid;
+            TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                        "negative reciprocal square root is rejected");
+            pointers[a] = (void *)gold->input_a;
+            test_qp[quant[2]].scale = 65536.0f;
+            TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                        "out-of-range reference right shift is rejected");
+        }
+        if (gold->operation == TIGRIS_OP_ABS || gold->operation == TIGRIS_OP_SQUARED_DIFFERENCE) {
+            test_qp[quant[2]].scale = 1.0e-20f;
+            TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                        "out-of-range reference multiplier is rejected");
+        }
+        if (gold->operation == TIGRIS_OP_ABS) {
+            test_qp[quant[2]].scale = gold->scales[0] / 16777216.0f;
+            TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                        "overflowing reference product is rejected");
+        }
+        test_qp[quant[2]].scale = gold->scales[2];
+        test_tensors[a].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                    "missing quantization is rejected");
+    }
+}
+
 /* Main */
 
 int main(void)
@@ -2298,6 +2387,7 @@ int main(void)
     test_concat_s8_height();
     test_depthwise_multiplier_s8();
     test_unsupported_op_s8();
+    test_elementwise_reference_goldens();
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);

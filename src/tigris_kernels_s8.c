@@ -1905,6 +1905,186 @@ static TIGRIS_KERNEL_NOINLINE int kern_layer_norm_s8(
     return 0;
 }
 
+static int32_t elementwise_shift_left(int32_t value, int shift)
+{
+    int64_t result = (int64_t)value * ((int64_t)1 << shift);
+    if (result > INT32_MAX) return INT32_MAX;
+    if (result < INT32_MIN) return INT32_MIN;
+    return (int32_t)result;
+}
+
+static int32_t elementwise_multiply(int32_t value, int32_t multiplier, int shift)
+{
+    int left = shift > 0 ? shift : 0;
+    int right = shift < 0 ? -shift : 0;
+    int32_t product = sat_round_dbl_high_mul(
+        elementwise_shift_left(value, left), multiplier);
+    if (right > 31) return 0;
+    uint32_t mask = ((uint32_t)1u << right) - 1u;
+    uint32_t remainder = (uint32_t)product & mask;
+    uint32_t threshold = (mask >> 1) + (product < 0 ? 1u : 0u);
+    return (int32_t)((int64_t)product >> right) + (remainder > threshold ? 1 : 0);
+}
+
+static int elementwise_multiplier(double scale, int32_t *multiplier, int *shift)
+{
+    if (!isfinite(scale) || scale < 0.0) return 0;
+    compute_quant_mult(scale, multiplier, shift);
+    if (*shift < -31) {
+        *shift = 0;
+        *multiplier = 0;
+    }
+    return *shift <= 30;
+}
+
+static int elementwise_requantize(
+    int32_t value, int32_t multiplier, int shift, int32_t zero, int8_t *output)
+{
+    /* Reject shifts and products outside the reference fixed-point domain. */
+    if (shift < -31 || shift > 30) return 0;
+    int left = shift > 0 ? shift : 0;
+    int64_t shifted = (int64_t)value * ((int64_t)1 << left);
+    if (shifted > INT32_MAX || shifted < INT32_MIN) return 0;
+    int32_t result = elementwise_multiply(value, multiplier, shift);
+    if (result > 127 - zero) *output = 127;
+    else if (result < -128 - zero) *output = -128;
+    else *output = (int8_t)(result + zero);
+    return 1;
+}
+
+static int elementwise_leading_zeros(uint32_t value)
+{
+    int count = 0;
+    if (value == 0u) return 32;
+    uint32_t remaining = value;
+    while ((remaining & 0x80000000u) == 0u) {
+        remaining <<= 1;
+        count++;
+    }
+    return count;
+}
+
+static int32_t elementwise_inverse_sqrt(int32_t value, int *output_shift)
+{
+    *output_shift = 0;
+    if (value <= 1) return INT32_MAX;
+    int pairs = (elementwise_leading_zeros((uint32_t)value) - 1) / 2 - 1;
+    int shift = 11 - pairs;
+    int32_t normalized = value * ((int32_t)1 << (2 * pairs));
+    int32_t half = round_div_by_pot(normalized >> 1, 1);
+    int32_t estimate = 268435456;
+    for (int step = 0; step < 5; step++) {
+        int32_t cube = sat_round_dbl_high_mul(
+            sat_round_dbl_high_mul(estimate, estimate), estimate);
+        cube = elementwise_shift_left(cube, 6);
+        int32_t next = sat_round_dbl_high_mul(402653184, estimate) -
+                       sat_round_dbl_high_mul(half, cube);
+        estimate = elementwise_shift_left(next, 3);
+    }
+    estimate = sat_round_dbl_high_mul(estimate, 1518500250);
+    if (shift < 0) return elementwise_shift_left(estimate, -shift);
+    *output_shift = -shift;
+    return estimate;
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_elementwise_unary_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const int8_t *input = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t *output = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    const tigris_quant_param_t *iq = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    const tigris_quant_param_t *oq = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    if (!input || !output || !iq || !oq || iq->scale <= 0.0f || oq->scale <= 0.0f)
+        return -1;
+    double scale = op->op_type == TIGRIS_OP_ABS
+        ? (double)(iq->scale / oq->scale)
+        : 1.0 / (double)(sqrtf(iq->scale) * oq->scale);
+    int32_t multiplier;
+    int shift;
+    if (!elementwise_multiplier(scale, &multiplier, &shift)) return -1;
+    uint32_t count = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_s8(plan, ins[0], mem, &input, &output);
+    for (uint32_t i = 0; i < count; i++) {
+        int32_t value = (int32_t)input[i] - iq->zero_point;
+        if (op->op_type == TIGRIS_OP_ABS) {
+            value = value < 0 ? -value : value;
+            if (iq->scale != oq->scale) {
+                if (!elementwise_requantize(value, multiplier, shift, oq->zero_point, &output[i]))
+                    return -1;
+                continue;
+            }
+        } else {
+            if (value < 0) return -1;
+            if (value == 0) {
+                output[i] = 127;
+                continue;
+            }
+            int inverse_shift;
+            int32_t inverse = elementwise_inverse_sqrt(value, &inverse_shift);
+            value = elementwise_multiply(1, inverse, inverse_shift + 20);
+            if (!elementwise_requantize(value, multiplier, shift - 20, oq->zero_point, &output[i]))
+                return -1;
+            continue;
+        }
+        output[i] = clamp_s8(value + oq->zero_point);
+    }
+    return 0;
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_elementwise_binary_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    uint32_t period;
+    if (!binary_s8_io_is_valid(plan, op, mem, &period)) return -1;
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    uint16_t out = tigris_op_outputs(plan, op)[0];
+    const tigris_quant_param_t *aq = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    const tigris_quant_param_t *bq = tigris_tensor_quant(plan, &plan->tensors[ins[1]]);
+    const tigris_quant_param_t *yq = tigris_tensor_quant(plan, &plan->tensors[out]);
+    if (!aq || !bq || !yq || aq->scale <= 0.0f || bq->scale <= 0.0f || yq->scale <= 0.0f)
+        return -1;
+    int32_t multipliers[3] = {0, 0, 0};
+    int shifts[3] = {0, 0, 0};
+    if (op->op_type == TIGRIS_OP_SQUARED_DIFFERENCE) {
+        double twice_max = 2.0 * (double)fmaxf(aq->scale, bq->scale);
+        if (!elementwise_multiplier((double)aq->scale / twice_max, &multipliers[0], &shifts[0]) ||
+            !elementwise_multiplier((double)bq->scale / twice_max, &multipliers[1], &shifts[1]) ||
+            !elementwise_multiplier(twice_max * twice_max / (double)(16384.0f * yq->scale),
+                                    &multipliers[2], &shifts[2]))
+            return -1;
+    } else if (aq->scale != bq->scale || aq->scale != yq->scale ||
+               aq->zero_point != bq->zero_point || aq->zero_point != yq->zero_point) {
+        return -1;
+    }
+    const int8_t *a = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    const int8_t *b = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[1]);
+    int8_t *y = (int8_t *)tigris_mem_tensor_ptr(mem, out);
+    uint32_t count = tile_aware_numel(plan, ins[0], mem);
+    if (mem->tile.active && period == 0u)
+        b += (size_t)mem->tile.in_row_start * tile_row_elems(plan, ins[0], mem);
+    apply_pointwise_row_offset_s8(plan, ins[0], mem, &a, &y);
+    for (uint32_t i = 0; i < count; i++) {
+        int32_t av = (int32_t)a[i];
+        int32_t bv = (int32_t)b[period ? i % period : i];
+        if (op->op_type == TIGRIS_OP_MAXIMUM || op->op_type == TIGRIS_OP_MINIMUM) {
+            int32_t result = op->op_type == TIGRIS_OP_MAXIMUM ? (av > bv ? av : bv) : (av < bv ? av : bv);
+            y[i] = (int8_t)result;
+            continue;
+        }
+        av -= aq->zero_point;
+        bv -= bq->zero_point;
+        av = elementwise_multiply(av * 128, multipliers[0], shifts[0]);
+        bv = elementwise_multiply(bv * 128, multipliers[1], shifts[1]);
+        int32_t difference = av - bv;
+        if (!elementwise_requantize(difference * difference, multipliers[2], shifts[2],
+                                    yq->zero_point, &y[i]))
+            return -1;
+    }
+    return 0;
+}
+
 /* HardSwish via a 256-entry LUT, mirroring kern_sigmoid_s8:
  * x * relu6(x + 3) / 6 on the dequantized input, requantized to the output. */
 static TIGRIS_KERNEL_NOINLINE int kern_hardswish_s8(
@@ -2305,6 +2485,11 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ERF:         return kern_erf_s8(plan, op, mem);
     case TIGRIS_OP_HARDSWISH:   return kern_hardswish_s8(plan, op, mem);
+    case TIGRIS_OP_ABS:        return kern_elementwise_unary_s8(plan, op, mem);
+    case TIGRIS_OP_RSQRT:      return kern_elementwise_unary_s8(plan, op, mem);
+    case TIGRIS_OP_SQUARED_DIFFERENCE: return kern_elementwise_binary_s8(plan, op, mem);
+    case TIGRIS_OP_MAXIMUM:    return kern_elementwise_binary_s8(plan, op, mem);
+    case TIGRIS_OP_MINIMUM:    return kern_elementwise_binary_s8(plan, op, mem);
     case TIGRIS_OP_RESIZE_LINEAR: return kern_resize_linear_s8(plan, op, mem);
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm_s8(plan, op, op_index, mem);
     case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean_s8(plan, op, op_index, mem);

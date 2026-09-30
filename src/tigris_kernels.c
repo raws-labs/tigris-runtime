@@ -446,6 +446,47 @@ static int kern_sigmoid(
     return 0;
 }
 
+static float elementwise_round(float value)
+{
+    float base = floorf(value);
+    float fraction = value - base;
+    if (fraction < 0.5f) return base;
+    if (fraction > 0.5f) return base + 1.0f;
+    return fmodf(base, 2.0f) == 0.0f ? base : base + 1.0f;
+}
+
+static int kern_elementwise_unary_f32(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *input = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float *output = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    uint32_t count = tile_aware_numel(plan, ins[0], mem);
+    if (!input || !output) return -1;
+    apply_pointwise_row_offset_f32(plan, ins[0], mem, &input, &output);
+    for (uint32_t i = 0; i < count; i++) {
+        float value = input[i];
+        switch (op->op_type) {
+        case TIGRIS_OP_ABS: value = fabsf(value); break;
+        case TIGRIS_OP_RSQRT: value = 1.0f / sqrtf(value); break;
+        case TIGRIS_OP_NEG: value = -value; break;
+        case TIGRIS_OP_EXP: value = expf(value); break;
+        case TIGRIS_OP_LOG: value = logf(value); break;
+        case TIGRIS_OP_SQRT: value = sqrtf(value); break;
+        case TIGRIS_OP_SQUARE: value *= value; break;
+        case TIGRIS_OP_FLOOR: value = floorf(value); break;
+        case TIGRIS_OP_CEIL: value = ceilf(value); break;
+        case TIGRIS_OP_ROUND: value = elementwise_round(value); break;
+        case TIGRIS_OP_SIN: value = sinf(value); break;
+        case TIGRIS_OP_COS: value = cosf(value); break;
+        default: return -1;
+        }
+        output[i] = value;
+    }
+    return 0;
+}
+
 /* HardSwish: x * relu6(x + 3) / 6. */
 static int kern_hardswish(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
@@ -677,6 +718,11 @@ static int kern_conv1d(
 #define BINARY_MUL 1
 #define BINARY_SUB 2
 #define BINARY_DIV 3
+#define BINARY_SQUARED_DIFFERENCE 4
+#define BINARY_MAXIMUM 5
+#define BINARY_MINIMUM 6
+#define BINARY_FLOOR_DIV 7
+#define BINARY_FLOOR_MOD 8
 
 static int kern_binary_f32(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem,
@@ -806,6 +852,17 @@ static int kern_binary_f32(
         case BINARY_MUL: v = A[i] * b; break;
         case BINARY_SUB: v = A[i] - b; break;
         case BINARY_DIV: v = A[i] / b; break;
+        case BINARY_SQUARED_DIFFERENCE: v = A[i] - b; v *= v; break;
+        case BINARY_MAXIMUM: v = A[i] < b ? b : A[i]; break;
+        case BINARY_MINIMUM: v = b < A[i] ? b : A[i]; break;
+        case BINARY_FLOOR_DIV:
+            if (b == 0.0f) return -1;
+            v = floorf(A[i] / b);
+            break;
+        case BINARY_FLOOR_MOD:
+            v = fmodf(A[i], b);
+            if (v != 0.0f && ((b < 0.0f) != (v < 0.0f))) v += b;
+            break;
         default:         v = A[i] + b; break;
         }
         Y[i] = apply_fused_act_f32(v, op->fused_act);
@@ -1724,6 +1781,24 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_MATMUL:      return kern_matmul(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ERF:         return kern_erf(plan, op, mem);
+    case TIGRIS_OP_ABS: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_RSQRT: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_NEG: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_EXP: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_LOG: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_SQRT: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_SQUARE: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_FLOOR: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_CEIL: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_ROUND: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_SIN: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_COS: return kern_elementwise_unary_f32(plan, op, mem);
+    case TIGRIS_OP_DIV: return kern_binary_f32(plan, op, mem, BINARY_DIV);
+    case TIGRIS_OP_SQUARED_DIFFERENCE: return kern_binary_f32(plan, op, mem, BINARY_SQUARED_DIFFERENCE);
+    case TIGRIS_OP_MAXIMUM: return kern_binary_f32(plan, op, mem, BINARY_MAXIMUM);
+    case TIGRIS_OP_MINIMUM: return kern_binary_f32(plan, op, mem, BINARY_MINIMUM);
+    case TIGRIS_OP_FLOOR_DIV: return kern_binary_f32(plan, op, mem, BINARY_FLOOR_DIV);
+    case TIGRIS_OP_FLOOR_MOD: return kern_binary_f32(plan, op, mem, BINARY_FLOOR_MOD);
     case TIGRIS_OP_HARDSWISH:   return kern_hardswish(plan, op, mem);
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm(plan, op, op_index, mem);
     case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean(plan, op, op_index, mem);

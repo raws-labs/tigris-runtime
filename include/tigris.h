@@ -158,6 +158,23 @@ typedef enum {
     TIGRIS_OP_SPLIT             = 35,
     TIGRIS_OP_RESIZE_LINEAR     = 36,  /* bilinear upsample */
     TIGRIS_OP_HARDSWISH         = 37,
+    TIGRIS_OP_ABS               = 38,
+    TIGRIS_OP_RSQRT             = 39,
+    TIGRIS_OP_SQUARED_DIFFERENCE = 40,
+    TIGRIS_OP_MAXIMUM           = 41,
+    TIGRIS_OP_MINIMUM           = 42,
+    TIGRIS_OP_NEG               = 43,
+    TIGRIS_OP_EXP               = 44,
+    TIGRIS_OP_LOG               = 45,
+    TIGRIS_OP_SQRT              = 46,
+    TIGRIS_OP_SQUARE            = 47,
+    TIGRIS_OP_FLOOR             = 48,
+    TIGRIS_OP_CEIL              = 49,
+    TIGRIS_OP_ROUND             = 50,
+    TIGRIS_OP_SIN               = 51,
+    TIGRIS_OP_COS               = 52,
+    TIGRIS_OP_FLOOR_DIV         = 53,
+    TIGRIS_OP_FLOOR_MOD         = 54,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

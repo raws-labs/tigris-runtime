@@ -16,6 +16,7 @@
 #include "tigris.h"
 #include "tigris_mem.h"
 #include "tigris_kernels.h"
+#include "elementwise_f32_golden.h"
 
 /* Test infrastructure */
 
@@ -2956,6 +2957,76 @@ static void test_split(void)
 }
 
 
+static void test_elementwise_reference_goldens(void)
+{
+    printf("  test_elementwise_reference_goldens...\n");
+    for (size_t c = 0; c < sizeof(elementwise_float_goldens) / sizeof(elementwise_float_goldens[0]); c++) {
+        const elementwise_float_golden_t *gold = &elementwise_float_goldens[c];
+        int32_t shape[] = {1, 4, 4, 1};
+        tigris_tensor_t tensors[3];
+        memset(tensors, 0, sizeof(tensors));
+        for (int i = 0; i < 3; i++) {
+            tensors[i].ndim = 4;
+            tensors[i].dtype = 1;
+            tensors[i].size_bytes = sizeof(gold->a);
+        }
+        uint16_t indices[] = {0, 1, 2};
+        tigris_op_t op;
+        memset(&op, 0, sizeof(op));
+        op.op_type = gold->operation;
+        op.num_inputs = gold->inputs;
+        op.num_outputs = 1;
+        op.outputs_off = 2;
+        op.weight_idx = TIGRIS_NO_WEIGHT;
+        op.bias_idx = TIGRIS_NO_WEIGHT;
+        tigris_file_header_t header;
+        memset(&header, 0, sizeof(header));
+        header.num_tensors = 3;
+        header.num_ops = 1;
+        tigris_plan_t plan;
+        memset(&plan, 0, sizeof(plan));
+        plan.header = &header;
+        plan.tensors = tensors;
+        plan.ops = &op;
+        plan.index_pool = indices;
+        plan.shape_pool = shape;
+        float actual[16];
+        void *pointers[] = {(void *)gold->a, (void *)gold->b, actual};
+        tigris_mem_t mem;
+        memset(&mem, 0, sizeof(mem));
+        mem.tensor_ptrs = pointers;
+        mem.num_tensors = 3;
+        TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                    "elementwise float reference runs");
+        for (int i = 0; i < 16; i++) {
+            TEST_ASSERT(isfinite(actual[i]), "finite reference result");
+            TEST_ASSERT_NEAR(actual[i], gold->y[i], EPS, "TFLM float reference");
+        }
+        for (int i = 0; i < 16; i++) actual[i] = 85.0f;
+        mem.tile.active = 1;
+        mem.tile.in_h = 2;
+        mem.tile.out_h = 2;
+        mem.tile.in_w = 4;
+        mem.tile.out_w = 4;
+        mem.tile.in_row_start = 1;
+        mem.tile.out_row_start = 1;
+        TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                    "elementwise float band runs");
+        for (int i = 0; i < 16; i++) {
+            float expected = i >= 4 && i < 12 ? gold->y[i] : 85.0f;
+            TEST_ASSERT_NEAR(actual[i], expected, EPS, "band preserves surrounding elements");
+        }
+        if (gold->operation == TIGRIS_OP_FLOOR_DIV) {
+            float denominator[16];
+            memcpy(denominator, gold->b, sizeof(denominator));
+            denominator[4] = 0.0f;
+            pointers[1] = denominator;
+            TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0,
+                        "floor division rejects a zero denominator");
+        }
+    }
+}
+
 int main(void)
 {
     printf("TiGrIS Kernel Tests\n\n");
@@ -2979,6 +3050,7 @@ int main(void)
     test_concat();
     test_concat_last_axis_variants();
     test_hardswish();
+    test_elementwise_reference_goldens();
     test_per_channel_mul();
     test_resize_nearest();
     test_resize_linear();

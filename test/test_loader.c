@@ -1844,6 +1844,94 @@ static void build_semantic_plan(
     buf[SEMANTIC_STRINGS_OFF] = '\0';
 }
 
+#define ELEMENTWISE_QUANT_OFF 300u
+#define ELEMENTWISE_PLAN_SIZE 376u
+
+static void build_elementwise_quant_plan(
+    uint8_t *buf, tigris_op_type_t type, uint8_t inputs)
+{
+    memset(buf, 0, ELEMENTWISE_PLAN_SIZE);
+    build_semantic_plan(buf, type, inputs);
+    memmove(buf + SEMANTIC_TENSORS_OFF + 8u, buf + SEMANTIC_TENSORS_OFF,
+            SEMANTIC_PLAN_SIZE - SEMANTIC_TENSORS_OFF);
+    tigris_file_header_t *header = (tigris_file_header_t *)buf;
+    header->file_size = ELEMENTWISE_PLAN_SIZE;
+    header->num_quant_params = 3;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
+    for (int i = 0; i < 6; i++) dir[i].offset += 8u;
+    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, ELEMENTWISE_QUANT_OFF};
+    uint16_t *quant_header = (uint16_t *)(buf + ELEMENTWISE_QUANT_OFF);
+    quant_header[0] = 3;
+    quant_header[1] = 1;
+    tigris_quant_param_t *quant = (tigris_quant_param_t *)(buf + ELEMENTWISE_QUANT_OFF + 4u);
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + 8u);
+    for (uint16_t i = 0; i < 3; i++) {
+        tensors[i].dtype = 3;
+        tensors[i].size_bytes /= sizeof(float);
+        tensors[i].quant_param_idx = i;
+        quant[i].scale = 0.125f;
+        quant[i].zero_point = -17;
+        quant[i].num_channels = 1;
+        quant[i].shift_off = 1;
+    }
+    tigris_op_t *op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF + 8u);
+    op->act_min = -128;
+    op->act_max = 127;
+}
+
+static void test_elementwise_semantics(void)
+{
+    static const tigris_op_type_t kinds[] = {
+        TIGRIS_OP_ABS, TIGRIS_OP_RSQRT, TIGRIS_OP_NEG, TIGRIS_OP_EXP,
+        TIGRIS_OP_LOG, TIGRIS_OP_SQRT, TIGRIS_OP_SQUARE, TIGRIS_OP_FLOOR,
+        TIGRIS_OP_CEIL, TIGRIS_OP_ROUND, TIGRIS_OP_SIN, TIGRIS_OP_COS,
+        TIGRIS_OP_DIV, TIGRIS_OP_SQUARED_DIFFERENCE, TIGRIS_OP_MAXIMUM,
+        TIGRIS_OP_MINIMUM, TIGRIS_OP_FLOOR_DIV, TIGRIS_OP_FLOOR_MOD,
+    };
+    _Alignas(4) uint8_t buf[ELEMENTWISE_PLAN_SIZE];
+    tigris_plan_t plan;
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        uint8_t inputs = i < 12u ? 1u : 2u;
+        build_semantic_plan(buf, kinds[i], inputs);
+        TEST_ASSERT_EQ(tigris_plan_load(buf, SEMANTIC_PLAN_SIZE, &plan), TIGRIS_OK,
+                       "elementwise float plan loads");
+        semantic_set_shape(buf, 1, 4, 1, 1, 4, 2);
+        TEST_ASSERT_EQ(tigris_plan_load(buf, SEMANTIC_PLAN_SIZE, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "elementwise mismatched shape rejected");
+        build_semantic_plan(buf, kinds[i], inputs == 1u ? 2u : 1u);
+        TEST_ASSERT_EQ(tigris_plan_load(buf, SEMANTIC_PLAN_SIZE, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "elementwise wrong arity rejected");
+
+        build_elementwise_quant_plan(buf, kinds[i], inputs);
+        int quantized = kinds[i] == TIGRIS_OP_ABS || kinds[i] == TIGRIS_OP_RSQRT ||
+            kinds[i] == TIGRIS_OP_SQUARED_DIFFERENCE || kinds[i] == TIGRIS_OP_MAXIMUM ||
+            kinds[i] == TIGRIS_OP_MINIMUM;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                       quantized ? TIGRIS_OK : TIGRIS_ERR_BAD_OPERATOR,
+                       "elementwise int8 capability checked");
+        if (!quantized) continue;
+        tigris_quant_param_t *quant = (tigris_quant_param_t *)(buf + ELEMENTWISE_QUANT_OFF + 4u);
+        quant[0].num_channels = 2;
+        quant[0].shift_off = 2;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "elementwise per-channel quantization rejected");
+        quant[0].num_channels = 1;
+        if (kinds[i] == TIGRIS_OP_MAXIMUM || kinds[i] == TIGRIS_OP_MINIMUM) {
+            quant[2].scale = 0.25f;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "comparison quantization mismatch rejected");
+            quant[2].scale = 0.125f;
+            quant[1].zero_point++;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "comparison zero point mismatch rejected");
+        }
+        tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + 8u);
+        tensors[0].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "elementwise missing quantization rejected");
+    }
+}
+
 static void test_nonweighted_operator_semantics(void)
 {
     printf("  test_nonweighted_operator_semantics...\n");
@@ -2788,6 +2876,7 @@ int main(int argc, char *argv[])
     test_rank4_row_band_contract();
     test_operator_semantic_guards();
     test_nonweighted_operator_semantics();
+    test_elementwise_semantics();
     test_convolution_semantic_guards();
     test_conv_transpose_semantic_guards();
     test_conv_transpose_quant_channels_guard();

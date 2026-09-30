@@ -114,7 +114,7 @@ run_coverage() {
         -DCMAKE_C_FLAGS="-O0 -g --coverage" \
         -DCMAKE_EXE_LINKER_FLAGS="--coverage" >/dev/null
   cmake --build build-coverage --parallel >/dev/null
-  ctest --test-dir build-coverage --output-on-failure >/dev/null
+  ctest --test-dir build-coverage --output-on-failure >/dev/null || return 1
   python3 scripts/check_coverage.py --gcov "$COVERAGE_GCOV" build-coverage
 }
 if have "$COVERAGE_CC" && have "$COVERAGE_GCOV" && have cmake; then

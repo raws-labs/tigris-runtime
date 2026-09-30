@@ -690,6 +690,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_depthwise_conv2d_s8(
     int IH = x_shape[1];
     int IW = x_shape[2];
     int C  = x_shape[3];
+    int OC = y_shape[3];
+    int M  = OC / C;
     int OH = y_shape[1];
     int OW = y_shape[2];
     int KH = op->spatial.kernel_h;
@@ -718,7 +720,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_depthwise_conv2d_s8(
         in_row_start  = mem->tile.in_row_start;
     }
 
-    /* Weight layout: [KH, KW, C] (HWC) */
+    /* Output channel oc reads input channel oc / M, M the channel multiplier.
+     * Weight layout: [KH, KW, OC] (HWC) */
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
@@ -729,19 +732,20 @@ static TIGRIS_KERNEL_NOINLINE int kern_depthwise_conv2d_s8(
                 int base_w = ow * SW - PL;
                 int kw0, kw1;
                 tap_range(base_w, IW, KW, DW, &kw0, &kw1);
-                for (int c = 0; c < C; c++) {
-                    int32_t acc = B ? load_bias_s32(B, (uint32_t)c) : 0;
+                for (int oc = 0; oc < OC; oc++) {
+                    int c = oc / M;
+                    int32_t acc = B ? load_bias_s32(B, (uint32_t)oc) : 0;
                     for (int kh = kh0; kh < kh1; kh++) {
                         int ih = base_h + kh * DH;
                         for (int kw = kw0; kw < kw1; kw++) {
                             int iw = base_w + kw * DW;
                             int32_t x_val = (int32_t)X[((n*IH+ih)*IW+iw)*C+c] - input_zp;
-                            int32_t w_val = (int32_t)W[(kh*KW+kw)*C+c];
+                            int32_t w_val = (int32_t)W[(kh*KW+kw)*OC+oc];
                             acc += x_val * w_val;
                         }
                     }
-                    int32_t scaled = requant_apply(&rq, acc, c);
-                    Y[((n*OH+oh_g)*OW+ow)*C+c] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
+                    int32_t scaled = requant_apply(&rq, acc, oc);
+                    Y[((n*OH+oh_g)*OW+ow)*OC+oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
                 }
             }
         }
@@ -1135,16 +1139,25 @@ static TIGRIS_KERNEL_NOINLINE int kern_split_s8(
     const uint16_t *ins  = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
     const uint8_t *source = (const uint8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    if (source == NULL)
+    const tigris_tensor_t *input = &plan->tensors[ins[0]];
+    const int32_t *in_shape = tigris_tensor_shape(plan, input);
+    if (source == NULL || op->spatial.kernel_h >= input->ndim)
         return -1;
+    /* Each part is one run per position ahead of the split axis. */
+    uint32_t positions = 1;
+    for (uint32_t axis = 0; axis < op->spatial.kernel_h; axis++)
+        positions *= (uint32_t)in_shape[axis];
+    uint32_t stride = input->size_bytes / positions;
     uint32_t offset = 0;
     for (uint8_t i = 0; i < op->num_outputs; i++) {
         const tigris_tensor_t *part = &plan->tensors[outs[i]];
-        void *destination = tigris_mem_tensor_ptr(mem, outs[i]);
+        uint8_t *destination = (uint8_t *)tigris_mem_tensor_ptr(mem, outs[i]);
+        uint32_t run = part->size_bytes / positions;
         if (destination == NULL)
             return -1;
-        memcpy(destination, source + offset, part->size_bytes);
-        offset += part->size_bytes;
+        for (uint32_t q = 0; q < positions; q++)
+            memcpy(destination + (size_t)q * run, source + (size_t)q * stride + offset, run);
+        offset += run;
     }
     return 0;
 }
@@ -1471,25 +1484,31 @@ static TIGRIS_KERNEL_NOINLINE int kern_concat_s8(
 
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
 
-    /* Concat along the last stored axis; see kern_concat for the shape of it.
-     * Rank 4 is an image's channel axis, rank 3 a sequence's feature axis. */
+    /* Concat along one stored axis; see kern_concat for the shape of it. */
     uint8_t rank = plan->tensors[outs[0]].ndim;
-    int positions = y_shape[0];
+    uint8_t axis = (rank == 4u && op->spatial.kernel_h == 0)
+                 ? 3u : (uint8_t)op->spatial.kernel_h;
+    int positions = 1;
+    int inner = 1;
     int out_c_offset = 0;
-    int total_OC = y_shape[rank - 1u];
 
     /* A constant operand carries no scale or zero point in the plan, so an
      * int8 concatenation cannot place one. The compiler keeps these float. */
     if (op->weight_idx != TIGRIS_NO_WEIGHT)
         return -1;
 
-    if (rank == 4u) {
-        int H = mem->tile.active ? mem->tile.out_h : y_shape[1];
-        int W = mem->tile.active ? mem->tile.out_w : y_shape[2];
-        positions *= H * W;
-    } else {
-        positions *= mem->tile.active ? mem->tile.out_h : y_shape[1];
+    if (axis == 0u || axis >= rank || (mem->tile.active && axis != rank - 1u))
+        return -1;
+    for (uint8_t j = 0; j < axis; j++)
+        positions *= y_shape[j];
+    for (uint8_t j = (uint8_t)(axis + 1u); j < rank; j++)
+        inner *= y_shape[j];
+    if (mem->tile.active) {
+        positions = y_shape[0] * mem->tile.out_h;
+        if (rank == 4u)
+            positions *= mem->tile.out_w;
     }
+    int total_OC = y_shape[axis] * inner;
 
     const tigris_quant_param_t *qp_y =
         tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
@@ -1499,7 +1518,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_concat_s8(
     for (int i = 0; i < op->num_inputs; i++) {
         const int8_t *Xi = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[i]);
         const int32_t *xi_shape = tigris_tensor_shape(plan, &plan->tensors[ins[i]]);
-        int Ci = xi_shape[rank - 1u];
+        int Ci = xi_shape[axis] * inner;
 
         const tigris_quant_param_t *qp_i =
             tigris_tensor_quant(plan, &plan->tensors[ins[i]]);
@@ -1594,11 +1613,26 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_nearest_s8(
     return 0;
 }
 
+/* One axis of TFLite's integer bilinear coordinate (reference_ops.h,
+ * ComputeInterpolationValuesInteger): the source position in 1/1024 steps
+ * and the two rows or columns it lies between. */
+static void resize_linear_position_s8(int32_t out_index, int32_t scale_10, int half_pixel,
+                                      int32_t in_size, int32_t *pos, int32_t *lo, int32_t *hi)
+{
+    *pos = half_pixel ? out_index * scale_10 + scale_10 / 2 - (1 << 9)
+                      : out_index * scale_10;
+    *lo = (*pos / (1 << 10) > 0) ? *pos / (1 << 10) : 0;
+    *hi = ((*pos + (1 << 10) - 1) / (1 << 10) < in_size - 1)
+        ? (*pos + (1 << 10) - 1) / (1 << 10) : in_size - 1;
+}
+
 /* Bilinear upsample by an integer factor, int8. Mirrors kern_resize_linear:
  * the same source coordinate (half-pixel, or asymmetric when kernel_h is 1)
- * and the same tile origins. The four samples are dequantized, mixed, and the
- * result requantized to the output, which is what a quantized graph that
- * dequantizes, resizes and quantizes again computes. */
+ * and the same tile origins. With matching input and output quantization it
+ * is TFLite's integer kernel (ResizeBilinearInteger): 10-bit coordinates,
+ * raw int8 samples, one rounding at 2^20. Otherwise the four samples are
+ * dequantized, mixed, and requantized to the output, which is what a
+ * quantized graph that dequantizes, resizes and quantizes again computes. */
 static TIGRIS_KERNEL_NOINLINE int kern_resize_linear_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -1632,6 +1666,12 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_linear_s8(
     float in_zp = (float)in_qp->zero_point;
     float inv_out = 1.0f / out_qp->scale;
     int32_t out_zp = out_qp->zero_point;
+    int integer = in_qp->scale == out_qp->scale && in_qp->zero_point == out_qp->zero_point;
+    int half_pixel = op->spatial.kernel_h != 1;
+    int32_t scale_h_10 = ((1 << 10) * IH + OH / 2) / OH;
+    int32_t scale_w_10 = ((1 << 10) * IW + OW / 2) / OW;
+    int32_t full_ih = IH;
+    int32_t full_iw = IW;
     if (mem->tile.active) {
         IH = mem->tile.in_h;
         OH = mem->tile.out_h;
@@ -1639,6 +1679,40 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_linear_s8(
         OW = mem->tile.out_w;
         out_origin = mem->tile.out_row_origin;
         in_origin = mem->tile.in_row_origin;
+    }
+
+    if (integer) {
+        for (int n = 0; n < N; n++) {
+            for (int oh = 0; oh < OH; oh++) {
+                int32_t py, gy0, gy1;
+                resize_linear_position_s8(oh + out_origin, scale_h_10, half_pixel, full_ih,
+                                          &py, &gy0, &gy1);
+                int32_t y0 = gy0 - in_origin;
+                int32_t y1 = gy1 - in_origin;
+                if (y0 < 0 || y1 > IH - 1)
+                    return -1;
+                int32_t dy = py - (1 << 10) * gy0;
+                for (int ow = 0; ow < OW; ow++) {
+                    int32_t px, x0, x1;
+                    resize_linear_position_s8(ow, scale_w_10, half_pixel, full_iw, &px, &x0, &x1);
+                    int32_t dx = px - (1 << 10) * x0;
+                    const int8_t *r0 = X + ((size_t)(n * IH + y0) * (size_t)IW) * (size_t)C;
+                    const int8_t *r1 = X + ((size_t)(n * IH + y1) * (size_t)IW) * (size_t)C;
+                    int8_t *dst = Y + ((size_t)(n * OH + oh) * (size_t)OW + (size_t)ow) *
+                                  (size_t)C;
+                    for (int c = 0; c < C; c++) {
+                        int64_t sum =
+                            (int64_t)r0[(size_t)x0 * C + c] * (int64_t)(((1 << 10) - dy) * ((1 << 10) - dx)) +
+                            (int64_t)r1[(size_t)x0 * C + c] * (int64_t)(dy * ((1 << 10) - dx)) +
+                            (int64_t)r0[(size_t)x1 * C + c] * (int64_t)(((1 << 10) - dy) * dx) +
+                            (int64_t)r1[(size_t)x1 * C + c] * (int64_t)(dy * dx);
+                        int64_t half = (sum > 0) ? (1 << 19) : -(1 << 19);
+                        dst[c] = clamp_s8((int32_t)((sum + half) / (1 << 20)));
+                    }
+                }
+            }
+        }
+        return 0;
     }
 
     for (int n = 0; n < N; n++) {
@@ -2162,7 +2236,12 @@ static TIGRIS_KERNEL_NOINLINE int kern_mul_s8(
     float sy = qp_y ? qp_y->scale : 1.0f;
     int32_t zy = qp_y ? qp_y->zero_point : 0;
 
-    float combined_scale = (sa * sb) / sy;
+    /* TFLite-exact quantized Mul (reference/integer_ops/mul.h): the integer
+     * product of the offset operands, requantized by one fixed-point multiplier
+     * derived in double from the three scales as TFLite's Prepare does. */
+    int32_t y_mult;
+    int y_shift;
+    compute_quant_mult((double)sa * (double)sb / (double)sy, &y_mult, &y_shift);
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
     if (mem->tile.active) {
@@ -2173,11 +2252,12 @@ static TIGRIS_KERNEL_NOINLINE int kern_mul_s8(
         Y += (size_t)mem->tile.out_row_start * row_elems;
     }
     for (uint32_t i = 0; i < n; i++) {
-        float real_prod = (float)((int32_t)A[i] - za) *
-                          (float)((int32_t)B_ptr[b_period ? i % b_period : i] - zb) *
-                          combined_scale;
-        int32_t q = (int32_t)roundf(real_prod) + zy;
-        Y[i] = clamp_s8(q);
+        int32_t product = ((int32_t)A[i] - za) *
+                          ((int32_t)B_ptr[b_period ? i % b_period : i] - zb);
+        int32_t q = multiply_by_quantized_multiplier(product, y_mult, y_shift) + zy;
+        Y[i] = (op->fused_act == TIGRIS_ACT_NONE)
+             ? clamp_s8(q)
+             : clamp_act(q, op->act_min, op->act_max);
     }
     return 0;
 }
@@ -2241,6 +2321,14 @@ int tigris_dispatch_kernel_s8(
 static uint16_t effective_dilation(uint16_t dilation)
 {
     return dilation ? dilation : 1u;
+}
+
+static int32_t depthwise_multiplier(const tigris_plan_t *plan, const tigris_op_t *op)
+{
+    const tigris_tensor_t *x = &plan->tensors[tigris_op_inputs(plan, op)[0]];
+    const tigris_tensor_t *y = &plan->tensors[tigris_op_outputs(plan, op)[0]];
+    int32_t c = tigris_tensor_shape(plan, x)[3];
+    return c > 0 ? tigris_tensor_shape(plan, y)[3] / c : 0;
 }
 
 static int is_conv_or_depthwise(const tigris_op_t *op)
@@ -2394,6 +2482,12 @@ tigris_accel_route_t tigris_accel_pre_route(
     if (backend == TIGRIS_ACCEL_ESP_NN && is_conv_or_depthwise(op) &&
         (effective_dilation(op->spatial.dilation_h) != 1u ||
          effective_dilation(op->spatial.dilation_w) != 1u))
+        return TIGRIS_ACCEL_ROUTE_S8_REF;
+
+    /* Both adapters pass a channel multiplier of 1. */
+    if ((backend == TIGRIS_ACCEL_ESP_NN || backend == TIGRIS_ACCEL_CMSIS_NN) &&
+        op && op->op_type == TIGRIS_OP_DEPTHWISE && plan &&
+        depthwise_multiplier(plan, op) != 1)
         return TIGRIS_ACCEL_ROUTE_S8_REF;
 
     return TIGRIS_ACCEL_ROUTE_ADAPTER;

@@ -2121,6 +2121,143 @@ static void test_split_s8(void)
                 "split_s8 without a source is refused");
 }
 
+/* One-operator plan with the given tensors, for the tests below. */
+static void one_op_s8(tigris_plan_t *plan, uint8_t type, const uint16_t *ins, int n_in,
+                      const uint16_t *outs, int n_out, uint16_t weight)
+{
+    test_ops[0].op_type = type;
+    test_ops[0].num_inputs = (uint8_t)n_in; test_ops[0].num_outputs = (uint8_t)n_out;
+    test_ops[0].inputs_off = add_indices(ins, n_in);
+    test_ops[0].outputs_off = add_indices(outs, n_out);
+    test_ops[0].weight_idx = weight;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].act_min = -128; test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+    build_plan(plan);
+}
+
+/* Operand pairs where TFLite's fixed-point product and a float product
+ * rounded once differ by one step; expected values follow TFLite's
+ * MultiplyByQuantizedMultiplier. */
+static void test_mul_s8_tflite_rounding(void)
+{
+    printf("  test_mul_s8_tflite_rounding...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    int32_t shape[] = {1, 4};
+    uint16_t t_a = add_tensor(&plan, "a", shape, 2, 3, 4, add_quant_param(0.0235f, -3, 1, NULL, NULL));
+    uint16_t t_b = add_tensor(&plan, "b", shape, 2, 3, 4, add_quant_param(0.0173f, 5, 1, NULL, NULL));
+    uint16_t t_y = add_tensor(&plan, "y", shape, 2, 3, 4, add_quant_param(0.0311f, -7, 1, NULL, NULL));
+    uint16_t ins[] = {t_a, t_b}, outs[] = {t_y};
+    one_op_s8(&plan, TIGRIS_OP_MUL, ins, 2, outs, 1, TIGRIS_NO_WEIGHT);
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    const int8_t a[] = {-126, -126, -125, -125}, b[] = {-32, 42, -53, 63};
+    const int8_t expected[] = {53, -67, 86, -100};
+    tigris_mem_alloc_fast(&mem, t_a, 4); memcpy(ptrs[t_a], a, 4);
+    tigris_mem_alloc_fast(&mem, t_b, 4); memcpy(ptrs[t_b], b, 4);
+    tigris_mem_alloc_fast(&mem, t_y, 4);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0, "mul_s8 runs");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], expected[i], "mul_s8 rounds like TFLite");
+}
+
+/* A split along the inner axis of [2, 3] into [2, 1] and [2, 2]: one run per
+ * row from each part. */
+static void test_split_s8_inner_axis(void)
+{
+    printf("  test_split_s8_inner_axis...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t qp = add_quant_param(0.25f, -3, 1, NULL, NULL);
+    int32_t whole[] = {2, 3}, narrow[] = {2, 1}, wide[] = {2, 2};
+    uint16_t t_in = add_tensor(&plan, "x", whole, 2, 3, 6, qp);
+    uint16_t t_a = add_tensor(&plan, "a", narrow, 2, 3, 2, qp);
+    uint16_t t_b = add_tensor(&plan, "b", wide, 2, 3, 4, qp);
+    uint16_t ins[] = {t_in}, outs[] = {t_a, t_b};
+    one_op_s8(&plan, TIGRIS_OP_SPLIT, ins, 1, outs, 2, TIGRIS_NO_WEIGHT);
+    test_ops[0].spatial.kernel_h = 1;
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    const int8_t values[] = {1, 2, 3, 4, 5, 6};
+    tigris_mem_alloc_fast(&mem, t_in, 6); memcpy(ptrs[t_in], values, 6);
+    tigris_mem_alloc_fast(&mem, t_a, 2);
+    tigris_mem_alloc_fast(&mem, t_b, 4);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0, "inner split runs");
+    const int8_t first[] = {1, 4}, second[] = {2, 3, 5, 6};
+    for (int i = 0; i < 2; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_a])[i], first[i], "inner split part 0");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_b])[i], second[i], "inner split part 1");
+    test_ops[0].spatial.kernel_h = 2;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "split past the last axis is refused");
+}
+
+/* NHWC [1,1,2,2] and [1,2,2,2] joined along height; the second input is
+ * quantized differently and is requantized on the way. */
+static void test_concat_s8_height(void)
+{
+    printf("  test_concat_s8_height...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t out_qp = add_quant_param(0.25f, 0, 1, NULL, NULL);
+    int32_t top[] = {1, 1, 2, 2}, bottom[] = {1, 2, 2, 2}, whole[] = {1, 3, 2, 2};
+    uint16_t t_a = add_tensor(&plan, "a", top, 4, 3, 4, out_qp);
+    uint16_t t_b = add_tensor(&plan, "b", bottom, 4, 3, 8, add_quant_param(0.5f, 0, 1, NULL, NULL));
+    uint16_t t_y = add_tensor(&plan, "y", whole, 4, 3, 12, out_qp);
+    uint16_t ins[] = {t_a, t_b}, outs[] = {t_y};
+    one_op_s8(&plan, TIGRIS_OP_CONCAT, ins, 2, outs, 1, TIGRIS_NO_WEIGHT);
+    test_ops[0].spatial.kernel_h = 1;
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    const int8_t a[] = {1, 2, 3, 4}, b[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const int8_t expected[] = {1, 2, 3, 4, 2, 4, 6, 8, 10, 12, 14, 16};
+    tigris_mem_alloc_fast(&mem, t_a, 4); memcpy(ptrs[t_a], a, 4);
+    tigris_mem_alloc_fast(&mem, t_b, 8); memcpy(ptrs[t_b], b, 8);
+    tigris_mem_alloc_fast(&mem, t_y, 12);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0, "height concat runs");
+    for (int i = 0; i < 12; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], expected[i], "height concat value");
+    mem.tile.active = 1; mem.tile.out_h = 1; mem.tile.out_w = 2;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "a tile across the joined axis is refused");
+}
+
+/* One input channel, two filters of 1x1: output channel oc reads channel
+ * oc / 2. The requantization is the identity. */
+static void test_depthwise_multiplier_s8(void)
+{
+    printf("  test_depthwise_multiplier_s8...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    const int32_t mult[] = {1 << 30}, shift[] = {1};
+    int32_t in_shape[] = {1, 1, 2, 1}, out_shape[] = {1, 1, 2, 2};
+    uint16_t t_x = add_tensor(&plan, "x", in_shape, 4, 3, 2, add_quant_param(1.0f, 0, 1, NULL, NULL));
+    uint16_t t_y = add_tensor(&plan, "y", out_shape, 4, 3, 4, add_quant_param(1.0f, 0, 1, mult, shift));
+    const int8_t weights[] = {2, -1};
+    uint16_t ins[] = {t_x}, outs[] = {t_y};
+    one_op_s8(&plan, TIGRIS_OP_DEPTHWISE, ins, 1, outs, 1, add_weight(weights, 2, "w"));
+    test_ops[0].spatial.kernel_h = 1; test_ops[0].spatial.kernel_w = 1;
+    test_ops[0].spatial.stride_h = 1; test_ops[0].spatial.stride_w = 1;
+    test_ops[0].spatial.group = 1;
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    const int8_t x[] = {3, -2};
+    const int8_t expected[] = {6, -3, -4, 2};
+    tigris_mem_alloc_fast(&mem, t_x, 2); memcpy(ptrs[t_x], x, 2);
+    tigris_mem_alloc_fast(&mem, t_y, 4);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "depthwise multiplier runs");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], expected[i], "depthwise multiplier value");
+}
+
 /* Main */
 
 int main(void)
@@ -2156,6 +2293,10 @@ int main(void)
     test_reduce_mean_s8();
     test_binary_requant_is_read_from_the_plan();
     test_split_s8();
+    test_mul_s8_tflite_rounding();
+    test_split_s8_inner_axis();
+    test_concat_s8_height();
+    test_depthwise_multiplier_s8();
     test_unsupported_op_s8();
 
     printf("\nResults: %d passed, %d failed, %d total\n",

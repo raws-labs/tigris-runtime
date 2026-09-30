@@ -338,6 +338,8 @@ static int kern_depthwise_conv2d(
     int IH = x_shape[1];
     int IW = x_shape[2];
     int C  = x_shape[3];
+    int OC = y_shape[3];
+    int M  = OC / C;
     int OH = y_shape[1];
     int OW = y_shape[2];
     int KH = op->spatial.kernel_h;
@@ -367,8 +369,9 @@ static int kern_depthwise_conv2d(
         in_row_start  = mem->tile.in_row_start;
     }
 
-    /* Depthwise: group == C, each channel convolved independently.
-     * Weight layout: [KH, KW, C] (HWC) */
+    /* Depthwise: group == C, each input channel convolved independently by
+     * M filters; output channel oc reads input channel oc / M.
+     * Weight layout: [KH, KW, OC] (HWC) */
     for (int n = 0; n < N; n++) {
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
@@ -379,18 +382,19 @@ static int kern_depthwise_conv2d(
                 int base_w = ow * SW - PL;
                 int kw0, kw1;
                 tap_range(base_w, IW, KW, DW, &kw0, &kw1);
-                for (int c = 0; c < C; c++) {
-                    float sum = B ? B[c] : 0.0f;
+                for (int oc = 0; oc < OC; oc++) {
+                    int c = oc / M;
+                    float sum = B ? B[oc] : 0.0f;
                     for (int kh = kh0; kh < kh1; kh++) {
                         int ih = base_h + kh * DH;
                         for (int kw = kw0; kw < kw1; kw++) {
                             int iw = base_w + kw * DW;
                             float x_val = X[((n * IH + ih) * IW + iw) * C + c];
-                            float w_val = W[(kh * KW + kw) * C + c];
+                            float w_val = W[(kh * KW + kw) * OC + oc];
                             sum += x_val * w_val;
                         }
                     }
-                    Y[((n * OH + oh_g) * OW + ow) * C + c] = apply_fused_act_f32(sum, op->fused_act);
+                    Y[((n * OH + oh_g) * OW + ow) * OC + oc] = apply_fused_act_f32(sum, op->fused_act);
                 }
             }
         }
@@ -949,16 +953,25 @@ static int kern_split(
     const uint16_t *ins  = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
     const uint8_t *source = (const uint8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    if (source == NULL)
+    const tigris_tensor_t *input = &plan->tensors[ins[0]];
+    const int32_t *in_shape = tigris_tensor_shape(plan, input);
+    if (source == NULL || op->spatial.kernel_h >= input->ndim)
         return -1;
+    /* Each part is one run per position ahead of the split axis. */
+    uint32_t positions = 1;
+    for (uint32_t axis = 0; axis < op->spatial.kernel_h; axis++)
+        positions *= (uint32_t)in_shape[axis];
+    uint32_t stride = input->size_bytes / positions;
     uint32_t offset = 0;
     for (uint8_t i = 0; i < op->num_outputs; i++) {
         const tigris_tensor_t *part = &plan->tensors[outs[i]];
-        void *destination = tigris_mem_tensor_ptr(mem, outs[i]);
+        uint8_t *destination = (uint8_t *)tigris_mem_tensor_ptr(mem, outs[i]);
+        uint32_t run = part->size_bytes / positions;
         if (destination == NULL)
             return -1;
-        memcpy(destination, source + offset, part->size_bytes);
-        offset += part->size_bytes;
+        for (uint32_t q = 0; q < positions; q++)
+            memcpy(destination + (size_t)q * run, source + (size_t)q * stride + offset, run);
+        offset += run;
     }
     return 0;
 }
@@ -1270,22 +1283,31 @@ static int kern_concat(
 
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
 
-    /* Concat along the last stored axis: every tensor carries it innermost,
-     * so each input contributes one run per position and the positions are
-     * the product of the axes ahead of it. Rank 4 is an image's channel axis
-     * and rank 3 a sequence's feature axis; the arithmetic is the same. */
+    /* Concat along one stored axis: each input contributes one contiguous
+     * run per position, a run being its extent along the axis times every
+     * axis after it, and the positions are the product of the axes ahead of
+     * it. Along the last axis, an image's channels or a sequence's features,
+     * the run is the input's own extent and a tile only shortens the axes
+     * ahead; any other axis is cut whole and never tiled. */
     uint8_t rank = plan->tensors[outs[0]].ndim;
-    int positions = y_shape[0];
-    int total_OC = y_shape[rank - 1u];
+    uint8_t axis = (rank == 4u && op->spatial.kernel_h == 0)
+                 ? 3u : (uint8_t)op->spatial.kernel_h;
+    int positions = 1;
+    int inner = 1;
     int out_c_offset = 0;
 
-    if (rank == 4u) {
-        int H = mem->tile.active ? mem->tile.out_h : y_shape[1];
-        int W = mem->tile.active ? mem->tile.out_w : y_shape[2];
-        positions *= H * W;
-    } else {
-        positions *= mem->tile.active ? mem->tile.out_h : y_shape[1];
+    if (axis == 0u || axis >= rank || (mem->tile.active && axis != rank - 1u))
+        return -1;
+    for (uint8_t j = 0; j < axis; j++)
+        positions *= y_shape[j];
+    for (uint8_t j = (uint8_t)(axis + 1u); j < rank; j++)
+        inner *= y_shape[j];
+    if (mem->tile.active) {
+        positions = y_shape[0] * mem->tile.out_h;
+        if (rank == 4u)
+            positions *= mem->tile.out_w;
     }
+    int total_OC = y_shape[axis] * inner;
 
     /* A constant leading part, which is how a learned token is prepended to a
      * sequence. The plan names it as the operator's weight and the loader has
@@ -1298,7 +1320,7 @@ static int kern_concat(
             return -1;
         for (int i = 0; i < op->num_inputs; i++) {
             const tigris_tensor_t *part = &plan->tensors[ins[i]];
-            leading -= tigris_tensor_shape(plan, part)[rank - 1u];
+            leading -= tigris_tensor_shape(plan, part)[axis] * inner;
         }
         if (leading <= 0)
             return -1;
@@ -1312,7 +1334,7 @@ static int kern_concat(
     for (int i = 0; i < op->num_inputs; i++) {
         const float *Xi = (const float *)tigris_mem_tensor_ptr(mem, ins[i]);
         const int32_t *xi_shape = tigris_tensor_shape(plan, &plan->tensors[ins[i]]);
-        int Ci = xi_shape[rank - 1u];
+        int Ci = xi_shape[axis] * inner;
 
         if (Xi == NULL)
             return -1;

@@ -2318,6 +2318,18 @@ static void test_elementwise_reference_goldens(void)
             TEST_ASSERT_EQ(actual[i], expected, "band matches TFLM and preserves surrounding bytes");
         }
         mem.tile.active = 0;
+        if (gold->operation == TIGRIS_OP_DIV) {
+            int8_t invalid[768];
+            memcpy(invalid, gold->input_b, gold->count);
+            invalid[0] = (int8_t)gold->zeros[1];
+            pointers[b] = invalid;
+            TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                        "zero centered divisor is rejected");
+            pointers[b] = (void *)gold->input_b;
+            test_qp[quant[2]].scale = gold->scales[0] / (gold->scales[1] * 1099511627776.0f);
+            TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                        "negative reference rounding exponent is rejected");
+        }
         if (gold->operation == TIGRIS_OP_RSQRT) {
             int8_t invalid[256];
             memcpy(invalid, gold->input_a, sizeof(invalid));
@@ -2330,7 +2342,8 @@ static void test_elementwise_reference_goldens(void)
             TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
                         "out-of-range reference right shift is rejected");
         }
-        if (gold->operation == TIGRIS_OP_ABS || gold->operation == TIGRIS_OP_SQUARED_DIFFERENCE) {
+        if (gold->operation == TIGRIS_OP_ABS || gold->operation == TIGRIS_OP_SQUARED_DIFFERENCE ||
+            gold->operation == TIGRIS_OP_DIV) {
             test_qp[quant[2]].scale = 1.0e-20f;
             TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
                         "out-of-range reference multiplier is rejected");

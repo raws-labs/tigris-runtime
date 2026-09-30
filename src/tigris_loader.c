@@ -521,7 +521,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 return TIGRIS_ERR_BAD_OPERATOR;
             if (dtype == 3) {
                 const tigris_tensor_t *second = &plan->tensors[inputs[1]];
-                if ((op->op_type != TIGRIS_OP_SQUARED_DIFFERENCE &&
+                if ((op->op_type != TIGRIS_OP_DIV && op->op_type != TIGRIS_OP_SQUARED_DIFFERENCE &&
                      op->op_type != TIGRIS_OP_MAXIMUM && op->op_type != TIGRIS_OP_MINIMUM) ||
                     input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                     second->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
@@ -530,7 +530,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                     !quant_channels_fit(plan, second, 1) ||
                     !quant_channels_fit(plan, output, 1))
                     return TIGRIS_ERR_BAD_OPERATOR;
-                if (op->op_type != TIGRIS_OP_SQUARED_DIFFERENCE) {
+                if (op->op_type == TIGRIS_OP_MAXIMUM || op->op_type == TIGRIS_OP_MINIMUM) {
                     const tigris_quant_param_t *a = &plan->quant_params[input->quant_param_idx];
                     const tigris_quant_param_t *b = &plan->quant_params[second->quant_param_idx];
                     const tigris_quant_param_t *y = &plan->quant_params[output->quant_param_idx];

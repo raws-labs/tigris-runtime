@@ -1625,6 +1625,7 @@ static void test_concat_last_axis_variants(void)
     op.inputs_off = 0; op.outputs_off = 2;
     op.weight_idx = TIGRIS_NO_WEIGHT;
     op.bias_idx = TIGRIS_NO_WEIGHT;
+    op.spatial.kernel_h = 2;
 
     tigris_file_header_t header;
     memset(&header, 0, sizeof(header));
@@ -1679,6 +1680,135 @@ static void test_concat_last_axis_variants(void)
     ptrs[1] = NULL;
     TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0,
                 "missing concat input is refused");
+}
+
+/* Runs one float operator over tensors whose shapes and bytes are given in
+ * order: inputs first, then outputs. */
+typedef struct {
+    tigris_tensor_t tensors[4];
+    int32_t shapes[16];
+    uint16_t indices[4];
+    tigris_file_header_t header;
+    tigris_plan_t plan;
+    tigris_op_t op;
+} one_op_f32_t;
+
+static void one_op_f32(one_op_f32_t *t, uint8_t type, int n_in, int n_out,
+                       const int32_t *const *shapes, const uint8_t *ndims)
+{
+    memset(t, 0, sizeof(*t));
+    int cursor = 0;
+    for (int i = 0; i < n_in + n_out; i++) {
+        uint32_t numel = 1;
+        t->tensors[i].shape_off = (uint16_t)cursor;
+        t->tensors[i].ndim = ndims[i];
+        t->tensors[i].dtype = 1;
+        for (int d = 0; d < ndims[i]; d++) {
+            t->shapes[cursor++] = shapes[i][d];
+            numel *= (uint32_t)shapes[i][d];
+        }
+        t->tensors[i].size_bytes = numel * (uint32_t)sizeof(float);
+        t->indices[i] = (uint16_t)i;
+    }
+    t->op.op_type = type;
+    t->op.num_inputs = (uint8_t)n_in; t->op.num_outputs = (uint8_t)n_out;
+    t->op.inputs_off = 0; t->op.outputs_off = (uint16_t)n_in;
+    t->op.weight_idx = TIGRIS_NO_WEIGHT; t->op.bias_idx = TIGRIS_NO_WEIGHT;
+    t->header.num_tensors = (uint16_t)(n_in + n_out); t->header.num_ops = 1;
+    t->plan.header = &t->header; t->plan.tensors = t->tensors; t->plan.ops = &t->op;
+    t->plan.index_pool = t->indices; t->plan.shape_pool = t->shapes;
+}
+
+static void test_concat_inner_axis(void)
+{
+    printf("  test_concat_inner_axis...\n");
+    /* NHWC [1,1,2,2] above [1,2,2,2]: joined along height. */
+    const int32_t a_shape[] = {1, 1, 2, 2}, b_shape[] = {1, 2, 2, 2}, y_shape[] = {1, 3, 2, 2};
+    const int32_t *shapes[] = {a_shape, b_shape, y_shape};
+    const uint8_t ndims[] = {4, 4, 4};
+    one_op_f32_t t;
+    one_op_f32(&t, TIGRIS_OP_CONCAT, 2, 1, shapes, ndims);
+    t.op.spatial.kernel_h = 1;
+    float A[4] = {1, 2, 3, 4}, B[8] = {5, 6, 7, 8, 9, 10, 11, 12}, Y[12];
+    void *ptrs[3] = {A, B, Y};
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs; mem.num_tensors = 3;
+    TEST_ASSERT(tigris_dispatch_kernel(&t.plan, &t.op, 0, &mem, NULL) == 0, "height concat runs");
+    for (int i = 0; i < 12; i++)
+        TEST_ASSERT_NEAR(Y[i], (float)(i + 1), EPS, "height concat value");
+
+    /* Width: each row takes A's row, then B's. */
+    const int32_t aw[] = {1, 2, 1, 2}, bw[] = {1, 2, 2, 2}, yw[] = {1, 2, 3, 2};
+    const int32_t *wide[] = {aw, bw, yw};
+    one_op_f32(&t, TIGRIS_OP_CONCAT, 2, 1, wide, ndims);
+    t.op.spatial.kernel_h = 2;
+    TEST_ASSERT(tigris_dispatch_kernel(&t.plan, &t.op, 0, &mem, NULL) == 0, "width concat runs");
+    const float width[12] = {1, 2, 5, 6, 7, 8, 3, 4, 9, 10, 11, 12};
+    for (int i = 0; i < 12; i++)
+        TEST_ASSERT_NEAR(Y[i], width[i], EPS, "width concat value");
+
+    mem.tile.active = 1; mem.tile.out_h = 1; mem.tile.out_w = 3;
+    TEST_ASSERT(tigris_dispatch_kernel(&t.plan, &t.op, 0, &mem, NULL) != 0,
+                "a tile across the joined axis is refused");
+    mem.tile.active = 0;
+    t.op.spatial.kernel_h = 4;
+    TEST_ASSERT(tigris_dispatch_kernel(&t.plan, &t.op, 0, &mem, NULL) != 0,
+                "an axis past the rank is refused");
+}
+
+static void test_split_inner_axis(void)
+{
+    printf("  test_split_inner_axis...\n");
+    const int32_t x[] = {2, 3}, a[] = {2, 1}, b[] = {2, 2};
+    const int32_t *shapes[] = {x, a, b};
+    const uint8_t ndims[] = {2, 2, 2};
+    one_op_f32_t t;
+    one_op_f32(&t, TIGRIS_OP_SPLIT, 1, 2, shapes, ndims);
+    t.op.spatial.kernel_h = 1;
+    float X[6] = {1, 2, 3, 4, 5, 6}, A[2], B[4];
+    void *ptrs[3] = {X, A, B};
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs; mem.num_tensors = 3;
+    TEST_ASSERT(tigris_dispatch_kernel(&t.plan, &t.op, 0, &mem, NULL) == 0, "inner split runs");
+    const float first[2] = {1, 4}, second[4] = {2, 3, 5, 6};
+    for (int i = 0; i < 2; i++)
+        TEST_ASSERT_NEAR(A[i], first[i], EPS, "inner split part 0");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(B[i], second[i], EPS, "inner split part 1");
+}
+
+static void test_depthwise_multiplier(void)
+{
+    printf("  test_depthwise_multiplier...\n");
+    /* One input channel, two 1x1 filters: output channel oc reads oc / 2. */
+    const int32_t x[] = {1, 1, 2, 1}, y[] = {1, 1, 2, 2};
+    const int32_t *shapes[] = {x, y};
+    const uint8_t ndims[] = {4, 4};
+    one_op_f32_t t;
+    one_op_f32(&t, TIGRIS_OP_DEPTHWISE, 1, 1, shapes, ndims);
+    float W[2] = {2.0f, -1.0f};
+    tigris_weight_entry_t weight;
+    memset(&weight, 0, sizeof(weight));
+    weight.size_bytes = sizeof(W);
+    t.plan.weight_entries = &weight;
+    t.plan.weight_blob = (const uint8_t *)W;
+    t.header.num_weights = 1;
+    t.op.weight_idx = 0;
+    t.op.spatial.kernel_h = 1; t.op.spatial.kernel_w = 1;
+    t.op.spatial.stride_h = 1; t.op.spatial.stride_w = 1;
+    t.op.spatial.group = 1;
+    float X[2] = {3.0f, -2.0f}, Y[4];
+    void *ptrs[2] = {X, Y};
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs; mem.num_tensors = 2;
+    TEST_ASSERT(tigris_dispatch_kernel(&t.plan, &t.op, 0, &mem, NULL) == 0,
+                "depthwise multiplier runs");
+    const float expected[4] = {6.0f, -3.0f, -4.0f, 2.0f};
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(Y[i], expected[i], EPS, "depthwise multiplier value");
 }
 
 /* Bilinear Resize, checked against ONNX Runtime (opset 13, mode linear) on an
@@ -2857,6 +2987,9 @@ int main(void)
     test_layer_norm();
     test_reduce_mean();
     test_split();
+    test_concat_inner_axis();
+    test_split_inner_axis();
+    test_depthwise_multiplier();
     test_softmax();
     test_mul();
     test_constant_binary_f32();

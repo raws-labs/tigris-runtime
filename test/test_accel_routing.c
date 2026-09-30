@@ -349,6 +349,25 @@ static void test_unit_dilation_keeps_esp_adapter(void)
                    "explicit unit dilation keeps ESP-NN adapter");
 }
 
+/* Both adapters pass a channel multiplier of 1, so a depthwise convolution
+ * that writes more channels than it reads runs on s8_ref. */
+static void test_depthwise_multiplier_routes_reference(void)
+{
+    printf("  test_depthwise_multiplier_routes_reference...\n");
+    route_fixture_t fx;
+    build_fixture(&fx, TIGRIS_OP_DEPTHWISE, 1);
+    fx.op.spatial.dilation_w = 1;
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+                   TIGRIS_ACCEL_ROUTE_ADAPTER, "ESP-NN keeps a unit multiplier");
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0),
+                   TIGRIS_ACCEL_ROUTE_ADAPTER, "CMSIS-NN keeps a unit multiplier");
+    fx.shapes[7] = 2;
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+                   TIGRIS_ACCEL_ROUTE_S8_REF, "ESP-NN routes a multiplier to s8_ref");
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0),
+                   TIGRIS_ACCEL_ROUTE_S8_REF, "CMSIS-NN routes a multiplier to s8_ref");
+}
+
 static void test_esp_asymmetric_pad_workspace_policy(void)
 {
     printf("  test_esp_asymmetric_pad_workspace_policy...\n");
@@ -709,6 +728,7 @@ int main(void)
     test_cmsis_dilation_and_tile_routes();
     test_cmsis_plain_height_tile_routes_adapter();
     test_unit_dilation_keeps_esp_adapter();
+    test_depthwise_multiplier_routes_reference();
     test_rolled_tile_routing();
     test_width_tiled_routing();
     test_row_banded_ops_route_to_reference();

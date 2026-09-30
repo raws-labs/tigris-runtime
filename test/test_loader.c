@@ -1525,10 +1525,10 @@ static void build_split_plan(uint8_t *buf)
     buf[SPLIT_STRINGS_OFF] = '\0';
 }
 
-/* A split's parts are contiguous runs of its input, which is the only cut
- * that needs no arithmetic. The loader has to say so: a part that differs
- * anywhere but the outermost stored axis, or a set that does not cover the
- * input exactly, would be copied wrongly rather than refused. */
+/* A split's parts are one run of its input per position ahead of the split
+ * axis, which needs no arithmetic. The loader has to say so: a part that
+ * differs anywhere but the axis kernel_h names, or a set that does not cover
+ * the input exactly, would be copied wrongly rather than refused. */
 static void test_split_contract(void)
 {
     printf("  test_split_contract...\n");
@@ -1560,6 +1560,19 @@ static void test_split_contract(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_OPERATOR,
                    "a part cut on an inner axis rejected");
+
+    /* The same cut is a split along the stored axis kernel_h names. */
+    ((tigris_op_t *)(buf + SPLIT_OPS_OFF))->spatial.kernel_h = 2;
+    shapes[3] = 4; shapes[5] = 6;
+    shapes[6] = 4; shapes[8] = 2;
+    tensors[1].size_bytes = 48u * (uint32_t)sizeof(float);
+    tensors[2].size_bytes = 16u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "a split along a named inner axis accepted");
+    ((tigris_op_t *)(buf + SPLIT_OPS_OFF))->spatial.kernel_h = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "a split axis past the rank rejected");
 
     /* One part is not a split. */
     build_split_plan(buf);
@@ -1922,19 +1935,42 @@ static void test_nonweighted_operator_semantics(void)
                    TIGRIS_ERR_BAD_OPERATOR,
                    "non-global GlobalAveragePool output rejected");
 
+    /* The compiler names the stored axis in kernel_h: 3 for channels. */
     build_semantic_plan(buf, TIGRIS_OP_CONCAT, 2);
     semantic_set_shape(buf, 1, 4, 1, 2, 2, 4);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.kernel_h = 3;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "valid channel Concat loads");
+    op->spatial.kernel_h = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "rank-4 Concat without an axis means channels");
+
+    build_semantic_plan(buf, TIGRIS_OP_CONCAT, 2);
+    semantic_set_shape(buf, 1, 4, 1, 4, 2, 2);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.kernel_h = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "valid height Concat loads");
+    op->spatial.kernel_h = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "Concat along the wrong axis rejected");
+    op->spatial.kernel_h = 4;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR, "Concat axis past the rank rejected");
 
     build_semantic_plan(buf, TIGRIS_OP_CONCAT, 2);
     semantic_set_shape(buf, 2, 4, 1, 1, 4, 2);
     semantic_set_shape(buf, 1, 4, 1, 2, 2, 4);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.kernel_h = 3;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_OPERATOR, "Concat spatial mismatch rejected");
 
     build_semantic_plan(buf, TIGRIS_OP_CONCAT, 2);
     semantic_set_shape(buf, 1, 4, 1, 2, 2, 3);
+    op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF);
+    op->spatial.kernel_h = 3;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_OPERATOR, "Concat channel sum rejected");
 

@@ -267,6 +267,19 @@ static int legacy_semantics_are_builtin(uint8_t op_type)
     }
 }
 
+/* Whether two tensors are quantized alike: the same parameters, whichever
+ * entry of the plan states them, so a byte copy between them is exact. */
+static int same_quantization(const tigris_quant_param_t *a, const tigris_quant_param_t *b)
+{
+    if (a == b)
+        return 1;
+    if (a == NULL || b == NULL)
+        return 0;
+    return a->num_channels == 1u && b->num_channels == 1u &&
+           memcmp(&a->scale, &b->scale, sizeof(a->scale)) == 0 &&
+           a->zero_point == b->zero_point;
+}
+
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     const tigris_file_header_t *hdr = plan->header;
@@ -332,16 +345,18 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 return TIGRIS_ERR_BAD_OPERATOR;
 
             uint64_t weight_elements =
-                (uint64_t)op->spatial.kernel_h * op->spatial.kernel_w *
-                input_channels;
+                (uint64_t)op->spatial.kernel_h * op->spatial.kernel_w;
             if (op->op_type == TIGRIS_OP_CONV) {
                 if (op->spatial.group != 1)
                     return TIGRIS_ERR_BAD_OPERATOR;
-                weight_elements *= output_channels;
+                weight_elements *= (uint64_t)input_channels * output_channels;
             } else {
-                if (op->spatial.group != input_channels ||
-                    output_channels != input_channels)
+                /* One group per input channel, each with the same number of
+                 * filters: the channel multiplier. */
+                if (op->spatial.group != input_channels || input_channels == 0u ||
+                    output_channels % input_channels != 0u)
                     return TIGRIS_ERR_BAD_OPERATOR;
+                weight_elements *= output_channels;
             }
             uint64_t weight_bytes = weight_elements *
                 (dtype == 1 ? sizeof(float) : sizeof(int8_t));
@@ -442,14 +457,15 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             break;
 
         case TIGRIS_OP_SPLIT: {
-            /* The parts are contiguous runs of the input, which is what makes
-             * a split need no arithmetic: every output keeps the input's
-             * shape but for the outermost stored axis, and their extents on
-             * that axis sum to the input's. A split anywhere else interleaves
-             * and is refused rather than copied wrongly. */
+            /* A split needs no arithmetic: every output keeps the input's
+             * shape but for the stored axis named in kernel_h, 0 being the
+             * outermost, and their extents on that axis sum to the input's.
+             * Each part is then one contiguous run per position ahead of the
+             * axis. */
             if (op->num_inputs != 1u || op->num_outputs < 2u ||
-                input->ndim == 0u)
+                input->ndim == 0u || op->spatial.kernel_h >= input->ndim)
                 return TIGRIS_ERR_BAD_OPERATOR;
+            const uint8_t split_axis = (uint8_t)op->spatial.kernel_h;
             const int32_t *in_shape = tigris_tensor_shape(plan, input);
             int64_t covered = 0;
             uint32_t total_bytes = 0;
@@ -458,21 +474,21 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 if (part->ndim != input->ndim || part->dtype != input->dtype)
                     return TIGRIS_ERR_BAD_OPERATOR;
                 const int32_t *part_shape = tigris_tensor_shape(plan, part);
-                for (uint8_t axis = 1; axis < input->ndim; axis++) {
-                    if (part_shape[axis] != in_shape[axis])
+                for (uint8_t axis = 0; axis < input->ndim; axis++) {
+                    if (axis != split_axis && part_shape[axis] != in_shape[axis])
                         return TIGRIS_ERR_BAD_OPERATOR;
                 }
-                if (part_shape[0] <= 0)
+                if (part_shape[split_axis] <= 0)
                     return TIGRIS_ERR_BAD_OPERATOR;
-                covered += part_shape[0];
+                covered += part_shape[split_axis];
                 if (total_bytes > UINT32_MAX - part->size_bytes)
                     return TIGRIS_ERR_BAD_OPERATOR;
                 total_bytes += part->size_bytes;
-                if (tigris_tensor_quant(plan, part) !=
-                    tigris_tensor_quant(plan, input))
+                if (!same_quantization(tigris_tensor_quant(plan, part),
+                                       tigris_tensor_quant(plan, input)))
                     return TIGRIS_ERR_BAD_OPERATOR;
             }
-            if (covered != (int64_t)in_shape[0] ||
+            if (covered != (int64_t)in_shape[split_axis] ||
                 total_bytes != input->size_bytes)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
@@ -641,23 +657,27 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         }
 
         case TIGRIS_OP_CONCAT: {
-            /* Concatenation runs along the last stored axis, which every
-             * tensor carries innermost: an image's channel axis at rank 4, a
-             * sequence's feature axis at rank 3. The inputs have to agree on
-             * every other axis and add up along this one. */
+            /* Concatenation runs along one stored axis after the batch axis,
+             * named in kernel_h. The inputs have to agree on every other axis
+             * and add up along this one. */
             const int32_t *out_shape;
             uint64_t along = 0;
             uint8_t last;
+            uint8_t axis;
             uint32_t covered = 0;
             if (op->num_inputs == 0 || op->num_outputs != 1 ||
                 op->bias_idx != TIGRIS_NO_WEIGHT ||
                 output->ndim < 3u || output->ndim > 4u)
                 return TIGRIS_ERR_BAD_OPERATOR;
             last = (uint8_t)(output->ndim - 1u);
-            /* Rank 4 has always meant the channel axis and says so by its
-             * rank alone, so a plan from before the axis was recorded still
+            /* Rank 4 has always meant the channel axis when no axis is
+             * recorded, so a plan from before the axis was recorded still
              * loads. Rank 3 has to name it. */
-            if (output->ndim == 3u && op->spatial.kernel_h != (int32_t)last)
+            if (output->ndim == 4u && op->spatial.kernel_h == 0)
+                axis = last;
+            else if (op->spatial.kernel_h >= 1u && op->spatial.kernel_h <= last)
+                axis = (uint8_t)op->spatial.kernel_h;
+            else
                 return TIGRIS_ERR_BAD_OPERATOR;
             out_shape = tigris_tensor_shape(plan, output);
             for (uint8_t i = 0; i < op->num_inputs; i++) {
@@ -666,11 +686,11 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 if (part->ndim != output->ndim)
                     return TIGRIS_ERR_BAD_OPERATOR;
                 shape = tigris_tensor_shape(plan, part);
-                for (uint8_t j = 0; j < last; j++) {
-                    if (shape[j] != out_shape[j])
+                for (uint8_t j = 0; j <= last; j++) {
+                    if (j != axis && shape[j] != out_shape[j])
                         return TIGRIS_ERR_BAD_OPERATOR;
                 }
-                along += (uint32_t)shape[last];
+                along += (uint32_t)shape[axis];
                 if (covered > output->size_bytes - part->size_bytes)
                     return TIGRIS_ERR_BAD_OPERATOR;
                 covered += part->size_bytes;
@@ -681,7 +701,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
              * of the output. */
             if (op->weight_idx != TIGRIS_NO_WEIGHT) {
                 const tigris_weight_entry_t *constant;
-                if (op->weight_idx >= hdr->num_weights)
+                if (op->weight_idx >= hdr->num_weights || axis != last)
                     return TIGRIS_ERR_BAD_OPERATOR;
                 constant = &plan->weight_entries[op->weight_idx];
                 if (along >= (uint64_t)out_shape[last] ||
@@ -690,7 +710,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                     return TIGRIS_ERR_BAD_OPERATOR;
                 break;
             }
-            if (along != (uint64_t)out_shape[last] ||
+            if (along != (uint64_t)out_shape[axis] ||
                 covered != output->size_bytes)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;

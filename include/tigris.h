@@ -81,7 +81,7 @@ extern "C" {
  * added without a schema version. Payloads are little-endian and their length
  * is the record's data_len. */
 #define TIGRIS_OP_ATTR_TRANSPOSE_PERM 1  /* uint8[rank], axis permutation */
-#define TIGRIS_OP_ATTR_EPSILON        2  /* float32, variance floor */
+#define TIGRIS_OP_ATTR_EPSILON        2  /* float32, normalization floor */
 #define TIGRIS_OP_ATTR_ALPHA          3  /* float32, negative slope */
 #define TIGRIS_OP_ATTR_CLIP_BOUNDS    4  /* float32[2], lower then upper */
 #define TIGRIS_OP_ATTR_PADS           5  /* int32[2*rank], leading, trailing */
@@ -185,6 +185,11 @@ typedef enum {
     TIGRIS_OP_COS               = 52,
     TIGRIS_OP_FLOOR_DIV         = 53,
     TIGRIS_OP_FLOOR_MOD         = 54,
+    TIGRIS_OP_PRELU              = 55,
+    TIGRIS_OP_ELU                = 56,
+    TIGRIS_OP_LOG_SOFTMAX        = 57,
+    TIGRIS_OP_L2_NORMALIZATION   = 58,
+    TIGRIS_OP_L2_POOL            = 59,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

@@ -8,6 +8,7 @@
  * When fixture files are provided, loads each and verifies the parsed plan.
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1879,6 +1880,345 @@ static void build_elementwise_quant_plan(
     op->act_max = 127;
 }
 
+static void test_activation_attribute_contract(void)
+{
+    _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
+    tigris_plan_t plan;
+    const uint8_t kinds[] = {TIGRIS_OP_LEAKY_RELU, TIGRIS_OP_L2_NORMALIZATION};
+    for (size_t k = 0; k < sizeof(kinds); k++) {
+        build_transpose_plan(buf);
+        tigris_op_t *op = (tigris_op_t *)(buf + TRANSPOSE_OPS_OFF);
+        op->op_type = kinds[k];
+        tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
+        tensors[1].shape_off = tensors[0].shape_off;
+        tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+        attr->type = k == 0u ? TIGRIS_OP_ATTR_ALPHA : TIGRIS_OP_ATTR_EPSILON;
+        attr->data_len = sizeof(float);
+        const float valid[] = {0.0f, 0.125f};
+        for (size_t v = 0; v < sizeof(valid) / sizeof(valid[0]); v++) {
+            memcpy(buf + TRANSPOSE_ATTR_DATA_OFF, &valid[v], sizeof(float));
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                           "finite activation attribute loads, including zero epsilon");
+        }
+        float negative = -0.125f;
+        memcpy(buf + TRANSPOSE_ATTR_DATA_OFF, &negative, sizeof(float));
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                       k == 0u ? TIGRIS_OK : TIGRIS_ERR_BAD_SECTION,
+                       "negative alpha is supported and negative epsilon is rejected");
+        const float invalid[] = {NAN, INFINITY};
+        for (size_t v = 0; v < sizeof(invalid) / sizeof(invalid[0]); v++) {
+            memcpy(buf + TRANSPOSE_ATTR_DATA_OFF, &invalid[v], sizeof(float));
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                           "nonfinite activation attribute rejected");
+        }
+        memcpy(buf + TRANSPOSE_ATTR_DATA_OFF, &valid[1], sizeof(float));
+        attr->data_len = 1;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                       "truncated activation attribute rejected");
+        attr->data_len = sizeof(float);
+        op->op_type = TIGRIS_OP_ELU;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                       "activation attributes cannot attach to Elu");
+        op->op_type = kinds[k];
+        tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+        memset(&dir[6], 0, sizeof(dir[6]));
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                       k == 0u ? TIGRIS_OK : TIGRIS_ERR_BAD_SECTION,
+                       "LeakyRelu defaults alpha but L2Normalization requires epsilon");
+    }
+}
+
+static void test_activation_semantic_contract(void)
+{
+    _Alignas(4) uint8_t buf[ELEMENTWISE_PLAN_SIZE + 16u];
+    tigris_plan_t plan;
+    const uint8_t kinds[] = {TIGRIS_OP_LEAKY_RELU, TIGRIS_OP_ELU,
+                             TIGRIS_OP_LOG_SOFTMAX, TIGRIS_OP_L2_NORMALIZATION};
+    for (size_t k = 0; k < sizeof(kinds); k++) {
+        for (int quantized = 0; quantized < 2; quantized++) {
+            uint32_t offset = quantized ? 8u : 0u;
+            if (quantized) build_elementwise_quant_plan(buf, kinds[k], 1);
+            else build_semantic_plan(buf, kinds[k], 1);
+            tigris_file_header_t *header = (tigris_file_header_t *)buf;
+            tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
+            tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + offset);
+            tigris_op_t *op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF + offset);
+            if (kinds[k] == TIGRIS_OP_L2_NORMALIZATION) {
+                uint32_t attrs_off = quantized ? ELEMENTWISE_PLAN_SIZE : SEMANTIC_PLAN_SIZE;
+                header->file_size = attrs_off + 16u;
+                dir[quantized ? 7 : 6] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, attrs_off};
+                memset(buf + attrs_off, 0, 16u);
+                uint16_t count = 1;
+                memcpy(buf + attrs_off, &count, sizeof(count));
+                tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_EPSILON, sizeof(float), 0};
+                memcpy(buf + attrs_off + 4u, &attr, sizeof(attr));
+                float epsilon = 1.0e-6f;
+                memcpy(buf + attrs_off + 12u, &epsilon, sizeof(epsilon));
+            }
+            tigris_quant_param_t *quant = (tigris_quant_param_t *)(buf + ELEMENTWISE_QUANT_OFF + 4u);
+            if (quantized && k >= 2u) {
+                quant[1].scale = k == 2u ? 0.0625f : 0.0078125f;
+                quant[1].zero_point = k == 2u ? 127 : 0;
+            }
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_OK,
+                           "activation with matching shapes and encoding loads");
+            op->num_inputs = 2;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "activation rejects extra input");
+            op->num_inputs = 1;
+            int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + offset);
+            dims[5] = 1; dims[6] = 4;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "activation rejects equal-size output with different shape");
+            dims[5] = 2; dims[6] = 2;
+            if (quantized) {
+                for (uint16_t t = 0; t < 2u; t++) {
+                    tensors[t].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+                    TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                                   "activation requires input and output quantization");
+                    tensors[t].quant_param_idx = t;
+                    quant[t].num_channels = 2;
+                    quant[t].shift_off = 2;
+                    TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                                   "activation rejects per-channel activation quantization");
+                    quant[t].num_channels = 1;
+                    quant[t].shift_off = 1;
+                }
+                if (k >= 2u) {
+                    quant[1].scale *= 2.0f;
+                    TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                                   "normalization requires its fixed output scale");
+                    quant[1].scale /= 2.0f;
+                    quant[1].zero_point--;
+                    TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                                   "normalization requires its fixed output zero point");
+                    quant[1].zero_point++;
+                }
+            }
+            for (uint16_t t = 0; t < 2u; t++) {
+                tensors[t].ndim = 0;
+                tensors[t].size_bytes = quantized ? 1u : sizeof(float);
+            }
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan),
+                           k < 2u ? TIGRIS_OK : TIGRIS_ERR_BAD_OPERATOR,
+                           "scalar pointwise activations load and scalar normalizations are refused");
+            for (uint16_t t = 0; t < 2u; t++) {
+                tensors[t].ndim = 5;
+                tensors[t].shape_off = 0;
+                tensors[t].size_bytes = quantized ? 8u : 8u * sizeof(float);
+            }
+            dims[0] = 1; dims[1] = 1; dims[2] = 1; dims[3] = 1; dims[4] = 8;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan),
+                           k == 3u ? TIGRIS_ERR_BAD_OPERATOR : TIGRIS_OK,
+                           "only L2Normalization has a rank-four limit");
+        }
+    }
+}
+
+#define PRELU_PLAN_SIZE 420u
+#define PRELU_ATTRS_OFF 404u
+#define PRELU_WEIGHTS_OFF 308u
+#define PRELU_QUANT_OFF 328u
+
+static void build_prelu_contract_plan(uint8_t *buf, int quantized)
+{
+    memset(buf, 0, PRELU_PLAN_SIZE);
+    build_elementwise_quant_plan(buf, TIGRIS_OP_PRELU, 1);
+    memmove(buf + SEMANTIC_TENSORS_OFF + 16u, buf + SEMANTIC_TENSORS_OFF + 8u,
+            ELEMENTWISE_PLAN_SIZE - SEMANTIC_TENSORS_OFF - 8u);
+    tigris_file_header_t *header = (tigris_file_header_t *)buf;
+    header->file_size = PRELU_PLAN_SIZE;
+    header->num_weights = 1;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
+    for (int i = 0; i < 7; i++) dir[i].offset += 8u;
+    memmove(buf + PRELU_QUANT_OFF, buf + ELEMENTWISE_QUANT_OFF + 8u,
+            ELEMENTWISE_PLAN_SIZE - ELEMENTWISE_QUANT_OFF);
+    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHTS, PRELU_WEIGHTS_OFF};
+    dir[7] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, PRELU_QUANT_OFF};
+    dir[8] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, PRELU_ATTRS_OFF};
+    memset(&dir[9], 0, sizeof(dir[9]));
+    uint16_t count = 1;
+    memcpy(buf + PRELU_ATTRS_OFF, &count, sizeof(count));
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_CONSTANT_OPERAND, 4, 0};
+    memcpy(buf + PRELU_ATTRS_OFF + 4u, &attr, sizeof(attr));
+    const uint8_t payload[] = {1, 0, quantized ? 2u : 255u, quantized ? 0u : 255u};
+    memcpy(buf + PRELU_ATTRS_OFF + 12u, payload, sizeof(payload));
+    tigris_weight_entry_t weight = {0, 0, quantized ? 2u : 8u};
+    memcpy(buf + PRELU_WEIGHTS_OFF, &weight, sizeof(weight));
+    tigris_op_t *op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF + 16u);
+    op->weight_idx = 0;
+    if (!quantized) {
+        tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + 16u);
+        for (int i = 0; i < 3; i++) {
+            tensors[i].dtype = 1;
+            tensors[i].size_bytes *= sizeof(float);
+            tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        }
+    }
+}
+
+static void test_prelu_loader_contract(void)
+{
+    _Alignas(4) uint8_t buf[PRELU_PLAN_SIZE];
+    tigris_plan_t plan;
+    for (int quantized = 0; quantized < 2; quantized++) {
+        build_prelu_contract_plan(buf, quantized);
+        tigris_op_t *op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF + 16u);
+        tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + 16u);
+        uint8_t *payload = buf + PRELU_ATTRS_OFF + 12u;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                       "PRelu constant alpha loads");
+        payload[0] = 0;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "PRelu refuses a constant first operand");
+        payload[0] = 1;
+        op->num_inputs = 2;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "PRelu refuses dynamic alpha with a constant record");
+        op->num_inputs = 1;
+        op->weight_idx = TIGRIS_NO_WEIGHT;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "PRelu requires the alpha weight");
+        op->weight_idx = 0;
+        int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + 16u);
+        dims[5] = 1; dims[6] = 4;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "PRelu requires unchanged output shape");
+        dims[5] = 2; dims[6] = 2;
+        if (quantized) {
+            payload[2] = 255; payload[3] = 255;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "int8 PRelu requires alpha quantization");
+            payload[2] = 2; payload[3] = 0;
+            tigris_quant_param_t *q = (tigris_quant_param_t *)(buf + PRELU_QUANT_OFF + 4u);
+            q[2].num_channels = 2; q[2].shift_off = 2;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "int8 PRelu refuses per-channel alpha encoding");
+            q[2].num_channels = 1; q[2].shift_off = 1;
+        }
+        for (uint16_t t = 0; t < 2u; t++) {
+            tensors[t].ndim = 5; tensors[t].shape_off = 0;
+        }
+        dims[0] = 1; dims[1] = 1; dims[2] = 1; dims[3] = 1; dims[4] = 8;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "PRelu refuses rank five");
+        for (uint16_t t = 0; t < 2u; t++) {
+            tensors[t].ndim = 0;
+            tensors[t].size_bytes = quantized ? 1u : sizeof(float);
+        }
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "PRelu refuses rank zero");
+        build_prelu_contract_plan(buf, quantized);
+        tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+        memset(&dir[8], 0, sizeof(dir[8]));
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "PRelu refuses absent operand placement metadata");
+    }
+    build_semantic_plan(buf, TIGRIS_OP_PRELU, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, SEMANTIC_PLAN_SIZE, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "PRelu refuses two dynamic operands");
+}
+
+static void test_prelu_tiling_contract(void)
+{
+    _Alignas(4) uint8_t buf[PRELU_PLAN_SIZE + 32u];
+    tigris_plan_t plan;
+    for (uint8_t rank = 2; rank <= 4u; rank++) {
+        build_prelu_contract_plan(buf, 0);
+        memmove(buf + SEMANTIC_TENSORS_OFF + 24u, buf + SEMANTIC_TENSORS_OFF + 16u,
+                PRELU_PLAN_SIZE - SEMANTIC_TENSORS_OFF - 16u);
+        tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+        for (int i = 0; i < 9; i++) dir[i].offset += 8u;
+        const uint32_t tile_off = SEMANTIC_INDEX_OFF + 24u;
+        memmove(buf + tile_off + sizeof(tigris_tile_plan_t), buf + tile_off,
+                PRELU_PLAN_SIZE + 8u - tile_off);
+        for (int i = 0; i < 9; i++)
+            if (dir[i].offset >= tile_off) dir[i].offset += sizeof(tigris_tile_plan_t);
+        memmove(&dir[4], &dir[3], 6u * sizeof(dir[0]));
+        dir[3] = (tigris_section_entry_t){TIGRIS_SEC_TILE_PLANS, tile_off};
+        memset(&dir[10], 0, sizeof(dir[10]));
+        tigris_file_header_t *header = (tigris_file_header_t *)buf;
+        header->file_size = sizeof(buf);
+        header->num_tile_plans = 1;
+        tigris_stage_t *stage = (tigris_stage_t *)(buf + SEMANTIC_STAGES_OFF + 24u);
+        stage->tile_plan_idx = 0;
+        stage->inputs_off = 3; stage->inputs_count = 1;
+        stage->outputs_off = 4; stage->outputs_count = 1;
+        tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + 24u);
+        int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + 48u);
+        const int32_t shapes[3][4] = {{4, 2, 1, 1}, {1, 4, 2, 1}, {1, 2, 2, 2}};
+        for (int t = 0; t < 2; t++) {
+            tensors[t].ndim = rank;
+            memcpy(dims + 4 * t, shapes[rank - 2u], 4u * sizeof(int32_t));
+        }
+        tigris_tile_plan_t tile = {0};
+        tile.tileable = 1;
+        tile.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+        tile.tile_height = 1;
+        tile.original_height = rank == 4u ? 2u : 4u;
+        tile.num_tiles = tile.original_height;
+        memcpy(buf + tile_off, &tile, sizeof(tile));
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                       "constant-alpha PRelu accepts row, sequence, and image height tiling");
+    }
+}
+
+static void test_activation_tiling_contract(void)
+{
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+    const uint8_t kinds[] = {TIGRIS_OP_LEAKY_RELU, TIGRIS_OP_ELU,
+                             TIGRIS_OP_LOG_SOFTMAX, TIGRIS_OP_L2_NORMALIZATION};
+    for (size_t k = 0; k < sizeof(kinds); k++) {
+        for (uint8_t rank = 2; rank <= 4u; rank++) {
+            build_tiled_stage_plan(buf, kinds[k], rank);
+            tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+            int32_t *dims = (int32_t *)(buf + TILED_SHAPES_OFF);
+            if (rank == 2u) {
+                dims[0] = 4; dims[1] = 8;
+                tensors[0].size_bytes = 32u * sizeof(float);
+            }
+            memcpy(dims + 4, dims, 4u * sizeof(int32_t));
+            tensors[1].size_bytes = tensors[0].size_bytes;
+            tigris_tile_plan_t *tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+            tile->original_height = rank == 2u ? dims[0] : dims[1];
+            tile->num_tiles = tile->original_height;
+            if (kinds[k] == TIGRIS_OP_L2_NORMALIZATION) {
+                tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+                dir[7] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, TILED_ATTRS_OFF};
+                uint16_t count = 1;
+                memcpy(buf + TILED_ATTRS_OFF, &count, sizeof(count));
+                tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_EPSILON, sizeof(float), 0};
+                memcpy(buf + TILED_ATTRS_OFF + 4u, &attr, sizeof(attr));
+                float epsilon = 1.0e-6f;
+                memcpy(buf + TILED_ATTR_DATA_OFF, &epsilon, sizeof(epsilon));
+            }
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                           "activation accepts row, sequence, and image height tiling");
+        }
+    }
+    _Alignas(4) uint8_t pool_buf[ELEMENTWISE_PLAN_SIZE];
+    build_semantic_plan(pool_buf, TIGRIS_OP_L2_POOL, 1);
+    TEST_ASSERT_EQ(tigris_plan_load(pool_buf, SEMANTIC_PLAN_SIZE, &plan), TIGRIS_OK,
+                   "float L2Pool loads");
+    semantic_set_shape(pool_buf, 1, 4, 1, 1, 4, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(pool_buf, SEMANTIC_PLAN_SIZE, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "L2Pool rejects inconsistent output geometry");
+    build_elementwise_quant_plan(pool_buf, TIGRIS_OP_L2_POOL, 1);
+    TEST_ASSERT_EQ(tigris_plan_load(pool_buf, sizeof(pool_buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "L2Pool rejects int8 activations");
+    build_tiled_stage_plan(buf, TIGRIS_OP_L2_POOL, 4);
+    tigris_op_t *op = (tigris_op_t *)(buf + TILED_OPS_OFF);
+    op->spatial.kernel_h = 1; op->spatial.kernel_w = 1;
+    op->spatial.stride_h = 1; op->spatial.stride_w = 1;
+    int32_t *dims = (int32_t *)(buf + TILED_SHAPES_OFF);
+    memcpy(dims + 4, dims, 4u * sizeof(int32_t));
+    tigris_tile_plan_t *tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+    tile->original_height = 2; tile->num_tiles = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "L2Pool supports image height tiling");
+}
+
 static void test_resize_scale_guards(void)
 {
     _Alignas(4) uint8_t buf[TILED_PLAN_SIZE + 4u];
@@ -2947,6 +3287,11 @@ int main(int argc, char *argv[])
     test_operator_semantic_guards();
     test_nonweighted_operator_semantics();
     test_elementwise_semantics();
+    test_activation_attribute_contract();
+    test_activation_semantic_contract();
+    test_prelu_loader_contract();
+    test_prelu_tiling_contract();
+    test_activation_tiling_contract();
     test_convolution_semantic_guards();
     test_conv_transpose_semantic_guards();
     test_conv_transpose_quant_channels_guard();

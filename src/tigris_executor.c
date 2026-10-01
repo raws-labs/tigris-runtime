@@ -127,7 +127,7 @@ static int is_height_spatial_op(uint8_t type)
     return type == TIGRIS_OP_CONV ||
            type == TIGRIS_OP_DEPTHWISE ||
            type == TIGRIS_OP_MAX_POOL ||
-           type == TIGRIS_OP_AVG_POOL;
+           type == TIGRIS_OP_AVG_POOL || type == TIGRIS_OP_L2_POOL;
 }
 
 /* Resize computes its source band from the full input and output extents. */
@@ -146,6 +146,10 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_SIGMOID ||
            type == TIGRIS_OP_TANH ||
            type == TIGRIS_OP_SOFTMAX ||
+           type == TIGRIS_OP_LEAKY_RELU ||
+           type == TIGRIS_OP_ELU ||
+           type == TIGRIS_OP_LOG_SOFTMAX ||
+           type == TIGRIS_OP_L2_NORMALIZATION ||
            type == TIGRIS_OP_ERF ||
            type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_ABS ||
@@ -169,6 +173,7 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_MINIMUM ||
            type == TIGRIS_OP_FLOOR_DIV ||
            type == TIGRIS_OP_FLOOR_MOD ||
+           type == TIGRIS_OP_PRELU ||
            type == TIGRIS_OP_MUL ||
            type == TIGRIS_OP_CONCAT;
 }
@@ -184,6 +189,10 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_SIGMOID ||
            type == TIGRIS_OP_TANH ||
            type == TIGRIS_OP_SOFTMAX ||
+           type == TIGRIS_OP_LEAKY_RELU ||
+           type == TIGRIS_OP_ELU ||
+           type == TIGRIS_OP_LOG_SOFTMAX ||
+           type == TIGRIS_OP_L2_NORMALIZATION ||
            type == TIGRIS_OP_ERF ||
            type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_ABS ||
@@ -210,6 +219,7 @@ static int is_axis1_binary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_MINIMUM ||
            type == TIGRIS_OP_FLOOR_DIV ||
            type == TIGRIS_OP_FLOOR_MOD ||
+           type == TIGRIS_OP_PRELU ||
            type == TIGRIS_OP_MUL;
 }
 
@@ -2191,6 +2201,10 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_SIN ||
            type == TIGRIS_OP_COS ||
            type == TIGRIS_OP_SOFTMAX ||
+           type == TIGRIS_OP_LEAKY_RELU ||
+           type == TIGRIS_OP_ELU ||
+           type == TIGRIS_OP_LOG_SOFTMAX ||
+           type == TIGRIS_OP_L2_NORMALIZATION ||
            type == TIGRIS_OP_LAYER_NORM ||
            type == TIGRIS_OP_RESHAPE ||
            type == TIGRIS_OP_FLATTEN ||
@@ -2203,6 +2217,7 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_MINIMUM ||
            type == TIGRIS_OP_FLOOR_DIV ||
            type == TIGRIS_OP_FLOOR_MOD ||
+           type == TIGRIS_OP_PRELU ||
            type == TIGRIS_OP_MUL;
 }
 

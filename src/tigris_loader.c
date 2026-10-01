@@ -111,7 +111,7 @@ static int is_binary_op(uint8_t type)
            type == TIGRIS_OP_MUL || type == TIGRIS_OP_DIV ||
            type == TIGRIS_OP_SQUARED_DIFFERENCE ||
            type == TIGRIS_OP_MAXIMUM || type == TIGRIS_OP_MINIMUM ||
-           type == TIGRIS_OP_FLOOR_DIV || type == TIGRIS_OP_FLOOR_MOD;
+           type == TIGRIS_OP_FLOOR_DIV || type == TIGRIS_OP_FLOOR_MOD || type == TIGRIS_OP_PRELU;
 }
 
 /* Whether a binary operand of this shape broadcasts to the output: its rank
@@ -202,6 +202,10 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_SIGMOID ||
            type == TIGRIS_OP_TANH ||
            type == TIGRIS_OP_SOFTMAX ||
+           type == TIGRIS_OP_LEAKY_RELU ||
+           type == TIGRIS_OP_ELU ||
+           type == TIGRIS_OP_LOG_SOFTMAX ||
+           type == TIGRIS_OP_L2_NORMALIZATION ||
            type == TIGRIS_OP_ERF ||
            type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_ABS ||
@@ -285,6 +289,10 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_SIN ||
            type == TIGRIS_OP_COS ||
            type == TIGRIS_OP_SOFTMAX ||
+           type == TIGRIS_OP_LEAKY_RELU ||
+           type == TIGRIS_OP_ELU ||
+           type == TIGRIS_OP_LOG_SOFTMAX ||
+           type == TIGRIS_OP_L2_NORMALIZATION ||
            type == TIGRIS_OP_LAYER_NORM ||
            type == TIGRIS_OP_RESHAPE ||
            type == TIGRIS_OP_FLATTEN ||
@@ -297,6 +305,7 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_MINIMUM ||
            type == TIGRIS_OP_FLOOR_DIV ||
            type == TIGRIS_OP_FLOOR_MOD ||
+           type == TIGRIS_OP_PRELU ||
            type == TIGRIS_OP_MUL;
 }
 
@@ -309,6 +318,7 @@ static int is_axis1_binary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_MINIMUM ||
            type == TIGRIS_OP_FLOOR_DIV ||
            type == TIGRIS_OP_FLOOR_MOD ||
+           type == TIGRIS_OP_PRELU ||
            type == TIGRIS_OP_MUL;
 }
 
@@ -323,7 +333,8 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
 {
     switch (kind) {
     case TIGRIS_OP_ATTR_TRANSPOSE_PERM: return op_type == TIGRIS_OP_TRANSPOSE;
-    case TIGRIS_OP_ATTR_EPSILON:        return op_type == TIGRIS_OP_LAYER_NORM;
+    case TIGRIS_OP_ATTR_EPSILON:        return op_type == TIGRIS_OP_LAYER_NORM ||
+                                                op_type == TIGRIS_OP_L2_NORMALIZATION;
     case TIGRIS_OP_ATTR_ALPHA:          return op_type == TIGRIS_OP_LEAKY_RELU;
     case TIGRIS_OP_ATTR_CLIP_BOUNDS:    return op_type == TIGRIS_OP_CLIP;
     case TIGRIS_OP_ATTR_PADS:           return op_type == TIGRIS_OP_PAD;
@@ -553,6 +564,30 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
 
+        case TIGRIS_OP_LEAKY_RELU:
+        case TIGRIS_OP_ELU:
+        case TIGRIS_OP_LOG_SOFTMAX:
+        case TIGRIS_OP_L2_NORMALIZATION:
+            if (!op_has_plain_io(op, 1, 1) ||
+                !tensor_shapes_equal(plan, input, output) ||
+                ((op->op_type == TIGRIS_OP_LOG_SOFTMAX ||
+                  op->op_type == TIGRIS_OP_L2_NORMALIZATION) && input->ndim == 0u) ||
+                (op->op_type == TIGRIS_OP_L2_NORMALIZATION && input->ndim > 4u))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            if (dtype == 3u) {
+                if (input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                    output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                    !quant_channels_fit(plan, input, 1) || !quant_channels_fit(plan, output, 1))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                const tigris_quant_param_t *q = &plan->quant_params[output->quant_param_idx];
+                if ((op->op_type == TIGRIS_OP_LOG_SOFTMAX &&
+                     (q->scale != 0.0625f || q->zero_point != 127)) ||
+                    (op->op_type == TIGRIS_OP_L2_NORMALIZATION &&
+                     (q->scale != 0.0078125f || q->zero_point != 0)))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
+            break;
+
         case TIGRIS_OP_ABS:
         case TIGRIS_OP_RSQRT:
         case TIGRIS_OP_NEG:
@@ -584,8 +619,18 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         case TIGRIS_OP_MINIMUM:
         case TIGRIS_OP_FLOOR_DIV:
         case TIGRIS_OP_FLOOR_MOD:
+        case TIGRIS_OP_PRELU:
         {
             const tigris_quant_param_t *second_quant = NULL;
+            if (op->op_type == TIGRIS_OP_PRELU) {
+                uint8_t len = 0;
+                const uint8_t *attr = tigris_op_attribute_data(
+                    plan, op_index, TIGRIS_OP_ATTR_CONSTANT_OPERAND, &len);
+                if (op->num_inputs != 1u || !attr || len < 4u || attr[0] != 1u ||
+                    input->ndim == 0u || input->ndim > 4u ||
+                    !tensor_shapes_equal(plan, input, output))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
             if (!shape_broadcasts_to(tigris_tensor_shape(plan, input), input->ndim,
                                      plan, output))
                 return TIGRIS_ERR_BAD_OPERATOR;
@@ -608,7 +653,8 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             }
             if (dtype == 3) {
                 if ((op->op_type != TIGRIS_OP_DIV && op->op_type != TIGRIS_OP_SQUARED_DIFFERENCE &&
-                     op->op_type != TIGRIS_OP_MAXIMUM && op->op_type != TIGRIS_OP_MINIMUM) ||
+                     op->op_type != TIGRIS_OP_MAXIMUM && op->op_type != TIGRIS_OP_MINIMUM &&
+                     op->op_type != TIGRIS_OP_PRELU) ||
                     input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                     output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                     !quant_channels_fit(plan, input, 1) ||
@@ -810,7 +856,10 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             break;
 
         case TIGRIS_OP_MAX_POOL:
-        case TIGRIS_OP_AVG_POOL: {
+        case TIGRIS_OP_AVG_POOL:
+        case TIGRIS_OP_L2_POOL: {
+            if (op->op_type == TIGRIS_OP_L2_POOL && dtype != 1u)
+                return TIGRIS_ERR_BAD_OPERATOR;
             if (!op_has_plain_io(op, 1, 1) ||
                 input->ndim != 4 || output->ndim != 4 ||
                 (op->spatial.dilation_h > 1) ||
@@ -1601,7 +1650,8 @@ tigris_error_t tigris_plan_load_ex(
                  * finite. Both would otherwise reach a kernel as a divisor or
                  * a multiplier with no defined result. */
                 if (!isfinite(value) ||
-                    (attr->type == TIGRIS_OP_ATTR_EPSILON && value <= 0.0f))
+                    (attr->type == TIGRIS_OP_ATTR_EPSILON &&
+                     (value < 0.0f || (value == 0.0f && op->op_type != TIGRIS_OP_L2_NORMALIZATION))))
                     return TIGRIS_ERR_BAD_SECTION;
                 break;
             }
@@ -1738,7 +1788,8 @@ tigris_error_t tigris_plan_load_ex(
                 return TIGRIS_ERR_BAD_SECTION;
             /* A normalization divides by a variance floor it cannot default,
              * so the attribute is required rather than optional. */
-            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM) !=
+            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM ||
+                 candidate.ops[op_idx].op_type == TIGRIS_OP_L2_NORMALIZATION) !=
                 has_epsilon)
                 return TIGRIS_ERR_BAD_SECTION;
             /* A reduction cannot default the axes it collapses either. */
@@ -1753,6 +1804,7 @@ tigris_error_t tigris_plan_load_ex(
         for (uint16_t op_idx = 0; op_idx < hdr->num_ops; op_idx++) {
             if (candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE ||
                 candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM ||
+                candidate.ops[op_idx].op_type == TIGRIS_OP_L2_NORMALIZATION ||
                 candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MEAN)
                 return TIGRIS_ERR_BAD_SECTION;
         }
@@ -2144,7 +2196,7 @@ tigris_error_t tigris_plan_load_ex(
                         if (type == TIGRIS_OP_CONV ||
                             type == TIGRIS_OP_DEPTHWISE ||
                             type == TIGRIS_OP_MAX_POOL ||
-                            type == TIGRIS_OP_AVG_POOL) {
+                            type == TIGRIS_OP_AVG_POOL || type == TIGRIS_OP_L2_POOL) {
                             spatial_count++;
                         } else if (type == TIGRIS_OP_RESIZE ||
                                    type == TIGRIS_OP_RESIZE_LINEAR) {
@@ -2193,6 +2245,11 @@ tigris_error_t tigris_plan_load_ex(
                                     * in the rank-3 contract above and in
                                     * is_height_tiling_op. */
                                    type != TIGRIS_OP_SOFTMAX &&
+                                   type != TIGRIS_OP_LEAKY_RELU &&
+                                   type != TIGRIS_OP_PRELU &&
+                                   type != TIGRIS_OP_ELU &&
+                                   type != TIGRIS_OP_LOG_SOFTMAX &&
+                                   type != TIGRIS_OP_L2_NORMALIZATION &&
                                    type != TIGRIS_OP_ADD &&
                                    type != TIGRIS_OP_SUB &&
                                    type != TIGRIS_OP_MUL &&
@@ -2235,7 +2292,7 @@ tigris_error_t tigris_plan_load_ex(
                 if (op_type == TIGRIS_OP_CONV ||
                     op_type == TIGRIS_OP_DEPTHWISE ||
                     op_type == TIGRIS_OP_MAX_POOL ||
-                    op_type == TIGRIS_OP_AVG_POOL) {
+                    op_type == TIGRIS_OP_AVG_POOL || op_type == TIGRIS_OP_L2_POOL) {
                     spatial_count++;
                     note_requirement(&required.spatial_ops_per_stage,
                                      spatial_count);
@@ -2253,6 +2310,11 @@ tigris_error_t tigris_plan_load_ex(
                             * of stripe-tileable stages, so its operator list
                             * is that one. */
                            op_type != TIGRIS_OP_SOFTMAX &&
+                           op_type != TIGRIS_OP_LEAKY_RELU &&
+                           op_type != TIGRIS_OP_PRELU &&
+                           op_type != TIGRIS_OP_ELU &&
+                           op_type != TIGRIS_OP_LOG_SOFTMAX &&
+                           op_type != TIGRIS_OP_L2_NORMALIZATION &&
                            op_type != TIGRIS_OP_ERF &&
                            op_type != TIGRIS_OP_HARDSWISH &&
                            op_type != TIGRIS_OP_ABS &&

@@ -2553,6 +2553,216 @@ static void test_pad_s8(void)
                 "pad without its widths is refused");
 }
 
+static void test_activation_s8_domains(void)
+{
+    printf("  test_activation_s8_domains...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t iq = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t oq = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t x = add_tensor(&plan, "x", NULL, 0, 3, 1, iq);
+    uint16_t y = add_tensor(&plan, "y", NULL, 0, 3, 1, oq);
+    one_op_s8(&plan, TIGRIS_OP_LEAKY_RELU, &x, 1, &y, 1, TIGRIS_NO_WEIGHT);
+    int8_t input = -100, output = 85;
+    void *pointers[MAX_TENSORS] = {0};
+    pointers[x] = &input;
+    pointers[y] = &output;
+    tigris_mem_t mem = {0};
+    mem.tensor_ptrs = pointers;
+    mem.num_tensors = test_header.num_tensors;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                   0, "scalar LeakyRelu runs");
+    TEST_ASSERT_EQ(output, -1, "scalar LeakyRelu applies its default alpha");
+
+    float alpha = 16777216.0f;
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_ALPHA, sizeof(alpha), 0};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = (const uint8_t *)&alpha;
+    plan.num_op_attributes = 1;
+    input = -128;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "LeakyRelu rejects overflow in the alpha branch left shift");
+    alpha = 0.01f;
+    input = 127;
+    test_qp[iq].scale = 16777216.0f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "LeakyRelu rejects overflow in the identity branch left shift");
+    test_qp[iq].scale = 1073741824.0f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "LeakyRelu rejects a shift beyond the reference multiplier domain");
+    test_qp[iq].scale = 1.0f;
+    alpha = NAN;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "LeakyRelu rejects nonfinite alpha");
+    alpha = 0.01f;
+    attr.data_len = 1;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "LeakyRelu rejects truncated alpha");
+
+    test_ops[0].op_type = TIGRIS_OP_ELU;
+    plan.num_op_attributes = 0;
+    input = -1;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                   0, "scalar Elu runs");
+    TEST_ASSERT_EQ(output, -1, "scalar Elu rounds its transformed value");
+    output = 85;
+    test_qp[oq].scale = 0x1p-31f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "Elu rejects an out-of-int32 LUT conversion even for an unused input value");
+    TEST_ASSERT_EQ(output, 85, "Elu validates the table before writing output");
+    test_qp[oq].scale = 0x1p-140f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "Elu rejects a nonfinite LUT rescaling");
+    test_qp[oq].scale = 1.0f;
+    test_qp[iq].scale = NAN;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "activation rejects nonfinite input scale");
+    test_qp[iq].scale = 1.0f;
+    test_tensors[x].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "activation rejects missing input quantization");
+    test_tensors[x].quant_param_idx = iq;
+    test_ops[0].op_type = TIGRIS_OP_LOG_SOFTMAX;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "LogSoftmax rejects a scalar without a normalization axis");
+    test_ops[0].op_type = TIGRIS_OP_L2_NORMALIZATION;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "L2Normalization rejects a scalar without a normalization axis");
+}
+
+static void test_prelu_s8_domains(void)
+{
+    printf("  test_prelu_s8_domains...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t iq = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t aq = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t oq = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    int32_t shape[] = {1};
+    uint16_t x = add_tensor(&plan, "x", shape, 1, 3, 1, iq);
+    uint16_t y = add_tensor(&plan, "y", shape, 1, 3, 1, oq);
+    int8_t slope = 127;
+    one_op_s8(&plan, TIGRIS_OP_PRELU, &x, 1, &y, 1, add_weight(&slope, 1, "alpha"));
+    uint8_t payload[4] = {1, 0, (uint8_t)aq, 0};
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_CONSTANT_OPERAND, sizeof(payload), 0};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = payload;
+    plan.num_op_attributes = 1;
+    int8_t input = -128, output = 85;
+    void *pointers[MAX_TENSORS] = {0};
+    pointers[x] = &input;
+    pointers[y] = &output;
+    tigris_mem_t mem = {0};
+    mem.tensor_ptrs = pointers;
+    mem.num_tensors = test_header.num_tensors;
+    test_qp[oq].scale = 0x1p-16f;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                   0, "PRelu accepts a large representable negative product");
+    TEST_ASSERT_EQ(output, -128, "PRelu clamps a representable product to int8");
+    test_qp[oq].scale = 0x1p-17f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "PRelu rejects overflow while shifting the negative-branch product");
+    input = 127;
+    test_qp[oq].scale = 1.0f;
+    test_qp[iq].scale = 16777216.0f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "PRelu rejects overflow in its identity branch left shift");
+    test_qp[iq].scale = 1.0f;
+    test_qp[aq].scale = 1073741824.0f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "PRelu rejects an alpha multiplier outside the reference domain");
+    test_qp[aq].scale = 1.0f;
+    payload[2] = 0xFFu;
+    payload[3] = 0xFFu;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "PRelu rejects a constant alpha without quantization");
+}
+
+static void test_normalization_s8_domains(void)
+{
+    printf("  test_normalization_s8_domains...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t iq = add_quant_param(0.125f, 0, 1, NULL, NULL);
+    uint16_t oq = add_quant_param(0.0625f, 127, 1, NULL, NULL);
+    int32_t shape[] = {1, 4095};
+    uint16_t x = add_tensor(&plan, "x", shape, 2, 3, 4095, iq);
+    uint16_t y = add_tensor(&plan, "y", shape, 2, 3, 4095, oq);
+    one_op_s8(&plan, TIGRIS_OP_LOG_SOFTMAX, &x, 1, &y, 1, TIGRIS_NO_WEIGHT);
+    static int8_t input[33026], output[33026];
+    memset(input, 0, sizeof(input));
+    void *pointers[MAX_TENSORS] = {0};
+    pointers[x] = input;
+    pointers[y] = output;
+    tigris_mem_t mem = {0};
+    mem.tensor_ptrs = pointers;
+    mem.num_tensors = test_header.num_tensors;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                   0, "LogSoftmax accepts 4095 equal exponentials");
+    TEST_ASSERT_EQ(output[0], -6, "LogSoftmax normalizes the last safe equal row");
+    test_shapes[test_tensors[x].shape_off + 1] = 4096;
+    test_shapes[test_tensors[y].shape_off + 1] = 4096;
+    test_tensors[x].size_bytes = test_tensors[y].size_bytes = 4096;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "LogSoftmax rejects int32 overflow from 4096 equal exponentials");
+
+    test_shapes[test_tensors[x].shape_off + 1] = 1024;
+    test_shapes[test_tensors[y].shape_off + 1] = 1024;
+    test_tensors[x].size_bytes = test_tensors[y].size_bytes = 1024;
+    input[0] = -127;
+    float boundary = (32.0f - logf(1023.0f)) / 127.0f;
+    const float scales[] = {nextafterf(boundary, 0.0f), boundary, nextafterf(boundary, INFINITY)};
+    for (size_t i = 0; i < sizeof(scales) / sizeof(scales[0]); i++) {
+        test_qp[iq].scale = scales[i];
+        TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                       0, "LogSoftmax cutoff prevents subtraction overflow");
+        TEST_ASSERT_EQ(output[0], -128, "LogSoftmax saturates the sample at its subtraction boundary");
+        TEST_ASSERT_EQ(output[1], 16, "LogSoftmax preserves the other normalized samples");
+    }
+    const float invalid_scales[] = {0x1p-27f, 0x1p-26f, 16.0f};
+    for (size_t i = 0; i < sizeof(invalid_scales) / sizeof(invalid_scales[0]); i++) {
+        test_qp[iq].scale = invalid_scales[i];
+        TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                    "LogSoftmax rejects an undefined reference scaling domain");
+    }
+    test_qp[iq].scale = 0.125f;
+    test_qp[oq].zero_point = 0;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "LogSoftmax rejects a noncanonical output zero point");
+    test_qp[oq].zero_point = 127;
+    test_qp[oq].scale = 0.125f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "LogSoftmax rejects a noncanonical output scale");
+
+    test_ops[0].op_type = TIGRIS_OP_L2_NORMALIZATION;
+    test_qp[oq].scale = 1.0f / 128.0f;
+    test_qp[oq].zero_point = 0;
+    test_qp[iq].zero_point = -128;
+    memset(input, 127, sizeof(input));
+    test_shapes[test_tensors[x].shape_off + 1] = 33025;
+    test_shapes[test_tensors[y].shape_off + 1] = 33025;
+    test_tensors[x].size_bytes = test_tensors[y].size_bytes = 33025;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                   0, "L2Normalization accepts 33025 maximal centered squares");
+    TEST_ASSERT_EQ(output[0], 1, "L2Normalization scales a near-limit accumulator");
+    test_shapes[test_tensors[x].shape_off + 1] = 33026;
+    test_shapes[test_tensors[y].shape_off + 1] = 33026;
+    test_tensors[x].size_bytes = test_tensors[y].size_bytes = 33026;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "L2Normalization rejects int32 sum-of-squares overflow");
+    memset(input, -128, sizeof(input));
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                   0, "L2Normalization accepts a large zero-norm vector");
+    TEST_ASSERT_EQ(output[0], 0, "L2Normalization emits zero for a zero-norm vector");
+    test_qp[oq].zero_point = 1;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "L2Normalization rejects a nonzero output zero point");
+    test_qp[oq].zero_point = 0;
+    test_qp[oq].scale = 1.0f / 256.0f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "L2Normalization rejects a noncanonical output scale");
+}
+
 /* Main */
 
 int main(void)
@@ -2598,6 +2808,9 @@ int main(void)
     test_binary_s8_constant_shape();
     test_unsupported_op_s8();
     test_elementwise_reference_goldens();
+    test_activation_s8_domains();
+    test_prelu_s8_domains();
+    test_normalization_s8_domains();
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);

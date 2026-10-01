@@ -19,6 +19,7 @@
 #include "tigris_kernels_s8.h"
 #include "elementwise_f32_golden.h"
 #include "resize_golden.h"
+#include "activation_golden.h"
 
 /* Test infrastructure */
 
@@ -3167,6 +3168,105 @@ static void test_elementwise_reference_goldens(void)
     }
 }
 
+static void test_activation_reference_goldens(void)
+{
+    printf("  test_activation_reference_goldens...\n");
+    for (size_t g = 0; g < sizeof(activation_goldens) / sizeof(activation_goldens[0]); g++) {
+        const activation_golden_t *gold = &activation_goldens[g];
+        tigris_file_header_t header = {0};
+        tigris_tensor_t tensors[2] = {0};
+        tigris_op_t op = {0};
+        tigris_plan_t plan = {0};
+        tigris_mem_t mem = {0};
+        tigris_quant_param_t quant[3] = {{0}};
+        tigris_weight_entry_t weight = {0};
+        tigris_op_attribute_t attribute = {0};
+        uint8_t payload[20] = {0};
+        uint16_t indices[] = {0, 1};
+        uint32_t element = gold->dtype == 3 ? 1u : 4u;
+        void *output = calloc(gold->output_count, element);
+        void *pointers[] = {(void *)gold->input, output};
+        TEST_ASSERT(output != NULL, "activation output allocated");
+        if (!output) return;
+        header.num_tensors = 2;
+        header.num_ops = 1;
+        header.num_weights = gold->alpha_count ? 1 : 0;
+        header.num_quant_params = 3;
+        for (int i = 0; i < 3; i++) {
+            quant[i].scale = gold->scales[i];
+            quant[i].zero_point = gold->zeros[i];
+            quant[i].num_channels = 1;
+        }
+        for (int i = 0; i < 2; i++) {
+            tensors[i].shape_off = (uint32_t)i * 4u;
+            tensors[i].ndim = 4;
+            tensors[i].dtype = gold->dtype;
+            tensors[i].quant_param_idx = gold->dtype == 3 ? (uint16_t)(i * 2) : TIGRIS_NO_QUANT_PARAM;
+            tensors[i].size_bytes = (i == 0 ? gold->input_count : gold->output_count) * element;
+        }
+        op.op_type = gold->op;
+        op.num_inputs = 1;
+        op.num_outputs = 1;
+        op.outputs_off = 1;
+        op.weight_idx = gold->alpha_count ? 0 : TIGRIS_NO_WEIGHT;
+        op.bias_idx = TIGRIS_NO_WEIGHT;
+        op.spatial.kernel_h = op.spatial.kernel_w = 3;
+        op.spatial.stride_h = op.spatial.stride_w = 2;
+        op.spatial.pad_top = op.spatial.pad_left = 1;
+        op.spatial.pad_bottom = op.spatial.pad_right = 1;
+        weight.size_bytes = gold->alpha_count * element;
+        if (gold->op == TIGRIS_OP_PRELU) {
+            attribute.type = TIGRIS_OP_ATTR_CONSTANT_OPERAND;
+            attribute.data_len = 20;
+            payload[0] = 1;
+            payload[2] = gold->dtype == 3 ? 1 : 255;
+            payload[3] = gold->dtype == 3 ? 0 : 255;
+            for (int axis = 0; axis < 4; axis++)
+                memcpy(payload + 4 + 4 * axis, &gold->alpha_shape[axis], 4);
+        } else if (gold->op == TIGRIS_OP_LEAKY_RELU) {
+            attribute.type = TIGRIS_OP_ATTR_ALPHA;
+            attribute.data_len = 4;
+            memcpy(payload, &gold->slope, 4);
+        } else if (gold->op == TIGRIS_OP_L2_NORMALIZATION) {
+            float epsilon = 1e-6f;
+            attribute.type = TIGRIS_OP_ATTR_EPSILON;
+            attribute.data_len = 4;
+            memcpy(payload, &epsilon, 4);
+        }
+        plan.header = &header;
+        plan.tensors = tensors;
+        plan.ops = &op;
+        plan.shape_pool = gold->shapes;
+        plan.index_pool = indices;
+        plan.quant_params = quant;
+        plan.num_quant_params = 3;
+        plan.weight_entries = &weight;
+        plan.weight_blob = gold->alpha;
+        plan.num_op_attributes = attribute.type ? 1 : 0;
+        plan.op_attributes = &attribute;
+        plan.op_attribute_data = payload;
+        mem.tensor_ptrs = pointers;
+        mem.num_tensors = 2;
+        tigris_kernel_fn kernel = gold->dtype == 3 ? tigris_dispatch_kernel_s8 : tigris_dispatch_kernel;
+        int result = kernel(&plan, &op, 0, &mem, NULL);
+        if (result != 0) fprintf(stderr, "    activation case %zu op %u result %d\n", g, gold->op, result);
+        TEST_ASSERT(result == 0, "activation golden runs");
+        for (uint32_t i = 0; i < gold->output_count; i++) {
+            int equal = memcmp((uint8_t *)output + i * element,
+                               (const uint8_t *)gold->output + i * element, element) == 0;
+            if (!equal) {
+                fprintf(stderr, "    activation case %zu op %u element %u\n", g, gold->op, i);
+                if (gold->dtype == 3)
+                    fprintf(stderr, "    actual %d expected %d\n", ((int8_t *)output)[i], ((const int8_t *)gold->output)[i]);
+                else
+                    fprintf(stderr, "    actual %.9g expected %.9g\n", (double)((float *)output)[i], (double)((const float *)gold->output)[i]);
+            }
+            TEST_ASSERT(equal, "activation output bits equal TFLM");
+        }
+        free(output);
+    }
+}
+
 int main(void)
 {
     printf("TiGrIS Kernel Tests\n\n");
@@ -3194,6 +3294,7 @@ int main(void)
     test_per_channel_mul();
     test_resize_nearest();
     test_resize_reference_goldens();
+    test_activation_reference_goldens();
     test_resize_linear();
     test_sigmoid();
     test_erf();

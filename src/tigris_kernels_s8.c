@@ -71,10 +71,12 @@ static inline int32_t sat_round_dbl_high_mul(int32_t a, int32_t b)
 static inline int32_t round_div_by_pot(int32_t x, int exponent)
 {
     if (exponent <= 0) return x;
-    int32_t mask = ((int32_t)1 << exponent) - 1;
-    int32_t remainder = x & mask;
-    int32_t threshold = (mask >> 1) + (x < 0 ? 1 : 0);
-    return (x >> exponent) + (remainder > threshold ? 1 : 0);
+    uint32_t mask = ((uint32_t)1u << exponent) - 1u;
+    uint32_t remainder = (uint32_t)x & mask;
+    uint32_t threshold = (mask >> 1) + (x < 0 ? 1u : 0u);
+    int32_t quotient = x >= 0 ? (int32_t)((uint32_t)x >> exponent)
+                             : -1 - (int32_t)(~(uint32_t)x >> exponent);
+    return quotient + (remainder > threshold ? 1 : 0);
 }
 
 /**
@@ -1920,9 +1922,15 @@ static int32_t elementwise_inverse_sqrt(int32_t value, int *output_shift)
 {
     *output_shift = 0;
     if (value <= 1) return INT32_MAX;
-    int pairs = (elementwise_leading_zeros((uint32_t)value) - 1) / 2 - 1;
-    int shift = 11 - pairs;
-    int32_t normalized = value * ((int32_t)1 << (2 * pairs));
+    int32_t reduced = value;
+    int shift = 11;
+    while (reduced >= ((int32_t)1 << 29)) {
+        reduced /= 4;
+        shift++;
+    }
+    int pairs = (elementwise_leading_zeros((uint32_t)reduced) - 1) / 2 - 1;
+    shift -= pairs;
+    int32_t normalized = reduced * ((int32_t)1 << (2 * pairs));
     int32_t half = round_div_by_pot(normalized >> 1, 1);
     int32_t estimate = 268435456;
     for (int step = 0; step < 5; step++) {
@@ -1983,6 +1991,156 @@ static int elementwise_divide(
     else if (result < -128 - zero) *output = -128;
     else *output = (int8_t)(result + zero);
     return 1;
+}
+
+typedef struct {
+    const int8_t *input;
+    int8_t *output;
+    const tigris_quant_param_t *input_quant;
+    const tigris_quant_param_t *output_quant;
+    uint32_t count;
+    uint32_t width;
+} activation_s8_t;
+
+static int activation_s8_begin(
+    const tigris_plan_t *plan, const tigris_op_t *op, const tigris_mem_t *mem,
+    activation_s8_t *view)
+{
+    if (op->num_inputs != 1u || op->num_outputs != 1u) return 0;
+    uint16_t input_index = tigris_op_inputs(plan, op)[0];
+    uint16_t output_index = tigris_op_outputs(plan, op)[0];
+    const tigris_tensor_t *input = &plan->tensors[input_index];
+    const tigris_tensor_t *output = &plan->tensors[output_index];
+    if (input->dtype != 3u || output->dtype != 3u ||
+        input->ndim != output->ndim || input->size_bytes != output->size_bytes ||
+        (input->ndim == 0u && (op->op_type == TIGRIS_OP_LOG_SOFTMAX ||
+                              op->op_type == TIGRIS_OP_L2_NORMALIZATION))) return 0;
+    const int32_t *shape = tigris_tensor_shape(plan, input);
+    const int32_t *output_shape = tigris_tensor_shape(plan, output);
+    for (uint8_t axis = 0; axis < input->ndim; axis++)
+        if (shape[axis] <= 0 || shape[axis] != output_shape[axis]) return 0;
+    view->input = (const int8_t *)tigris_mem_tensor_ptr(mem, input_index);
+    view->output = (int8_t *)tigris_mem_tensor_ptr(mem, output_index);
+    view->input_quant = tigris_tensor_quant(plan, input);
+    view->output_quant = tigris_tensor_quant(plan, output);
+    if (!view->input || !view->output || !view->input_quant || !view->output_quant ||
+        !isfinite(view->input_quant->scale) || !isfinite(view->output_quant->scale) ||
+        view->input_quant->scale <= 0.0f || view->output_quant->scale <= 0.0f) return 0;
+    view->count = tile_aware_numel(plan, input_index, mem);
+    view->width = input->ndim == 0u ? 1u : (uint32_t)shape[input->ndim - 1u];
+    if (view->count == 0u || view->count % view->width != 0u) return 0;
+    apply_pointwise_row_offset_s8(plan, input_index, mem, &view->input, &view->output);
+    return 1;
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_leaky_relu_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    activation_s8_t view;
+    if (!activation_s8_begin(plan, op, mem, &view)) return -1;
+    float alpha = 0.01f;
+    uint8_t length = 0;
+    const uint8_t *raw = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_ALPHA, &length);
+    if (raw) {
+        if (length != sizeof(alpha)) return -1;
+        memcpy(&alpha, raw, sizeof(alpha));
+    }
+    if (!isfinite(alpha)) return -1;
+    int32_t multipliers[2];
+    int shifts[2];
+    float identity_scale = view.input_quant->scale / view.output_quant->scale;
+    float alpha_scale = view.input_quant->scale * alpha / view.output_quant->scale;
+    if (!elementwise_multiplier((double)identity_scale, &multipliers[0], &shifts[0]) ||
+        !elementwise_multiplier((double)fabsf(alpha_scale), &multipliers[1], &shifts[1])) return -1;
+    for (uint32_t i = 0; i < view.count; i++) {
+        int32_t value = (int32_t)view.input[i] - view.input_quant->zero_point;
+        int branch = value < 0 ? 1 : 0;
+        int left = shifts[branch] > 0 ? shifts[branch] : 0;
+        int64_t shifted = (int64_t)value * ((int64_t)1 << left);
+        if (shifted < INT32_MIN || shifted > INT32_MAX) return -1;
+        int32_t result = elementwise_multiply(value, multipliers[branch], shifts[branch]);
+        if (branch == 1 && alpha_scale < 0.0f) {
+            if (result == INT32_MIN) return -1;
+            result = -result;
+        }
+        int64_t offset = (int64_t)result + view.output_quant->zero_point;
+        if (offset < INT32_MIN || offset > INT32_MAX) return -1;
+        view.output[i] = clamp_s8((int32_t)offset);
+    }
+    return 0;
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_prelu_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    tigris_binary_operands_t operands;
+    int8_t *output;
+    uint32_t count;
+    if (!binary_s8_begin(plan, op, op_index, mem, &operands, &output, &count)) return -1;
+    const tigris_quant_param_t *iq = operands.quant[0];
+    const tigris_quant_param_t *aq = operands.quant[1];
+    const tigris_quant_param_t *oq = tigris_tensor_quant(plan, &plan->tensors[operands.output]);
+    if (!iq || !aq || !oq || iq->scale <= 0.0f || aq->scale <= 0.0f || oq->scale <= 0.0f) return -1;
+    int32_t multipliers[2];
+    int shifts[2];
+    if (!elementwise_multiplier((double)iq->scale / (double)oq->scale, &multipliers[0], &shifts[0]) ||
+        !elementwise_multiplier((double)iq->scale * (double)aq->scale / (double)oq->scale,
+                                &multipliers[1], &shifts[1])) return -1;
+    for (uint32_t i = 0; i < count; i++) {
+        int32_t value = binary_s8_at(&operands, 0u, i) - iq->zero_point;
+        int branch = value < 0 ? 1 : 0;
+        if (branch == 1) value *= binary_s8_at(&operands, 1u, i) - aq->zero_point;
+        if (!elementwise_requantize(value, multipliers[branch], shifts[branch],
+                                    oq->zero_point, &output[i])) return -1;
+    }
+    return 0;
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_elu_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    activation_s8_t view;
+    if (!activation_s8_begin(plan, op, mem, &view)) return -1;
+    int8_t table[256];
+    float inverse_scale = 1.0f / view.output_quant->scale;
+    for (int32_t value = -128; value <= 127; value++) {
+        float real = view.input_quant->scale * (float)(value - view.input_quant->zero_point);
+        float transformed = real < 0.0f ? expf(real) - 1.0f : real;
+        float rescaled = roundf(transformed * inverse_scale);
+        float quantized = rescaled + (float)view.output_quant->zero_point;
+        if (!isfinite(quantized) || (double)quantized < (double)INT32_MIN ||
+            (double)quantized > (double)INT32_MAX) return -1;
+        table[(uint8_t)(int8_t)value] = clamp_s8((int32_t)quantized);
+    }
+    for (uint32_t i = 0; i < view.count; i++) view.output[i] = table[(uint8_t)view.input[i]];
+    return 0;
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_l2_normalization_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    activation_s8_t view;
+    if (!activation_s8_begin(plan, op, mem, &view) ||
+        view.output_quant->scale != 1.0f / 128.0f || view.output_quant->zero_point != 0) return -1;
+    for (uint32_t row = 0; row < view.count / view.width; row++) {
+        const int8_t *input = view.input + (size_t)row * view.width;
+        int8_t *output = view.output + (size_t)row * view.width;
+        int64_t sum = 0;
+        for (uint32_t c = 0; c < view.width; c++) {
+            int32_t centered = (int32_t)input[c] - view.input_quant->zero_point;
+            sum += (int64_t)centered * (int64_t)centered;
+            if (sum > INT32_MAX) return -1;
+        }
+        int shift;
+        int32_t inverse = elementwise_inverse_sqrt((int32_t)sum, &shift);
+        for (uint32_t c = 0; c < view.width; c++) {
+            int32_t centered = (int32_t)input[c] - view.input_quant->zero_point;
+            if (!elementwise_requantize(centered, inverse, shift + 7, 0, &output[c])) return -1;
+        }
+    }
+    return 0;
 }
 
 static TIGRIS_KERNEL_NOINLINE int kern_elementwise_unary_s8(
@@ -2310,6 +2468,99 @@ static void softmax_row_fixed_point(
     }
 }
 
+static int32_t log_softmax_saturate(int64_t value)
+{
+    if (value > INT32_MAX) return INT32_MAX;
+    if (value < INT32_MIN) return INT32_MIN;
+    return (int32_t)value;
+}
+
+static int32_t log_softmax_power(int32_t value, int exponent)
+{
+    return exponent < 0 ? round_div_by_pot(value, -exponent) : sat_shift_left(value, exponent);
+}
+
+/* The fixed-point logarithm maps the Q12.19 sum to Q5.26. */
+static int32_t log_softmax_log_sum(int32_t sum)
+{
+    int headroom_a = count_leading_zeros((uint32_t)sum);
+    int32_t r_a = sat_shift_left(sat_round_dbl_high_mul(
+        log_softmax_power(sum, headroom_a - 1), 1518500250), 1);
+    int32_t power_a = log_softmax_saturate((int64_t)sat_shift_left(12 - headroom_a, 25) + 8388608);
+    int32_t z_b = sat_round_dbl_high_mul(sum, 1518500250);
+    int headroom_b = count_leading_zeros((uint32_t)z_b) - 1;
+    int32_t r_b = log_softmax_power(sum, headroom_b);
+    int32_t power_b = log_softmax_saturate((int64_t)sat_shift_left(12 - headroom_b, 25) - 8388608);
+    int32_t r = r_a < r_b ? r_a : r_b;
+    int32_t power = power_a > power_b ? power_a : power_b;
+    int32_t p = (int32_t)(((int64_t)r + 1805811301 + 1) / 2);
+    int32_t q = wrapping_add(r, -1805811301);
+    q = wrapping_add(q, q);
+    int32_t square = sat_round_dbl_high_mul(q, q);
+    int32_t numerator = wrapping_add(sat_round_dbl_high_mul(q, r),
+        sat_round_dbl_high_mul(sat_round_dbl_high_mul(q, square), 117049297));
+    int32_t denominator = wrapping_add(sat_round_dbl_high_mul(p,
+        wrapping_add(wrapping_add(1057819769, q), sat_round_dbl_high_mul(127690142, square))),
+        sat_round_dbl_high_mul(638450708, q));
+    int32_t reciprocal = softmax_one_over_one_plus_x(denominator);
+    return sat_shift_left(wrapping_add(sat_round_dbl_high_mul(power, 1488522236),
+        sat_round_dbl_high_mul(round_div_by_pot(numerator, 6), reciprocal)), 1);
+}
+
+static int log_softmax_row(
+    const int8_t *input, int8_t *output, uint32_t width,
+    const softmax_params_t *forward, int32_t reverse_multiplier, int reverse_shift)
+{
+    int32_t maximum = input[0];
+    for (uint32_t c = 1; c < width; c++)
+        if (input[c] > maximum) maximum = input[c];
+    int64_t sum = 0;
+    for (uint32_t c = 0; c < width; c++) {
+        int32_t diff = (int32_t)input[c] - maximum;
+        if (diff >= forward->diff_min) {
+            sum += round_div_by_pot(softmax_exp_negative(softmax_scaled_diff(diff, forward)), 12);
+            if (sum > INT32_MAX) return -1;
+        }
+    }
+    int32_t log_sum = log_softmax_log_sum((int32_t)sum);
+    if (log_sum < 0) return -1;
+    int32_t shifted_log_sum = log_sum + INT32_MIN;
+    int32_t minimum = elementwise_multiply(shifted_log_sum, reverse_multiplier, reverse_shift);
+    if (minimum < forward->diff_min - 1) minimum = forward->diff_min - 1;
+    for (uint32_t c = 0; c < width; c++) {
+        int32_t diff = (int32_t)input[c] - maximum;
+        if (diff > minimum) {
+            int64_t centered = (int64_t)softmax_scaled_diff(diff, forward) - log_sum;
+            if (centered < INT32_MIN || centered > INT32_MAX) return -1;
+            output[c] = clamp_s8(round_div_by_pot((int32_t)centered, 22) + 127);
+        } else {
+            output[c] = -128;
+        }
+    }
+    return 0;
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_log_softmax_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    activation_s8_t view;
+    if (!activation_s8_begin(plan, op, mem, &view) ||
+        view.output_quant->scale != 1.0f / 16.0f || view.output_quant->zero_point != 127) return -1;
+    softmax_params_t forward;
+    if (!softmax_params(view.input_quant->scale, &forward) || forward.left_shift < 1) return -1;
+    double reverse = (double)((int32_t)1 << (31 - forward.left_shift)) / (double)forward.multiplier;
+    int32_t reverse_multiplier;
+    int reverse_shift;
+    if (reverse <= 0.0 || reverse >= 1.0 ||
+        !elementwise_multiplier(reverse, &reverse_multiplier, &reverse_shift)) return -1;
+    for (uint32_t row = 0; row < view.count / view.width; row++) {
+        if (log_softmax_row(view.input + (size_t)row * view.width,
+                            view.output + (size_t)row * view.width, view.width,
+                            &forward, reverse_multiplier, reverse_shift) != 0) return -1;
+    }
+    return 0;
+}
+
 static TIGRIS_KERNEL_NOINLINE int kern_softmax_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -2470,6 +2721,11 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_SIGMOID:     return kern_sigmoid_s8(plan, op, mem);
     case TIGRIS_OP_TANH:        return kern_tanh_s8(plan, op, mem);
     case TIGRIS_OP_SOFTMAX:     return kern_softmax_s8(plan, op, mem);
+    case TIGRIS_OP_LEAKY_RELU: return kern_leaky_relu_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_PRELU: return kern_prelu_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_ELU: return kern_elu_s8(plan, op, mem);
+    case TIGRIS_OP_LOG_SOFTMAX: return kern_log_softmax_s8(plan, op, mem);
+    case TIGRIS_OP_L2_NORMALIZATION: return kern_l2_normalization_s8(plan, op, mem);
     case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, op_index, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
     case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose_s8(plan, op, mem);

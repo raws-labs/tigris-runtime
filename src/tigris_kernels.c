@@ -492,6 +492,87 @@ static int kern_elementwise_unary_f32(
     return 0;
 }
 
+static int kern_activation_f32(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    const uint16_t input_index = tigris_op_inputs(plan, op)[0];
+    const uint16_t output_index = tigris_op_outputs(plan, op)[0];
+    const float *input = (const float *)tigris_mem_tensor_ptr(mem, input_index);
+    float *output = (float *)tigris_mem_tensor_ptr(mem, output_index);
+    if (!input || !output) return -1;
+    float alpha = 0.01f;
+    if (op->op_type == TIGRIS_OP_LEAKY_RELU) {
+        uint8_t length = 0;
+        const uint8_t *raw = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_ALPHA, &length);
+        if (raw) {
+            if (length != sizeof(alpha)) return -1;
+            memcpy(&alpha, raw, sizeof(alpha));
+        }
+        if (!isfinite(alpha)) return -1;
+    }
+    uint32_t count = tile_aware_numel(plan, input_index, mem);
+    apply_pointwise_row_offset_f32(plan, input_index, mem, &input, &output);
+    for (uint32_t i = 0; i < count; i++) {
+        float value = input[i];
+        output[i] = op->op_type == TIGRIS_OP_ELU
+            ? (value < 0.0f ? expm1f(value) : value)
+            : (value > 0.0f ? value : value * alpha);
+    }
+    return 0;
+}
+
+static int kern_normalization_f32(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    const uint16_t input_index = tigris_op_inputs(plan, op)[0];
+    const uint16_t output_index = tigris_op_outputs(plan, op)[0];
+    const tigris_tensor_t *tensor = &plan->tensors[input_index];
+    const tigris_tensor_t *result = &plan->tensors[output_index];
+    if (tensor->ndim == 0u || !tensor_is_f32(plan, tensor) ||
+        !tensor_is_f32(plan, result) || !tensor_shapes_equal(plan, tensor, result)) return -1;
+    const int32_t *shape = tigris_tensor_shape(plan, tensor);
+    int32_t width = shape[tensor->ndim - 1u];
+    uint32_t count = tile_aware_numel(plan, input_index, mem);
+    if (width <= 0 || count % (uint32_t)width != 0u) return -1;
+    const float *input = (const float *)tigris_mem_tensor_ptr(mem, input_index);
+    float *output = (float *)tigris_mem_tensor_ptr(mem, output_index);
+    if (!input || !output) return -1;
+    float epsilon = 1.0e-6f;
+    if (op->op_type == TIGRIS_OP_L2_NORMALIZATION) {
+        uint8_t length = 0;
+        const uint8_t *raw = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_EPSILON, &length);
+        if (raw) {
+            if (length != sizeof(epsilon)) return -1;
+            memcpy(&epsilon, raw, sizeof(epsilon));
+        }
+        if (!isfinite(epsilon) || epsilon < 0.0f) return -1;
+    }
+    apply_pointwise_row_offset_f32(plan, input_index, mem, &input, &output);
+    for (uint32_t row = 0; row < count / (uint32_t)width; row++) {
+        const float *x = input + (size_t)row * (size_t)width;
+        float *y = output + (size_t)row * (size_t)width;
+        float maximum = -FLT_MAX;
+        if (op->op_type == TIGRIS_OP_LOG_SOFTMAX) {
+            for (int32_t c = 0; c < width; c++)
+                if (x[c] > maximum) maximum = x[c];
+        }
+        float sum = 0.0f;
+        for (int32_t c = 0; c < width; c++)
+            sum += op->op_type == TIGRIS_OP_LOG_SOFTMAX ? expf(x[c] - maximum) : x[c] * x[c];
+        if (op->op_type == TIGRIS_OP_LOG_SOFTMAX) {
+            float log_sum = logf(sum);
+            for (int32_t c = 0; c < width; c++) y[c] = x[c] - maximum - log_sum;
+        } else {
+            float norm = sqrtf(sum);
+            if (norm < epsilon) norm = epsilon;
+            for (int32_t c = 0; c < width; c++) y[c] = norm == 0.0f ? 0.0f : x[c] / norm;
+        }
+    }
+    return 0;
+}
+
 /* HardSwish: x * relu6(x + 3) / 6. */
 static int kern_hardswish(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
@@ -728,6 +809,7 @@ static int kern_conv1d(
 #define BINARY_MINIMUM 6
 #define BINARY_FLOOR_DIV 7
 #define BINARY_FLOOR_MOD 8
+#define BINARY_PRELU 9
 
 /* Declared in tigris_binary_operands.h, shared with the int8 kernels. */
 
@@ -984,6 +1066,7 @@ static int kern_binary_f32(
         float v;
         switch (operation) {
         case BINARY_MUL: v = a * b; break;
+        case BINARY_PRELU: v = a >= 0.0f ? a : a * b; break;
         case BINARY_SUB: v = a - b; break;
         case BINARY_DIV: v = a / b; break;
         case BINARY_SQUARED_DIFFERENCE: v = a - b; v *= v; break;
@@ -1533,10 +1616,14 @@ static int kern_avg_pool(
                         int ih = base_h + kh;
                         for (int kw = kw0; kw < kw1; kw++) {
                             int iw = base_w + kw;
-                            sum += X[((n * IH + ih) * IW + iw) * C + c];
+                            float value = X[((n * IH + ih) * IW + iw) * C + c];
+                            sum += op->op_type == TIGRIS_OP_L2_POOL ? value * value : value;
                         }
                     }
-                    Y[((n * OH + oh_g) * OW + ow) * C + c] = sum / (float)count;
+                    float value = sum / (float)count;
+                    if (op->op_type == TIGRIS_OP_L2_POOL)
+                        value = apply_fused_act_f32(sqrtf(value), op->fused_act);
+                    Y[((n * OH + oh_g) * OW + ow) * C + c] = value;
                 }
             }
         }
@@ -2096,6 +2183,12 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_SIGMOID:     return kern_sigmoid(plan, op, mem);
     case TIGRIS_OP_TANH:        return kern_tanh(plan, op, mem);
     case TIGRIS_OP_SOFTMAX:     return kern_softmax(plan, op, mem);
+    case TIGRIS_OP_LEAKY_RELU: return kern_activation_f32(plan, op, op_index, mem);
+    case TIGRIS_OP_ELU: return kern_activation_f32(plan, op, op_index, mem);
+    case TIGRIS_OP_PRELU: return kern_binary_f32(plan, op, op_index, mem, BINARY_PRELU);
+    case TIGRIS_OP_LOG_SOFTMAX: return kern_normalization_f32(plan, op, op_index, mem);
+    case TIGRIS_OP_L2_NORMALIZATION: return kern_normalization_f32(plan, op, op_index, mem);
+    case TIGRIS_OP_L2_POOL: return kern_avg_pool(plan, op, mem);
     case TIGRIS_OP_ADD:         return kern_add(plan, op, op_index, mem);
     case TIGRIS_OP_MUL:         return kern_mul(plan, op, op_index, mem);
     case TIGRIS_OP_CONV1D:      return kern_conv1d(plan, op, mem);

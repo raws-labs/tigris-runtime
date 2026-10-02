@@ -1217,6 +1217,67 @@ static int kern_reduce_mean(
     return 0;
 }
 
+static int kern_reduce_f32(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    int32_t outer, reduced, inner;
+    if (mem->tile.active || op->num_inputs != 1u || op->num_outputs != 1u ||
+        reduce_mean_extents(plan, op, op_index, &outer, &reduced, &inner) != 0) return -1;
+    const float *input = (const float *)tigris_mem_tensor_ptr(mem, tigris_op_inputs(plan, op)[0]);
+    float *output = (float *)tigris_mem_tensor_ptr(mem, tigris_op_outputs(plan, op)[0]);
+    if (!input || !output) return -1;
+    for (int32_t o = 0; o < outer; o++) {
+        const float *src = input + (size_t)o * (size_t)reduced * (size_t)inner;
+        float *dst = output + (size_t)o * (size_t)inner;
+        for (int32_t i = 0; i < inner; i++) {
+            float value = op->op_type == TIGRIS_OP_REDUCE_MAX ? -FLT_MAX
+                        : op->op_type == TIGRIS_OP_REDUCE_MIN ? FLT_MAX : 0.0f;
+            for (int32_t r = 0; r < reduced; r++) {
+                float sample = src[(size_t)r * (size_t)inner + (size_t)i];
+                if (op->op_type == TIGRIS_OP_REDUCE_SUM) value = sample + value;
+                else if ((op->op_type == TIGRIS_OP_REDUCE_MAX && sample > value) ||
+                         (op->op_type == TIGRIS_OP_REDUCE_MIN && sample < value)) value = sample;
+            }
+            dst[i] = value;
+        }
+    }
+    return 0;
+}
+
+static int kern_cumsum_f32(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    int32_t outer, reduced, inner;
+    uint8_t length = 0;
+    const uint8_t *options = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_CUMSUM_OPTIONS, &length);
+    if (!options || length != 2u || options[0] > 1u || options[1] > 1u ||
+        mem->tile.active || op->num_inputs != 1u || op->num_outputs != 1u ||
+        reduce_mean_extents(plan, op, op_index, &outer, &reduced, &inner) != 0) return -1;
+    const uint16_t x = tigris_op_inputs(plan, op)[0];
+    const uint16_t y = tigris_op_outputs(plan, op)[0];
+    if (!tensor_shapes_equal(plan, &plan->tensors[x], &plan->tensors[y])) return -1;
+    const float *input = (const float *)tigris_mem_tensor_ptr(mem, x);
+    float *output = (float *)tigris_mem_tensor_ptr(mem, y);
+    if (!input || !output) return -1;
+    for (int32_t o = 0; o < outer; o++) {
+        for (int32_t i = 0; i < inner; i++) {
+            float sum = 0.0f;
+            for (int32_t r = 0; r < reduced; r++) {
+                int32_t step = options[1] != 0u ? reduced - 1 - r : r;
+                size_t index = ((size_t)o * (size_t)reduced + (size_t)step) * (size_t)inner + (size_t)i;
+                float sample = input[index];
+                if (options[0] != 0u) output[index] = sum;
+                sum += sample;
+                if (options[0] == 0u) output[index] = sum;
+            }
+        }
+    }
+    return 0;
+}
+
 /**
  * Split a tensor into contiguous parts along its outermost stored axis.
  *
@@ -2228,6 +2289,10 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_HARDSWISH:   return kern_hardswish(plan, op, mem);
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm(plan, op, op_index, mem);
     case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean(plan, op, op_index, mem);
+    case TIGRIS_OP_REDUCE_MAX:
+    case TIGRIS_OP_REDUCE_MIN:
+    case TIGRIS_OP_REDUCE_SUM: return kern_reduce_f32(plan, op, op_index, mem);
+    case TIGRIS_OP_CUMSUM: return kern_cumsum_f32(plan, op, op_index, mem);
     case TIGRIS_OP_SPLIT:       return kern_split(plan, op, mem);
     case TIGRIS_OP_PAD:         return kern_pad(plan, op, op_index, mem);
     default:

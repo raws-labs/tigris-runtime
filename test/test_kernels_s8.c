@@ -2763,6 +2763,179 @@ static void test_normalization_s8_domains(void)
                 "L2Normalization rejects a noncanonical output scale");
 }
 
+static void test_reduce_s8_domains(void)
+{
+    printf("  test_reduce_s8_domains...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t iq = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t oq = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    int32_t input_shape[] = {1, 3, 1}, output_shape[] = {1, 1, 1};
+    uint16_t x = add_tensor(&plan, "x", input_shape, 3, 3, 3, iq);
+    uint16_t y = add_tensor(&plan, "y", output_shape, 3, 3, 1, oq);
+    one_op_s8(&plan, TIGRIS_OP_REDUCE_MAX, &x, 1, &y, 1, TIGRIS_NO_WEIGHT);
+    uint8_t axis = 1;
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_AXES, 1, 0};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = &axis;
+    plan.num_op_attributes = 1;
+    int8_t small[] = {-4, 3, -2}, output = 85;
+    void *pointers[MAX_TENSORS] = {0};
+    pointers[x] = small; pointers[y] = &output;
+    tigris_mem_t mem = {0};
+    mem.tensor_ptrs = pointers; mem.num_tensors = test_header.num_tensors;
+    const uint8_t kinds[] = {TIGRIS_OP_REDUCE_MAX, TIGRIS_OP_REDUCE_MIN};
+    for (size_t k = 0; k < sizeof(kinds); k++) {
+        test_ops[0].op_type = kinds[k];
+        TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                       0, "extreme reduction with identical encoding runs");
+        TEST_ASSERT_EQ(output, k == 0u ? 3 : -4, "extreme reduction selects the input byte");
+        test_qp[oq].scale = 2.0f;
+        TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                    "extreme reduction rejects changed scale");
+        test_qp[oq].scale = 1.0f;
+        test_qp[oq].zero_point = 1;
+        TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                    "extreme reduction rejects changed zero point");
+        test_qp[oq].zero_point = 0;
+    }
+    test_ops[0].op_type = TIGRIS_OP_REDUCE_SUM;
+    test_qp[iq].scale = 16777216.0f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) == 0,
+                "SUM accepts a large multiplier when the actual shifted sum fits");
+    small[0] = 127;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "SUM rejects a left-shift overflow before clamping");
+    test_qp[iq].scale = 1073741824.0f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "SUM rejects a multiplier shift outside the reference domain");
+    test_qp[iq].scale = 1.0f;
+
+    const uint32_t max_positive_count = 16909320u;
+    int8_t *large = malloc(max_positive_count + 1u);
+    TEST_ASSERT(large != NULL, "SUM overflow fixture allocated");
+    if (!large) return;
+    pointers[x] = large;
+    memset(large, 127, max_positive_count + 1u);
+    test_qp[iq].zero_point = 127;
+    test_shapes[test_tensors[x].shape_off + 1u] = (int32_t)max_positive_count;
+    test_tensors[x].size_bytes = max_positive_count;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                   0, "SUM accepts the last representable positive raw accumulator");
+    TEST_ASSERT_EQ(output, 0, "SUM subtracts the zero-point contribution after accumulation");
+    test_shapes[test_tensors[x].shape_off + 1u]++;
+    test_tensors[x].size_bytes++;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "SUM rejects raw accumulator overflow even when centered values are zero");
+    test_qp[iq].zero_point = -128;
+    test_shapes[test_tensors[x].shape_off + 1u] = 8421505;
+    test_tensors[x].size_bytes = 8421505u;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "SUM rejects a centered sum outside int32 despite a valid raw sum");
+    memset(large, -127, max_positive_count);
+    test_shapes[test_tensors[x].shape_off + 1u] = (int32_t)max_positive_count;
+    test_tensors[x].size_bytes = max_positive_count;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                   0, "SUM permits the reference's int64 zero-point product");
+    TEST_ASSERT_EQ(output, 127, "SUM clamps a valid corrected sum");
+    memset(large, -128, 16777217u);
+    test_shapes[test_tensors[x].shape_off + 1u] = 16777216;
+    test_tensors[x].size_bytes = 16777216u;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                   0, "SUM accepts INT32_MIN as a raw accumulator");
+    TEST_ASSERT_EQ(output, 0, "SUM corrects the valid negative boundary");
+    test_shapes[test_tensors[x].shape_off + 1u]++;
+    test_tensors[x].size_bytes++;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "SUM rejects raw accumulator underflow");
+    free(large);
+}
+
+static void test_cumsum_s8_domains(void)
+{
+    printf("  test_cumsum_s8_domains...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t iq = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t oq = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    int32_t shape[] = {1, 32, 1};
+    uint16_t x = add_tensor(&plan, "x", shape, 3, 3, 32, iq);
+    uint16_t y = add_tensor(&plan, "y", shape, 3, 3, 32, oq);
+    one_op_s8(&plan, TIGRIS_OP_CUMSUM, &x, 1, &y, 1, TIGRIS_NO_WEIGHT);
+    uint8_t data[] = {1, 0, 0};
+    tigris_op_attribute_t attrs[] = {
+        {0, TIGRIS_OP_ATTR_AXES, 1, 0}, {0, TIGRIS_OP_ATTR_CUMSUM_OPTIONS, 2, 1},
+    };
+    plan.op_attributes = attrs; plan.op_attribute_data = data; plan.num_op_attributes = 2;
+    int8_t input[33], output[33];
+    void *pointers[MAX_TENSORS] = {0};
+    pointers[x] = input; pointers[y] = output;
+    tigris_mem_t mem = {0};
+    mem.tensor_ptrs = pointers; mem.num_tensors = test_header.num_tensors;
+    for (int negative = 0; negative < 2; negative++) {
+        memset(input, negative ? -128 : 127, sizeof(input));
+        for (uint8_t exclusive = 0; exclusive < 2u; exclusive++) {
+            for (uint8_t reverse = 0; reverse < 2u; reverse++) {
+                data[1] = exclusive; data[2] = reverse;
+                for (int t = 0; t < 2; t++) {
+                    test_shapes[test_tensors[t].shape_off + 1u] = 32;
+                    test_tensors[t].size_bytes = 32;
+                }
+                TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                               0, "CumSum accepts a representable boundary prefix");
+                TEST_ASSERT_EQ(output[reverse ? 0 : 31], negative ? -128 : 127,
+                               "CumSum clamps each representable prefix");
+                for (int t = 0; t < 2; t++) {
+                    test_shapes[test_tensors[t].shape_off + 1u] = 33;
+                    test_tensors[t].size_bytes = 33;
+                }
+                TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                            "CumSum rejects overflow even in the final unused exclusive update");
+            }
+        }
+    }
+    for (int t = 0; t < 2; t++) {
+        test_shapes[test_tensors[t].shape_off + 1u] = 3;
+        test_tensors[t].size_bytes = 3;
+    }
+    data[1] = 1; data[2] = 0;
+    test_qp[iq].zero_point = 5;
+    memset(input, 5, sizeof(input));
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL),
+                   0, "CumSum executes the reference's nonzero initial offset");
+    for (int i = 0; i < 3; i++) TEST_ASSERT_EQ(output[i], -5, "exclusive CumSum retains the initial offset");
+    test_qp[iq].zero_point = 0;
+    test_qp[iq].scale = 524288.0f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "CumSum rejects an output multiplier equal to one");
+    test_qp[iq].scale = 1048576.0f;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "CumSum rejects an output multiplier greater than one");
+    test_qp[iq].scale = 1.0f;
+    attrs[1].data_len = 1;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "CumSum rejects truncated options");
+    attrs[1].data_len = 2;
+    data[1] = 2;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "CumSum rejects a nonboolean exclusive flag");
+    data[1] = 0; data[2] = 2;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "CumSum rejects a nonboolean reverse flag");
+    data[2] = 0;
+    plan.num_op_attributes = 1;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "CumSum requires explicit options");
+    plan.num_op_attributes = 2;
+    data[0] = 3;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "CumSum rejects an out-of-range axis");
+    data[0] = 1;
+    mem.tile.active = 1;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "CumSum refuses partial-axis execution");
+}
+
 /* Main */
 
 int main(void)
@@ -2811,6 +2984,8 @@ int main(void)
     test_activation_s8_domains();
     test_prelu_s8_domains();
     test_normalization_s8_domains();
+    test_reduce_s8_domains();
+    test_cumsum_s8_domains();
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);

@@ -1880,6 +1880,255 @@ static void build_elementwise_quant_plan(
     op->act_max = 127;
 }
 
+#define NATIVE_REDUCTION_PLAN_SIZE (ELEMENTWISE_PLAN_SIZE + 24u)
+
+static void build_native_reduction_plan(
+    uint8_t *buf, tigris_op_type_t type, int quantized, uint8_t axis)
+{
+    memset(buf, 0, NATIVE_REDUCTION_PLAN_SIZE);
+    if (quantized) build_elementwise_quant_plan(buf, type, 1);
+    else build_semantic_plan(buf, type, 1);
+    uint32_t offset = quantized ? 8u : 0u;
+    uint32_t attrs_off = quantized ? ELEMENTWISE_PLAN_SIZE : 292u;
+    tigris_file_header_t *header = (tigris_file_header_t *)buf;
+    header->file_size = attrs_off + 24u;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
+    dir[quantized ? 7 : 6] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, attrs_off};
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + offset);
+    int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + offset);
+    uint32_t bytes = quantized ? 1u : sizeof(float);
+    for (uint16_t t = 0; t < 2u; t++) {
+        tensors[t].ndim = 3;
+        tensors[t].size_bytes = 24u * bytes;
+        dims[4u * t] = 2; dims[4u * t + 1u] = 3; dims[4u * t + 2u] = 4;
+    }
+    if (type != TIGRIS_OP_CUMSUM) {
+        tensors[1].size_bytes /= (uint32_t)dims[axis];
+        dims[4u + axis] = 1;
+    }
+    uint16_t count = type == TIGRIS_OP_CUMSUM ? 2u : 1u;
+    memcpy(buf + attrs_off, &count, sizeof(count));
+    tigris_op_attribute_t *attrs = (tigris_op_attribute_t *)(buf + attrs_off + 4u);
+    attrs[0] = (tigris_op_attribute_t){0, TIGRIS_OP_ATTR_AXES, 1, 0};
+    if (count == 2u)
+        attrs[1] = (tigris_op_attribute_t){0, TIGRIS_OP_ATTR_CUMSUM_OPTIONS, 2, 1};
+    buf[attrs_off + 4u + count * sizeof(*attrs)] = axis;
+}
+
+static void test_native_reduction_contract(void)
+{
+    _Alignas(4) uint8_t buf[NATIVE_REDUCTION_PLAN_SIZE];
+    tigris_plan_t plan;
+    const uint8_t kinds[] = {TIGRIS_OP_REDUCE_MAX, TIGRIS_OP_REDUCE_MIN, TIGRIS_OP_REDUCE_SUM};
+    for (size_t k = 0; k < sizeof(kinds); k++) {
+        for (int quantized = 0; quantized < 2; quantized++) {
+            uint32_t offset = quantized ? 8u : 0u;
+            for (uint8_t axis = 0; axis < 3u; axis++) {
+                build_native_reduction_plan(buf, kinds[k], quantized, axis);
+                tigris_file_header_t *header = (tigris_file_header_t *)buf;
+                tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + offset);
+                int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + offset);
+                TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_OK,
+                               "rank-three reduction accepts every kept axis");
+                tensors[1].ndim = 2;
+                uint8_t written = 0;
+                for (uint8_t a = 0; a < 3u; a++) if (a != axis) dims[4u + written++] = dims[a];
+                TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_OK,
+                               "rank-three reduction accepts every dropped axis");
+                int32_t first = dims[4]; dims[4] = dims[5]; dims[5] = first;
+                TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                               "reduction rejects changed nonreduced extents");
+            }
+            build_native_reduction_plan(buf, kinds[k], quantized, 1);
+            tigris_file_header_t *header = (tigris_file_header_t *)buf;
+            tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + offset);
+            tigris_op_t *op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF + offset);
+            int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + offset);
+            uint32_t attrs_off = quantized ? ELEMENTWISE_PLAN_SIZE : 292u;
+            tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + attrs_off + 4u);
+            op->num_inputs = 2;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "native reduction rejects a second activation input");
+            op->num_inputs = 1;
+            tensors[0].ndim = 4; dims[2] = 2; dims[3] = 2;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "native reduction rejects rank-four input");
+            tensors[0].ndim = 3; dims[2] = 4;
+            tensors[1].ndim = 4; dims[7] = 1;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "native reduction rejects rank-four output");
+            tensors[1].ndim = 3;
+            attr->data_len = 2;
+            buf[attrs_off + 12u] = 0; buf[attrs_off + 13u] = 1;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "native reduction rejects multiple axes");
+            attr->data_len = 1;
+            buf[attrs_off + 12u] = 3;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
+                           "native reduction rejects an axis outside the rank");
+            buf[attrs_off + 12u] = 1;
+            if (quantized) {
+                tigris_quant_param_t *quant = (tigris_quant_param_t *)(buf + ELEMENTWISE_QUANT_OFF + 4u);
+                for (uint16_t t = 0; t < 2u; t++) {
+                    tensors[t].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+                    TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                                   "int8 reduction requires input and output quantization");
+                    tensors[t].quant_param_idx = t;
+                    quant[t].num_channels = 2; quant[t].shift_off = 2;
+                    TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                                   "int8 reduction rejects per-channel activation quantization");
+                    quant[t].num_channels = 1; quant[t].shift_off = 1;
+                }
+                quant[1].scale *= 2.0f;
+                TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan),
+                               k == 2u ? TIGRIS_OK : TIGRIS_ERR_BAD_OPERATOR,
+                               "only SUM can change the reduction output scale");
+                quant[1].scale /= 2.0f;
+                quant[1].zero_point++;
+                TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan),
+                               k == 2u ? TIGRIS_OK : TIGRIS_ERR_BAD_OPERATOR,
+                               "only SUM can change the reduction output zero point");
+            }
+            tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
+            memset(&dir[quantized ? 7 : 6], 0, sizeof(*dir));
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
+                           "native reduction requires an axes attribute");
+        }
+    }
+}
+
+static void test_cumsum_loader_contract(void)
+{
+    _Alignas(4) uint8_t buf[NATIVE_REDUCTION_PLAN_SIZE];
+    tigris_plan_t plan;
+    for (int quantized = 0; quantized < 2; quantized++) {
+        uint32_t offset = quantized ? 8u : 0u;
+        uint32_t attrs_off = quantized ? ELEMENTWISE_PLAN_SIZE : 292u;
+        tigris_file_header_t *header = (tigris_file_header_t *)buf;
+        for (uint8_t axis = 0; axis < 3u; axis++) {
+            build_native_reduction_plan(buf, TIGRIS_OP_CUMSUM, quantized, axis);
+            for (uint8_t flags = 0; flags < 4u; flags++) {
+                buf[attrs_off + 21u] = flags & 1u;
+                buf[attrs_off + 22u] = flags >> 1;
+                TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_OK,
+                               "CumSum accepts every axis and exclusive/reverse combination");
+            }
+        }
+        build_native_reduction_plan(buf, TIGRIS_OP_CUMSUM, quantized, 1);
+        tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + offset);
+        tigris_op_t *op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF + offset);
+        int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + offset);
+        tigris_op_attribute_t *attrs = (tigris_op_attribute_t *)(buf + attrs_off + 4u);
+        op->num_inputs = 2;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "CumSum rejects a second activation input");
+        op->num_inputs = 1;
+        dims[5] = 4; dims[6] = 3;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "CumSum rejects equal-sized tensors with different shapes");
+        dims[5] = 3; dims[6] = 4;
+        for (uint16_t t = 0; t < 2u; t++) {
+            tensors[t].ndim = 2; dims[4u * t] = 6; dims[4u * t + 1u] = 4;
+        }
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "CumSum rejects matching rank-two tensors");
+        for (uint16_t t = 0; t < 2u; t++) {
+            tensors[t].ndim = 3; dims[4u * t] = 2; dims[4u * t + 1u] = 3;
+        }
+        if (quantized) {
+            tigris_quant_param_t *quant = (tigris_quant_param_t *)(buf + ELEMENTWISE_QUANT_OFF + 4u);
+            for (uint16_t t = 0; t < 2u; t++) {
+                tensors[t].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+                TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                               "int8 CumSum requires both quantization records");
+                tensors[t].quant_param_idx = t;
+                quant[t].num_channels = 2; quant[t].shift_off = 2;
+                TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                               "int8 CumSum rejects per-channel quantization");
+                quant[t].num_channels = 1; quant[t].shift_off = 1;
+            }
+            quant[0].scale = 65535.0f;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_OK,
+                           "CumSum accepts a scale ratio below its fixed-point limit");
+            quant[0].scale = 65536.0f;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "CumSum rejects a scale ratio at its fixed-point limit");
+            quant[0].scale = 131072.0f;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "CumSum rejects a scale ratio above its fixed-point limit");
+            quant[0].scale = 0.125f;
+        }
+        attrs[1].data_len = 1;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
+                       "CumSum requires two option bytes");
+        attrs[1].data_len = 2;
+        for (uint8_t option = 0; option < 2u; option++) {
+            buf[attrs_off + 21u + option] = 2;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
+                           "CumSum rejects a nonboolean option");
+            buf[attrs_off + 21u + option] = 0;
+        }
+        attrs[0].data_len = 2; buf[attrs_off + 20u] = 0; buf[attrs_off + 21u] = 1;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "CumSum rejects multiple axes");
+        attrs[0].data_len = 1; buf[attrs_off + 20u] = 3;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
+                       "CumSum rejects an axis outside the rank");
+        buf[attrs_off + 20u] = 1;
+        op->op_type = TIGRIS_OP_REDUCE_SUM;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
+                       "CumSum options cannot attach to a reduction");
+        op->op_type = TIGRIS_OP_CUMSUM;
+        uint16_t count = 1;
+        memcpy(buf + attrs_off, &count, sizeof(count));
+        attrs[0].data_offset = 8;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
+                       "CumSum requires explicit options beside its axis");
+        attrs[0] = attrs[1]; attrs[0].data_offset = 9;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
+                       "CumSum requires an axis beside its options");
+        tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
+        memset(&dir[quantized ? 7 : 6], 0, sizeof(*dir));
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
+                       "CumSum requires an attribute section");
+    }
+}
+
+static void test_native_reduction_tiling_contract(void)
+{
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE + 12u];
+    tigris_plan_t plan;
+    const uint8_t kinds[] = {TIGRIS_OP_REDUCE_MAX, TIGRIS_OP_REDUCE_MIN,
+                             TIGRIS_OP_REDUCE_SUM, TIGRIS_OP_CUMSUM};
+    for (size_t k = 0; k < sizeof(kinds); k++) {
+        memset(buf, 0, sizeof(buf));
+        build_tiled_stage_plan(buf, TIGRIS_OP_REDUCE_MEAN, 3);
+        tigris_file_header_t *header = (tigris_file_header_t *)buf;
+        header->file_size = sizeof(buf);
+        ((tigris_op_t *)(buf + TILED_OPS_OFF))->op_type = kinds[k];
+        tigris_stage_t *stage = (tigris_stage_t *)(buf + TILED_STAGES_OFF);
+        tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+        int32_t *dims = (int32_t *)(buf + TILED_SHAPES_OFF);
+        memcpy(dims + 4, dims, 3u * sizeof(*dims));
+        if (kinds[k] == TIGRIS_OP_CUMSUM) {
+            uint16_t count = 2;
+            memcpy(buf + TILED_ATTRS_OFF, &count, sizeof(count));
+            tigris_op_attribute_t *attrs = (tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u);
+            attrs[1] = (tigris_op_attribute_t){0, TIGRIS_OP_ATTR_CUMSUM_OPTIONS, 2, 1};
+            buf[TILED_ATTRS_OFF + 20u] = 1;
+        } else {
+            dims[5] = 1;
+            tensors[1].size_bytes /= 4u;
+        }
+        stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                       "native reduction plan loads without tiling");
+        stage->tile_plan_idx = 0;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "native reductions and scans refuse height tiling");
+    }
+}
+
 static void test_activation_attribute_contract(void)
 {
     _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
@@ -3287,6 +3536,9 @@ int main(int argc, char *argv[])
     test_operator_semantic_guards();
     test_nonweighted_operator_semantics();
     test_elementwise_semantics();
+    test_native_reduction_contract();
+    test_cumsum_loader_contract();
+    test_native_reduction_tiling_contract();
     test_activation_attribute_contract();
     test_activation_semantic_contract();
     test_prelu_loader_contract();

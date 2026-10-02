@@ -90,7 +90,8 @@ extern "C" {
 #define TIGRIS_OP_ATTR_POOL_ROUNDING  8  /* uint8[1], see below */
 #define TIGRIS_OP_ATTR_CONSTANT_OPERAND 9 /* uint8[4], see below */
 #define TIGRIS_OP_ATTR_RESIZE_SCALES  10 /* float32[2], output/input H/W scales */
-#define TIGRIS_OP_ATTR_MAX            10
+#define TIGRIS_OP_ATTR_CUMSUM_OPTIONS 11 /* uint8[2], exclusive and reverse */
+#define TIGRIS_OP_ATTR_MAX            11
 
 /* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
  * first operand's, the second operand's, and the result's. */
@@ -190,6 +191,10 @@ typedef enum {
     TIGRIS_OP_LOG_SOFTMAX        = 57,
     TIGRIS_OP_L2_NORMALIZATION   = 58,
     TIGRIS_OP_L2_POOL            = 59,
+    TIGRIS_OP_REDUCE_MAX         = 60,
+    TIGRIS_OP_REDUCE_MIN         = 61,
+    TIGRIS_OP_REDUCE_SUM         = 62,
+    TIGRIS_OP_CUMSUM             = 63,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

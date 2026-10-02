@@ -2687,6 +2687,151 @@ static TIGRIS_KERNEL_NOINLINE int kern_mul_s8(
     return 0;
 }
 
+typedef struct {
+    const int8_t *input;
+    int8_t *output;
+    const tigris_quant_param_t *input_quant;
+    const tigris_quant_param_t *output_quant;
+    int32_t outer, reduced, inner;
+} reduction_s8_t;
+
+static int reduction_s8_begin(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    const tigris_mem_t *mem, reduction_s8_t *view)
+{
+    if (mem->tile.active || op->num_inputs != 1u || op->num_outputs != 1u) return 0;
+    uint16_t x = tigris_op_inputs(plan, op)[0];
+    uint16_t y = tigris_op_outputs(plan, op)[0];
+    const tigris_tensor_t *input = &plan->tensors[x];
+    const tigris_tensor_t *output = &plan->tensors[y];
+    uint8_t length = 0;
+    const uint8_t *axis = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_AXES, &length);
+    if (input->dtype != 3u || output->dtype != 3u || input->ndim != 3u ||
+        !axis || length != 1u || axis[0] >= 3u) return 0;
+    const int32_t *shape = tigris_tensor_shape(plan, input);
+    uint32_t count = 1u;
+    view->outer = 1;
+    view->inner = 1;
+    for (uint8_t a = 0; a < 3u; a++) {
+        if (shape[a] <= 0 || count > UINT32_MAX / (uint32_t)shape[a]) return 0;
+        count *= (uint32_t)shape[a];
+        if (a < axis[0]) {
+            if (view->outer > INT32_MAX / shape[a]) return 0;
+            view->outer *= shape[a];
+        } else if (a > axis[0]) {
+            if (view->inner > INT32_MAX / shape[a]) return 0;
+            view->inner *= shape[a];
+        }
+    }
+    view->reduced = shape[axis[0]];
+    uint32_t outputs = op->op_type == TIGRIS_OP_CUMSUM ? count : count / (uint32_t)view->reduced;
+    if (input->size_bytes != count || output->size_bytes != outputs) return 0;
+    if (op->op_type == TIGRIS_OP_CUMSUM) {
+        const int32_t *out_shape = tigris_tensor_shape(plan, output);
+        if (output->ndim != 3u) return 0;
+        for (uint8_t a = 0; a < 3u; a++) if (shape[a] != out_shape[a]) return 0;
+    }
+    view->input = (const int8_t *)tigris_mem_tensor_ptr(mem, x);
+    view->output = (int8_t *)tigris_mem_tensor_ptr(mem, y);
+    view->input_quant = tigris_tensor_quant(plan, input);
+    view->output_quant = tigris_tensor_quant(plan, output);
+    if (!view->input || !view->output || !view->input_quant || !view->output_quant ||
+        view->input_quant->num_channels != 1u || view->output_quant->num_channels != 1u ||
+        !isfinite(view->input_quant->scale) || !isfinite(view->output_quant->scale) ||
+        view->input_quant->scale <= 0.0f || view->output_quant->scale <= 0.0f ||
+        view->input_quant->zero_point < -128 || view->input_quant->zero_point > 127 ||
+        view->output_quant->zero_point < -128 || view->output_quant->zero_point > 127) return 0;
+    return 1;
+}
+
+static int reduction_s8_requantize(
+    int32_t value, int32_t multiplier, int shift, int32_t zero, int8_t *output)
+{
+    int left = shift > 0 ? shift : 0;
+    int64_t shifted = (int64_t)value * ((int64_t)1 << left);
+    if (shifted < INT32_MIN || shifted > INT32_MAX) return 0;
+    int64_t result = (int64_t)elementwise_multiply(value, multiplier, shift) + zero;
+    if (result < INT32_MIN || result > INT32_MAX) return 0;
+    *output = clamp_s8((int32_t)result);
+    return 1;
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_reduce_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    reduction_s8_t view;
+    if (!reduction_s8_begin(plan, op, op_index, mem, &view)) return -1;
+    int32_t multiplier = 0;
+    int shift = 0;
+    if (op->op_type == TIGRIS_OP_REDUCE_SUM) {
+        if (!elementwise_multiplier((double)view.input_quant->scale / view.output_quant->scale,
+                                    &multiplier, &shift)) return -1;
+    } else if (view.input_quant->scale != view.output_quant->scale ||
+               view.input_quant->zero_point != view.output_quant->zero_point) return -1;
+    for (int32_t o = 0; o < view.outer; o++) {
+        const int8_t *src = view.input + (size_t)o * (size_t)view.reduced * (size_t)view.inner;
+        int8_t *dst = view.output + (size_t)o * (size_t)view.inner;
+        for (int32_t i = 0; i < view.inner; i++) {
+            int64_t value = 0;
+            if (op->op_type == TIGRIS_OP_REDUCE_MAX) value = -128;
+            else if (op->op_type == TIGRIS_OP_REDUCE_MIN) value = 127;
+            for (int32_t r = 0; r < view.reduced; r++) {
+                int32_t sample = src[(size_t)r * (size_t)view.inner + (size_t)i];
+                if (op->op_type == TIGRIS_OP_REDUCE_SUM) {
+                    value += sample;
+                    if (value < INT32_MIN || value > INT32_MAX) return -1;
+                } else if ((op->op_type == TIGRIS_OP_REDUCE_MAX && sample > value) ||
+                           (op->op_type == TIGRIS_OP_REDUCE_MIN && sample < value)) value = sample;
+            }
+            if (op->op_type == TIGRIS_OP_REDUCE_SUM) {
+                value -= (int64_t)view.input_quant->zero_point * view.reduced;
+                if (value < INT32_MIN || value > INT32_MAX ||
+                    !reduction_s8_requantize((int32_t)value, multiplier, shift,
+                                             view.output_quant->zero_point, &dst[i])) return -1;
+            } else dst[i] = (int8_t)value;
+        }
+    }
+    return 0;
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_cumsum_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    reduction_s8_t view;
+    if (!reduction_s8_begin(plan, op, op_index, mem, &view)) return -1;
+    uint8_t length = 0;
+    const uint8_t *options = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_CUMSUM_OPTIONS, &length);
+    if (!options || length != 2u || options[0] > 1u || options[1] > 1u) return -1;
+    double scale = (2.0 * view.input_quant->scale) / (1048576.0 * view.output_quant->scale);
+    int32_t multiplier;
+    int shift;
+    if (scale <= 0.0 || scale >= 1.0 || !elementwise_multiplier(scale, &multiplier, &shift) ||
+        shift > 0) return -1;
+    int32_t initial = sat_round_dbl_high_mul(-view.input_quant->zero_point * 1048576, 1073741824);
+    for (int32_t o = 0; o < view.outer; o++) {
+        for (int32_t i = 0; i < view.inner; i++) {
+            /* The reference seeds the accumulator with the scaled input offset. */
+            int64_t sum = initial;
+            for (int32_t r = 0; r < view.reduced; r++) {
+                int32_t step = options[1] != 0u ? view.reduced - 1 - r : r;
+                size_t index = ((size_t)o * (size_t)view.reduced + (size_t)step) * (size_t)view.inner + (size_t)i;
+                int32_t sample = (int32_t)view.input[index] - view.input_quant->zero_point;
+                int32_t scaled = sat_round_dbl_high_mul(sample * 1048576, 1073741824);
+                int32_t value = (int32_t)sum;
+                sum += scaled;
+                if (sum < INT32_MIN || sum > INT32_MAX) return -1;
+                if (options[0] == 0u) value = (int32_t)sum;
+                if (!reduction_s8_requantize(value, multiplier, shift,
+                                             view.output_quant->zero_point, &view.output[index])) return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 /* Dispatch */
 
 int tigris_dispatch_kernel_s8(
@@ -2744,6 +2889,10 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_RESIZE_LINEAR: return kern_resize_linear_s8(plan, op, mem);
     case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm_s8(plan, op, op_index, mem);
     case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_REDUCE_MAX:
+    case TIGRIS_OP_REDUCE_MIN:
+    case TIGRIS_OP_REDUCE_SUM: return kern_reduce_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_CUMSUM: return kern_cumsum_s8(plan, op, op_index, mem);
     case TIGRIS_OP_SPLIT:       return kern_split_s8(plan, op, mem);
     case TIGRIS_OP_PAD:         return kern_pad_s8(plan, op, op_index, mem);
     default:

@@ -20,6 +20,7 @@
 #include "elementwise_f32_golden.h"
 #include "resize_golden.h"
 #include "activation_golden.h"
+#include "reduction_golden.h"
 
 /* Test infrastructure */
 
@@ -3267,6 +3268,73 @@ static void test_activation_reference_goldens(void)
     }
 }
 
+static void test_reduction_reference_goldens(void)
+{
+    printf("  test_reduction_reference_goldens...\n");
+    for (size_t g = 0; g < sizeof(reduction_goldens) / sizeof(reduction_goldens[0]); g++) {
+        const reduction_golden_t *gold = &reduction_goldens[g];
+        tigris_file_header_t header = {0};
+        tigris_tensor_t tensors[2] = {0};
+        tigris_op_t op = {0};
+        tigris_plan_t plan = {0};
+        tigris_mem_t mem = {0};
+        tigris_quant_param_t quant[2] = {{0}};
+        tigris_op_attribute_t attributes[2] = {{0}};
+        uint8_t payload[] = {gold->axis, gold->exclusive, gold->reverse};
+        uint16_t indices[] = {0, 1};
+        uint32_t element = gold->dtype == 3 ? 1u : 4u;
+        void *output = calloc(gold->output_count, element);
+        void *pointers[] = {(void *)gold->input, output};
+        TEST_ASSERT(output != NULL, "reduction output allocated");
+        if (!output) return;
+        header.num_tensors = 2;
+        header.num_ops = 1;
+        header.num_quant_params = 2;
+        for (int i = 0; i < 2; i++) {
+            quant[i].scale = gold->scales[i];
+            quant[i].zero_point = gold->zeros[i];
+            quant[i].num_channels = 1;
+            tensors[i].shape_off = (uint32_t)i * 3u;
+            tensors[i].ndim = i == 0 ? 3 : gold->output_rank;
+            tensors[i].dtype = gold->dtype;
+            tensors[i].quant_param_idx = gold->dtype == 3 ? (uint16_t)i : TIGRIS_NO_QUANT_PARAM;
+            tensors[i].size_bytes = (i == 0 ? gold->input_count : gold->output_count) * element;
+        }
+        op.op_type = gold->op;
+        op.num_inputs = op.num_outputs = 1;
+        op.outputs_off = 1;
+        op.weight_idx = op.bias_idx = TIGRIS_NO_WEIGHT;
+        attributes[0].type = TIGRIS_OP_ATTR_AXES;
+        attributes[0].data_len = 1;
+        attributes[1].type = TIGRIS_OP_ATTR_CUMSUM_OPTIONS;
+        attributes[1].data_len = 2;
+        attributes[1].data_offset = 1;
+        plan.header = &header;
+        plan.tensors = tensors;
+        plan.ops = &op;
+        plan.shape_pool = gold->shapes;
+        plan.index_pool = indices;
+        plan.quant_params = quant;
+        plan.num_quant_params = 2;
+        plan.num_op_attributes = gold->op == TIGRIS_OP_CUMSUM ? 2 : 1;
+        plan.op_attributes = attributes;
+        plan.op_attribute_data = payload;
+        mem.tensor_ptrs = pointers;
+        mem.num_tensors = 2;
+        tigris_kernel_fn kernel = gold->dtype == 3 ? tigris_dispatch_kernel_s8 : tigris_dispatch_kernel;
+        int result = kernel(&plan, &op, 0, &mem, NULL);
+        if (result != 0) fprintf(stderr, "    reduction case %zu op %u result %d\n", g, gold->op, result);
+        TEST_ASSERT(result == 0, "reduction golden runs");
+        for (uint32_t i = 0; i < gold->output_count; i++) {
+            int equal = memcmp((uint8_t *)output + i * element,
+                               (const uint8_t *)gold->output + i * element, element) == 0;
+            if (!equal) fprintf(stderr, "    reduction case %zu op %u element %u\n", g, gold->op, i);
+            TEST_ASSERT(equal, "reduction output bits equal TFLM");
+        }
+        free(output);
+    }
+}
+
 int main(void)
 {
     printf("TiGrIS Kernel Tests\n\n");
@@ -3295,6 +3363,7 @@ int main(void)
     test_resize_nearest();
     test_resize_reference_goldens();
     test_activation_reference_goldens();
+    test_reduction_reference_goldens();
     test_resize_linear();
     test_sigmoid();
     test_erf();

@@ -338,7 +338,12 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     case TIGRIS_OP_ATTR_ALPHA:          return op_type == TIGRIS_OP_LEAKY_RELU;
     case TIGRIS_OP_ATTR_CLIP_BOUNDS:    return op_type == TIGRIS_OP_CLIP;
     case TIGRIS_OP_ATTR_PADS:           return op_type == TIGRIS_OP_PAD;
-    case TIGRIS_OP_ATTR_AXES:           return op_type == TIGRIS_OP_REDUCE_MEAN;
+    case TIGRIS_OP_ATTR_AXES:           return op_type == TIGRIS_OP_REDUCE_MEAN ||
+                                                op_type == TIGRIS_OP_REDUCE_MAX ||
+                                                op_type == TIGRIS_OP_REDUCE_MIN ||
+                                                op_type == TIGRIS_OP_REDUCE_SUM ||
+                                                op_type == TIGRIS_OP_CUMSUM;
+    case TIGRIS_OP_ATTR_CUMSUM_OPTIONS: return op_type == TIGRIS_OP_CUMSUM;
     case TIGRIS_OP_ATTR_POOL_ROUNDING:  return op_type == TIGRIS_OP_GLOBAL_AVG;
     case TIGRIS_OP_ATTR_RESIZE_SCALES:  return op_type == TIGRIS_OP_RESIZE ||
                                              op_type == TIGRIS_OP_RESIZE_LINEAR;
@@ -749,7 +754,39 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             break;
         }
 
+        case TIGRIS_OP_CUMSUM: {
+            uint8_t num_axes = 0;
+            const uint8_t *axes = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_AXES, &num_axes);
+            if (!op_has_plain_io(op, 1, 1) || input->ndim != 3u ||
+                !tensor_shapes_equal(plan, input, output) || !axes || num_axes != 1u || axes[0] >= 3u)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            if (dtype == 3u) {
+                if (input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                    output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                    !quant_channels_fit(plan, input, 1) || !quant_channels_fit(plan, output, 1))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                const tigris_quant_param_t *iq = &plan->quant_params[input->quant_param_idx];
+                const tigris_quant_param_t *oq = &plan->quant_params[output->quant_param_idx];
+                if ((double)iq->scale / (double)oq->scale >= 524288.0)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
+            break;
+        }
+
+        case TIGRIS_OP_REDUCE_MAX:
+        case TIGRIS_OP_REDUCE_MIN:
+        case TIGRIS_OP_REDUCE_SUM:
         case TIGRIS_OP_REDUCE_MEAN: {
+            if (dtype == 3u && op->op_type != TIGRIS_OP_REDUCE_MEAN) {
+                if (input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                    output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
+                    !quant_channels_fit(plan, input, 1) || !quant_channels_fit(plan, output, 1))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                if ((op->op_type == TIGRIS_OP_REDUCE_MAX || op->op_type == TIGRIS_OP_REDUCE_MIN) &&
+                    !same_quantization(&plan->quant_params[input->quant_param_idx],
+                                       &plan->quant_params[output->quant_param_idx]))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
             /* One rank-3 activation in, one of its axes collapsed. The result
              * keeps that axis at one or drops it, which is the difference
              * between keepdims and not, and every other extent stays put. */
@@ -1744,6 +1781,12 @@ tigris_error_t tigris_plan_load_ex(
                     return TIGRIS_ERR_BAD_SECTION;
                 break;
             }
+            case TIGRIS_OP_ATTR_CUMSUM_OPTIONS: {
+                const uint8_t *options = candidate.op_attribute_data + attr->data_offset;
+                if (attr->data_len != 2u || options[0] > 1u || options[1] > 1u)
+                    return TIGRIS_ERR_BAD_SECTION;
+                break;
+            }
             case TIGRIS_OP_ATTR_AXES: {
                 if (attr->data_len == 0u || attr->data_len > input->ndim)
                     return TIGRIS_ERR_BAD_SECTION;
@@ -1770,6 +1813,7 @@ tigris_error_t tigris_plan_load_ex(
             int has_transpose_perm = 0;
             int has_epsilon = 0;
             int has_axes = 0;
+            int has_cumsum_options = 0;
             while (attr_cursor < candidate.num_op_attributes &&
                    candidate.op_attributes[attr_cursor].op_index == op_idx) {
                 if (candidate.op_attributes[attr_cursor].type ==
@@ -1781,6 +1825,8 @@ tigris_error_t tigris_plan_load_ex(
                 if (candidate.op_attributes[attr_cursor].type ==
                     TIGRIS_OP_ATTR_AXES)
                     has_axes = 1;
+                if (candidate.op_attributes[attr_cursor].type == TIGRIS_OP_ATTR_CUMSUM_OPTIONS)
+                    has_cumsum_options = 1;
                 attr_cursor++;
             }
             if ((candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE) !=
@@ -1793,7 +1839,13 @@ tigris_error_t tigris_plan_load_ex(
                 has_epsilon)
                 return TIGRIS_ERR_BAD_SECTION;
             /* A reduction cannot default the axes it collapses either. */
-            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MEAN) !=
+            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_CUMSUM) != has_cumsum_options)
+                return TIGRIS_ERR_BAD_SECTION;
+            if ((candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MEAN ||
+                 candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MAX ||
+                 candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MIN ||
+                 candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_SUM ||
+                 candidate.ops[op_idx].op_type == TIGRIS_OP_CUMSUM) !=
                 has_axes)
                 return TIGRIS_ERR_BAD_SECTION;
         }
@@ -1805,7 +1857,11 @@ tigris_error_t tigris_plan_load_ex(
             if (candidate.ops[op_idx].op_type == TIGRIS_OP_TRANSPOSE ||
                 candidate.ops[op_idx].op_type == TIGRIS_OP_LAYER_NORM ||
                 candidate.ops[op_idx].op_type == TIGRIS_OP_L2_NORMALIZATION ||
-                candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MEAN)
+                candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MEAN ||
+                candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MAX ||
+                candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_MIN ||
+                candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_SUM ||
+                candidate.ops[op_idx].op_type == TIGRIS_OP_CUMSUM)
                 return TIGRIS_ERR_BAD_SECTION;
         }
     }

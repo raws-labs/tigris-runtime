@@ -3345,6 +3345,65 @@ static void test_reduction_reference_goldens(void)
     }
 }
 
+/* ArgMax and ArgMin read their one axis from an input of any rank; ties keep
+ * the first index. */
+static void test_arg_any_rank(void)
+{
+    printf("  test_arg_any_rank...\n");
+    static const float values[] = {3.0f, -1.0f, 3.0f, 0.5f, 2.0f, -4.0f, 2.0f, 7.0f};
+    static const struct {
+        uint8_t rank, axis, out_rank;
+        int32_t shape[4], out_shape[3];
+        uint32_t count, out_count;
+        int32_t max[4], min[4];
+    } cases[] = {
+        {1, 0, 0, {8}, {0}, 8, 1, {7}, {5}},
+        {2, 1, 1, {2, 4}, {2}, 8, 2, {0, 3}, {1, 1}},
+        {2, 0, 1, {2, 4}, {4}, 8, 4, {0, 0, 0, 1}, {1, 1, 1, 0}},
+        {4, 3, 3, {1, 2, 1, 4}, {1, 2, 1}, 8, 2, {0, 3}, {1, 1}},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        for (uint8_t kind = TIGRIS_OP_ARG_MAX; kind <= TIGRIS_OP_ARG_MIN; kind++) {
+            tigris_file_header_t header = {0};
+            tigris_tensor_t tensors[2] = {{0}};
+            tigris_op_t op = {0};
+            tigris_plan_t plan = {0};
+            tigris_mem_t mem = {0};
+            tigris_op_attribute_t attribute = {0, TIGRIS_OP_ATTR_AXES, 1, 0};
+            int32_t shapes[7] = {0};
+            int32_t output[4] = {-1, -1, -1, -1};
+            void *pointers[] = {(void *)values, output};
+            uint16_t indices[] = {0, 1};
+            memcpy(shapes, cases[c].shape, cases[c].rank * sizeof(int32_t));
+            memcpy(shapes + 4, cases[c].out_shape, cases[c].out_rank * sizeof(int32_t));
+            header.num_tensors = 2;
+            header.num_ops = 1;
+            tensors[0] = (tigris_tensor_t){0, cases[c].count * 4u, 0, cases[c].rank, 1, 0,
+                                           TIGRIS_NO_QUANT_PARAM, 0};
+            tensors[1] = (tigris_tensor_t){0, cases[c].out_count * 4u, 4, cases[c].out_rank, 6, 0,
+                                           TIGRIS_NO_QUANT_PARAM, 0};
+            op.op_type = kind;
+            op.num_inputs = op.num_outputs = 1;
+            op.outputs_off = 1;
+            op.weight_idx = op.bias_idx = TIGRIS_NO_WEIGHT;
+            plan.header = &header;
+            plan.tensors = tensors;
+            plan.ops = &op;
+            plan.shape_pool = shapes;
+            plan.index_pool = indices;
+            plan.num_op_attributes = 1;
+            plan.op_attributes = &attribute;
+            plan.op_attribute_data = &cases[c].axis;
+            mem.tensor_ptrs = pointers;
+            mem.num_tensors = 2;
+            TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0, "arg runs at any rank");
+            const int32_t *expected = kind == TIGRIS_OP_ARG_MAX ? cases[c].max : cases[c].min;
+            for (uint32_t i = 0; i < cases[c].out_count; i++)
+                TEST_ASSERT(output[i] == expected[i], "arg index at any rank");
+        }
+    }
+}
+
 static void test_movement_goldens(void)
 {
     for (size_t g = 0; g < sizeof(movement_goldens) / sizeof(movement_goldens[0]); g++) {
@@ -3461,6 +3520,7 @@ int main(void)
     test_resize_reference_goldens();
     test_activation_reference_goldens();
     test_reduction_reference_goldens();
+    test_arg_any_rank();
     test_resize_linear();
     test_sigmoid();
     test_erf();

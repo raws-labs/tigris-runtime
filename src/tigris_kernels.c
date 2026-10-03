@@ -1152,6 +1152,40 @@ static int kern_global_avg_pool(
 }
 
 /**
+ * [outer, reduced, inner] of an operator's input around its one axis, for an
+ * input of any rank: the extents before the axis, the axis, and after it.
+ */
+static int axis_extents(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    int32_t *outer, int32_t *reduced, int32_t *inner)
+{
+    const tigris_tensor_t *in = &plan->tensors[tigris_op_inputs(plan, op)[0]];
+    uint8_t num_axes = 0u;
+    const uint8_t *axes = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_AXES, &num_axes);
+    if (axes == NULL || num_axes != 1u || axes[0] >= in->ndim)
+        return -1;
+
+    const int32_t *shape = tigris_tensor_shape(plan, in);
+    int64_t lead = 1;
+    int64_t trail = 1;
+    for (uint8_t axis = 0; axis < in->ndim; axis++) {
+        if (shape[axis] <= 0)
+            return -1;
+        if (axis < axes[0])
+            lead *= shape[axis];
+        else if (axis > axes[0])
+            trail *= shape[axis];
+        if (lead > INT32_MAX || trail > INT32_MAX)
+            return -1;
+    }
+    *outer = (int32_t)lead;
+    *reduced = shape[axes[0]];
+    *inner = (int32_t)trail;
+    return 0;
+}
+
+/**
  * Mean over one axis of a rank-3 tensor.
  *
  * The plan names a serialized axis, so the operator reads the same whichever
@@ -1164,27 +1198,9 @@ static int reduce_mean_extents(
     int32_t *outer, int32_t *reduced, int32_t *inner)
 {
     const tigris_tensor_t *in = &plan->tensors[tigris_op_inputs(plan, op)[0]];
-    uint8_t num_axes = 0u;
-    const uint8_t *axes = tigris_op_attribute_data(
-        plan, op_index, TIGRIS_OP_ATTR_AXES, &num_axes);
-    if (axes == NULL || num_axes != 1u || in->ndim != 3u || axes[0] >= 3u)
+    if (in->ndim != 3u)
         return -1;
-
-    const int32_t *shape = tigris_tensor_shape(plan, in);
-    int32_t lead = 1;
-    int32_t trail = 1;
-    for (uint8_t axis = 0; axis < 3u; axis++) {
-        if (shape[axis] <= 0)
-            return -1;
-        if (axis < axes[0])
-            lead *= shape[axis];
-        else if (axis > axes[0])
-            trail *= shape[axis];
-    }
-    *outer = lead;
-    *reduced = shape[axes[0]];
-    *inner = trail;
-    return 0;
+    return axis_extents(plan, op, op_index, outer, reduced, inner);
 }
 
 static uint32_t movement_product(const int32_t *shape, uint8_t begin, uint8_t end)
@@ -1324,7 +1340,7 @@ int tigris_arg_execute(const tigris_plan_t *plan, const tigris_op_t *op,
 {
     int32_t outer, reduced, inner;
     if (mem->tile.active || op->num_inputs != 1u || op->num_outputs != 1u ||
-        reduce_mean_extents(plan, op, op_index, &outer, &reduced, &inner) != 0)
+        axis_extents(plan, op, op_index, &outer, &reduced, &inner) != 0)
         return -1;
     uint16_t src = tigris_op_inputs(plan, op)[0];
     uint16_t dst = tigris_op_outputs(plan, op)[0];

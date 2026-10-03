@@ -595,7 +595,9 @@ static int bool_and_sum_valid(const tigris_plan_t *plan, const tigris_op_t *op, 
         if (y->dtype == 3u) {
             const tigris_quant_param_t *qy = tigris_tensor_quant(plan, y);
             if (qy == NULL || qy->num_channels != 1u) return 0;
-            if (type == TIGRIS_OP_CAST) return qy->scale == 1.0f && qy->zero_point == 0;
+            if (type == TIGRIS_OP_CAST)
+                return isfinite(qy->scale) && qy->scale > 0.0f &&
+                       qy->zero_point >= -128 && qy->zero_point <= 127;
             const tigris_quant_param_t *qx = tigris_tensor_quant(plan, x);
             if (qx == NULL || qx->num_channels != 1u) return 0;
             /* The exact input multiplier 0.5 follows the reference's left shift 20. */

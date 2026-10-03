@@ -3793,9 +3793,16 @@ static void test_bool_contract(void)
             ((tigris_op_attribute_t *)(buf + 676))->data_len = 16;
             TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "comparison refuses short requantization");
         }
-        if ((gold->op == TIGRIS_OP_SELECT_V2 || gold->op == TIGRIS_OP_CAST) && gold->dtypes[3] == 3) {
+        if (gold->op == TIGRIS_OP_SELECT_V2 && gold->dtypes[3] == 3) {
             q[3].scale *= 2.0f;
-            TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "selection and cast preserve encoding");
+            TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "selection preserves encoding");
+        }
+        if (gold->op == TIGRIS_OP_CAST && gold->dtypes[3] == 3) {
+            q[3].scale = 0.25f;
+            q[3].zero_point = -3;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "cast quantizes to any int8 encoding");
+            q[3].scale = 0.0f;
+            TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "cast refuses a zero scale");
         }
         if (gold->op == TIGRIS_OP_ADD_N && gold->dtypes[0] == 3) {
             q[1].scale *= 2.0f;

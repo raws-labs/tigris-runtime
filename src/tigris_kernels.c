@@ -1064,13 +1064,26 @@ int tigris_bool_execute(const tigris_plan_t *plan, const tigris_op_t *op,
         const uint8_t *x = (const uint8_t *)tigris_mem_tensor_ptr(mem, tigris_op_inputs(plan, op)[0]);
         if (x == NULL) return -1;
         x += (size_t)mem->tile.in_row_start * row;
+        /* An int8 result quantizes 0.0 and 1.0 as TFLite's QUANTIZE does:
+         * round(value / scale) + zero point, clamped. With scale 1 and zero
+         * point 0 that is TFLite's raw bool-to-int8 copy. */
+        int8_t levels[2] = {0, 1};
+        if (output->dtype == 3u) {
+            const tigris_quant_param_t *q = tigris_tensor_quant(plan, output);
+            if (q == NULL || !(q->scale > 0.0f) || q->zero_point < -128 || q->zero_point > 127)
+                return -1;
+            const float one = 1.0f / q->scale;
+            const int32_t level = (one > 255.0f) ? 127 : ((int32_t)roundf(one) + q->zero_point);
+            levels[0] = (int8_t)q->zero_point;
+            levels[1] = (int8_t)((level > 127) ? 127 : level);
+        }
         for (uint32_t i = 0u; i < count; i++) {
             if (x[i] > 1u) return -1;
             if (op->op_type == TIGRIS_OP_LOGICAL_NOT) y[i] = x[i] == 0u ? 1u : 0u;
             else if (output->dtype == 1u) {
                 const float value = (float)x[i];
                 memcpy(y + (size_t)i * sizeof(value), &value, sizeof(value));
-            } else y[i] = x[i];
+            } else y[i] = (uint8_t)levels[x[i]];
         }
         return 0;
     }

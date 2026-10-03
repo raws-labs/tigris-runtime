@@ -3492,6 +3492,54 @@ static void test_movement_goldens(void)
     }
 }
 
+/* Bool to int8 quantizes 0.0 and 1.0 into the output's encoding, as TFLite's
+ * QUANTIZE after a float CAST does; at scale 1 and zero point 0 that is the
+ * raw copy of TFLite's own bool-to-int8 CAST. */
+static void test_cast_bool_to_int8(void)
+{
+    printf("  test_cast_bool_to_int8...\n");
+    static const struct { float scale; int32_t zero_point; int8_t off, on; } cases[] = {
+        {1.0f, 0, 0, 1}, {1.0f / 256.0f, -128, -128, 127}, {0.3f, 5, 5, 8}, {1e-9f, 100, 100, 127},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        tigris_file_header_t header = {0};
+        tigris_tensor_t tensors[2] = {{0}};
+        tigris_op_t op = {0};
+        tigris_plan_t plan = {0};
+        tigris_mem_t mem = {0};
+        tigris_quant_param_t quant = {0};
+        int32_t shapes[2] = {4, 4};
+        uint8_t flags[4] = {0, 1, 1, 0};
+        int8_t output[4] = {0};
+        void *pointers[] = {flags, output};
+        uint16_t indices[] = {0, 1};
+        quant.scale = cases[c].scale;
+        quant.zero_point = cases[c].zero_point;
+        quant.num_channels = 1;
+        header.num_tensors = 2;
+        header.num_ops = 1;
+        header.num_quant_params = 1;
+        tensors[0] = (tigris_tensor_t){0, 4u, 0, 1, 9, 0, TIGRIS_NO_QUANT_PARAM, 0};
+        tensors[1] = (tigris_tensor_t){0, 4u, 1, 1, 3, 0, 0, 0};
+        op.op_type = TIGRIS_OP_CAST;
+        op.num_inputs = op.num_outputs = 1;
+        op.outputs_off = 1;
+        op.weight_idx = op.bias_idx = TIGRIS_NO_WEIGHT;
+        plan.header = &header;
+        plan.tensors = tensors;
+        plan.ops = &op;
+        plan.shape_pool = shapes;
+        plan.index_pool = indices;
+        plan.quant_params = &quant;
+        plan.num_quant_params = 1;
+        mem.tensor_ptrs = pointers;
+        mem.num_tensors = 2;
+        TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL) == 0, "bool cast to int8 runs");
+        for (int i = 0; i < 4; i++)
+            TEST_ASSERT(output[i] == (flags[i] ? cases[c].on : cases[c].off), "bool cast quantizes 0 and 1");
+    }
+}
+
 static void test_bool_goldens(void)
 {
     for (size_t g = 0; g < sizeof(bool_goldens) / sizeof(bool_goldens[0]); g++) {
@@ -3627,6 +3675,7 @@ static void test_bool_goldens(void)
 int main(void)
 {
     test_bool_goldens();
+    test_cast_bool_to_int8();
     test_movement_goldens();
     printf("TiGrIS Kernel Tests\n\n");
 

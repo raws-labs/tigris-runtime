@@ -8,7 +8,7 @@ from generate_elementwise_goldens import (
 )
 
 
-KINDS = {"REDUCE_MAX": 60, "REDUCE_MIN": 61, "SUM": 62, "CUMSUM": 63}
+KINDS = {"REDUCE_MAX": 60, "REDUCE_MIN": 61, "SUM": 62, "CUMSUM": 63, "ARG_MAX": 64, "ARG_MIN": 65}
 
 
 def reduction_model(kind, shape, axis, keep, exclusive, reverse, quantized, scales, zeros):
@@ -41,6 +41,15 @@ def reduction_model(kind, shape, axis, keep, exclusive, reverse, quantized, scal
         op.builtinOptions.reverse = reverse
     else:
         op.builtinOptions.keepDims = keep
+    if kind in {"ARG_MAX", "ARG_MIN"}:
+        output = graph.tensors[2]
+        output.type = schema.TensorType.INT32
+        output.quantization = None
+        output.shape = np.array([dim for i, dim in enumerate(shape) if i != axis], np.int32)
+        options = "ArgMaxOptions" if kind == "ARG_MAX" else "ArgMinOptions"
+        op.builtinOptionsType = getattr(schema.BuiltinOptions, options)
+        op.builtinOptions = getattr(schema, options + "T")()
+        op.builtinOptions.outputType = schema.TensorType.INT32
     builder = flatbuffers.Builder(4096)
     builder.Finish(model.Pack(builder), file_identifier=b"TFL3")
     return bytes(builder.Output()), target
@@ -56,6 +65,8 @@ def cases():
                 if kind in {"REDUCE_MAX", "REDUCE_MIN"}:
                     scales, zeros = (scales[0],) * 3, (zeros[0],) * 3
                 raw = (np.arange(np.prod(shape), dtype=np.int32) * 73 + 19) % 256 - 128
+                if kind in {"ARG_MAX", "ARG_MIN"}:
+                    raw %= 5  # Repeated extrema exercise first-index ties.
                 data = raw.astype(np.int8) if quantized else raw.astype(np.float32) * np.float32(scales[0])
                 if not quantized:
                     data[:4] = [0, -0.0, 1e-7, -1e-7]
@@ -85,10 +96,11 @@ def main():
         kind, quantized, shape, target, scales, zeros, axis, exclusive, reverse, data, expected = case
         counts[quantized] += len(expected)
         for label, array in (("x", data), ("y", expected)):
-            ctype = "int8_t" if quantized else "float"
+            integer = quantized or (label == "y" and kind in {"ARG_MAX", "ARG_MIN"})
+            ctype = "int32_t" if label == "y" and kind in {"ARG_MAX", "ARG_MIN"} else "int8_t" if quantized else "float"
             lines.append(f"static const {ctype} reduction_{number}_{label}[] = {{")
             for offset in range(0, len(array), 12):
-                values = [str(int(v)) if quantized else f"{float(v):.9e}f" for v in array[offset:offset + 12]]
+                values = [str(int(v)) if integer else f"{float(v):.9e}f" for v in array[offset:offset + 12]]
                 lines.append("    " + ", ".join(values) + ",")
             lines.append("};")
         dims = ", ".join(map(str, (*shape, *target, *([1] * (3 - len(target))))))

@@ -3185,7 +3185,9 @@ static void test_activation_reference_goldens(void)
         uint8_t payload[20] = {0};
         uint16_t indices[] = {0, 1};
         uint32_t element = gold->dtype == 3 ? 1u : 4u;
-        void *output = calloc(gold->output_count, element);
+        int index_output = gold->op == TIGRIS_OP_ARG_MAX || gold->op == TIGRIS_OP_ARG_MIN;
+        uint32_t output_element = index_output ? 4u : element;
+        void *output = calloc(gold->output_count, output_element);
         void *pointers[] = {(void *)gold->input, output};
         TEST_ASSERT(output != NULL, "activation output allocated");
         if (!output) return;
@@ -3253,8 +3255,8 @@ static void test_activation_reference_goldens(void)
         if (result != 0) fprintf(stderr, "    activation case %zu op %u result %d\n", g, gold->op, result);
         TEST_ASSERT(result == 0, "activation golden runs");
         for (uint32_t i = 0; i < gold->output_count; i++) {
-            int equal = memcmp((uint8_t *)output + i * element,
-                               (const uint8_t *)gold->output + i * element, element) == 0;
+            int equal = memcmp((uint8_t *)output + i * output_element,
+                               (const uint8_t *)gold->output + i * output_element, output_element) == 0;
             if (!equal) {
                 fprintf(stderr, "    activation case %zu op %u element %u\n", g, gold->op, i);
                 if (gold->dtype == 3)
@@ -3283,7 +3285,9 @@ static void test_reduction_reference_goldens(void)
         uint8_t payload[] = {gold->axis, gold->exclusive, gold->reverse};
         uint16_t indices[] = {0, 1};
         uint32_t element = gold->dtype == 3 ? 1u : 4u;
-        void *output = calloc(gold->output_count, element);
+        int index_output = gold->op == TIGRIS_OP_ARG_MAX || gold->op == TIGRIS_OP_ARG_MIN;
+        uint32_t output_element = index_output ? 4u : element;
+        void *output = calloc(gold->output_count, output_element);
         void *pointers[] = {(void *)gold->input, output};
         TEST_ASSERT(output != NULL, "reduction output allocated");
         if (!output) return;
@@ -3299,6 +3303,11 @@ static void test_reduction_reference_goldens(void)
             tensors[i].dtype = gold->dtype;
             tensors[i].quant_param_idx = gold->dtype == 3 ? (uint16_t)i : TIGRIS_NO_QUANT_PARAM;
             tensors[i].size_bytes = (i == 0 ? gold->input_count : gold->output_count) * element;
+        }
+        if (index_output) {
+            tensors[1].dtype = 6;
+            tensors[1].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+            tensors[1].size_bytes = gold->output_count * output_element;
         }
         op.op_type = gold->op;
         op.num_inputs = op.num_outputs = 1;
@@ -3326,8 +3335,8 @@ static void test_reduction_reference_goldens(void)
         if (result != 0) fprintf(stderr, "    reduction case %zu op %u result %d\n", g, gold->op, result);
         TEST_ASSERT(result == 0, "reduction golden runs");
         for (uint32_t i = 0; i < gold->output_count; i++) {
-            int equal = memcmp((uint8_t *)output + i * element,
-                               (const uint8_t *)gold->output + i * element, element) == 0;
+            int equal = memcmp((uint8_t *)output + i * output_element,
+                               (const uint8_t *)gold->output + i * output_element, output_element) == 0;
             if (!equal) fprintf(stderr, "    reduction case %zu op %u element %u\n", g, gold->op, i);
             TEST_ASSERT(equal, "reduction output bits equal TFLM");
         }

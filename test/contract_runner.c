@@ -102,7 +102,7 @@ static int choose_dispatch(
     dtype = plan->tensors[plan->model_inputs[0]].dtype;
     for (uint16_t i = 0; i < plan->header->num_tensors; ++i) {
         if ((plan->tensors[i].flags & TIGRIS_TENSOR_CONSTANT) == 0 &&
-            plan->tensors[i].dtype != dtype)
+            plan->tensors[i].dtype != dtype && plan->tensors[i].dtype != 6u)
             return -1;
     }
 

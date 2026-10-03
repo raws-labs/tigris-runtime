@@ -92,7 +92,7 @@ const char *tigris_host_create(
     }
     for (uint16_t i = 0; i < host->plan.header->num_tensors; ++i) {
         const tigris_tensor_t *tensor = &host->plan.tensors[i];
-        if (!(tensor->flags & TIGRIS_TENSOR_CONSTANT) && tensor->dtype != dtype) {
+        if (!(tensor->flags & TIGRIS_TENSOR_CONSTANT) && tensor->dtype != dtype && tensor->dtype != 6u) {
             error = "Mixed execution dtypes are not supported";
             goto fail;
         }

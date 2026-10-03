@@ -396,8 +396,44 @@ static void test_unconvertible_interfaces_are_refused(void)
     free(ptrs);
 }
 
+static void test_index_output(void)
+{
+    int32_t indices[] = {0, 17, INT32_MAX};
+    int64_t wide[3] = {0};
+    int32_t narrow[3] = {0};
+    void *ptrs[] = {indices};
+    tigris_file_header_t header = {0};
+    tigris_tensor_t tensor = {0};
+    tigris_plan_t plan = {0};
+    tigris_mem_t mem = {0};
+    header.num_tensors = 1;
+    tensor.dtype = 6;
+    tensor.iface_dtype = 7;
+    tensor.flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+    tensor.quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    tensor.size_bytes = sizeof(indices);
+    plan.header = &header;
+    plan.tensors = &tensor;
+    mem.num_tensors = 1;
+    mem.tensor_ptrs = ptrs;
+    TEST_ASSERT_EQ(tigris_iface_bytes(&plan, 0), sizeof(wide), "index interface doubles storage bytes");
+    TEST_ASSERT_EQ(tigris_output_read(&plan, &mem, 0, wide, sizeof(wide)), TIGRIS_OK, "indices widen exactly");
+    for (int i = 0; i < 3; i++) TEST_ASSERT_EQ(wide[i], indices[i], "widened index");
+    TEST_ASSERT_EQ(tigris_output_read(&plan, &mem, 0, narrow, sizeof(narrow)), TIGRIS_ERR_BAD_SIZE, "stored size is not interface size");
+    tensor.iface_dtype = 0;
+    TEST_ASSERT_EQ(tigris_output_read(&plan, &mem, 0, narrow, sizeof(narrow)), TIGRIS_OK, "int32 interface copies");
+    TEST_ASSERT(memcmp(indices, narrow, sizeof(indices)) == 0, "int32 bytes unchanged");
+    tensor.iface_dtype = 7;
+    tensor.flags |= TIGRIS_TENSOR_MODEL_INPUT;
+    TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, wide, sizeof(wide)), TIGRIS_ERR_BAD_INTERFACE, "index input conversion refused");
+    tensor.size_bytes = UINT32_MAX - 3u;
+    TEST_ASSERT_EQ(tigris_iface_bytes(&plan, 0), 0, "widening overflow refused");
+    TEST_ASSERT_EQ(tigris_output_read(&plan, &mem, 0, wide, 0), TIGRIS_ERR_BAD_SIZE, "overflow cannot wrap buffer length");
+}
+
 int main(void)
 {
+    test_index_output();
     printf("TiGrIS Model Interface Tests\n\n");
     if (load_fixture() != 0) {
         fprintf(stderr, "Cannot load the schema-v6 fixture\n");

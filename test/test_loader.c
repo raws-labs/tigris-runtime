@@ -1952,7 +1952,42 @@ static void test_arg_contract(void)
                 op->num_outputs = 0;
                 TEST_ASSERT(tigris_plan_load(buf, header->file_size, &plan) != TIGRIS_OK, "orphan index refused");
             }
+            /* An index reads its axis from any rank: [2, 12] -> [2], and
+             * [2, 3, 2, 2] -> [2, 3, 2] over the last axis. */
+            build_native_reduction_plan(buf, kind, q, 1);
+            uint32_t off = q ? 8u : 0u;
+            tigris_file_header_t *header = (tigris_file_header_t *)buf;
+            tigris_tensor_t *t = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + off);
+            int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + off);
+            t[1].dtype = 6;
+            t[1].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+            t[0].ndim = 2; dims[0] = 2; dims[1] = 12;
+            t[1].ndim = 1; dims[4] = 2;
+            t[1].size_bytes = 2u * 4u;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_OK, "rank-two arg accepted");
+            t[1].ndim = 2; dims[5] = 1;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_OK, "rank-two arg keeps its axis");
+            dims[5] = 2; t[1].size_bytes = 4u * 4u;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR, "kept axis must be one");
+            t[0].ndim = 4; dims[0] = 2; dims[1] = 3; dims[2] = 2; dims[3] = 2;
+            t[1].ndim = 3; dims[4] = 2; dims[5] = 3; dims[6] = 2;
+            t[1].size_bytes = 12u * 4u;
+            buf[header->file_size - 24u + 12u] = 3;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_OK, "rank-four arg accepted");
+            t[1].ndim = 1; dims[4] = 12;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR, "arg drops only one axis");
         }
+    }
+    /* The reductions keep the rank-three contract. */
+    build_native_reduction_plan(buf, TIGRIS_OP_REDUCE_MAX, 0, 1);
+    {
+        tigris_file_header_t *header = (tigris_file_header_t *)buf;
+        tigris_tensor_t *t = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF);
+        int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF);
+        t[0].ndim = 2; dims[0] = 2; dims[1] = 12;
+        t[1].ndim = 1; dims[4] = 2;
+        t[1].size_bytes = 2u * 4u;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR, "rank-two reduction refused");
     }
 }
 

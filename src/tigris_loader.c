@@ -133,6 +133,8 @@ static int shape_broadcasts_to(const int32_t *shape, uint8_t ndim,
 }
 
 #define TIGRIS_MAX_TENSOR_RANK_FOR_ATTR 8u
+/** Highest input rank an ArgMax or ArgMin reads its axis from. */
+#define TIGRIS_ARG_MAX_RANK 6u
 
 /* A binary operator's constant operand, held in its weight: one value, one
  * per channel, or one per element of `output`, or the shape the long form of
@@ -1048,24 +1050,29 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                                        &plan->quant_params[output->quant_param_idx]))
                     return TIGRIS_ERR_BAD_OPERATOR;
             }
-            /* One rank-3 activation in, one of its axes collapsed. The result
-             * keeps that axis at one or drops it, which is the difference
-             * between keepdims and not, and every other extent stays put. */
+            /* One activation in, one of its axes collapsed: rank 3 for the
+             * reductions, any rank up to TIGRIS_ARG_MAX_RANK for an index. The
+             * result keeps that axis at one or drops it, which is the
+             * difference between keepdims and not, and every other extent
+             * stays put. */
             uint8_t num_axes = 0u;
             const uint8_t *axes = tigris_op_attribute_data(
                 plan, op_index, TIGRIS_OP_ATTR_AXES, &num_axes);
-            if (!op_has_plain_io(op, 1, 1) || input->ndim != 3u ||
-                axes == NULL || num_axes != 1u || axes[0] >= 3u ||
-                (output->ndim != 3u && output->ndim != 2u))
+            const uint8_t rank = input->ndim;
+            const int rank_fits = index_output ? (rank >= 1u && rank <= TIGRIS_ARG_MAX_RANK)
+                                               : (rank == 3u);
+            if (!op_has_plain_io(op, 1, 1) || !rank_fits ||
+                axes == NULL || num_axes != 1u || axes[0] >= rank ||
+                (output->ndim != rank && (uint8_t)(output->ndim + 1u) != rank))
                 return TIGRIS_ERR_BAD_OPERATOR;
             const int32_t *in_shape = tigris_tensor_shape(plan, input);
             const int32_t *out_shape = tigris_tensor_shape(plan, output);
             uint8_t written = 0u;
-            for (uint8_t axis = 0; axis < 3u; axis++) {
+            for (uint8_t axis = 0; axis < rank; axis++) {
                 if (in_shape[axis] <= 0)
                     return TIGRIS_ERR_BAD_OPERATOR;
                 int32_t want = (axis == axes[0]) ? 1 : in_shape[axis];
-                if (axis == axes[0] && output->ndim == 2u)
+                if (axis == axes[0] && output->ndim != rank)
                     continue;  /* keepdims=0 drops the axis instead */
                 if (written >= output->ndim || out_shape[written] != want)
                     return TIGRIS_ERR_BAD_OPERATOR;

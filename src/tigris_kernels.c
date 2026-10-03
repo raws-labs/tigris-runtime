@@ -1187,6 +1187,138 @@ static int reduce_mean_extents(
     return 0;
 }
 
+static uint32_t movement_product(const int32_t *shape, uint8_t begin, uint8_t end)
+{
+    uint32_t result = 1u;
+    for (uint8_t a = begin; a < end; a++) result *= (uint32_t)shape[a];
+    return result;
+}
+
+static int movement_gather(const tigris_plan_t *plan, const tigris_op_t *op,
+                           const int32_t *metadata, const uint8_t *input, uint8_t *output)
+{
+    const tigris_tensor_t *source = &plan->tensors[tigris_op_inputs(plan, op)[0]];
+    const int32_t *shape = tigris_tensor_shape(plan, source);
+    const uint8_t *indices = (const uint8_t *)tigris_op_weight(plan, op);
+    if (!indices) return -1;
+    uint32_t count = plan->weight_entries[op->weight_idx].size_bytes / 4u;
+    uint32_t element = tigris_dtype_size(source->dtype);
+    if (op->op_type == TIGRIS_OP_GATHER_ND) {
+        uint8_t depth = (uint8_t)metadata[metadata[0]];
+        uint32_t inner = movement_product(shape, depth, source->ndim);
+        for (uint32_t n = 0u; n < count / depth; n++) {
+            uint32_t offset = 0u;
+            for (uint8_t a = 0u; a < depth; a++) {
+                int32_t coordinate;
+                memcpy(&coordinate, indices + ((size_t)n * depth + a) * 4u, 4u);
+                if (coordinate < 0 || coordinate >= shape[a]) return -1;
+                offset = offset * (uint32_t)shape[a] + (uint32_t)coordinate;
+            }
+            memcpy(output + (size_t)n * inner * element,
+                   input + (size_t)offset * inner * element, (size_t)inner * element);
+        }
+        return 0;
+    }
+    uint8_t axis = (uint8_t)metadata[0], batch = (uint8_t)metadata[1];
+    uint32_t batches = movement_product(shape, 0u, batch);
+    uint32_t outer = movement_product(shape, batch, axis);
+    uint32_t inner = movement_product(shape, (uint8_t)(axis + 1u), source->ndim);
+    uint32_t per_batch = count / batches;
+    for (uint32_t b = 0u; b < batches; b++) {
+        for (uint32_t o = 0u; o < outer; o++) {
+            for (uint32_t n = 0u; n < per_batch; n++) {
+                int32_t coordinate;
+                memcpy(&coordinate, indices + ((size_t)b * per_batch + n) * 4u, 4u);
+                if (coordinate < 0 || coordinate >= shape[axis]) return -1;
+                size_t from = ((size_t)b * outer + o) * (uint32_t)shape[axis] + (uint32_t)coordinate;
+                size_t to = ((size_t)b * outer + o) * per_batch + n;
+                memcpy(output + to * inner * element, input + from * inner * element, (size_t)inner * element);
+            }
+        }
+    }
+    return 0;
+}
+
+int tigris_movement_execute(const tigris_plan_t *plan, const tigris_op_t *op,
+                            uint16_t op_index, tigris_mem_t *mem)
+{
+    int32_t metadata[19] = {0};
+    uint8_t length = 0u;
+    const uint8_t *payload = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_MOVEMENT, &length);
+    if (mem->tile.active || !payload || length == 0u || length > sizeof(metadata) || length % 4u != 0u ||
+        op->num_inputs == 0u || op->num_outputs != 1u) return -1;
+    memcpy(metadata, payload, length);
+    uint16_t in_idx = tigris_op_inputs(plan, op)[0], out_idx = tigris_op_outputs(plan, op)[0];
+    const tigris_tensor_t *source = &plan->tensors[in_idx], *target = &plan->tensors[out_idx];
+    const int32_t *shape = tigris_tensor_shape(plan, source);
+    const int32_t *out_shape = tigris_tensor_shape(plan, target);
+    const uint8_t *input = (const uint8_t *)tigris_mem_tensor_ptr(mem, in_idx);
+    uint8_t *output = (uint8_t *)tigris_mem_tensor_ptr(mem, out_idx);
+    uint32_t element = tigris_dtype_size(source->dtype);
+    if (!input || !output || source->ndim == 0u || source->ndim > 6u ||
+        (source->dtype != 1u && source->dtype != 3u) || target->dtype != source->dtype) return -1;
+    if (op->op_type == TIGRIS_OP_GATHER || op->op_type == TIGRIS_OP_GATHER_ND ||
+        op->op_type == TIGRIS_OP_EMBEDDING_LOOKUP)
+        return movement_gather(plan, op, metadata, input, output);
+    if (op->op_type == TIGRIS_OP_DYNAMIC_UPDATE_SLICE) {
+        if (length != (uint32_t)source->ndim * 8u) return -1;
+        const int32_t *ushape = metadata + source->ndim;
+        const uint8_t *values;
+        if (op->weight_idx == TIGRIS_NO_WEIGHT) {
+            if (op->num_inputs != 2u) return -1;
+            values = (const uint8_t *)tigris_mem_tensor_ptr(mem, tigris_op_inputs(plan, op)[1]);
+        } else values = (const uint8_t *)tigris_op_weight(plan, op);
+        if (!values) return -1;
+        uint32_t update_count = movement_product(ushape, 0u, source->ndim);
+        if (output != input) memcpy(output, input, source->size_bytes);
+        for (uint32_t i = 0u; i < update_count; i++) {
+            uint32_t rest = i;
+            size_t offset = 0u, stride = 1u;
+            for (uint8_t a = source->ndim; a > 0u; a--) {
+                uint8_t d = (uint8_t)(a - 1u);
+                offset += ((size_t)rest % (uint32_t)ushape[d] + (uint32_t)metadata[d]) * stride;
+                rest /= (uint32_t)ushape[d];
+                stride *= (uint32_t)shape[d];
+            }
+            memcpy(output + offset * element, values + (size_t)i * element, element);
+        }
+        return 0;
+    }
+    uint32_t shrink = 0u;
+    if (op->op_type == TIGRIS_OP_STRIDED_SLICE && length > (uint32_t)source->ndim * 12u)
+        shrink = (uint32_t)metadata[3u * source->ndim];
+    if (shrink == 0u && target->ndim != source->ndim) return -1;
+    for (uint32_t i = 0u; i < target->size_bytes / element; i++) {
+        uint32_t rest = i;
+        size_t offset = 0u, stride = 1u;
+        uint8_t out_axis = target->ndim;
+        for (uint8_t a = source->ndim; a > 0u; a--) {
+            uint8_t d = (uint8_t)(a - 1u);
+            int64_t coordinate = 0;
+            if ((shrink & (1u << d)) == 0u) {
+                if (out_axis == 0u) return -1;
+                out_axis--;
+                coordinate = (int64_t)rest % out_shape[out_axis];
+                rest /= (uint32_t)out_shape[out_axis];
+            }
+            if (op->op_type == TIGRIS_OP_STRIDED_SLICE) {
+                coordinate = metadata[3u * d] + coordinate * metadata[3u * d + 2u];
+            } else if (op->op_type == TIGRIS_OP_MIRROR_PAD) {
+                coordinate -= metadata[1u + 2u * d];
+                if (coordinate < 0) coordinate = -coordinate - metadata[0];
+                else if (coordinate >= shape[d]) coordinate = (int64_t)2 * shape[d] - 2 + metadata[0] - coordinate;
+            } else if (op->op_type == TIGRIS_OP_REVERSE_V2) {
+                if (((uint32_t)metadata[0] & (1u << d)) != 0u) coordinate = shape[d] - 1 - coordinate;
+            } else return -1;
+            if (coordinate < 0 || coordinate >= shape[d]) return -1;
+            offset += (size_t)coordinate * stride;
+            stride *= (uint32_t)shape[d];
+        }
+        memcpy(output + (size_t)i * element, input + offset * element, element);
+    }
+    return 0;
+}
+
 int tigris_arg_execute(const tigris_plan_t *plan, const tigris_op_t *op,
                        uint16_t op_index, tigris_mem_t *mem)
 {
@@ -2328,6 +2460,14 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_REDUCE_MAX:
     case TIGRIS_OP_REDUCE_MIN:
     case TIGRIS_OP_REDUCE_SUM: return kern_reduce_f32(plan, op, op_index, mem);
+    case TIGRIS_OP_GATHER:
+    case TIGRIS_OP_GATHER_ND:
+    case TIGRIS_OP_STRIDED_SLICE:
+    case TIGRIS_OP_MIRROR_PAD:
+    case TIGRIS_OP_REVERSE_V2:
+    case TIGRIS_OP_EMBEDDING_LOOKUP:
+    case TIGRIS_OP_DYNAMIC_UPDATE_SLICE:
+        return tigris_movement_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ARG_MAX:
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CUMSUM: return kern_cumsum_f32(plan, op, op_index, mem);

@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "tigris.h"
+#include "movement_golden.h"
 #include "tigris_loader.h"
 
 /* Test infrastructure */
@@ -3541,8 +3542,118 @@ static void test_schema_compatibility_fixtures(void)
 
 /* Main */
 
+#define MOVEMENT_PLAN_SIZE 1280u
+
+static void build_movement_plan(uint8_t *buf, const movement_golden_t *gold)
+{
+    memset(buf, 0, MOVEMENT_PLAN_SIZE);
+    tigris_file_header_t *h = (tigris_file_header_t *)buf;
+    memcpy(h->magic, TIGRIS_MAGIC_BYTES, 4);
+    h->version = TIGRIS_SCHEMA_VERSION;
+    h->file_size = MOVEMENT_PLAN_SIZE;
+    h->section_dir_off = sizeof(*h);
+    h->num_tensors = 3;
+    h->num_ops = h->num_stages = 1;
+    h->num_weights = gold->index_count != 0u ? 1 : 0;
+    h->num_quant_params = gold->dtype == 3 ? 3 : 0;
+    h->num_model_inputs = gold->update_count != 0u ? 2 : 1;
+    h->num_model_outputs = 1;
+    h->model_io_off = 4;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + h->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, 144};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, 192};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, 232};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, 260};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, 288};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, 360};
+    uint8_t section = 6;
+    if (h->num_weights != 0u) dir[section++] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHTS, 368};
+    if (h->num_quant_params != 0u) dir[section++] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, 1024};
+    dir[section] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, 1152};
+    tigris_tensor_t *t = (tigris_tensor_t *)(buf + 144);
+    uint32_t counts[] = {gold->input_count, gold->update_count ? gold->update_count : 1u, gold->output_count};
+    uint8_t ranks[] = {gold->rank, gold->update_rank ? gold->update_rank : 1u, gold->output_rank};
+    for (int i = 0; i < 3; i++) {
+        t[i].shape_off = (uint32_t)i * 6u;
+        t[i].ndim = ranks[i];
+        t[i].dtype = gold->dtype;
+        t[i].quant_param_idx = gold->dtype == 3 ? (uint16_t)i : TIGRIS_NO_QUANT_PARAM;
+        t[i].size_bytes = counts[i] * tigris_dtype_size(gold->dtype);
+    }
+    t[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    if (h->num_model_inputs == 2) t[1].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    t[2].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+    memcpy(buf + 288, gold->shapes, sizeof(gold->shapes));
+    tigris_op_t *op = (tigris_op_t *)(buf + 192);
+    op->op_type = gold->op;
+    op->num_inputs = h->num_model_inputs;
+    op->num_outputs = 1;
+    op->outputs_off = 2;
+    op->weight_idx = h->num_weights ? 0 : TIGRIS_NO_WEIGHT;
+    op->bias_idx = TIGRIS_NO_WEIGHT;
+    op->act_min = -128; op->act_max = 127;
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + 232);
+    stage->ops_off = 3; stage->ops_count = 1;
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+    uint16_t *indices = (uint16_t *)(buf + 260);
+    indices[0] = 0; indices[1] = 1; indices[2] = 2; indices[3] = 0;
+    indices[4] = 0; indices[5] = h->num_model_inputs == 2 ? 1 : 2; indices[6] = 2;
+    if (h->num_weights) {
+        tigris_weight_entry_t *weight = (tigris_weight_entry_t *)(buf + 368);
+        weight->size_bytes = gold->index_count * 4u;
+        memcpy(buf + 368 + sizeof(*weight), gold->indices, weight->size_bytes);
+    }
+    if (h->num_quant_params) {
+        uint16_t *qh = (uint16_t *)(buf + 1024);
+        qh[0] = 3; qh[1] = 1;
+        tigris_quant_param_t *q = (tigris_quant_param_t *)(buf + 1028);
+        for (int i = 0; i < 3; i++) {
+            q[i].scale = 0.125f; q[i].zero_point = -17;
+            q[i].num_channels = 1; q[i].shift_off = 1;
+        }
+    }
+    uint16_t count = 1;
+    memcpy(buf + 1152, &count, sizeof(count));
+    tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + 1156);
+    attr->type = TIGRIS_OP_ATTR_MOVEMENT;
+    attr->data_len = (uint8_t)(gold->metadata_count * 4u);
+    memcpy(buf + 1164, gold->metadata, attr->data_len);
+}
+
+static void test_movement_contract(void)
+{
+    _Alignas(4) uint8_t buf[MOVEMENT_PLAN_SIZE];
+    tigris_plan_t plan;
+    for (size_t g = 0; g < sizeof(movement_goldens) / sizeof(movement_goldens[0]); g++) {
+        build_movement_plan(buf, &movement_goldens[g]);
+        tigris_error_t error = tigris_plan_load(buf, sizeof(buf), &plan);
+        if (error != TIGRIS_OK) fprintf(stderr, "movement loader case %zu: %d\n", g, error);
+        TEST_ASSERT_EQ(error, TIGRIS_OK, "movement reference metadata loads");
+        tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + 1156);
+        attr->data_len--;
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "truncated movement metadata refused");
+        attr->data_len++;
+        tigris_tensor_t *t = (tigris_tensor_t *)(buf + 144);
+        t[2].dtype = 9;
+        t[2].size_bytes = movement_goldens[g].output_count;
+        t[2].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "movement cannot produce bool");
+        build_movement_plan(buf, &movement_goldens[g]);
+        int32_t invalid = -99;
+        memcpy(buf + 1164, &invalid, sizeof(invalid));
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "invalid movement metadata refused");
+        if (movement_goldens[g].dtype == 3) {
+            build_movement_plan(buf, &movement_goldens[g]);
+            ((tigris_quant_param_t *)(buf + 1028))[2].scale = 0.25f;
+            TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "movement cannot rescale int8");
+        }
+    }
+}
+
 int main(int argc, char *argv[])
 {
+    test_movement_contract();
     printf("TiGrIS Plan Loader Tests\n\n");
 
     printf("Error handling tests:\n");

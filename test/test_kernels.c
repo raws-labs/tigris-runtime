@@ -14,6 +14,7 @@
 #include <math.h>
 
 #include "tigris.h"
+#include "movement_golden.h"
 #include "tigris_mem.h"
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
@@ -3344,8 +3345,95 @@ static void test_reduction_reference_goldens(void)
     }
 }
 
+static void test_movement_goldens(void)
+{
+    for (size_t g = 0; g < sizeof(movement_goldens) / sizeof(movement_goldens[0]); g++) {
+        const movement_golden_t *gold = &movement_goldens[g];
+        tigris_file_header_t header = {0};
+        tigris_tensor_t tensors[3] = {{0}};
+        tigris_op_t op = {0};
+        tigris_plan_t plan = {0};
+        tigris_mem_t mem = {0};
+        tigris_quant_param_t quant = {0};
+        tigris_op_attribute_t attr = {0};
+        tigris_weight_entry_t weight = {0};
+        uint16_t indices[] = {0, 1, 2};
+        uint32_t element = tigris_dtype_size(gold->dtype);
+        void *output = calloc(gold->output_count, element);
+        void *pointers[] = {(void *)gold->input, (void *)gold->update, output};
+        TEST_ASSERT(output != NULL, "movement output allocated");
+        if (!output) return;
+        header.num_tensors = 3;
+        header.num_ops = 1;
+        header.num_weights = gold->index_count != 0u ? 1 : 0;
+        header.num_quant_params = gold->dtype == 3 ? 1 : 0;
+        uint32_t counts[] = {gold->input_count, gold->update_count, gold->output_count};
+        uint8_t ranks[] = {gold->rank, gold->update_rank, gold->output_rank};
+        for (int i = 0; i < 3; i++) {
+            tensors[i].shape_off = (uint32_t)i * 6u;
+            tensors[i].ndim = ranks[i];
+            tensors[i].dtype = gold->dtype;
+            tensors[i].quant_param_idx = gold->dtype == 3 ? 0 : TIGRIS_NO_QUANT_PARAM;
+            tensors[i].size_bytes = counts[i] * element;
+        }
+        quant.scale = 0.125f;
+        quant.zero_point = -17;
+        quant.num_channels = 1;
+        op.op_type = gold->op;
+        op.num_inputs = gold->update_count != 0u ? 2 : 1;
+        op.num_outputs = 1;
+        op.outputs_off = 2;
+        op.weight_idx = gold->index_count != 0u ? 0 : TIGRIS_NO_WEIGHT;
+        op.bias_idx = TIGRIS_NO_WEIGHT;
+        weight.size_bytes = gold->index_count * 4u;
+        attr.type = TIGRIS_OP_ATTR_MOVEMENT;
+        attr.data_len = (uint8_t)(gold->metadata_count * 4u);
+        plan.header = &header;
+        plan.tensors = tensors;
+        plan.ops = &op;
+        plan.shape_pool = gold->shapes;
+        plan.index_pool = indices;
+        plan.quant_params = &quant;
+        plan.num_quant_params = header.num_quant_params;
+        plan.num_op_attributes = 1;
+        plan.op_attributes = &attr;
+        plan.op_attribute_data = (const uint8_t *)gold->metadata;
+        plan.weight_entries = &weight;
+        plan.weight_blob = (const uint8_t *)gold->indices;
+        mem.tensor_ptrs = pointers;
+        mem.num_tensors = 3;
+        tigris_kernel_fn kernel = gold->dtype == 3 ? tigris_dispatch_kernel_s8 : tigris_dispatch_kernel;
+        int result = kernel(&plan, &op, 0, &mem, NULL);
+        if (result != 0) fprintf(stderr, "movement golden %zu op %u failed\n", g, gold->op);
+        TEST_ASSERT(result == 0, "movement golden executes");
+        TEST_ASSERT(memcmp(output, gold->output, (size_t)gold->output_count * element) == 0, "movement bytes match TFLM");
+        if (gold->update_count != 0u) {
+            header.num_weights = 1;
+            op.weight_idx = 0;
+            op.num_inputs = 1;
+            weight.size_bytes = gold->update_count * element;
+            plan.weight_blob = (const uint8_t *)gold->update;
+            memset(output, 0, (size_t)gold->output_count * element);
+            TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) == 0, "constant update executes");
+            TEST_ASSERT(memcmp(output, gold->output, (size_t)gold->output_count * element) == 0, "constant update matches TFLM");
+            memcpy(output, gold->input, (size_t)gold->input_count * element);
+            pointers[0] = output;
+            TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) == 0, "in-place update executes");
+            TEST_ASSERT(memcmp(output, gold->output, (size_t)gold->output_count * element) == 0, "in-place update matches TFLM");
+            pointers[0] = (void *)gold->input;
+        }
+        mem.tile.active = 1;
+        TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) != 0, "movement refuses tile state");
+        mem.tile.active = 0;
+        attr.data_len = 0;
+        TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) != 0, "movement refuses missing metadata");
+        free(output);
+    }
+}
+
 int main(void)
 {
+    test_movement_goldens();
     printf("TiGrIS Kernel Tests\n\n");
 
     test_conv2d();

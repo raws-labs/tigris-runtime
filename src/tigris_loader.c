@@ -403,19 +403,113 @@ static int same_quantization(const tigris_quant_param_t *a, const tigris_quant_p
            a->zero_point == b->zero_point;
 }
 
+typedef struct {
+    uint8_t inputs[3];
+    uint8_t output;
+} dtype_signature_t;
+
+
+uint8_t tigris_plan_data_dtype(const tigris_plan_t *plan)
+{
+    uint8_t dtype = 0u;
+    for (uint16_t i = 0; i < plan->header->num_tensors; i++) {
+        const tigris_tensor_t *tensor = &plan->tensors[i];
+        if ((tensor->flags & TIGRIS_TENSOR_CONSTANT) != 0u ||
+            (tensor->dtype != 1u && tensor->dtype != 3u)) continue;
+        if (dtype != 0u && dtype != tensor->dtype) return 0u;
+        dtype = tensor->dtype;
+    }
+    return dtype;
+}
+
+static int dtype_matches_slot(uint8_t dtype, uint8_t role, uint8_t data_dtype)
+{
+    return dtype == (role == 0u ? data_dtype : role);
+}
+
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
+    /* Zero is the homogeneous data dtype; the final input slot repeats. */
+    static const dtype_signature_t dtype_signatures[TIGRIS_OP_ARG_MIN + 1] = {
+        [TIGRIS_OP_CONV] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_DEPTHWISE] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_RELU] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_RELU6] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_MAX_POOL] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_AVG_POOL] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_ADD] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_MUL] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_FULLY_CONN] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_SOFTMAX] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_CLIP] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_SIGMOID] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_CONCAT] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_PAD] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_GLOBAL_AVG] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_FLATTEN] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_RESHAPE] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_SUB] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_DIV] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_TANH] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_LEAKY_RELU] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_BATCH_NORM] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_INST_NORM] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_CONV_TRANSPOSE] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_MATMUL] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_REDUCE_MEAN] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_SQUEEZE] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_UNSQUEEZE] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_TRANSPOSE] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_RESIZE] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_GLOBAL_MAX] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_CONV1D] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_LAYER_NORM] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_ERF] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_SPLIT] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_RESIZE_LINEAR] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_HARDSWISH] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_ABS] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_RSQRT] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_SQUARED_DIFFERENCE] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_MAXIMUM] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_MINIMUM] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_NEG] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_EXP] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_LOG] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_SQRT] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_SQUARE] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_FLOOR] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_CEIL] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_ROUND] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_SIN] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_COS] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_FLOOR_DIV] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_FLOOR_MOD] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_PRELU] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_ELU] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_LOG_SOFTMAX] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_L2_NORMALIZATION] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_L2_POOL] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_REDUCE_MAX] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_REDUCE_MIN] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_REDUCE_SUM] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_CUMSUM] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_ARG_MAX] = {{0, 0, 0}, 6},
+        [TIGRIS_OP_ARG_MIN] = {{0, 0, 0}, 6},
+    };
     const tigris_file_header_t *hdr = plan->header;
     const int legacy = hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES;
+    const uint8_t data_dtype = tigris_plan_data_dtype(plan);
     for (uint16_t t = 0; t < hdr->num_tensors; t++) {
-        if (plan->tensors[t].dtype != 6u) continue;
+        if (!tigris_dtype_terminal_only(plan->tensors[t].dtype)) continue;
         uint32_t producers = 0u;
         for (uint16_t n = 0; n < hdr->num_ops; n++) {
             const tigris_op_t *producer = &plan->ops[n];
             const uint16_t *outputs = tigris_op_outputs(plan, producer);
             for (uint8_t j = 0; j < producer->num_outputs; j++) {
                 if (outputs[j] != t) continue;
-                if (producer->op_type != TIGRIS_OP_ARG_MAX && producer->op_type != TIGRIS_OP_ARG_MIN)
+                if (producer->op_type >= sizeof(dtype_signatures) / sizeof(dtype_signatures[0]) ||
+                    dtype_signatures[producer->op_type].output != 6u)
                     return TIGRIS_ERR_BAD_OPERATOR;
                 producers++;
             }
@@ -437,15 +531,16 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         const tigris_tensor_t *output = &plan->tensors[outputs[0]];
         uint8_t dtype = input->dtype;
         int index_output = op->op_type == TIGRIS_OP_ARG_MAX || op->op_type == TIGRIS_OP_ARG_MIN;
-        if (dtype != 1u && dtype != 3u)
+        if (op->op_type >= sizeof(dtype_signatures) / sizeof(dtype_signatures[0]))
             return TIGRIS_ERR_BAD_OPERATOR;
-
+        const dtype_signature_t *signature = &dtype_signatures[op->op_type];
         for (uint8_t i = 0; i < op->num_inputs; i++) {
-            if (plan->tensors[inputs[i]].dtype != dtype)
+            uint8_t role = signature->inputs[i < 3u ? i : 2u];
+            if (!dtype_matches_slot(plan->tensors[inputs[i]].dtype, role, data_dtype))
                 return TIGRIS_ERR_BAD_OPERATOR;
         }
         for (uint8_t i = 0; i < op->num_outputs; i++) {
-            if (plan->tensors[outputs[i]].dtype != (index_output ? 6u : dtype))
+            if (!dtype_matches_slot(plan->tensors[outputs[i]].dtype, signature->output, data_dtype))
                 return TIGRIS_ERR_BAD_OPERATOR;
         }
         if (dtype == 3 && op->act_min > op->act_max)
@@ -1531,7 +1626,7 @@ tigris_error_t tigris_plan_load_ex(
                                TIGRIS_TENSOR_MODEL_INPUT |
                                TIGRIS_TENSOR_MODEL_OUTPUT |
                                TIGRIS_TENSOR_LINEAR)) != 0 ||
-            ((tensor->dtype == 1 || tensor->dtype == 6) &&
+            ((tensor->dtype == 1 || tensor->dtype == 6 || tensor->dtype == 9) &&
              tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM))
             return TIGRIS_ERR_BAD_TENSOR;
         /* The byte was reserved and written as zero before the interface dtype
@@ -1554,7 +1649,7 @@ tigris_error_t tigris_plan_load_ex(
                    tensor->dtype == 3u && tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM)))
                 return TIGRIS_ERR_BAD_TENSOR;
         }
-        if (tensor->dtype == 6u &&
+        if (tigris_dtype_terminal_only(tensor->dtype) &&
             ((tensor->flags & (TIGRIS_TENSOR_MODEL_INPUT | TIGRIS_TENSOR_CONSTANT)) != 0u ||
              (tensor->flags & TIGRIS_TENSOR_MODEL_OUTPUT) == 0u ||
              (tensor->iface_dtype == 7u && tensor->size_bytes > UINT32_MAX / 2u)))
@@ -1566,12 +1661,8 @@ tigris_error_t tigris_plan_load_ex(
                 return TIGRIS_ERR_BAD_TENSOR;
             elements *= (uint32_t)value;
         }
-        uint32_t element_size;
-        if (tensor->dtype == 1 || tensor->dtype == 6)
-            element_size = sizeof(float);
-        else if (tensor->dtype == 3)
-            element_size = sizeof(int8_t);
-        else
+        uint32_t element_size = tigris_dtype_size(tensor->dtype);
+        if (tensor->dtype != 1u && tensor->dtype != 3u && tensor->dtype != 6u && tensor->dtype != 9u)
             return TIGRIS_ERR_BAD_TENSOR;
         if (elements > UINT32_MAX / element_size ||
             tensor->size_bytes != elements * element_size)

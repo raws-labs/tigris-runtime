@@ -85,17 +85,13 @@ const char *tigris_host_create(
         error = "Host execution requires model inputs, outputs, stages, and a fast budget";
         goto fail;
     }
-    dtype = host->plan.tensors[host->plan.model_inputs[0]].dtype;
+    dtype = tigris_plan_data_dtype(&host->plan);
     if (dtype != 1u && dtype != 3u) {
         error = "Host execution supports float32 and int8 plans";
         goto fail;
     }
     for (uint16_t i = 0; i < host->plan.header->num_tensors; ++i) {
         const tigris_tensor_t *tensor = &host->plan.tensors[i];
-        if (!(tensor->flags & TIGRIS_TENSOR_CONSTANT) && tensor->dtype != dtype && tensor->dtype != 6u) {
-            error = "Mixed execution dtypes are not supported";
-            goto fail;
-        }
         slow_required += (uint64_t)tensor->size_bytes + TIGRIS_TENSOR_ALIGN;
     }
     /* Keep room for live tensors and a second copy during arena movement. */

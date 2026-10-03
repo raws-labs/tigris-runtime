@@ -11,16 +11,6 @@
 #define IFACE_DTYPE_INT32   6
 #define IFACE_DTYPE_INT64   7
 
-static uint32_t dtype_size(uint8_t dtype)
-{
-    if (dtype == IFACE_DTYPE_INT32) return (uint32_t)sizeof(int32_t);
-    if (dtype == IFACE_DTYPE_INT64) return (uint32_t)sizeof(int64_t);
-    if (dtype == IFACE_DTYPE_FLOAT32) return (uint32_t)sizeof(float);
-    if (dtype == IFACE_DTYPE_INT8) return (uint32_t)sizeof(int8_t);
-    if (dtype == IFACE_DTYPE_UINT8) return (uint32_t)sizeof(uint8_t);
-    return 0u;
-}
-
 /* The tensor's declared dtype, which is its own dtype when none is recorded. */
 static uint8_t declared_dtype(const tigris_tensor_t *tensor)
 {
@@ -46,8 +36,8 @@ uint32_t tigris_iface_bytes(const tigris_plan_t *plan, uint16_t tensor_idx)
         (uint8_t)(TIGRIS_TENSOR_MODEL_INPUT | TIGRIS_TENSOR_MODEL_OUTPUT));
     if (!tensor)
         return 0u;
-    uint32_t stored = dtype_size(tensor->dtype);
-    uint32_t declared = dtype_size(declared_dtype(tensor));
+    uint32_t stored = tigris_dtype_size(tensor->dtype);
+    uint32_t declared = tigris_dtype_size(declared_dtype(tensor));
     if (stored == 0u || declared == 0u || tensor->size_bytes / stored > UINT32_MAX / declared)
         return 0u;
     return (tensor->size_bytes / stored) * declared;
@@ -79,8 +69,8 @@ static tigris_error_t resolve(
         return TIGRIS_ERR_BAD_TENSOR;
 
     uint8_t declared = declared_dtype(tensor);
-    uint32_t stored_size = dtype_size(tensor->dtype);
-    uint32_t declared_size = dtype_size(declared);
+    uint32_t stored_size = tigris_dtype_size(tensor->dtype);
+    uint32_t declared_size = tigris_dtype_size(declared);
     if (stored_size == 0u || declared_size == 0u)
         return TIGRIS_ERR_BAD_INTERFACE;
 
@@ -130,6 +120,11 @@ tigris_error_t tigris_input_write(
     if (!dst)
         return TIGRIS_ERR_NULL;
 
+    if (tensor->dtype == 9u) {
+        const uint8_t *values = (const uint8_t *)src;
+        for (uint32_t i = 0u; i < elements; i++)
+            if (values[i] > 1u) return TIGRIS_ERR_BAD_INTERFACE;
+    }
     if (declared_dtype(tensor) == tensor->dtype) {
         memcpy(dst, src, src_bytes);
         return TIGRIS_OK;

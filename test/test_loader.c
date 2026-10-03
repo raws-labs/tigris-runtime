@@ -15,6 +15,7 @@
 
 #include "tigris.h"
 #include "movement_golden.h"
+#include "bool_golden.h"
 #include "tigris_loader.h"
 
 /* Test infrastructure */
@@ -3686,9 +3687,140 @@ static void test_movement_contract(void)
     }
 }
 
+#define BOOL_PLAN_SIZE 2048u
+
+static void build_bool_plan(uint8_t *buf, const bool_golden_t *gold)
+{
+    memset(buf, 0, BOOL_PLAN_SIZE);
+    tigris_file_header_t *h = (tigris_file_header_t *)buf;
+    memcpy(h->magic, TIGRIS_MAGIC_BYTES, 4);
+    h->version = TIGRIS_SCHEMA_VERSION;
+    h->file_size = BOOL_PLAN_SIZE;
+    h->section_dir_off = sizeof(*h);
+    h->num_tensors = gold->inputs + 1u;
+    h->num_ops = h->num_stages = 1;
+    h->num_model_inputs = gold->inputs;
+    h->num_model_outputs = 1;
+    h->model_io_off = 40;
+    h->num_quant_params = 4;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + h->section_dir_off);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, 160};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, 240};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, 280};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, 320};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, 448};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, 528};
+    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, 544};
+    const int compare_s8 = gold->op >= TIGRIS_OP_EQUAL && gold->op <= TIGRIS_OP_GREATER_EQUAL && gold->dtypes[0] == 3;
+    if (compare_s8) dir[7] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, 672};
+    tigris_tensor_t *t = (tigris_tensor_t *)(buf + 160);
+    int32_t *shapes = (int32_t *)(buf + 448);
+    uint16_t *indices = (uint16_t *)(buf + 320);
+    for (uint8_t i = 0; i < h->num_tensors; i++) {
+        const uint8_t slot = i == gold->inputs ? 3u : i;
+        t[i].shape_off = (uint32_t)i * 5u;
+        t[i].ndim = gold->ranks[slot]; t[i].dtype = gold->dtypes[slot];
+        t[i].size_bytes = gold->sizes[slot];
+        t[i].quant_param_idx = t[i].dtype == 3u ? slot : TIGRIS_NO_QUANT_PARAM;
+        t[i].flags = i == gold->inputs ? TIGRIS_TENSOR_MODEL_OUTPUT : TIGRIS_TENSOR_MODEL_INPUT;
+        memcpy(shapes + i * 5u, gold->shapes + slot * 5u, 5u * sizeof(int32_t));
+        indices[i] = i;
+        indices[40u + i] = i;
+    }
+    tigris_op_t *op = (tigris_op_t *)(buf + 240);
+    op->op_type = gold->op; op->num_inputs = gold->inputs; op->num_outputs = 1;
+    op->outputs_off = gold->inputs;
+    op->weight_idx = op->bias_idx = TIGRIS_NO_WEIGHT;
+    op->act_min = -128; op->act_max = 127;
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + 280);
+    stage->ops_off = 39; stage->ops_count = 1;
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN; stage->chain_id = TIGRIS_NO_CHAIN;
+    uint16_t *qh = (uint16_t *)(buf + 544);
+    qh[0] = 4; qh[1] = 1;
+    tigris_quant_param_t *q = (tigris_quant_param_t *)(buf + 548);
+    for (uint8_t i = 0; i < 4; i++) {
+        q[i].scale = gold->scales[i]; q[i].zero_point = gold->zeros[i];
+        q[i].num_channels = 1; q[i].shift_off = 1;
+    }
+    if (compare_s8) {
+        uint16_t n = 1;
+        memcpy(buf + 672, &n, sizeof(n));
+        tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + 676);
+        attr->type = TIGRIS_OP_ATTR_COMPARISON_REQUANT; attr->data_len = 20;
+        memcpy(buf + 684, gold->requant, 20);
+    }
+}
+
+static void test_bool_contract(void)
+{
+    _Alignas(4) uint8_t buf[BOOL_PLAN_SIZE];
+    tigris_plan_t plan;
+    for (size_t g = 0; g < sizeof(bool_goldens) / sizeof(bool_goldens[0]); g++) {
+        const bool_golden_t *gold = &bool_goldens[g];
+        build_bool_plan(buf, gold);
+        tigris_error_t error = tigris_plan_load(buf, sizeof(buf), &plan);
+        if (error != TIGRIS_OK) fprintf(stderr, "bool loader case %zu: %d\n", g, error);
+        TEST_ASSERT_EQ(error, TIGRIS_OK, "bool reference metadata loads");
+        tigris_tensor_t *t = (tigris_tensor_t *)(buf + 160);
+        tigris_op_t *op = (tigris_op_t *)(buf + 240);
+        tigris_quant_param_t *q = (tigris_quant_param_t *)(buf + 548);
+        const uint8_t out = gold->inputs;
+        if (gold->ranks[3] == 0u && gold->dtypes[0] != 3u && gold->dtypes[3] != 3u) {
+            tigris_file_header_t *h = (tigris_file_header_t *)buf;
+            tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + h->section_dir_off);
+            h->num_quant_params = 0; h->file_size = 531;
+            dir[4].offset = 528;
+            dir[6] = (tigris_section_entry_t){0, 0};
+            for (uint8_t i = 0; i < h->num_tensors; i++) t[i].shape_off = 0;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, h->file_size, &plan), TIGRIS_OK,
+                           "scalar plan permits an empty shape pool before an odd-sized string table");
+            build_bool_plan(buf, gold);
+        }
+        t[out].dtype = 6; t[out].size_bytes = gold->sizes[3] / tigris_dtype_size(gold->dtypes[3]) * 4u;
+        t[out].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "bool operator refuses int32 output");
+        build_bool_plan(buf, gold);
+        op->fused_act = TIGRIS_ACT_RELU;
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "bool operator refuses fused activation");
+        build_bool_plan(buf, gold);
+        if (gold->op <= TIGRIS_OP_GREATER_EQUAL && gold->dtypes[0] == 3) {
+            q[0].scale = 1.0f;
+            TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "comparison refuses unit scale");
+            build_bool_plan(buf, gold);
+            ((int32_t *)(buf + 684))[0] = 7;
+            TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "comparison refuses invalid left shift");
+            build_bool_plan(buf, gold);
+            ((tigris_op_attribute_t *)(buf + 676))->data_len = 16;
+            TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "comparison refuses short requantization");
+        }
+        if ((gold->op == TIGRIS_OP_SELECT_V2 || gold->op == TIGRIS_OP_CAST) && gold->dtypes[3] == 3) {
+            q[3].scale *= 2.0f;
+            TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "selection and cast preserve encoding");
+        }
+        if (gold->op == TIGRIS_OP_ADD_N && gold->dtypes[0] == 3) {
+            q[1].scale *= 2.0f;
+            TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "sum requires equal input scales");
+            build_bool_plan(buf, gold);
+            uint16_t *indices = (uint16_t *)(buf + 320);
+            indices[36] = out; op->outputs_off = 36;
+            for (uint8_t i = 0; i < 33; i++) indices[i] = 0;
+            q[0].zero_point = -128;
+            op->num_inputs = 15;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "15 extreme inputs have a defined accumulator");
+            op->num_inputs = 16;
+            TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "16 extreme inputs overflow reference accumulator");
+            q[0].zero_point = 0; op->num_inputs = 32;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "32 centered inputs have a defined accumulator");
+            op->num_inputs = 33;
+            TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "33 centered inputs overflow reference accumulator");
+        }
+    }
+}
+
 int main(int argc, char *argv[])
 {
     test_movement_contract();
+    test_bool_contract();
     printf("TiGrIS Plan Loader Tests\n\n");
 
     printf("Error handling tests:\n");

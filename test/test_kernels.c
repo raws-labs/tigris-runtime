@@ -15,9 +15,11 @@
 
 #include "tigris.h"
 #include "movement_golden.h"
+#include "bool_golden.h"
 #include "tigris_mem.h"
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
+#include "../src/tigris_accel_policy.h"
 #include "elementwise_f32_golden.h"
 #include "resize_golden.h"
 #include "activation_golden.h"
@@ -3490,8 +3492,141 @@ static void test_movement_goldens(void)
     }
 }
 
+static void test_bool_goldens(void)
+{
+    for (size_t g = 0; g < sizeof(bool_goldens) / sizeof(bool_goldens[0]); g++) {
+        const bool_golden_t *gold = &bool_goldens[g];
+        const int comparison = gold->op >= TIGRIS_OP_EQUAL && gold->op <= TIGRIS_OP_GREATER_EQUAL;
+        const int binary = gold->inputs >= 2 && gold->op != TIGRIS_OP_ADD_N;
+        for (int constant = -1; constant < (binary ? gold->inputs : 0); constant++) {
+            tigris_file_header_t header = {0};
+            tigris_tensor_t tensors[4] = {{0}};
+            tigris_op_t op = {0};
+            tigris_plan_t plan = {0};
+            tigris_mem_t mem = {0};
+            tigris_quant_param_t quant[4] = {{0}};
+            tigris_weight_entry_t weight = {0};
+            tigris_op_attribute_t attrs[2] = {{0}};
+            uint8_t payload[64] = {0};
+            uint16_t indices[4] = {0};
+            void *pointers[4] = {NULL};
+            int s8 = 0;
+            header.num_tensors = 4;
+            header.num_ops = 1;
+            header.num_weights = constant >= 0 ? 1 : 0;
+            for (int i = 0; i < 4; i++) {
+                tensors[i].ndim = gold->ranks[i];
+                tensors[i].shape_off = (uint16_t)(i * 5);
+                tensors[i].dtype = gold->dtypes[i];
+                tensors[i].size_bytes = gold->sizes[i];
+                tensors[i].quant_param_idx = gold->dtypes[i] == 3 ? (uint16_t)i : TIGRIS_NO_QUANT_PARAM;
+                quant[i].scale = gold->scales[i];
+                quant[i].zero_point = gold->zeros[i];
+                quant[i].num_channels = 1;
+                if (gold->dtypes[i] == 3) s8 = 1;
+                pointers[i] = malloc(gold->sizes[i] ? gold->sizes[i] : 1);
+                TEST_ASSERT(pointers[i] != NULL, "golden tensor allocation");
+                if (gold->sizes[i]) memcpy(pointers[i], gold->data[i], gold->sizes[i]);
+            }
+            for (int i = 0; i < gold->inputs; i++) {
+                if (i != constant) indices[op.num_inputs++] = (uint16_t)i;
+            }
+            indices[op.num_inputs] = 3;
+            op.outputs_off = op.num_inputs;
+            op.num_outputs = 1;
+            op.op_type = gold->op;
+            op.weight_idx = constant >= 0 ? 0 : TIGRIS_NO_WEIGHT;
+            op.bias_idx = TIGRIS_NO_WEIGHT;
+            op.act_min = -128;
+            op.act_max = 127;
+            uint32_t used = 0;
+            if (constant >= 0) {
+                attrs[0].type = TIGRIS_OP_ATTR_CONSTANT_OPERAND;
+                attrs[0].data_len = (uint8_t)(4 + 4 * gold->ranks[3]);
+                payload[0] = (uint8_t)constant;
+                payload[2] = gold->dtypes[constant] == 3 ? (uint8_t)constant : 255;
+                payload[3] = gold->dtypes[constant] == 3 ? 0 : 255;
+                for (int a = 0; a < gold->ranks[3]; a++) {
+                    int32_t dim = a < gold->ranks[3] - gold->ranks[constant] ? 1 : gold->shapes[constant * 5 + a - gold->ranks[3] + gold->ranks[constant]];
+                    memcpy(payload + 4 + 4 * a, &dim, 4);
+                }
+                used = attrs[0].data_len;
+                plan.num_op_attributes = 1;
+                weight.size_bytes = gold->sizes[constant];
+                plan.weight_blob = gold->data[constant];
+            }
+            if (comparison && s8) {
+                const int index = plan.num_op_attributes++;
+                attrs[index].type = TIGRIS_OP_ATTR_COMPARISON_REQUANT;
+                attrs[index].data_len = 20;
+                attrs[index].data_offset = used;
+                memcpy(payload + used, gold->requant, 20);
+            }
+            plan.header = &header;
+            plan.tensors = tensors;
+            plan.ops = &op;
+            plan.index_pool = indices;
+            plan.shape_pool = gold->shapes;
+            plan.quant_params = quant;
+            plan.num_quant_params = 4;
+            plan.op_attributes = attrs;
+            plan.op_attribute_data = payload;
+            plan.weight_entries = &weight;
+            mem.tensor_ptrs = pointers;
+            mem.num_tensors = 4;
+            tigris_kernel_fn kernel = s8 ? tigris_dispatch_kernel_s8 : tigris_dispatch_kernel;
+            memset(pointers[3], 0xa5, gold->sizes[3]);
+            int result = kernel(&plan, &op, 0, &mem, NULL);
+            if (result || memcmp(pointers[3], gold->data[3], gold->sizes[3]))
+                fprintf(stderr, "bool golden %zu op %u constant %d result %d\n", g, gold->op, constant, result);
+            TEST_ASSERT(result == 0, "bool reference executes");
+            TEST_ASSERT(memcmp(pointers[3], gold->data[3], gold->sizes[3]) == 0, "bool outputs are bit exact");
+            int dense = constant < 0 && gold->ranks[3] == 4;
+            for (int i = 0; i < gold->inputs; i++) {
+                if (gold->ranks[i] != 4 || memcmp(gold->shapes + i * 5, gold->shapes + 15, 4 * sizeof(int32_t))) dense = 0;
+            }
+            if (dense) {
+                const uint32_t row_bytes = (uint32_t)(gold->shapes[17] * gold->shapes[18]) * tigris_dtype_size(gold->dtypes[3]);
+                memset(pointers[3], 0xa5, gold->sizes[3]);
+                mem.tile.active = 1;
+                mem.tile.in_h = mem.tile.out_h = 2;
+                mem.tile.in_w = mem.tile.out_w = (uint16_t)gold->shapes[17];
+                mem.tile.in_row_start = mem.tile.out_row_start = 1;
+                TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) == 0, "bool row band executes");
+                TEST_ASSERT(memcmp((uint8_t *)pointers[3] + row_bytes, gold->data[3] + row_bytes, 2 * row_bytes) == 0, "bool row band is exact");
+                for (uint32_t i = 0; i < gold->sizes[3]; i++) {
+                    if (i < row_bytes || i >= 3 * row_bytes)
+                        TEST_ASSERT(((uint8_t *)pointers[3])[i] == 0xa5, "bool row band preserves surrounding bytes");
+                }
+            }
+            if (gold->op >= TIGRIS_OP_LOGICAL_AND && gold->op <= TIGRIS_OP_LOGICAL_NOT) {
+                mem.tile.active = 0;
+                TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL) == 0, "logical kernel shared with s8");
+                TEST_ASSERT(memcmp(pointers[3], gold->data[3], gold->sizes[3]) == 0, "logical s8 bytes match");
+            }
+            if (s8 || (gold->op >= TIGRIS_OP_LOGICAL_AND && gold->op <= TIGRIS_OP_LOGICAL_NOT)) {
+                memset(&mem.tile, 0, sizeof(mem.tile));
+                for (int backend = TIGRIS_ACCEL_ESP_NN; backend <= TIGRIS_ACCEL_CMSIS_NN; backend++) {
+                    memset(pointers[3], 0xa5, gold->sizes[3]);
+                    int handled = 0;
+                    TEST_ASSERT(tigris_accel_try_s8_ref((tigris_accel_backend_t)backend,
+                        &plan, &op, 0, &mem, NULL, &handled) == 0 && handled, "bool operators use the reference backend");
+                    TEST_ASSERT(memcmp(pointers[3], gold->data[3], gold->sizes[3]) == 0, "bool fallback preserves exact outputs");
+                }
+            }
+            if (constant != 0 && gold->dtypes[0] == 9u) {
+                memset(&mem.tile, 0, sizeof(mem.tile));
+                ((uint8_t *)pointers[0])[0] = 2;
+                TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) != 0, "noncanonical bool input is refused");
+            }
+            for (int i = 0; i < 4; i++) free(pointers[i]);
+        }
+    }
+}
+
 int main(void)
 {
+    test_bool_goldens();
     test_movement_goldens();
     printf("TiGrIS Kernel Tests\n\n");
 

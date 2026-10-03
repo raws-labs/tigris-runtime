@@ -154,7 +154,7 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
-           type == TIGRIS_OP_NEG ||
+           type == TIGRIS_OP_NEG || type == TIGRIS_OP_LOGICAL_NOT || type == TIGRIS_OP_CAST ||
            type == TIGRIS_OP_EXP ||
            type == TIGRIS_OP_LOG ||
            type == TIGRIS_OP_SQRT ||
@@ -174,6 +174,8 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_FLOOR_DIV ||
            type == TIGRIS_OP_FLOOR_MOD ||
            type == TIGRIS_OP_PRELU ||
+           (type >= TIGRIS_OP_EQUAL && type <= TIGRIS_OP_LOGICAL_OR) ||
+           type == TIGRIS_OP_SELECT_V2 || type == TIGRIS_OP_ADD_N ||
            type == TIGRIS_OP_MUL ||
            type == TIGRIS_OP_CONCAT;
 }
@@ -197,7 +199,7 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
-           type == TIGRIS_OP_NEG ||
+           type == TIGRIS_OP_NEG || type == TIGRIS_OP_LOGICAL_NOT || type == TIGRIS_OP_CAST ||
            type == TIGRIS_OP_EXP ||
            type == TIGRIS_OP_LOG ||
            type == TIGRIS_OP_SQRT ||
@@ -220,6 +222,8 @@ static int is_axis1_binary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_FLOOR_DIV ||
            type == TIGRIS_OP_FLOOR_MOD ||
            type == TIGRIS_OP_PRELU ||
+           (type >= TIGRIS_OP_EQUAL && type <= TIGRIS_OP_LOGICAL_OR) ||
+           type == TIGRIS_OP_SELECT_V2 || type == TIGRIS_OP_ADD_N ||
            type == TIGRIS_OP_MUL;
 }
 
@@ -2190,7 +2194,7 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
-           type == TIGRIS_OP_NEG ||
+           type == TIGRIS_OP_NEG || type == TIGRIS_OP_LOGICAL_NOT || type == TIGRIS_OP_CAST ||
            type == TIGRIS_OP_EXP ||
            type == TIGRIS_OP_LOG ||
            type == TIGRIS_OP_SQRT ||
@@ -2218,6 +2222,8 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_FLOOR_DIV ||
            type == TIGRIS_OP_FLOOR_MOD ||
            type == TIGRIS_OP_PRELU ||
+           (type >= TIGRIS_OP_EQUAL && type <= TIGRIS_OP_LOGICAL_OR) ||
+           type == TIGRIS_OP_SELECT_V2 || type == TIGRIS_OP_ADD_N ||
            type == TIGRIS_OP_MUL;
 }
 

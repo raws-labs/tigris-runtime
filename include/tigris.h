@@ -117,17 +117,19 @@ static inline uint32_t tigris_dtype_size(uint8_t dtype)
  * ReverseV2: a nonempty contiguous axis bitmask.
  * DynamicUpdateSlice: clamped starts[rank], update_shape[rank]. The update is
  * the second data tensor or the operator weight, in the input's encoding. */
-#define TIGRIS_OP_ATTR_MAX            12
+#define TIGRIS_OP_ATTR_COMPARISON_REQUANT 13 /* int32[5]: left shift, two multiplier/shift pairs */
+#define TIGRIS_OP_ATTR_COMPARISON_REQUANT_LEN 20u
+#define TIGRIS_OP_ATTR_MAX            13
 
 /* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
  * first operand's, the second operand's, and the result's. */
 #define TIGRIS_OP_ATTR_BINARY_REQUANT_LEN 24u
 
-/* A binary operator with one tensor input takes its other operand from its
- * weight: one value, one per channel, or one per element. This payload says
- * which operand the constant is (byte 0: 0 first, 1 second; byte 1: zero) and,
+/* A binary or select operator may take one operand from its weight: one
+ * value, one per channel, or one per element. This payload says which operand
+ * is constant (byte 0: operand index, up to 2 for select; byte 1: zero) and,
  * for int8, its quantization (bytes 2-3: quant param index, little endian;
- * TIGRIS_NO_QUANT_PARAM for float). Without it, only a float Add or Mul takes
+ * TIGRIS_NO_QUANT_PARAM for float or bool). Without it, only a float Add or Mul takes
  * a constant, as its second operand. */
 #define TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN 4u
 
@@ -230,6 +232,17 @@ typedef enum {
     TIGRIS_OP_REVERSE_V2               = 70,
     TIGRIS_OP_EMBEDDING_LOOKUP         = 71,
     TIGRIS_OP_DYNAMIC_UPDATE_SLICE     = 72,
+    TIGRIS_OP_EQUAL                      = 73,
+    TIGRIS_OP_LESS                       = 74,
+    TIGRIS_OP_LESS_EQUAL                 = 75,
+    TIGRIS_OP_GREATER                    = 76,
+    TIGRIS_OP_GREATER_EQUAL              = 77,
+    TIGRIS_OP_LOGICAL_AND                = 78,
+    TIGRIS_OP_LOGICAL_OR                 = 79,
+    TIGRIS_OP_LOGICAL_NOT                = 80,
+    TIGRIS_OP_SELECT_V2                  = 81,
+    TIGRIS_OP_CAST                       = 82,
+    TIGRIS_OP_ADD_N                      = 83,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

@@ -16,31 +16,32 @@
 
 /** Operands of up to this rank are read by output coordinate when a
  * broadcast is not a repetition; the others need no coordinates. */
-#define TIGRIS_BROADCAST_MAX_RANK 4u
+#define TIGRIS_BROADCAST_MAX_RANK 5u
 #define TIGRIS_BINARY_MAX_RANK 8u
 
-/** Both operands of a binary operator, in operand order, against the output
+/** Two binary operands or three select operands, in operand order, against the output
  * `output`. An operand is read densely (period 0, general 0) and follows a
  * tile; repeats every `period` elements, which is any broadcast over leading
  * axes, and is read whole under a tile; or, when `general` is set, by the
  * output coordinate through `stride` (0 on a broadcast axis) and is never
  * tiled. `dims` is the output's shape left-padded to the broadcast rank. */
 typedef struct {
-    const uint8_t *data[2];
-    uint32_t period[2];
-    uint8_t general[2];
-    uint32_t stride[2][TIGRIS_BROADCAST_MAX_RANK];
+    const uint8_t *data[3];
+    uint32_t period[3];
+    uint8_t general[3];
+    uint32_t stride[3][TIGRIS_BROADCAST_MAX_RANK];
     uint32_t dims[TIGRIS_BROADCAST_MAX_RANK];
-    const tigris_quant_param_t *quant[2];
+    const tigris_quant_param_t *quant[3];
     uint16_t output;
 } tigris_binary_operands_t;
 
-/** Resolves the operands of `op`: two tensors, or one tensor and a constant
+/** Resolves the operands of `op`: two or three tensors, with at most one replaced by a constant
  * from the weight table, each of the output's shape or broadcast to it. The
  * constant-operand attribute says which operand the constant is, how it is
  * quantized and, in its long form, its shape; without it only a float Add or
  * Mul takes a constant, as its second operand, holding one value, one per
- * channel, or one per element. `dtype` is 1 (float32) or 3 (int8). Returns 0
+ * channel, or one per element. `dtype` is 1 (float32), 3 (int8), or 9 (bool). Selection
+ * always reads its first operand as bool. Returns 0
  * for anything else. */
 int tigris_binary_operands(
     const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
@@ -50,6 +51,10 @@ int tigris_binary_operands(
  * broadcast. */
 uint32_t tigris_binary_general_index(const tigris_binary_operands_t *operands,
                                      uint8_t k, uint32_t i);
+
+/* Bool operations and byte-preserving selection share both dispatchers. */
+int tigris_bool_execute(const tigris_plan_t *plan, const tigris_op_t *op,
+                        uint16_t op_index, tigris_mem_t *mem);
 
 /** Pads `op`'s input into its output: the output is filled with `fill`
  * (one element of `element` bytes), then the input is copied in at the

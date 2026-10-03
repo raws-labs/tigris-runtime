@@ -379,6 +379,77 @@ static inline int32_t binary_s8_at(const tigris_binary_operands_t *operands, uin
     return (int32_t)((const int8_t *)operands->data[k])[index];
 }
 
+static TIGRIS_KERNEL_NOINLINE int kern_comparison_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index, tigris_mem_t *mem)
+{
+    tigris_binary_operands_t operands;
+    int8_t *y = NULL;
+    uint32_t count = 0u;
+    uint8_t len = 0u;
+    const uint8_t *attr = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_COMPARISON_REQUANT, &len);
+    int32_t values[5];
+    if (attr == NULL || len != sizeof(values) ||
+        !binary_s8_begin(plan, op, op_index, mem, &operands, &y, &count) ||
+        operands.quant[0] == NULL || operands.quant[1] == NULL) return -1;
+    memcpy(values, attr, sizeof(values));
+    if (values[0] != 8 || values[1] < 0 || values[3] < 0 ||
+        values[2] < -31 || values[2] > 0 || values[4] < -31 || values[4] > 0) return -1;
+    for (uint32_t i = 0u; i < count; i++) {
+        const int32_t a = multiply_by_quantized_multiplier(
+            (binary_s8_at(&operands, 0u, i) - operands.quant[0]->zero_point) * 256,
+            values[1], values[2]);
+        const int32_t b = multiply_by_quantized_multiplier(
+            (binary_s8_at(&operands, 1u, i) - operands.quant[1]->zero_point) * 256,
+            values[3], values[4]);
+        int value;
+        switch (op->op_type) {
+        case TIGRIS_OP_EQUAL: value = a == b; break;
+        case TIGRIS_OP_LESS: value = a < b; break;
+        case TIGRIS_OP_LESS_EQUAL: value = a <= b; break;
+        case TIGRIS_OP_GREATER: value = a > b; break;
+        default: value = a >= b; break;
+        }
+        y[i] = value ? 1 : 0;
+    }
+    return 0;
+}
+
+static TIGRIS_KERNEL_NOINLINE int kern_add_n_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *inputs = tigris_op_inputs(plan, op);
+    const uint16_t result = tigris_op_outputs(plan, op)[0];
+    const tigris_quant_param_t *qx = tigris_tensor_quant(plan, &plan->tensors[inputs[0]]);
+    const tigris_quant_param_t *qy = tigris_tensor_quant(plan, &plan->tensors[result]);
+    int8_t *y = (int8_t *)tigris_mem_tensor_ptr(mem, result);
+    const uint32_t count = tile_aware_numel(plan, result, mem);
+    const uint32_t row = mem->tile.active ? tile_row_elems(plan, result, mem) : 0u;
+    if (qx == NULL || qy == NULL || y == NULL) return -1;
+    const int64_t low = (-(int64_t)qx->zero_point + (int64_t)op->num_inputs * (-128 - (int64_t)qx->zero_point)) * 524288;
+    const int64_t high = (-(int64_t)qx->zero_point + (int64_t)op->num_inputs * (127 - (int64_t)qx->zero_point)) * 524288;
+    const double scale = 2.0 * (double)qx->scale / (1048576.0 * (double)qy->scale);
+    if (low < INT32_MIN || high > INT32_MAX || scale <= 0.0 || scale >= 1.0) return -1;
+    int32_t multiplier;
+    int shift;
+    compute_quant_mult(scale, &multiplier, &shift);
+    if (shift < -31) { multiplier = 0; shift = 0; }
+    y += (size_t)mem->tile.out_row_start * row;
+    for (uint32_t i = 0u; i < count; i++) {
+        /* Preserve the reference's initial scaled input offset. */
+        int32_t value = -qx->zero_point * 524288;
+        for (uint8_t k = 0u; k < op->num_inputs; k++) {
+            const int8_t *x = (const int8_t *)tigris_mem_tensor_ptr(mem, inputs[k]);
+            if (x == NULL) return -1;
+            value += ((int32_t)x[i + (size_t)mem->tile.in_row_start * row] - qx->zero_point) * 524288;
+        }
+        const int32_t scaled = multiply_by_quantized_multiplier(value, multiplier, shift);
+        /* Saturate before adding the output offset to avoid an overflowing sum. */
+        y[i] = scaled > 127 - qy->zero_point ? 127 : scaled < -128 - qy->zero_point ? -128
+               : (int8_t)(scaled + qy->zero_point);
+    }
+    return 0;
+}
+
 /* Int8 Kernels */
 
 static TIGRIS_KERNEL_NOINLINE int kern_conv2d_s8(
@@ -2900,6 +2971,17 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_EMBEDDING_LOOKUP:
     case TIGRIS_OP_DYNAMIC_UPDATE_SLICE:
         return tigris_movement_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_EQUAL: return kern_comparison_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_LESS: return kern_comparison_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_LESS_EQUAL: return kern_comparison_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_GREATER: return kern_comparison_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_GREATER_EQUAL: return kern_comparison_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_LOGICAL_AND: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_LOGICAL_OR: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_LOGICAL_NOT: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_SELECT_V2: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_CAST: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_ADD_N: return kern_add_n_s8(plan, op, mem);
     case TIGRIS_OP_ARG_MAX:
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CUMSUM: return kern_cumsum_s8(plan, op, op_index, mem);
@@ -3108,6 +3190,9 @@ tigris_accel_route_t tigris_accel_pre_route(
     const tigris_op_t     *op,
     int                    tile_active)
 {
+    if (op && op->op_type >= TIGRIS_OP_EQUAL && op->op_type <= TIGRIS_OP_ADD_N)
+        return TIGRIS_ACCEL_ROUTE_S8_REF;
+
     if (backend == TIGRIS_ACCEL_CMSIS_NN && tile_active &&
         cmsis_tiled_spatial_uses_reference(op))
         return TIGRIS_ACCEL_ROUTE_S8_REF;

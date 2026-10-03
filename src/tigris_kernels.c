@@ -892,14 +892,17 @@ int tigris_binary_operands(
     const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
     const tigris_mem_t *mem, uint8_t dtype, tigris_binary_operands_t *out)
 {
-    const uint32_t element = (dtype == 1u) ? 4u : 1u;
+    const uint8_t count_inputs = op != NULL && op->op_type == TIGRIS_OP_SELECT_V2 ? 3u : 2u;
+    const int comparison = op != NULL && op->op_type >= TIGRIS_OP_EQUAL && op->op_type <= TIGRIS_OP_GREATER_EQUAL;
+    const uint8_t output_dtype = comparison ? 9u : dtype;
+    const uint32_t output_element = tigris_dtype_size(output_dtype);
     if ((plan == NULL) || (op == NULL) || (mem == NULL) || (out == NULL) ||
         (plan->header == NULL) || (plan->tensors == NULL) ||
         (plan->index_pool == NULL) || (plan->shape_pool == NULL) ||
         (mem->tensor_ptrs == NULL) ||
-        (dtype != 1u && dtype != 3u) || op->num_outputs != 1u ||
+        (dtype != 1u && dtype != 3u && dtype != 9u) || op->num_outputs != 1u ||
         op->bias_idx != TIGRIS_NO_WEIGHT ||
-        (op->num_inputs != 1u && op->num_inputs != 2u))
+        (op->num_inputs != count_inputs && op->num_inputs != count_inputs - 1u))
         return 0;
 
     const uint16_t *ins = tigris_op_inputs(plan, op);
@@ -908,31 +911,31 @@ int tigris_binary_operands(
         (tigris_mem_tensor_ptr(mem, y_index) == NULL))
         return 0;
     const tigris_tensor_t *y = &plan->tensors[y_index];
-    const uint8_t rank = y->ndim;
+    const uint8_t rank = y->ndim == 0u ? 1u : y->ndim;
     uint32_t y_dims[TIGRIS_BINARY_MAX_RANK];
-    if ((y->dtype != dtype) || (rank == 0u) || (rank > TIGRIS_BINARY_MAX_RANK) ||
-        (mem->tile.active && (rank != 3u) && (rank != 4u)) ||
-        !binary_operand_shape(tigris_tensor_shape(plan, y), rank, rank, y_dims))
+    if ((y->dtype != output_dtype) || (rank == 0u) || (rank > TIGRIS_BINARY_MAX_RANK) ||
+        (mem->tile.active && (rank != 3u) && (rank != 4u) && !(mem->tile.row_tiled && rank == 2u)) ||
+        !binary_operand_shape(tigris_tensor_shape(plan, y), y->ndim, rank, y_dims))
         return 0;
     uint64_t count = 1u;
     for (uint8_t d = 0; d < rank; d++)
         count *= (uint64_t)y_dims[d];
-    if (count * element != y->size_bytes)
+    if (count * output_element != y->size_bytes)
         return 0;
     out->output = y_index;
     for (uint8_t a = 0; a < TIGRIS_BROADCAST_MAX_RANK; a++) {
-        out->dims[a] = (a < (uint8_t)(TIGRIS_BROADCAST_MAX_RANK - rank)) ? 1u
+        out->dims[a] = (rank > TIGRIS_BROADCAST_MAX_RANK || a < (uint8_t)(TIGRIS_BROADCAST_MAX_RANK - rank)) ? 1u
             : y_dims[a + rank - TIGRIS_BROADCAST_MAX_RANK];
     }
 
     uint8_t attr_len = 0u;
     const uint8_t *attr = tigris_op_attribute_data(
         plan, op_index, TIGRIS_OP_ATTR_CONSTANT_OPERAND, &attr_len);
-    uint8_t constant_position = 2u;
+    uint8_t constant_position = count_inputs;
     const tigris_quant_param_t *constant_quant = NULL;
     uint32_t constant_dims[TIGRIS_BINARY_MAX_RANK];
 
-    if (op->num_inputs == 2u) {
+    if (op->num_inputs == count_inputs) {
         if ((attr != NULL) || (op->weight_idx != TIGRIS_NO_WEIGHT))
             return 0;
     } else {
@@ -945,11 +948,11 @@ int tigris_binary_operands(
             uint16_t quant_index;
             if (((attr_len != TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN) &&
                  (attr_len != (uint8_t)(TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN + 4u * rank))) ||
-                (attr[0] > 1u) || (attr[1] != 0u))
+                (attr[0] >= count_inputs) || (attr[1] != 0u))
                 return 0;
             constant_position = attr[0];
             quant_index = (uint16_t)((uint16_t)attr[2] | (uint16_t)((uint16_t)attr[3] << 8));
-            if (dtype == 3u) {
+            if (dtype == 3u && !(count_inputs == 3u && constant_position == 0u)) {
                 if ((quant_index >= plan->num_quant_params) || (plan->quant_params == NULL))
                     return 0;
                 constant_quant = &plan->quant_params[quant_index];
@@ -964,6 +967,7 @@ int tigris_binary_operands(
         } else {
             constant_quant = NULL;
         }
+        const uint32_t element = count_inputs == 3u && constant_position == 0u ? 1u : tigris_dtype_size(dtype);
         if ((attr != NULL) && (attr_len != TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN)) {
             /* The constant's own shape, in stored axis order. */
             for (uint8_t d = 0; d < rank; d++) {
@@ -978,7 +982,7 @@ int tigris_binary_operands(
             /* One value, one per channel, or one per element. */
             for (uint8_t d = 0; d < rank; d++)
                 constant_dims[d] = 1u;
-            if (bytes == y->size_bytes) {
+            if (bytes == count * element) {
                 for (uint8_t d = 0; d < rank; d++)
                     constant_dims[d] = y_dims[d];
             } else if (bytes == y_dims[rank - 1u] * element) {
@@ -997,8 +1001,10 @@ int tigris_binary_operands(
     }
 
     uint8_t tensor_slot = 0u;
-    for (uint8_t k = 0; k < 2u; k++) {
+    for (uint8_t k = 0; k < count_inputs; k++) {
         uint32_t dims[TIGRIS_BINARY_MAX_RANK];
+        const uint8_t operand_dtype = count_inputs == 3u && k == 0u ? 9u : dtype;
+        const uint32_t element = tigris_dtype_size(operand_dtype);
         if (k == constant_position) {
             out->data[k] = (const uint8_t *)tigris_op_weight(plan, op);
             out->quant[k] = constant_quant;
@@ -1011,7 +1017,7 @@ int tigris_binary_operands(
                 return 0;
             const tigris_tensor_t *t = &plan->tensors[index];
             uint64_t numel = 1u;
-            if ((t->dtype != dtype) || (t->ndim == 0u) ||
+            if ((t->dtype != operand_dtype) ||
                 !binary_operand_shape(tigris_tensor_shape(plan, t), t->ndim, rank, dims))
                 return 0;
             for (uint8_t d = 0; d < rank; d++)
@@ -1022,6 +1028,8 @@ int tigris_binary_operands(
             out->quant[k] = tigris_tensor_quant(plan, t);
         }
         if ((out->data[k] == NULL) || !binary_operand_access(out, k, dims, y_dims, rank))
+            return 0;
+        if (out->general[k] != 0u && rank > (count_inputs == 3u ? 5u : 4u))
             return 0;
         /* A dense constant carries no row offset, and a general broadcast is
          * never tiled. */
@@ -1039,6 +1047,94 @@ static inline uint32_t binary_index(const tigris_binary_operands_t *operands, ui
     if (operands->general[k] != 0u)
         return tigris_binary_general_index(operands, k, i);
     return (operands->period[k] != 0u) ? (i % operands->period[k]) : i;
+}
+
+int tigris_bool_execute(const tigris_plan_t *plan, const tigris_op_t *op,
+                        uint16_t op_index, tigris_mem_t *mem)
+{
+    const uint16_t result = tigris_op_outputs(plan, op)[0];
+    const tigris_tensor_t *output = &plan->tensors[result];
+    uint8_t *y = (uint8_t *)tigris_mem_tensor_ptr(mem, result);
+    const uint32_t element = tigris_dtype_size(output->dtype);
+    const uint32_t count = tile_aware_numel(plan, result, mem);
+    const uint32_t row = mem->tile.active ? tile_row_elems(plan, result, mem) : 0u;
+    if (y == NULL) return -1;
+    y += (size_t)mem->tile.out_row_start * row * element;
+    if (op->op_type == TIGRIS_OP_CAST || op->op_type == TIGRIS_OP_LOGICAL_NOT) {
+        const uint8_t *x = (const uint8_t *)tigris_mem_tensor_ptr(mem, tigris_op_inputs(plan, op)[0]);
+        if (x == NULL) return -1;
+        x += (size_t)mem->tile.in_row_start * row;
+        for (uint32_t i = 0u; i < count; i++) {
+            if (x[i] > 1u) return -1;
+            if (op->op_type == TIGRIS_OP_LOGICAL_NOT) y[i] = x[i] == 0u ? 1u : 0u;
+            else if (output->dtype == 1u) {
+                const float value = (float)x[i];
+                memcpy(y + (size_t)i * sizeof(value), &value, sizeof(value));
+            } else y[i] = x[i];
+        }
+        return 0;
+    }
+    const int select = op->op_type == TIGRIS_OP_SELECT_V2;
+    const int compare = op->op_type >= TIGRIS_OP_EQUAL && op->op_type <= TIGRIS_OP_GREATER_EQUAL;
+    tigris_binary_operands_t operands;
+    const uint8_t dtype = select ? output->dtype : compare ? 1u : 9u;
+    if (!tigris_binary_operands(plan, op, op_index, mem, dtype, &operands)) return -1;
+    const uint8_t arity = select ? 3u : 2u;
+    for (uint8_t k = 0u; k < arity; k++) {
+        const uint32_t bytes = select && k == 0u ? 1u : tigris_dtype_size(dtype);
+        if (operands.period[k] == 0u)
+            operands.data[k] += (size_t)mem->tile.in_row_start * row * bytes;
+    }
+    for (uint32_t i = 0u; i < count; i++) {
+        const uint32_t a_index = binary_index(&operands, 0u, i);
+        if (select) {
+            const uint8_t condition = operands.data[0][a_index];
+            if (condition > 1u) return -1;
+            const uint8_t k = condition != 0u ? 1u : 2u;
+            memcpy(y + (size_t)i * element,
+                   operands.data[k] + (size_t)binary_index(&operands, k, i) * element, element);
+        } else if (compare) {
+            const float a = load_weight_f32(operands.data[0], a_index);
+            const float b = load_weight_f32(operands.data[1], binary_index(&operands, 1u, i));
+            int value;
+            switch (op->op_type) {
+            case TIGRIS_OP_EQUAL: value = a == b; break;
+            case TIGRIS_OP_LESS: value = a < b; break;
+            case TIGRIS_OP_LESS_EQUAL: value = a <= b; break;
+            case TIGRIS_OP_GREATER: value = a > b; break;
+            default: value = a >= b; break;
+            }
+            y[i] = value ? 1u : 0u;
+        } else {
+            const uint8_t a = operands.data[0][a_index];
+            const uint8_t b = operands.data[1][binary_index(&operands, 1u, i)];
+            if (a > 1u || b > 1u) return -1;
+            const int value = (op->op_type == TIGRIS_OP_LOGICAL_AND ? a != 0u && b != 0u : a != 0u || b != 0u) ? 1 : 0;
+            y[i] = value ? 1u : 0u;
+        }
+    }
+    return 0;
+}
+
+static int kern_add_n_f32(const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t *inputs = tigris_op_inputs(plan, op);
+    const uint16_t result = tigris_op_outputs(plan, op)[0];
+    float *y = (float *)tigris_mem_tensor_ptr(mem, result);
+    const uint32_t count = tile_aware_numel(plan, result, mem);
+    const uint32_t row = mem->tile.active ? tile_row_elems(plan, result, mem) : 0u;
+    if (y == NULL) return -1;
+    y += (size_t)mem->tile.out_row_start * row;
+    for (uint32_t i = 0u; i < count; i++) {
+        float value = 0.0f;
+        for (uint8_t k = 0u; k < op->num_inputs; k++) {
+            const float *x = (const float *)tigris_mem_tensor_ptr(mem, inputs[k]);
+            if (x == NULL) return -1;
+            value += x[i + (size_t)mem->tile.in_row_start * row];
+        }
+        y[i] = value;
+    }
+    return 0;
 }
 
 static int kern_binary_f32(
@@ -2484,6 +2580,17 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_EMBEDDING_LOOKUP:
     case TIGRIS_OP_DYNAMIC_UPDATE_SLICE:
         return tigris_movement_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_EQUAL: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_LESS: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_LESS_EQUAL: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_GREATER: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_GREATER_EQUAL: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_LOGICAL_AND: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_LOGICAL_OR: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_LOGICAL_NOT: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_SELECT_V2: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_CAST: return tigris_bool_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_ADD_N: return kern_add_n_f32(plan, op, mem);
     case TIGRIS_OP_ARG_MAX:
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CUMSUM: return kern_cumsum_f32(plan, op, op_index, mem);

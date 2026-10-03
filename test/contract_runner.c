@@ -99,13 +99,7 @@ static int choose_dispatch(
         plan->header->num_model_outputs == 0)
         return -1;
 
-    dtype = plan->tensors[plan->model_inputs[0]].dtype;
-    for (uint16_t i = 0; i < plan->header->num_tensors; ++i) {
-        if ((plan->tensors[i].flags & TIGRIS_TENSOR_CONSTANT) == 0 &&
-            plan->tensors[i].dtype != dtype && plan->tensors[i].dtype != 6u)
-            return -1;
-    }
-
+    dtype = tigris_plan_data_dtype(plan);
     if (dtype == 1) {
         *out_dispatch = tigris_dispatch_kernel;
         return 0;

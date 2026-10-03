@@ -56,6 +56,9 @@ tigris_error_t tigris_plan_load_ex(
     const uint8_t *buf, uint32_t buf_len, tigris_plan_t *out_plan,
     tigris_plan_limits_t *out_required);
 
+/** Homogeneous float32/int8 data dtype of a loaded plan, or zero if absent/mixed. */
+uint8_t tigris_plan_data_dtype(const tigris_plan_t *plan);
+
 /** The limits this build was compiled to allow. */
 void tigris_build_limits(tigris_plan_limits_t *out);
 

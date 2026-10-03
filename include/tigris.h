@@ -75,6 +75,23 @@ extern "C" {
 #define TIGRIS_SEC_OP_ATTRIBUTES  11
 #define TIGRIS_SEC_MAX            12  /* one past the last valid section */
 
+/* Auxiliary indices have terminal placement; bool tensors may occur anywhere. */
+static inline int tigris_dtype_terminal_only(uint8_t dtype)
+{
+    return dtype == 6u;
+}
+
+/* ONNX dtype element sizes; zero denotes an unsupported storage type. */
+static inline uint32_t tigris_dtype_size(uint8_t dtype)
+{
+    switch (dtype) {
+    case 1: case 6: return 4u;
+    case 2: case 3: case 9: return 1u;
+    case 7: return 8u;
+    default: return 0u;
+    }
+}
+
 /* Typed payloads stored in TIGRIS_SEC_OP_ATTRIBUTES. The loader refuses a kind
  * it does not know, so a plan carrying a newer kind fails to load on an older
  * runtime instead of running with different semantics; a kind can therefore be

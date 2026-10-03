@@ -396,6 +396,33 @@ static void test_unconvertible_interfaces_are_refused(void)
     free(ptrs);
 }
 
+static void test_bool_boundary(void)
+{
+    uint8_t storage[3] = {0};
+    uint8_t values[3] = {0, 1, 1};
+    uint8_t received[3] = {0};
+    void *ptrs[] = {storage};
+    tigris_file_header_t header = {0};
+    tigris_tensor_t tensor = {0};
+    tigris_plan_t plan = {0};
+    tigris_mem_t mem = {0};
+    header.num_tensors = 1;
+    tensor.dtype = 9;
+    tensor.flags = TIGRIS_TENSOR_MODEL_INPUT | TIGRIS_TENSOR_MODEL_OUTPUT;
+    tensor.quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    tensor.size_bytes = sizeof(storage);
+    plan.header = &header;
+    plan.tensors = &tensor;
+    mem.num_tensors = 1;
+    mem.tensor_ptrs = ptrs;
+    TEST_ASSERT_EQ(tigris_iface_bytes(&plan, 0), sizeof(storage), "bool element size is one byte");
+    TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, values, sizeof(values)), TIGRIS_OK, "bool input copies");
+    TEST_ASSERT_EQ(tigris_output_read(&plan, &mem, 0, received, sizeof(received)), TIGRIS_OK, "bool output copies");
+    TEST_ASSERT(memcmp(values, received, sizeof(values)) == 0, "bool bytes unchanged");
+    values[1] = 2;
+    TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, values, sizeof(values)), TIGRIS_ERR_BAD_INTERFACE, "noncanonical bool refused");
+}
+
 static void test_index_output(void)
 {
     int32_t indices[] = {0, 17, INT32_MAX};
@@ -434,6 +461,7 @@ static void test_index_output(void)
 int main(void)
 {
     test_index_output();
+    test_bool_boundary();
     printf("TiGrIS Model Interface Tests\n\n");
     if (load_fixture() != 0) {
         fprintf(stderr, "Cannot load the schema-v6 fixture\n");

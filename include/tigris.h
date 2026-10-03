@@ -195,6 +195,8 @@ typedef enum {
     TIGRIS_OP_REDUCE_MIN         = 61,
     TIGRIS_OP_REDUCE_SUM         = 62,
     TIGRIS_OP_CUMSUM             = 63,
+    TIGRIS_OP_ARG_MAX            = 64,
+    TIGRIS_OP_ARG_MIN            = 65,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

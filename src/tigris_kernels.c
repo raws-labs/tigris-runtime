@@ -1187,6 +1187,42 @@ static int reduce_mean_extents(
     return 0;
 }
 
+int tigris_arg_execute(const tigris_plan_t *plan, const tigris_op_t *op,
+                       uint16_t op_index, tigris_mem_t *mem)
+{
+    int32_t outer, reduced, inner;
+    if (mem->tile.active || op->num_inputs != 1u || op->num_outputs != 1u ||
+        reduce_mean_extents(plan, op, op_index, &outer, &reduced, &inner) != 0)
+        return -1;
+    uint16_t src = tigris_op_inputs(plan, op)[0];
+    uint16_t dst = tigris_op_outputs(plan, op)[0];
+    uint8_t dtype = plan->tensors[src].dtype;
+    const void *input = tigris_mem_tensor_ptr(mem, src);
+    int32_t *output = (int32_t *)tigris_mem_tensor_ptr(mem, dst);
+    if (!input || !output || (dtype != 1u && dtype != 3u) ||
+        plan->tensors[dst].dtype != 6u ||
+        (uint64_t)outer * (uint64_t)inner * sizeof(int32_t) != plan->tensors[dst].size_bytes)
+        return -1;
+    for (int32_t o = 0; o < outer; o++) {
+        for (int32_t i = 0; i < inner; i++) {
+            size_t base = (size_t)o * (size_t)reduced * (size_t)inner + (size_t)i;
+            float best = dtype == 1u ? ((const float *)input)[base] : (float)((const int8_t *)input)[base];
+            int32_t index = 0;
+            for (int32_t a = 1; a < reduced; a++) {
+                size_t pos = base + (size_t)a * (size_t)inner;
+                float value = dtype == 1u ? ((const float *)input)[pos] : (float)((const int8_t *)input)[pos];
+                if ((op->op_type == TIGRIS_OP_ARG_MAX && value > best) ||
+                    (op->op_type == TIGRIS_OP_ARG_MIN && value < best)) {
+                    best = value;
+                    index = a;
+                }
+            }
+            output[(size_t)o * (size_t)inner + (size_t)i] = index;
+        }
+    }
+    return 0;
+}
+
 static int kern_reduce_mean(
     const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
     tigris_mem_t *mem)
@@ -2292,6 +2328,8 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_REDUCE_MAX:
     case TIGRIS_OP_REDUCE_MIN:
     case TIGRIS_OP_REDUCE_SUM: return kern_reduce_f32(plan, op, op_index, mem);
+    case TIGRIS_OP_ARG_MAX:
+    case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CUMSUM: return kern_cumsum_f32(plan, op, op_index, mem);
     case TIGRIS_OP_SPLIT:       return kern_split(plan, op, mem);
     case TIGRIS_OP_PAD:         return kern_pad(plan, op, op_index, mem);

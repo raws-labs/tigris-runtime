@@ -38,6 +38,10 @@ int tigris_dispatch_kernel(
     tigris_mem_t        *mem,
     void                *user_ctx);
 
+/** Execute constant-index data movement for float32 or int8. */
+int tigris_movement_execute(const tigris_plan_t *plan, const tigris_op_t *op,
+                            uint16_t op_index, tigris_mem_t *mem);
+
 /** Write int32 indices from float32 or int8 data. */
 int tigris_arg_execute(const tigris_plan_t *plan, const tigris_op_t *op,
                        uint16_t op_index, tigris_mem_t *mem);

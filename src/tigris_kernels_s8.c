@@ -2892,6 +2892,14 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_REDUCE_MAX:
     case TIGRIS_OP_REDUCE_MIN:
     case TIGRIS_OP_REDUCE_SUM: return kern_reduce_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_GATHER:
+    case TIGRIS_OP_GATHER_ND:
+    case TIGRIS_OP_STRIDED_SLICE:
+    case TIGRIS_OP_MIRROR_PAD:
+    case TIGRIS_OP_REVERSE_V2:
+    case TIGRIS_OP_EMBEDDING_LOOKUP:
+    case TIGRIS_OP_DYNAMIC_UPDATE_SLICE:
+        return tigris_movement_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ARG_MAX:
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CUMSUM: return kern_cumsum_s8(plan, op, op_index, mem);

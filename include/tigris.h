@@ -108,7 +108,16 @@ static inline uint32_t tigris_dtype_size(uint8_t dtype)
 #define TIGRIS_OP_ATTR_CONSTANT_OPERAND 9 /* uint8[4], see below */
 #define TIGRIS_OP_ATTR_RESIZE_SCALES  10 /* float32[2], output/input H/W scales */
 #define TIGRIS_OP_ATTR_CUMSUM_OPTIONS 11 /* uint8[2], exclusive and reverse */
-#define TIGRIS_OP_ATTR_MAX            11
+#define TIGRIS_OP_ATTR_MOVEMENT       12 /* int32 metadata, described below */
+/* Gather/EmbeddingLookup: axis, batch_dims, index_rank, index_shape[index_rank].
+ * GatherND: index_rank, index_shape[index_rank]. Indices are an int32 weight.
+ * StridedSlice: (normalized start, exclusive end, step) per input axis,
+ * optionally followed by a shrink-axis bitmask.
+ * MirrorPad: symmetric (0/1), then (before, after) for each input axis.
+ * ReverseV2: a nonempty contiguous axis bitmask.
+ * DynamicUpdateSlice: clamped starts[rank], update_shape[rank]. The update is
+ * the second data tensor or the operator weight, in the input's encoding. */
+#define TIGRIS_OP_ATTR_MAX            12
 
 /* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
  * first operand's, the second operand's, and the result's. */
@@ -214,6 +223,13 @@ typedef enum {
     TIGRIS_OP_CUMSUM             = 63,
     TIGRIS_OP_ARG_MAX            = 64,
     TIGRIS_OP_ARG_MIN            = 65,
+    TIGRIS_OP_GATHER                   = 66,
+    TIGRIS_OP_GATHER_ND                = 67,
+    TIGRIS_OP_STRIDED_SLICE            = 68,
+    TIGRIS_OP_MIRROR_PAD               = 69,
+    TIGRIS_OP_REVERSE_V2               = 70,
+    TIGRIS_OP_EMBEDDING_LOOKUP         = 71,
+    TIGRIS_OP_DYNAMIC_UPDATE_SLICE     = 72,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

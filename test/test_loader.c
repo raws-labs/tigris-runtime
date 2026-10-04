@@ -3689,6 +3689,59 @@ static void build_movement_plan(uint8_t *buf, const movement_golden_t *gold)
     memcpy(buf + 1164, gold->metadata, attr->data_len);
 }
 
+static void test_runtime_index_contract(void)
+{
+    uint8_t buf[MOVEMENT_PLAN_SIZE];
+    tigris_plan_t plan;
+    for (size_t g = 0u; g < sizeof(movement_goldens) / sizeof(movement_goldens[0]); g++) {
+        movement_golden_t gold = movement_goldens[g];
+        int update = gold.op == TIGRIS_OP_DYNAMIC_UPDATE_SLICE;
+        if (gold.index_count == 0u && !update) continue;
+        if (update) {
+            gold.index_count = gold.update_count * tigris_dtype_size(gold.dtype) / 4u;
+            gold.indices = (const int32_t *)gold.update;
+            gold.update_count = 0u;
+        }
+        build_movement_plan(buf, &gold);
+        tigris_file_header_t *h = (tigris_file_header_t *)buf;
+        tigris_tensor_t *t = (tigris_tensor_t *)(buf + 144);
+        tigris_op_t *op = (tigris_op_t *)(buf + 192);
+        uint16_t *io = (uint16_t *)(buf + 260);
+        int32_t *shape = (int32_t *)(buf + 288);
+        tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + 1156);
+        h->num_model_inputs = 2u;
+        io[5] = 1u; io[6] = 2u;
+        t[1].flags = TIGRIS_TENSOR_MODEL_INPUT;
+        t[1].dtype = 6u;
+        t[1].iface_dtype = 7u;
+        t[1].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        op->num_inputs = 2u;
+        if (update) {
+            t[1].ndim = 1u;
+            shape[6] = gold.rank;
+            t[1].size_bytes = (uint32_t)gold.rank * 4u;
+            attr->data_len = (uint8_t)(gold.rank * 4u);
+            memcpy(buf + 1164, gold.metadata + gold.rank, attr->data_len);
+        } else {
+            uint8_t head = gold.op == TIGRIS_OP_GATHER_ND ? 1u : 3u;
+            t[1].ndim = (uint8_t)gold.metadata[head - 1u];
+            memcpy(shape + 6, gold.metadata + head, (size_t)t[1].ndim * 4u);
+            t[1].size_bytes = gold.index_count * 4u;
+            op->weight_idx = TIGRIS_NO_WEIGHT;
+        }
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "runtime index shape and dtype load");
+        op->num_inputs = 1u;
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "missing runtime index refused");
+        op->num_inputs = 2u;
+        t[1].dtype = 1u; t[1].iface_dtype = 0u;
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "float index refused");
+        t[1].dtype = 6u;
+        if (t[1].ndim == 0u) t[1].ndim = 1u;
+        shape[6]++;
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "index shape mismatch refused");
+    }
+}
+
 static void test_movement_contract(void)
 {
     _Alignas(4) uint8_t buf[MOVEMENT_PLAN_SIZE];
@@ -3976,6 +4029,7 @@ static void test_state_fixture(void)
 int main(int argc, char *argv[])
 {
     test_movement_contract();
+    test_runtime_index_contract();
     test_bool_contract();
     printf("TiGrIS Plan Loader Tests\n\n");
 

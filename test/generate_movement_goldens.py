@@ -34,7 +34,7 @@ def configurations():
         yield "DYNAMIC_UPDATE_SLICE", (2, 3, 4), [np.array(starts, np.int64)], {}
 
 
-def reference(kind, shape, constants, options, quantized):
+def reference(kind, shape, constants, options, quantized, dynamic=False):
     raw = (np.arange(np.prod(shape), dtype=np.int32) * 73 + 19) % 256 - 128
     data = raw.astype(np.int8) if quantized else raw.astype(np.float32) * np.float32(0.125)
     data = data.reshape(shape)
@@ -109,7 +109,10 @@ def reference(kind, shape, constants, options, quantized):
     if update is not None:
         args.append(tensor(update))
         graph.inputs.append(args[-1])
-    args.extend(tensor(value, True) for value in constants)
+    for value in constants:
+        args.append(tensor(value, not dynamic))
+        if dynamic:
+            graph.inputs.append(args[-1])
     if kind == "EMBEDDING_LOOKUP":
         args.reverse()
     out = tensor(np.zeros(target, data.dtype))
@@ -134,9 +137,15 @@ def reference(kind, shape, constants, options, quantized):
     interpreter.set_input(data, 0)
     if update is not None:
         interpreter.set_input(update, 1)
+    if dynamic:
+        for i, value in enumerate(constants, 2 if update is not None else 1):
+            interpreter.set_input(value, i)
     interpreter.invoke()
     result = np.array(interpreter.get_output(0), copy=True)
     assert result.shape == tuple(target), (kind, result.shape, target)
+    if not dynamic and kind in {"GATHER", "GATHER_ND", "EMBEDDING_LOOKUP", "DYNAMIC_UPDATE_SLICE"}:
+        runtime_result = reference(kind, shape, constants, options, quantized, dynamic=True)[2]
+        np.testing.assert_array_equal(runtime_result, result)
     indices = constants[0] if kind in {"GATHER", "GATHER_ND", "EMBEDDING_LOOKUP"} else np.array([], np.int32)
     return data, update, result, metadata, indices
 

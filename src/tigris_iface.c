@@ -80,8 +80,7 @@ static tigris_error_t resolve(
 
     const tigris_quant_param_t *quant = tigris_tensor_quant(plan, tensor);
     if (declared != tensor->dtype &&
-        !(flag == TIGRIS_TENSOR_MODEL_OUTPUT && tensor->dtype == IFACE_DTYPE_INT32 &&
-          declared == IFACE_DTYPE_INT64)) {
+        !(tensor->dtype == IFACE_DTYPE_INT32 && declared == IFACE_DTYPE_INT64)) {
         /* The conversions this runtime performs are from a float or a uint8
          * interface to a quantized int8 plan tensor. uint8 v and int8 v - 128
          * are the same real value because the compiler moved the zero point
@@ -127,6 +126,17 @@ tigris_error_t tigris_input_write(
     }
     if (declared_dtype(tensor) == tensor->dtype) {
         memcpy(dst, src, src_bytes);
+        return TIGRIS_OK;
+    }
+
+    if (tensor->dtype == IFACE_DTYPE_INT32) {
+        const int64_t *wide = (const int64_t *)src;
+        int32_t *indices = (int32_t *)dst;
+        for (uint32_t i = 0u; i < elements; i++) {
+            int64_t value = wide[i];
+            if (value < INT32_MIN || value > INT32_MAX) return TIGRIS_ERR_BAD_INTERFACE;
+            indices[i] = (int32_t)value;
+        }
         return TIGRIS_OK;
     }
 

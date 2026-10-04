@@ -81,8 +81,8 @@ extern "C" {
 #define TIGRIS_SEC_STATE          12
 #define TIGRIS_SEC_MAX            13  /* one past the last valid section */
 
-/* Auxiliary indices have terminal placement; bool tensors may occur anywhere. */
-static inline int tigris_dtype_terminal_only(uint8_t dtype)
+/* Auxiliary tensor placement is constrained by operator dtype slots. */
+static inline int tigris_dtype_requires_source(uint8_t dtype)
 {
     return dtype == 6u;
 }

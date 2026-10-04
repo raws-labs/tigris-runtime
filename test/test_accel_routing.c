@@ -752,8 +752,12 @@ static void test_binary_routes(void)
     TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "channel broadcast stays on reference");
     tensors[1].size_bytes = 8;
     quant[1].num_channels = 2;
-    TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "per-channel quantization stays on reference");
+    TEST_ASSERT(tigris_accel_binary_params(&plan, &op, NULL, &params),
+                "an input record carrying its producer's channels stays native");
     quant[1].num_channels = 1;
+    quant[2].num_channels = 2;
+    TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "per-channel output stays on reference");
+    quant[2].num_channels = 1;
     quant[2].scale = 0x1p-21f;
     TEST_ASSERT(!tigris_accel_binary_params(&plan, &op, NULL, &params), "unsafe left shift stays on reference");
     quant[2].scale = 0x1p27f;

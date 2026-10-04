@@ -86,6 +86,16 @@ static int output_dim_is_valid(
     return (padded - effective_kernel) / stride + 1u == (uint64_t)output;
 }
 
+/* Whether an int8 activation an operator reads has its encoding stated. Its
+ * record may also carry the per-channel requantization of the operator that
+ * wrote it; a reader uses only the scale and zero point. */
+static int quant_input_stated(const tigris_plan_t *plan, const tigris_tensor_t *tensor)
+{
+    return tensor->dtype != 3 ||
+           (tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM &&
+            tensor->quant_param_idx < plan->num_quant_params);
+}
+
 static int quant_channels_fit(
     const tigris_plan_t *plan, const tigris_tensor_t *tensor,
     uint32_t channels)
@@ -400,16 +410,17 @@ static int legacy_semantics_are_builtin(uint8_t op_type)
     }
 }
 
-/* Whether two tensors are quantized alike: the same parameters, whichever
- * entry of the plan states them, so a byte copy between them is exact. */
+/* Whether two activations are encoded alike: the same scale and zero point,
+ * whichever entry of the plan states them, so a byte copy between them is
+ * exact. Per-channel requantization a record carries for the operator that
+ * wrote the tensor is not part of its encoding. */
 static int same_quantization(const tigris_quant_param_t *a, const tigris_quant_param_t *b)
 {
     if (a == b)
         return 1;
     if (a == NULL || b == NULL)
         return 0;
-    return a->num_channels == 1u && b->num_channels == 1u &&
-           memcmp(&a->scale, &b->scale, sizeof(a->scale)) == 0 &&
+    return memcmp(&a->scale, &b->scale, sizeof(a->scale)) == 0 &&
            a->zero_point == b->zero_point;
 }
 
@@ -600,7 +611,7 @@ static int bool_and_sum_valid(const tigris_plan_t *plan, const tigris_op_t *op, 
                 return isfinite(qy->scale) && qy->scale > 0.0f &&
                        qy->zero_point >= -128 && qy->zero_point <= 127;
             const tigris_quant_param_t *qx = tigris_tensor_quant(plan, x);
-            if (qx == NULL || qx->num_channels != 1u) return 0;
+            if (qx == NULL) return 0;
             /* The exact input multiplier 0.5 follows the reference's left shift 20. */
             const int64_t low = (-(int64_t)qx->zero_point + (int64_t)op->num_inputs * (-128 - (int64_t)qx->zero_point)) * 524288;
             const int64_t high = (-(int64_t)qx->zero_point + (int64_t)op->num_inputs * (127 - (int64_t)qx->zero_point)) * 524288;
@@ -638,7 +649,7 @@ static int bool_and_sum_valid(const tigris_plan_t *plan, const tigris_op_t *op, 
             q = tigris_tensor_quant(plan, t);
         }
         if (dtype == 3u) {
-            if (q == NULL || q->num_channels != 1u) return 0;
+            if (q == NULL) return 0;
             if (comparison && (q->scale <= 0.0f || q->scale >= 1.0f)) return 0;
             if (arity == 3u && !same_quantization(q, qy)) return 0;
         }
@@ -965,7 +976,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             if (dtype == 3u) {
                 if (input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                     output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
-                    !quant_channels_fit(plan, input, 1) || !quant_channels_fit(plan, output, 1))
+                    !quant_input_stated(plan, input) || !quant_channels_fit(plan, output, 1))
                     return TIGRIS_ERR_BAD_OPERATOR;
                 const tigris_quant_param_t *q = &plan->quant_params[output->quant_param_idx];
                 if ((op->op_type == TIGRIS_OP_LOG_SOFTMAX &&
@@ -995,7 +1006,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 if ((op->op_type != TIGRIS_OP_ABS && op->op_type != TIGRIS_OP_RSQRT) ||
                     input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                     output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
-                    !quant_channels_fit(plan, input, 1) ||
+                    !quant_input_stated(plan, input) ||
                     !quant_channels_fit(plan, output, 1))
                     return TIGRIS_ERR_BAD_OPERATOR;
             }
@@ -1034,7 +1045,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                 if (dtype == 3u) {
                     const tigris_tensor_t *second = &plan->tensors[inputs[1]];
                     if (second->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
-                        !quant_channels_fit(plan, second, 1))
+                        !quant_input_stated(plan, second))
                         return TIGRIS_ERR_BAD_OPERATOR;
                     second_quant = &plan->quant_params[second->quant_param_idx];
                 }
@@ -1045,7 +1056,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                      op->op_type != TIGRIS_OP_PRELU) ||
                     input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                     output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
-                    !quant_channels_fit(plan, input, 1) ||
+                    !quant_input_stated(plan, input) ||
                     !quant_channels_fit(plan, output, 1))
                     return TIGRIS_ERR_BAD_OPERATOR;
                 if (op->op_type == TIGRIS_OP_MAXIMUM || op->op_type == TIGRIS_OP_MINIMUM) {
@@ -1146,7 +1157,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             if (dtype == 3u) {
                 if (input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                     output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
-                    !quant_channels_fit(plan, input, 1) || !quant_channels_fit(plan, output, 1))
+                    !quant_input_stated(plan, input) || !quant_channels_fit(plan, output, 1))
                     return TIGRIS_ERR_BAD_OPERATOR;
                 const tigris_quant_param_t *iq = &plan->quant_params[input->quant_param_idx];
                 const tigris_quant_param_t *oq = &plan->quant_params[output->quant_param_idx];
@@ -1166,7 +1177,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             if (dtype == 3u && !index_output && op->op_type != TIGRIS_OP_REDUCE_MEAN) {
                 if (input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
                     output->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
-                    !quant_channels_fit(plan, input, 1) || !quant_channels_fit(plan, output, 1))
+                    !quant_input_stated(plan, input) || !quant_channels_fit(plan, output, 1))
                     return TIGRIS_ERR_BAD_OPERATOR;
                 if ((op->op_type == TIGRIS_OP_REDUCE_MAX || op->op_type == TIGRIS_OP_REDUCE_MIN) &&
                     !same_quantization(&plan->quant_params[input->quant_param_idx],

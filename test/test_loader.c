@@ -1992,6 +1992,22 @@ static void test_arg_contract(void)
     }
 }
 
+static void test_reduce_all_contract(void)
+{
+    _Alignas(4) uint8_t buf[NATIVE_REDUCTION_PLAN_SIZE];
+    tigris_plan_t plan;
+    for (uint8_t axis = 0; axis < 3u; axis++) {
+        build_native_reduction_plan(buf, TIGRIS_OP_REDUCE_ALL, 0, axis);
+        tigris_file_header_t *header = (tigris_file_header_t *)buf;
+        tigris_tensor_t *t = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF);
+        t[0].dtype = 9; t[0].size_bytes = 24u;
+        t[1].dtype = 9; t[1].size_bytes /= 4u;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_OK, "bool reduce all accepted");
+        t[1].dtype = 1; t[1].size_bytes *= 4u;
+        TEST_ASSERT(tigris_plan_load(buf, header->file_size, &plan) != TIGRIS_OK, "reduce all writes bool");
+    }
+}
+
 static void test_native_reduction_contract(void)
 {
     _Alignas(4) uint8_t buf[NATIVE_REDUCTION_PLAN_SIZE];
@@ -3863,6 +3879,7 @@ int main(int argc, char *argv[])
     test_elementwise_semantics();
     test_native_reduction_contract();
     test_arg_contract();
+    test_reduce_all_contract();
     test_cumsum_loader_contract();
     test_native_reduction_tiling_contract();
     test_activation_attribute_contract();

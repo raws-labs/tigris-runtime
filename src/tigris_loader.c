@@ -353,7 +353,8 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
                                                 op_type == TIGRIS_OP_REDUCE_SUM ||
                                                 op_type == TIGRIS_OP_CUMSUM ||
                                                 op_type == TIGRIS_OP_ARG_MAX ||
-                                                op_type == TIGRIS_OP_ARG_MIN;
+                                                op_type == TIGRIS_OP_ARG_MIN ||
+                                                op_type == TIGRIS_OP_REDUCE_ALL;
     case TIGRIS_OP_ATTR_CUMSUM_OPTIONS: return op_type == TIGRIS_OP_CUMSUM;
     case TIGRIS_OP_ATTR_POOL_ROUNDING:  return op_type == TIGRIS_OP_GLOBAL_AVG;
     case TIGRIS_OP_ATTR_RESIZE_SCALES:  return op_type == TIGRIS_OP_RESIZE ||
@@ -652,7 +653,7 @@ static int bool_and_sum_valid(const tigris_plan_t *plan, const tigris_op_t *op, 
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     /* Zero is the data dtype, 255 also permits bool; the final input slot repeats. */
-    static const dtype_signature_t dtype_signatures[TIGRIS_OP_ADD_N + 1] = {
+    static const dtype_signature_t dtype_signatures[TIGRIS_OP_REDUCE_ALL + 1] = {
         [TIGRIS_OP_CONV] = {{0, 0, 0}, 0},
         [TIGRIS_OP_DEPTHWISE] = {{0, 0, 0}, 0},
         [TIGRIS_OP_RELU] = {{0, 0, 0}, 0},
@@ -736,6 +737,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         [TIGRIS_OP_SELECT_V2] = {{9, 0, 0}, 0},
         [TIGRIS_OP_CAST] = {{9, 9, 9}, 0},
         [TIGRIS_OP_ADD_N] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_REDUCE_ALL] = {{9, 9, 9}, 9},
     };
     const tigris_file_header_t *hdr = plan->header;
     const int legacy = hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES;
@@ -1159,6 +1161,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         case TIGRIS_OP_REDUCE_MAX:
         case TIGRIS_OP_REDUCE_MIN:
         case TIGRIS_OP_REDUCE_SUM:
+        case TIGRIS_OP_REDUCE_ALL:
         case TIGRIS_OP_REDUCE_MEAN: {
             if (dtype == 3u && !index_output && op->op_type != TIGRIS_OP_REDUCE_MEAN) {
                 if (input->quant_param_idx == TIGRIS_NO_QUANT_PARAM ||
@@ -2249,7 +2252,8 @@ tigris_error_t tigris_plan_load_ex(
                  candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_SUM ||
                  candidate.ops[op_idx].op_type == TIGRIS_OP_CUMSUM ||
                  candidate.ops[op_idx].op_type == TIGRIS_OP_ARG_MAX ||
-                 candidate.ops[op_idx].op_type == TIGRIS_OP_ARG_MIN) !=
+                 candidate.ops[op_idx].op_type == TIGRIS_OP_ARG_MIN ||
+                 candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_ALL) !=
                 has_axes)
                 return TIGRIS_ERR_BAD_SECTION;
         }
@@ -2267,7 +2271,8 @@ tigris_error_t tigris_plan_load_ex(
                 candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_SUM ||
                 candidate.ops[op_idx].op_type == TIGRIS_OP_CUMSUM ||
                  candidate.ops[op_idx].op_type == TIGRIS_OP_ARG_MAX ||
-                 candidate.ops[op_idx].op_type == TIGRIS_OP_ARG_MIN)
+                 candidate.ops[op_idx].op_type == TIGRIS_OP_ARG_MIN ||
+                 candidate.ops[op_idx].op_type == TIGRIS_OP_REDUCE_ALL)
                 return TIGRIS_ERR_BAD_SECTION;
         }
     }

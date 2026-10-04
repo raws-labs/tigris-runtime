@@ -2982,6 +2982,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_SELECT_V2: return tigris_bool_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CAST: return tigris_bool_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ADD_N: return kern_add_n_s8(plan, op, mem);
+    case TIGRIS_OP_REDUCE_ALL: return tigris_reduce_all_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ARG_MAX:
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CUMSUM: return kern_cumsum_s8(plan, op, op_index, mem);
@@ -3190,7 +3191,7 @@ tigris_accel_route_t tigris_accel_pre_route(
     const tigris_op_t     *op,
     int                    tile_active)
 {
-    if (op && op->op_type >= TIGRIS_OP_EQUAL && op->op_type <= TIGRIS_OP_ADD_N)
+    if (op && op->op_type >= TIGRIS_OP_EQUAL && op->op_type <= TIGRIS_OP_REDUCE_ALL)
         return TIGRIS_ACCEL_ROUTE_S8_REF;
 
     if (backend == TIGRIS_ACCEL_CMSIS_NN && tile_active &&

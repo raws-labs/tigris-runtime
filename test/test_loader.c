@@ -2068,8 +2068,9 @@ static void test_native_reduction_contract(void)
                                    "int8 reduction requires input and output quantization");
                     tensors[t].quant_param_idx = t;
                     quant[t].num_channels = 2; quant[t].shift_off = 2;
-                    TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
-                                   "int8 reduction rejects per-channel activation quantization");
+                    TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan),
+                                   t == 0u ? TIGRIS_OK : TIGRIS_ERR_BAD_OPERATOR,
+                                   "int8 reduction reads its input's encoding; its output is per tensor");
                     quant[t].num_channels = 1; quant[t].shift_off = 1;
                 }
                 quant[1].scale *= 2.0f;
@@ -2136,8 +2137,9 @@ static void test_cumsum_loader_contract(void)
                                "int8 CumSum requires both quantization records");
                 tensors[t].quant_param_idx = t;
                 quant[t].num_channels = 2; quant[t].shift_off = 2;
-                TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
-                               "int8 CumSum rejects per-channel quantization");
+                TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan),
+                               t == 0u ? TIGRIS_OK : TIGRIS_ERR_BAD_OPERATOR,
+                               "int8 CumSum reads its input's encoding; its output is per tensor");
                 quant[t].num_channels = 1; quant[t].shift_off = 1;
             }
             quant[0].scale = 65535.0f;
@@ -2321,8 +2323,9 @@ static void test_activation_semantic_contract(void)
                     tensors[t].quant_param_idx = t;
                     quant[t].num_channels = 2;
                     quant[t].shift_off = 2;
-                    TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
-                                   "activation rejects per-channel activation quantization");
+                    TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan),
+                                   t == 0u ? TIGRIS_OK : TIGRIS_ERR_BAD_OPERATOR,
+                                   "activation reads its input's encoding; its output is per tensor");
                     quant[t].num_channels = 1;
                     quant[t].shift_off = 1;
                 }
@@ -2651,11 +2654,19 @@ static void test_elementwise_semantics(void)
                        "elementwise int8 capability checked");
         if (!quantized) continue;
         tigris_quant_param_t *quant = (tigris_quant_param_t *)(buf + ELEMENTWISE_QUANT_OFF + 4u);
+        /* An input's record may carry the per-channel requantization of the
+         * operator that wrote it; the operator's own output is per tensor. */
         quant[0].num_channels = 2;
         quant[0].shift_off = 2;
-        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
-                       "elementwise per-channel quantization rejected");
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                       "elementwise input reads only its scale and zero point");
         quant[0].num_channels = 1;
+        if (inputs == 1u) {
+            quant[1].num_channels = 2;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "unary output quantization is per tensor");
+            quant[1].num_channels = 1;
+        }
         if (kinds[i] == TIGRIS_OP_DIV) {
             quant[1].scale = 0.25f;
             quant[1].zero_point = 31;

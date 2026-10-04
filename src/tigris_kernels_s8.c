@@ -2807,7 +2807,7 @@ static int reduction_s8_begin(
     view->input_quant = tigris_tensor_quant(plan, input);
     view->output_quant = tigris_tensor_quant(plan, output);
     if (!view->input || !view->output || !view->input_quant || !view->output_quant ||
-        view->input_quant->num_channels != 1u || view->output_quant->num_channels != 1u ||
+        view->output_quant->num_channels != 1u ||
         !isfinite(view->input_quant->scale) || !isfinite(view->output_quant->scale) ||
         view->input_quant->scale <= 0.0f || view->output_quant->scale <= 0.0f ||
         view->input_quant->zero_point < -128 || view->input_quant->zero_point > 127 ||
@@ -3158,7 +3158,7 @@ int tigris_accel_binary_params(const tigris_plan_t *plan, const tigris_op_t *op,
     const tigris_quant_param_t *aq = tigris_tensor_quant(plan, a);
     const tigris_quant_param_t *bq = tigris_tensor_quant(plan, b);
     const tigris_quant_param_t *yq = tigris_tensor_quant(plan, y);
-    if (!aq || !bq || !yq || aq->num_channels != 1 || bq->num_channels != 1 || yq->num_channels != 1)
+    if (!aq || !bq || !yq || yq->num_channels != 1)
         return 0;
     if (op->op_type == TIGRIS_OP_MUL) {
         double scale = (double)aq->scale * (double)bq->scale / (double)yq->scale;

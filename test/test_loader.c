@@ -1698,6 +1698,84 @@ static void test_rank4_row_band_contract(void)
                    "the spatial reading of the same shapes still loads");
 }
 
+static void check_reshape_band_execution(const tigris_plan_t *plan, uint32_t budget)
+{
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[256], slow[512];
+    void *pointers[2] = {NULL, NULL};
+    float input[32], output[32];
+    for (uint32_t i = 0; i < 32u; i++) input[i] = (float)i - 15.0f;
+    memset(fast, 0xA5, sizeof(fast));
+    tigris_mem_t mem;
+    tigris_exec_stats_t stats;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, pointers, 2, fast, budget, slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "reshape arenas");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, sizeof(input)), TIGRIS_MEM_OK, "input allocation");
+    TEST_ASSERT_EQ(tigris_input_write(plan, &mem, 0, input, sizeof(input)), TIGRIS_OK, "input write");
+    TEST_ASSERT_EQ(tigris_run(plan, &mem, tigris_dispatch_kernel, NULL, &stats), TIGRIS_EXEC_OK,
+                   "banded reshape execution");
+    TEST_ASSERT_EQ(stats.stages_tiled, 1u, "reshape actually tiled");
+    TEST_ASSERT(mem.fast_peak <= budget, "reshape fits its scheduled arena");
+    TEST_ASSERT_EQ(tigris_output_read(plan, &mem, 1, output, sizeof(output)), TIGRIS_OK, "output read");
+    TEST_ASSERT(memcmp(input, output, sizeof(input)) == 0, "reshape preserves every byte");
+    for (uint32_t i = budget; i < sizeof(fast); i++)
+        TEST_ASSERT_EQ(fast[i], 0xA5, "fast arena canary");
+}
+
+static void test_reshape_band_contract(void)
+{
+    printf("  test_reshape_band_contract...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+    build_tiled_stage_plan(buf, TIGRIS_OP_RESHAPE, 3);
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    tensors[0].flags |= TIGRIS_TENSOR_LINEAR;
+    tensors[1].flags |= TIGRIS_TENSOR_LINEAR;
+    tigris_tile_plan_t *tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+    tile->receptive_field = 1;
+    tile->tile_height = 3;
+    tile->num_tiles = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "split rows with a final partial band");
+    check_reshape_band_execution(&plan, 96u);
+    tile->original_height = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "incorrect original extent refused");
+    tile->original_height = 4;
+    tile->num_tiles = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "incorrect tile count refused");
+    tile->num_tiles = 2;
+    tile->halo = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "reshape has no halo");
+    tile->halo = 0;
+    tile->tile_width = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "reshape has no width tile");
+    tile->tile_width = 0;
+    tile->tile_height = 0;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "zero band refused");
+    int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[1] = 8; shapes[2] = 4;
+    shapes[5] = 4; shapes[6] = 8;
+    tile->original_height = 8;
+    tile->tile_height = 2;
+    tile->num_tiles = 4;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "integral row merge");
+    check_reshape_band_execution(&plan, 32u);
+    tile->tile_height = 3;
+    tile->num_tiles = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "non-integral endpoint refused");
+    tile->tile_height = 2;
+    tile->num_tiles = 4;
+    shapes[4] = 2; shapes[5] = 2;
+    TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK,
+                "batch redistribution refused");
+}
+
 static void test_operator_semantic_guards(void)
 {
     printf("  test_operator_semantic_guards...\n");
@@ -4163,6 +4241,7 @@ int main(int argc, char *argv[])
     test_tiled_conversion_contract();
     test_tiled_reduction_contract();
     test_rank4_row_band_contract();
+    test_reshape_band_contract();
     test_operator_semantic_guards();
     test_nonweighted_operator_semantics();
     test_elementwise_semantics();

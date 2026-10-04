@@ -2600,6 +2600,59 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
     return result;
 }
 
+/* Whether a stage is a Reshape whose rows map onto the output's. Kept out of
+ * line so the mapping it builds stays off the run loop's frame. */
+static TIGRIS_NOINLINE int stage_is_reshape_band(const tigris_plan_t *plan,
+                                                 const tigris_stage_t *stage)
+{
+    tigris_reshape_band_t view;
+    return tigris_reshape_band(plan, stage, &view);
+}
+
+static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_reshape(
+    const tigris_plan_t *plan, const tigris_stage_t *stage, tigris_mem_t *mem,
+    const uint16_t *last_consumer, uint16_t current_stage)
+{
+    tigris_reshape_band_t view;
+    const tigris_tile_plan_t *tile = &plan->tile_plans[stage->tile_plan_idx];
+    if (!tigris_reshape_band(plan, stage, &view) || !tigris_reshape_tile_valid(tile, &view))
+        return TIGRIS_EXEC_ERR_TILE;
+    uint16_t src = tigris_stage_inputs(plan, stage)[0], dst = tigris_stage_outputs(plan, stage)[0];
+    void *input = mem->tensor_ptrs[src];
+    if (!input) return TIGRIS_EXEC_ERR_MEM;
+    int alias = row_band_output_may_alias_input(plan, stage, last_consumer, current_stage);
+    if (alias) mem->tensor_ptrs[dst] = input;
+    else if (tigris_mem_alloc_slow(mem, dst, plan->tensors[dst].size_bytes) != TIGRIS_MEM_OK)
+        return TIGRIS_EXEC_ERR_MEM;
+    void *output = mem->tensor_ptrs[dst];
+    uint32_t element = tigris_dtype_size(plan->tensors[src].dtype);
+    uint32_t input_width = (uint32_t)view.input_width * element;
+    uint32_t output_width = (uint32_t)view.output_width * element;
+    tigris_exec_error_t result = TIGRIS_EXEC_OK;
+    for (int32_t start = 0; start < view.input_rows; start += tile->tile_height) {
+        int32_t count = view.input_rows - start;
+        if (count > tile->tile_height) count = tile->tile_height;
+        int32_t target_start = (int32_t)((int64_t)start * view.input_width / view.output_width);
+        int32_t target_count = (int32_t)((int64_t)count * view.input_width / view.output_width);
+        uint32_t bytes = (uint32_t)view.blocks * (uint32_t)count * input_width;
+        if (tigris_mem_alloc_fast(mem, src, bytes) != TIGRIS_MEM_OK) {
+            result = TIGRIS_EXEC_ERR_MEM;
+            break;
+        }
+        void *band = mem->tensor_ptrs[src];
+        gather_row_band((uint8_t *)band, (const uint8_t *)input, view.blocks,
+                        view.input_rows, start, count, input_width);
+        /* Both intervals name the same bytes; the output aliases this band. */
+        scatter_row_band((uint8_t *)output, (const uint8_t *)band, view.blocks,
+                         view.output_rows, target_start, target_count, output_width);
+        tigris_mem_reset_fast(mem);
+    }
+    mem->tensor_ptrs[src] = alias ? NULL : input;
+    mem->tensor_ptrs[dst] = output;
+    tigris_mem_reset_fast(mem);
+    return result;
+}
+
 /* Chained tiled execution */
 
 static TIGRIS_NOINLINE tigris_exec_error_t chain_kernel(
@@ -3673,6 +3726,21 @@ tigris_exec_error_t tigris_run_with_state(
             s += stage->chain_len - 1;
         } else if (stage->chain_len >= 2) {
             /* Non-head chain stage - should have been skipped; just in case */
+        } else if (stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
+                   stage->tile_plan_idx < run_plan->header->num_tile_plans &&
+                   run_plan->tile_plans &&
+                   run_plan->tile_plans[stage->tile_plan_idx].tileable &&
+                   stage_is_reshape_band(run_plan, stage)) {
+            /* A Reshape banded along rows that map onto the output's. Decided
+             * here, apart from the stripe contract below, which it shares no
+             * state with. */
+            tigris_exec_error_t err = exec_stage_tiled_reshape(
+                run_plan, stage, mem, last_consumer, s);
+            if (err != TIGRIS_EXEC_OK) {
+                result = err;
+                goto restore_fast_arena;
+            }
+            if (stats) stats->stages_tiled++;
         } else {
             const uint16_t *sin  = tigris_stage_inputs(run_plan, stage);
             const uint16_t *sout = tigris_stage_outputs(run_plan, stage);
@@ -3720,7 +3788,7 @@ tigris_exec_error_t tigris_run_with_state(
                 (common_tile_rank &&
                  stage_supports_axis1_tiling(run_plan, stage, rank));
             int needs_tiling =
-                (common_tile_rank || row_tiled) &&
+                (common_tile_rank || row_tiled || transposed) &&
                 total_io > (mem->fast_size - mem->fast_reserved);
 
             /* Schema-v5 stages may serialize the height/length axis (1D) or the

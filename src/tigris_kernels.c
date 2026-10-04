@@ -1480,6 +1480,35 @@ int tigris_arg_execute(const tigris_plan_t *plan, const tigris_op_t *op,
     return 0;
 }
 
+int tigris_reduce_all_execute(const tigris_plan_t *plan, const tigris_op_t *op,
+                              uint16_t op_index, tigris_mem_t *mem)
+{
+    int32_t outer, reduced, inner;
+    if (mem->tile.active || op->num_inputs != 1u || op->num_outputs != 1u ||
+        reduce_mean_extents(plan, op, op_index, &outer, &reduced, &inner) != 0)
+        return -1;
+    const uint16_t src = tigris_op_inputs(plan, op)[0];
+    const uint16_t dst = tigris_op_outputs(plan, op)[0];
+    const uint8_t *x = (const uint8_t *)tigris_mem_tensor_ptr(mem, src);
+    uint8_t *y = (uint8_t *)tigris_mem_tensor_ptr(mem, dst);
+    if (x == NULL || y == NULL || plan->tensors[src].dtype != 9u || plan->tensors[dst].dtype != 9u ||
+        (uint64_t)outer * (uint64_t)inner != plan->tensors[dst].size_bytes)
+        return -1;
+    for (int32_t o = 0; o < outer; o++) {
+        for (int32_t i = 0; i < inner; i++) {
+            uint8_t every = 1u;
+            for (int32_t a = 0; a < reduced; a++) {
+                const uint8_t value = x[((size_t)o * (size_t)reduced + (size_t)a) * (size_t)inner + (size_t)i];
+                if (value > 1u)
+                    return -1;
+                every &= value;
+            }
+            y[(size_t)o * (size_t)inner + (size_t)i] = every;
+        }
+    }
+    return 0;
+}
+
 static int kern_reduce_mean(
     const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
     tigris_mem_t *mem)
@@ -2585,6 +2614,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_REDUCE_MAX:
     case TIGRIS_OP_REDUCE_MIN:
     case TIGRIS_OP_REDUCE_SUM: return kern_reduce_f32(plan, op, op_index, mem);
+    case TIGRIS_OP_REDUCE_ALL: return tigris_reduce_all_execute(plan, op, op_index, mem);
     case TIGRIS_OP_GATHER:
     case TIGRIS_OP_GATHER_ND:
     case TIGRIS_OP_STRIDED_SLICE:

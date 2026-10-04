@@ -3540,6 +3540,57 @@ static void test_cast_bool_to_int8(void)
     }
 }
 
+/* REDUCE_ALL: true where every element along the axis is true. */
+static void test_reduce_all(void)
+{
+    printf("  test_reduce_all...\n");
+    /* [2, 3, 2]: rows of the middle axis. */
+    static const uint8_t x[12] = {1, 1, 1, 0, 1, 1,  0, 1, 0, 1, 1, 1};
+    static const struct { uint8_t axis; uint32_t count; uint8_t expected[6]; } cases[] = {
+        {0, 6, {0, 1, 0, 0, 1, 1}}, {1, 4, {1, 0, 0, 1}}, {2, 6, {1, 0, 1, 0, 0, 1}},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        tigris_file_header_t header = {0};
+        tigris_tensor_t tensors[2] = {{0}};
+        tigris_op_t op = {0};
+        tigris_plan_t plan = {0};
+        tigris_mem_t mem = {0};
+        tigris_op_attribute_t attribute = {0, TIGRIS_OP_ATTR_AXES, 1, 0};
+        int32_t shapes[6] = {2, 3, 2, 2, 3, 2};
+        uint8_t output[6] = {9, 9, 9, 9, 9, 9};
+        void *pointers[] = {(void *)x, output};
+        uint16_t indices[] = {0, 1};
+        shapes[3 + cases[c].axis] = 1;
+        header.num_tensors = 2;
+        header.num_ops = 1;
+        tensors[0] = (tigris_tensor_t){0, 12u, 0, 3, 9, 0, TIGRIS_NO_QUANT_PARAM, 0};
+        tensors[1] = (tigris_tensor_t){0, cases[c].count, 3, 3, 9, 0, TIGRIS_NO_QUANT_PARAM, 0};
+        op.op_type = TIGRIS_OP_REDUCE_ALL;
+        op.num_inputs = op.num_outputs = 1;
+        op.outputs_off = 1;
+        op.weight_idx = op.bias_idx = TIGRIS_NO_WEIGHT;
+        plan.header = &header;
+        plan.tensors = tensors;
+        plan.ops = &op;
+        plan.shape_pool = shapes;
+        plan.index_pool = indices;
+        plan.num_op_attributes = 1;
+        plan.op_attributes = &attribute;
+        plan.op_attribute_data = &cases[c].axis;
+        mem.tensor_ptrs = pointers;
+        mem.num_tensors = 2;
+        TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0, "reduce all runs");
+        for (uint32_t i = 0; i < cases[c].count; i++)
+            TEST_ASSERT(output[i] == cases[c].expected[i], "reduce all value");
+        TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL) == 0, "reduce all runs under s8");
+        uint8_t bad[12];
+        memcpy(bad, x, sizeof(bad));
+        bad[5] = 2;
+        pointers[0] = bad;
+        TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0, "reduce all refuses a non-bool byte");
+    }
+}
+
 static void test_bool_goldens(void)
 {
     for (size_t g = 0; g < sizeof(bool_goldens) / sizeof(bool_goldens[0]); g++) {
@@ -3676,6 +3727,7 @@ int main(void)
 {
     test_bool_goldens();
     test_cast_bool_to_int8();
+    test_reduce_all();
     test_movement_goldens();
     printf("TiGrIS Kernel Tests\n\n");
 

@@ -243,6 +243,7 @@ typedef enum {
     TIGRIS_OP_SELECT_V2                  = 81,
     TIGRIS_OP_CAST                       = 82,
     TIGRIS_OP_ADD_N                      = 83,
+    TIGRIS_OP_REDUCE_ALL                 = 84,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

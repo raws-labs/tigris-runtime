@@ -3343,6 +3343,47 @@ static void test_reduction_reference_goldens(void)
             if (!equal) fprintf(stderr, "    reduction case %zu op %u element %u\n", g, gold->op, i);
             TEST_ASSERT(equal, "reduction output bits equal TFLM");
         }
+        tensors[0].flags = tensors[1].flags = TIGRIS_TENSOR_LINEAR;
+        mem.tile.active = 1;
+        mem.tile.in_h = mem.tile.out_h = 1;
+        if (gold->axis == 1u) {
+            mem.tile.row_tiled = 1;
+            TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) != 0, "a band cannot split the reduced axis");
+        }
+        if (gold->axis == 2u && gold->output_rank == 3u) {
+            uint32_t batches = (uint32_t)gold->shapes[0];
+            uint32_t rows = (uint32_t)gold->shapes[1];
+            uint32_t in_row = (uint32_t)gold->shapes[2] * element;
+            uint32_t out_row = (uint32_t)gold->shapes[5] * output_element;
+            for (int mode = 0; mode < 2; mode++) {
+                mem.tile.row_tiled = mode;
+                for (uint32_t start = 0u; start < rows; start += 2u) {
+                    uint32_t band = rows - start < 2u ? rows - start : 2u;
+                    uint8_t *band_in = malloc((size_t)batches * band * in_row);
+                    size_t bytes = (size_t)batches * band * out_row;
+                    uint8_t *band_out = malloc(bytes + 16u);
+                    TEST_ASSERT(band_in != NULL && band_out != NULL, "band buffers allocated");
+                    if (!band_in || !band_out) { free(band_in); free(band_out); free(output); return; }
+                    for (uint32_t n = 0u; n < batches; n++)
+                        memcpy(band_in + (size_t)n * band * in_row,
+                               (const uint8_t *)gold->input + ((size_t)n * rows + start) * in_row,
+                               (size_t)band * in_row);
+                    memset(band_out, 0xa5, bytes + 16u);
+                    pointers[0] = band_in;
+                    pointers[1] = band_out;
+                    mem.tile.in_h = mem.tile.out_h = (int32_t)band;
+                    TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) == 0, "independent reduction band executes");
+                    for (uint32_t n = 0u; n < batches; n++)
+                        TEST_ASSERT(memcmp(band_out + (size_t)n * band * out_row,
+                                           (const uint8_t *)gold->output + ((size_t)n * rows + start) * out_row,
+                                           (size_t)band * out_row) == 0, "partial band equals TFLM bytes");
+                    for (size_t i = bytes; i < bytes + 16u; i++)
+                        TEST_ASSERT(band_out[i] == 0xa5u, "band output stays in its allocation");
+                    free(band_in);
+                    free(band_out);
+                }
+            }
+        }
         free(output);
     }
 }

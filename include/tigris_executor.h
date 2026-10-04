@@ -24,6 +24,7 @@ typedef enum {
     TIGRIS_EXEC_ERR_NO_STAGES = -4, /**< Plan has no stages */
     TIGRIS_EXEC_ERR_TILE    = -5,   /**< Tiled execution error */
     TIGRIS_EXEC_ERR_WORKSPACE = -6, /**< Executor workspace unavailable/too small */
+    TIGRIS_EXEC_ERR_STATE   = -7,   /**< Plan keeps state and none was given, or too little */
 } tigris_exec_error_t;
 
 /* Kernel callback */
@@ -206,6 +207,41 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
     tigris_exec_stats_t *stats,
     void                *workspace,
     size_t               workspace_size);
+
+/**
+ * Run a plan that keeps variables across invocations.
+ *
+ * The state buffer holds every variable between runs: each run reads the
+ * values the last one left and writes back the ones it assigns. Prepare it
+ * once with tigris_state_init(), which is also how it is reset. A plan
+ * without state also runs here, with state NULL and state_size 0.
+ *
+ * @return TIGRIS_EXEC_ERR_STATE when the plan keeps state and the buffer is
+ *         NULL or smaller than tigris_state_required(); otherwise as
+ *         tigris_run_with_workspace_buffer().
+ */
+tigris_exec_error_t tigris_run_with_state(
+    const tigris_plan_t *plan,
+    tigris_mem_t        *mem,
+    tigris_kernel_fn     kernel,
+    void                *user_ctx,
+    tigris_exec_stats_t *stats,
+    void                *workspace,
+    size_t               workspace_size,
+    void                *state,
+    size_t               state_size);
+
+/** Bytes of state a plan keeps across invocations; 0 for a plan without. */
+size_t tigris_state_required(const tigris_plan_t *plan);
+
+/**
+ * Write every variable's initial value into a state buffer, which prepares
+ * it for the first run and resets it after any number of runs.
+ *
+ * @return TIGRIS_EXEC_OK, or TIGRIS_EXEC_ERR_STATE when the buffer is NULL
+ *         or smaller than tigris_state_required().
+ */
+tigris_exec_error_t tigris_state_init(const tigris_plan_t *plan, void *state, size_t state_size);
 
 /** Return sizeof(tigris_executor_workspace_t) for language bindings/allocators. */
 size_t tigris_executor_workspace_size(void);

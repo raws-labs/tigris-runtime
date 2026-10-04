@@ -17,6 +17,9 @@
 #include "movement_golden.h"
 #include "bool_golden.h"
 #include "tigris_loader.h"
+#include "tigris_executor.h"
+#include "tigris_kernels.h"
+#include "tigris_iface.h"
 
 /* Test infrastructure */
 
@@ -3462,6 +3465,7 @@ static void test_schema_compatibility_fixtures(void)
      *   v8 LayerNorm:the typed attribute kinds
      *   v9 QDQ Add:  a quantized sum stating the multipliers that scale its
      *                two operands and its result
+     *   v10 state:   a variable kept across invocations in the state buffer
      */
     static const struct {
         const char *filename;
@@ -3480,6 +3484,7 @@ static void test_schema_compatibility_fixtures(void)
         {"schema-v7-tensor-layout.tgrs", TIGRIS_SCHEMA_VERSION_V7, 0, 2, 0, 0},
         {"schema-v8-layer-norm.tgrs", TIGRIS_SCHEMA_VERSION_V8, 0, 3, 0, 0},
         {"schema-v9-binary-requant.tgrs", TIGRIS_SCHEMA_VERSION_V9, 3, 1, 0, 0},
+        {"schema-v10-state.tgrs", TIGRIS_SCHEMA_VERSION_V10, 0, 3, 0, 0},
     };
     const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
 
@@ -3851,6 +3856,123 @@ static void test_bool_contract(void)
     }
 }
 
+static uint32_t state_section_offset(const uint8_t *buf)
+{
+    uint32_t dir;
+    memcpy(&dir, buf + 12, sizeof(dir));
+    for (;;) {
+        uint32_t type, offset;
+        memcpy(&type, buf + dir, sizeof(type));
+        memcpy(&offset, buf + dir + 4u, sizeof(offset));
+        if (type == 0u || type == TIGRIS_SEC_STATE)
+            return type == 0u ? 0u : offset;
+        dir += 8u;
+    }
+}
+
+/* One invocation of the v10 fixture on input {1, 0.5}: out receives its
+ * four outputs. */
+static tigris_exec_error_t run_state_fixture(const tigris_plan_t *plan, void *state,
+                                             size_t state_size, float *out)
+{
+    const uint32_t fast_size = tigris_fast_arena_required(plan);
+    uint32_t slow_size = 0u;
+    for (uint16_t t = 0; t < plan->header->num_tensors; t++)
+        slow_size += 2u * (plan->tensors[t].size_bytes + TIGRIS_TENSOR_ALIGN);
+    uint8_t *fast_raw = malloc((size_t)fast_size + TIGRIS_TENSOR_ALIGN);
+    uint8_t *slow_raw = malloc((size_t)slow_size + TIGRIS_TENSOR_ALIGN);
+    void **pointers = calloc(plan->header->num_tensors, sizeof(*pointers));
+    size_t workspace_size = tigris_executor_workspace_required(plan);
+    void *workspace = malloc(workspace_size);
+    tigris_exec_error_t result = TIGRIS_EXEC_ERR_MEM;
+    if (fast_raw && slow_raw && pointers && workspace) {
+        uint8_t *fast = fast_raw + (TIGRIS_TENSOR_ALIGN - ((uintptr_t)fast_raw % TIGRIS_TENSOR_ALIGN)) % TIGRIS_TENSOR_ALIGN;
+        uint8_t *slow = slow_raw + (TIGRIS_TENSOR_ALIGN - ((uintptr_t)slow_raw % TIGRIS_TENSOR_ALIGN)) % TIGRIS_TENSOR_ALIGN;
+        tigris_mem_t mem;
+        const float x[2] = {1.0f, 0.5f};
+        uint16_t input = plan->model_inputs[0];
+        if (tigris_mem_init(&mem, pointers, plan->header->num_tensors, fast, fast_size,
+                            slow, slow_size) == TIGRIS_MEM_OK &&
+            tigris_mem_alloc_slow(&mem, input, plan->tensors[input].size_bytes) == TIGRIS_MEM_OK &&
+            tigris_input_write(plan, &mem, input, x, sizeof(x)) == TIGRIS_OK) {
+            result = tigris_run_with_state(plan, &mem, tigris_dispatch_kernel, NULL, NULL,
+                                           workspace, workspace_size, state, state_size);
+            if (result == TIGRIS_EXEC_OK &&
+                tigris_output_read(plan, &mem, plan->model_outputs[0], out,
+                                   4u * sizeof(float)) != TIGRIS_OK)
+                result = TIGRIS_EXEC_ERR_MEM;
+        }
+    }
+    free(workspace);
+    free(pointers);
+    free(slow_raw);
+    free(fast_raw);
+    return result;
+}
+
+static void test_state_fixture(void)
+{
+    printf("  test_state_fixture...\n");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/schema-v10-state.tgrs", TIGRIS_SCHEMA_COMPAT_DIR);
+    uint32_t len = 0;
+    uint8_t *buf = load_file(path, &len);
+    TEST_ASSERT(buf != NULL, "state fixture is readable");
+    if (!buf)
+        return;
+    tigris_plan_t plan;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_OK, "state plan loads");
+    TEST_ASSERT_EQ(plan.num_state, 1, "one variable");
+    TEST_ASSERT_EQ(tigris_state_required(&plan), 48, "state buffer size");
+
+    /* The variable carries from run to run, a reset starts it over, and a
+     * run without a state buffer is refused. */
+    float state[12];
+    float first[4], later[4], again[4];
+    memset(state, 0xA5, sizeof(state));
+    TEST_ASSERT_EQ(tigris_state_init(&plan, state, sizeof(state)), TIGRIS_EXEC_OK, "state init");
+    TEST_ASSERT_EQ(tigris_state_init(&plan, state, sizeof(state) - 4u), TIGRIS_EXEC_ERR_STATE,
+                   "state init refuses a short buffer");
+    TEST_ASSERT_EQ(run_state_fixture(&plan, state, sizeof(state), first), TIGRIS_EXEC_OK, "first run");
+    TEST_ASSERT_EQ(run_state_fixture(&plan, state, sizeof(state), later), TIGRIS_EXEC_OK, "second run");
+    TEST_ASSERT(memcmp(first, later, sizeof(first)) != 0, "the variable carries into the next run");
+    TEST_ASSERT_EQ(tigris_state_init(&plan, state, sizeof(state)), TIGRIS_EXEC_OK, "state reset");
+    TEST_ASSERT_EQ(run_state_fixture(&plan, state, sizeof(state), again), TIGRIS_EXEC_OK, "run after reset");
+    TEST_ASSERT(memcmp(first, again, sizeof(first)) == 0, "a reset run repeats the first");
+    TEST_ASSERT_EQ(run_state_fixture(&plan, NULL, 0u, again), TIGRIS_EXEC_ERR_STATE,
+                   "a stateful plan needs its state buffer");
+    TEST_ASSERT_EQ(run_state_fixture(&plan, state, sizeof(state) - 4u, again), TIGRIS_EXEC_ERR_STATE,
+                   "a short state buffer is refused");
+
+    /* Malformed state sections. */
+    uint8_t *copy = malloc(len);
+    uint32_t section = state_section_offset(buf);
+    TEST_ASSERT(copy != NULL && section != 0u, "state section found");
+    if (copy && section) {
+        tigris_state_entry_t entry;
+        memcpy(&entry, buf + section + 8u, sizeof(entry));
+        memcpy(copy, buf, len);
+        copy[section + 2u] = 1u;
+        TEST_ASSERT(tigris_plan_load(copy, len, &plan) != TIGRIS_OK, "reserved field must be zero");
+        memcpy(copy, buf, len);
+        entry.bytes += 4u;
+        memcpy(copy + section + 8u, &entry, sizeof(entry));
+        TEST_ASSERT(tigris_plan_load(copy, len, &plan) != TIGRIS_OK, "entry size must match the tensor");
+        memcpy(copy, buf, len);
+        uint32_t version = TIGRIS_SCHEMA_VERSION_V9;
+        memcpy(copy + 4u, &version, sizeof(version));
+        TEST_ASSERT_EQ(tigris_plan_load(copy, len, &plan), TIGRIS_ERR_BAD_SECTION,
+                       "state needs schema 10");
+        memcpy(copy, buf, len);
+        uint32_t state_bytes = 44u;
+        memcpy(copy + section + 4u, &state_bytes, sizeof(state_bytes));
+        TEST_ASSERT_EQ(tigris_plan_load(copy, len, &plan), TIGRIS_ERR_BAD_SECTION,
+                       "a variable must fit the state buffer");
+    }
+    free(copy);
+    free(buf);
+}
+
 int main(int argc, char *argv[])
 {
     test_movement_contract();
@@ -3904,6 +4026,7 @@ int main(int argc, char *argv[])
 
     printf("\nSchema compatibility fixtures:\n");
     test_schema_compatibility_fixtures();
+    test_state_fixture();
     test_legacy_schema_validates_builtin_operators();
     test_quant_param_counts_are_reconciled();
 

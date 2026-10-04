@@ -52,6 +52,9 @@ enum {
 };
 /* Peaks cover execution arenas, not process memory. */
 TIGRIS_HOST_API uint64_t tigris_host_metric(const tigris_host_t *host, uint32_t metric);
+/* Returns every variable a stateful plan keeps to its initial value; NULL on
+ * success, else an error message. A stateless plan has nothing to reset. */
+TIGRIS_HOST_API const char *tigris_host_reset_state(tigris_host_t *host);
 
 #ifdef __cplusplus
 }

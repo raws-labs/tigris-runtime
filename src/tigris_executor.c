@@ -4,6 +4,7 @@
  */
 
 #include "tigris_executor.h"
+#include "tigris_binary_operands.h"
 #include "tigris_lz4.h"
 #include "tigris_transpose_band.h"
 #include "tigris_kernel_window.h"
@@ -499,6 +500,8 @@ static int stage_supports_axis1_tiling(
     const uint16_t *sops = tigris_stage_ops(plan, stage);
     int spatial_count = 0;
 
+    if (stage->ops_count == 1u && stage->chain_len == 0u &&
+        tigris_op_independent_band(plan, &plan->ops[sops[0]], sops[0], 0)) return 1;
     if (rank == 3) {
         int binary_count = 0;
         if (stage->chain_len != 0)
@@ -2278,7 +2281,7 @@ static int stage_is_row_tiled(
 
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         const tigris_op_t *op = &plan->ops[sops[j]];
-        if (!is_row_tiling_op(op->op_type) || op->num_inputs == 0u ||
+        if ((!is_row_tiling_op(op->op_type) && !tigris_op_independent_band(plan, op, sops[j], 1)) || op->num_inputs == 0u ||
             op->num_outputs != 1u)
             return 0;
         /* Every intermediate carries the same band, or a band means something

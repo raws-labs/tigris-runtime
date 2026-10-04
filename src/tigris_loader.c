@@ -7,6 +7,7 @@
  */
 
 #include "tigris_loader.h"
+#include "tigris_binary_operands.h"
 
 #include "tigris_transpose_band.h"
 
@@ -322,6 +323,65 @@ static int is_row_tiling_op(uint8_t type)
            (type >= TIGRIS_OP_EQUAL && type <= TIGRIS_OP_LOGICAL_OR) ||
            type == TIGRIS_OP_SELECT_V2 || type == TIGRIS_OP_ADD_N ||
            type == TIGRIS_OP_MUL;
+}
+
+
+int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
+                                uint16_t op_index, int row_tiled)
+{
+    if (op->num_inputs == 0u || op->num_outputs != 1u) return 0;
+    const tigris_tensor_t *in = &plan->tensors[tigris_op_inputs(plan, op)[0]];
+    const tigris_tensor_t *out = &plan->tensors[tigris_op_outputs(plan, op)[0]];
+    if (in->ndim < 2u || in->ndim > 6u || out->ndim < 2u || out->ndim > 6u) return 0;
+    int32_t ib, ir, ic, ob, orows, oc;
+    uint8_t row = row_tiled ? (uint8_t)(in->ndim - 2u) : 1u;
+    if (row_tiled) {
+        if (!tensor_row_view(plan, in, &ib, &ir, &ic) ||
+            !tensor_row_view(plan, out, &ob, &orows, &oc) || ib != ob || ir != orows) return 0;
+    } else {
+        if ((in->ndim != 3u && in->ndim != 4u) || out->ndim != in->ndim) return 0;
+        const int32_t *first = tigris_tensor_shape(plan, in);
+        const int32_t *last = tigris_tensor_shape(plan, out);
+        if (first[0] != last[0] || first[1] != last[1] || first[1] <= 1) return 0;
+        for (uint8_t i = 1u; i < op->num_inputs; i++) {
+            const tigris_tensor_t *operand = &plan->tensors[tigris_op_inputs(plan, op)[i]];
+            if (operand->ndim != in->ndim) return 0;
+            const int32_t *other = tigris_tensor_shape(plan, operand);
+            if (other[0] != first[0] || other[1] != first[1]) return 0;
+        }
+    }
+    uint8_t length = 0u;
+    uint8_t type = op->op_type;
+    if (type == TIGRIS_OP_REDUCE_MEAN || type == TIGRIS_OP_REDUCE_MAX ||
+        type == TIGRIS_OP_REDUCE_MIN || type == TIGRIS_OP_REDUCE_SUM ||
+        type == TIGRIS_OP_REDUCE_ALL || type == TIGRIS_OP_CUMSUM ||
+        type == TIGRIS_OP_ARG_MAX || type == TIGRIS_OP_ARG_MIN) {
+        const uint8_t *axes = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_AXES, &length);
+        return axes != NULL && length == 1u && axes[0] < in->ndim && axes[0] != row;
+    }
+    int32_t metadata[19] = {0};
+    const uint8_t *payload = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_MOVEMENT, &length);
+    if (!payload || length == 0u || length > sizeof(metadata) || length % 4u != 0u) return 0;
+    memcpy(metadata, payload, length);
+    const int32_t *shape = tigris_tensor_shape(plan, in);
+    if (type == TIGRIS_OP_GATHER || type == TIGRIS_OP_GATHER_ND || type == TIGRIS_OP_EMBEDDING_LOOKUP) {
+        if (op->num_inputs != 1u || op->weight_idx == TIGRIS_NO_WEIGHT) return 0;
+        if (type == TIGRIS_OP_GATHER_ND)
+            return metadata[0] > 0 && metadata[0] <= 6 && metadata[metadata[0]] <= row;
+        return metadata[0] != row && metadata[1] <= row;
+    }
+    if (type == TIGRIS_OP_STRIDED_SLICE) {
+        uint32_t shrink = length > (uint32_t)in->ndim * 12u ? (uint32_t)metadata[3u * in->ndim] : 0u;
+        return (shrink & (1u << row)) == 0u && metadata[3u * row] == 0 &&
+               metadata[3u * row + 1u] == shape[row] && metadata[3u * row + 2u] == 1;
+    }
+    if (type == TIGRIS_OP_MIRROR_PAD)
+        return metadata[1u + 2u * row] == 0 && metadata[2u + 2u * row] == 0;
+    if (type == TIGRIS_OP_REVERSE_V2)
+        return ((uint32_t)metadata[0] & (1u << row)) == 0u;
+    return type == TIGRIS_OP_DYNAMIC_UPDATE_SLICE && op->weight_idx == TIGRIS_NO_WEIGHT &&
+           op->num_inputs == 2u && length == (uint32_t)in->ndim * 8u &&
+           metadata[row] == 0 && metadata[in->ndim + row] == shape[row];
 }
 
 static int is_axis1_binary_pointwise_op(uint8_t type)
@@ -2597,7 +2657,8 @@ tigris_error_t tigris_plan_load_ex(
                         int32_t b = 0;
                         int32_t r = 0;
                         if (rop->num_inputs == 0u || rop->num_outputs != 1u ||
-                            !is_row_tiling_op(rop->op_type) ||
+                            (!is_row_tiling_op(rop->op_type) && !tigris_op_independent_band(
+                                &candidate, rop, candidate.index_pool[stage->ops_off + j], 1)) ||
                             !tensor_row_view(
                                 &candidate,
                                 &candidate.tensors[
@@ -2724,6 +2785,11 @@ tigris_error_t tigris_plan_load_ex(
                         stage->outputs_count != 1 ||
                         stage->chain_len != 0)
                         return TIGRIS_ERR_BAD_OPERATOR;
+                } else if (stage->ops_count == 1u && stage->chain_len == 0u &&
+                           tigris_op_independent_band(&candidate,
+                               &candidate.ops[candidate.index_pool[stage->ops_off]],
+                               candidate.index_pool[stage->ops_off], 0)) {
+                    /* The operator preserves serialized height on every operand. */
                 } else if (rank == 3) {
                     uint16_t conv_count = 0;
                     uint16_t binary_count = 0;

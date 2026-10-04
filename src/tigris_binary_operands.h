@@ -52,6 +52,10 @@ int tigris_binary_operands(
 uint32_t tigris_binary_general_index(const tigris_binary_operands_t *operands,
                                      uint8_t k, uint32_t i);
 
+/* Whether a reduction or movement preserves the existing row-band geometry. */
+int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
+                                uint16_t op_index, int row_tiled);
+
 /* Bool operations and byte-preserving selection share both dispatchers. */
 /** All of one axis of a rank-3 bool tensor, kept at one or dropped. */
 int tigris_reduce_all_execute(const tigris_plan_t *plan, const tigris_op_t *op,

@@ -208,7 +208,8 @@ static int kern_conv2d(
                 int kw0, kw1;
                 tap_range(base_w, IW, KW, DW, &kw0, &kw1);
                 for (int oc = 0; oc < OC; oc++) {
-                    float sum = B ? B[oc] : 0.0f;
+                    /* The bias follows the sum, as in TFLite's reference kernels. */
+                    float sum = 0.0f;
                     for (int kh = kh0; kh < kh1; kh++) {
                         int ih = base_h + kh * DH;
                         for (int kw = kw0; kw < kw1; kw++) {
@@ -220,7 +221,7 @@ static int kern_conv2d(
                             }
                         }
                     }
-                    Y[((n * OH + oh_g) * OW + ow) * OC + oc] = apply_fused_act_f32(sum, op->fused_act);
+                    Y[((n * OH + oh_g) * OW + ow) * OC + oc] = apply_fused_act_f32(B ? sum + B[oc] : sum, op->fused_act);
                 }
             }
         }
@@ -389,7 +390,8 @@ static int kern_depthwise_conv2d(
                 tap_range(base_w, IW, KW, DW, &kw0, &kw1);
                 for (int oc = 0; oc < OC; oc++) {
                     int c = oc / M;
-                    float sum = B ? B[oc] : 0.0f;
+                    /* The bias follows the sum, as in TFLite's reference kernels. */
+                    float sum = 0.0f;
                     for (int kh = kh0; kh < kh1; kh++) {
                         int ih = base_h + kh * DH;
                         for (int kw = kw0; kw < kw1; kw++) {
@@ -399,7 +401,7 @@ static int kern_depthwise_conv2d(
                             sum += x_val * w_val;
                         }
                     }
-                    Y[((n * OH + oh_g) * OW + ow) * OC + oc] = apply_fused_act_f32(sum, op->fused_act);
+                    Y[((n * OH + oh_g) * OW + ow) * OC + oc] = apply_fused_act_f32(B ? sum + B[oc] : sum, op->fused_act);
                 }
             }
         }
@@ -779,7 +781,8 @@ static int kern_conv1d(
     for (int n = 0; n < N; n++) {
         for (int ot = 0; ot < OT; ot++) {
             for (int oc = 0; oc < OC; oc++) {
-                float sum = B ? B[oc] : 0.0f;
+                /* The bias follows the sum, as in TFLite's reference kernels. */
+                float sum = 0.0f;
                 for (int k = 0; k < K; k++) {
                     int it = ot * S - PB + k * D;
                     if (it >= 0 && it < IT) {
@@ -789,7 +792,7 @@ static int kern_conv1d(
                         }
                     }
                 }
-                Y[(n * OT + ot) * OC + oc] = apply_fused_act_f32(sum, op->fused_act);
+                Y[(n * OT + ot) * OC + oc] = apply_fused_act_f32(B ? sum + B[oc] : sum, op->fused_act);
             }
         }
     }
@@ -1747,10 +1750,11 @@ static int kern_fully_connected(
 
     for (int n = 0; n < N; n++) {
         for (int oc = 0; oc < OC; oc++) {
-            float sum = B ? B[oc] : 0.0f;
+            /* The bias follows the sum, as in TFLite's reference kernels. */
+            float sum = 0.0f;
             for (int ic = 0; ic < IC; ic++)
                 sum += W[oc * IC + ic] * X[n * IC + ic];
-            Y[n * OC + oc] = apply_fused_act_f32(sum, op->fused_act);
+            Y[n * OC + oc] = apply_fused_act_f32(B ? sum + B[oc] : sum, op->fused_act);
         }
     }
     return 0;

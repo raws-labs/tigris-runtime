@@ -1788,6 +1788,42 @@ tigris_error_t tigris_plan_load_ex(
         candidate.op_attribute_data = buf + off + 4u + entries_size;
     }
 
+    /* Variables kept across invocations (optional, schema v10+): their
+     * entries and initial values, checked against the tensors below. */
+    if (section_offsets[TIGRIS_SEC_STATE]) {
+        if (hdr->version < TIGRIS_SCHEMA_VERSION_STATE)
+            return TIGRIS_ERR_BAD_SECTION;
+        uint32_t off = section_offsets[TIGRIS_SEC_STATE];
+        uint32_t end = section_ends[TIGRIS_SEC_STATE];
+        if (!bounds_ok(off, 8u, end))
+            return TIGRIS_ERR_BAD_SECTION;
+        uint16_t count;
+        uint16_t reserved;
+        memcpy(&count, buf + off, sizeof(count));
+        memcpy(&reserved, buf + off + 2u, sizeof(reserved));
+        memcpy(&candidate.state_bytes, buf + off + 4u, sizeof(candidate.state_bytes));
+        uint32_t entries_size = (uint32_t)count * sizeof(tigris_state_entry_t);
+        if (count == 0u || reserved != 0u || !bounds_ok(off + 8u, entries_size, end))
+            return TIGRIS_ERR_BAD_SECTION;
+        candidate.num_state = count;
+        candidate.state_entries = (const tigris_state_entry_t *)(buf + off + 8u);
+        candidate.state_section = buf + off;
+        for (uint16_t i = 0; i < count; i++) {
+            const tigris_state_entry_t *entry = &candidate.state_entries[i];
+            if (entry->bytes == 0u || (entry->offset % 4u) != 0u ||
+                entry->offset > candidate.state_bytes ||
+                entry->bytes > candidate.state_bytes - entry->offset ||
+                !bounds_ok(off + entry->initial, entry->bytes, end))
+                return TIGRIS_ERR_BAD_SECTION;
+            for (uint16_t j = 0; j < i; j++) {
+                const tigris_state_entry_t *other = &candidate.state_entries[j];
+                if (entry->offset < other->offset + other->bytes &&
+                    other->offset < entry->offset + entry->bytes)
+                    return TIGRIS_ERR_BAD_SECTION;
+            }
+        }
+    }
+
     /* Set weight_blob for XIP only when no compressed blocks */
     if (candidate.weight_entries && !candidate.weight_blocks) {
         uint32_t off = section_offsets[TIGRIS_SEC_WEIGHTS];
@@ -1910,7 +1946,11 @@ tigris_error_t tigris_plan_load_ex(
         if ((tensor->flags & ~(TIGRIS_TENSOR_CONSTANT |
                                TIGRIS_TENSOR_MODEL_INPUT |
                                TIGRIS_TENSOR_MODEL_OUTPUT |
-                               TIGRIS_TENSOR_LINEAR)) != 0 ||
+                               TIGRIS_TENSOR_LINEAR |
+                               TIGRIS_TENSOR_STATE)) != 0 ||
+            ((tensor->flags & TIGRIS_TENSOR_STATE) != 0u &&
+             (tensor->flags & (TIGRIS_TENSOR_CONSTANT | TIGRIS_TENSOR_MODEL_INPUT |
+                               TIGRIS_TENSOR_MODEL_OUTPUT)) != 0u) ||
             ((tensor->dtype == 1 || tensor->dtype == 6 || tensor->dtype == 9) &&
              tensor->quant_param_idx != TIGRIS_NO_QUANT_PARAM))
             return TIGRIS_ERR_BAD_TENSOR;
@@ -1983,6 +2023,41 @@ tigris_error_t tigris_plan_load_ex(
         if (((tensor->flags & TIGRIS_TENSOR_MODEL_INPUT) != 0) != found_input ||
             ((tensor->flags & TIGRIS_TENSOR_MODEL_OUTPUT) != 0) != found_output)
             return TIGRIS_ERR_BAD_TENSOR;
+    }
+
+    /* Every state tensor is one variable's value on entry or on exit, the
+     * two alike, sized as the entry states. */
+    for (uint16_t tensor_idx = 0; tensor_idx < hdr->num_tensors; tensor_idx++) {
+        uint16_t roles = 0u;
+        for (uint16_t i = 0; i < candidate.num_state; i++) {
+            const tigris_state_entry_t *entry = &candidate.state_entries[i];
+            if (entry->input == tensor_idx)
+                roles++;
+            if (entry->output == tensor_idx)
+                roles++;
+        }
+        const uint16_t flagged =
+            ((candidate.tensors[tensor_idx].flags & TIGRIS_TENSOR_STATE) != 0u) ? 1u : 0u;
+        if (roles != flagged)
+            return TIGRIS_ERR_BAD_TENSOR;
+    }
+    for (uint16_t i = 0; i < candidate.num_state; i++) {
+        const tigris_state_entry_t *entry = &candidate.state_entries[i];
+        if (entry->input >= hdr->num_tensors ||
+            (entry->output != 0xFFFFu && entry->output >= hdr->num_tensors))
+            return TIGRIS_ERR_BAD_TENSOR;
+        const tigris_tensor_t *in = &candidate.tensors[entry->input];
+        if (in->size_bytes != entry->bytes || (in->dtype != 1u && in->dtype != 3u))
+            return TIGRIS_ERR_BAD_TENSOR;
+        if (entry->output != 0xFFFFu) {
+            const tigris_tensor_t *out = &candidate.tensors[entry->output];
+            if (out->dtype != in->dtype || out->size_bytes != in->size_bytes ||
+                !tensor_shapes_equal(&candidate, in, out) ||
+                (out->flags & TIGRIS_TENSOR_LINEAR) != (in->flags & TIGRIS_TENSOR_LINEAR) ||
+                (in->dtype == 3u && !same_quantization(tigris_tensor_quant(&candidate, in),
+                                                       tigris_tensor_quant(&candidate, out))))
+                return TIGRIS_ERR_BAD_TENSOR;
+        }
     }
 
     for (uint16_t i = 0; i < hdr->num_ops; i++) {

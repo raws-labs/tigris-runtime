@@ -19,6 +19,8 @@ struct tigris_host {
     void *slow_allocation;
     void *workspace;
     size_t workspace_size;
+    void *state;          /* variables kept across runs, NULL for a stateless plan */
+    size_t state_size;
 };
 
 static void *allocate_aligned(uint32_t size, void **allocation)
@@ -41,6 +43,7 @@ void tigris_host_destroy(tigris_host_t *host)
 {
     if (host) {
         free(host->workspace);
+        free(host->state);
         free(host->mem.tensor_ptrs);
         free(host->slow_allocation);
         free(host->fast_allocation);
@@ -120,6 +123,15 @@ const char *tigris_host_create(
                         fast, fast_capacity, slow, slow_capacity) != TIGRIS_MEM_OK) {
         error = "Host arena initialization failed";
         goto fail;
+    }
+    host->state_size = tigris_state_required(&host->plan);
+    if (host->state_size > 0u) {
+        host->state = malloc(host->state_size);
+        if (!host->state ||
+            tigris_state_init(&host->plan, host->state, host->state_size) != TIGRIS_EXEC_OK) {
+            error = "Host state initialization failed";
+            goto fail;
+        }
     }
     host->dispatch = dtype == 1u ? tigris_dispatch_kernel : tigris_dispatch_kernel_s8;
     *out = host;
@@ -207,8 +219,9 @@ const char *tigris_host_run(
         if (written != TIGRIS_OK)
             return tigris_error_str(written);
     }
-    executed = tigris_run_with_workspace_buffer(&host->plan, &host->mem, host->dispatch,
-                                                NULL, &host->stats, host->workspace, host->workspace_size);
+    executed = tigris_run_with_state(&host->plan, &host->mem, host->dispatch, NULL, &host->stats,
+                                     host->workspace, host->workspace_size,
+                                     host->state, host->state_size);
     if (executed != TIGRIS_EXEC_OK)
         return tigris_exec_error_str(executed);
     for (uint32_t i = 0; i < output_count; ++i) {
@@ -217,6 +230,15 @@ const char *tigris_host_run(
         if (read != TIGRIS_OK)
             return tigris_error_str(read);
     }
+    return NULL;
+}
+
+const char *tigris_host_reset_state(tigris_host_t *host)
+{
+    if (!host)
+        return "Missing session";
+    if (tigris_state_init(&host->plan, host->state, host->state_size) != TIGRIS_EXEC_OK)
+        return "Host state reset failed";
     return NULL;
 }
 

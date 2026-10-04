@@ -3495,6 +3495,42 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
     void                *workspace_storage,
     size_t               workspace_size)
 {
+    return tigris_run_with_state(plan, mem, kernel, user_ctx, stats,
+                                 workspace_storage, workspace_size, NULL, 0u);
+}
+
+size_t tigris_state_required(const tigris_plan_t *plan)
+{
+    return (plan != NULL) ? (size_t)plan->state_bytes : 0u;
+}
+
+tigris_exec_error_t tigris_state_init(const tigris_plan_t *plan, void *state, size_t state_size)
+{
+    if (plan == NULL)
+        return TIGRIS_EXEC_ERR_NULL;
+    if (plan->num_state == 0u)
+        return TIGRIS_EXEC_OK;
+    if (state == NULL || state_size < plan->state_bytes)
+        return TIGRIS_EXEC_ERR_STATE;
+    for (uint16_t i = 0; i < plan->num_state; i++) {
+        const tigris_state_entry_t *entry = &plan->state_entries[i];
+        memcpy((uint8_t *)state + entry->offset, plan->state_section + entry->initial,
+               entry->bytes);
+    }
+    return TIGRIS_EXEC_OK;
+}
+
+tigris_exec_error_t tigris_run_with_state(
+    const tigris_plan_t *plan,
+    tigris_mem_t        *mem,
+    tigris_kernel_fn     kernel,
+    void                *user_ctx,
+    tigris_exec_stats_t *stats,
+    void                *workspace_storage,
+    size_t               workspace_size,
+    void                *state,
+    size_t               state_size)
+{
     if (!plan || !mem || !kernel)
         return TIGRIS_EXEC_ERR_NULL;
     if (!plan->header)
@@ -3546,6 +3582,26 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
     for (uint8_t i = 0; i < plan->header->num_model_outputs; i++) {
         if (plan->model_outputs[i] < num_t)
             last_consumer[plan->model_outputs[i]] = UINT16_MAX;
+    }
+
+    /* Each variable enters as its value from the last run, placed in slow
+     * memory as the caller places model inputs; its value on exit is kept
+     * until it is stored back. */
+    if (plan->num_state > 0u &&
+        (state == NULL || state_size < plan->state_bytes)) {
+        result = TIGRIS_EXEC_ERR_STATE;
+        goto restore_fast_arena;
+    }
+    for (uint16_t i = 0; i < plan->num_state; i++) {
+        const tigris_state_entry_t *entry = &plan->state_entries[i];
+        if (tigris_mem_alloc_slow(mem, entry->input, entry->bytes) != TIGRIS_MEM_OK) {
+            result = TIGRIS_EXEC_ERR_MEM;
+            goto restore_fast_arena;
+        }
+        memcpy(mem->tensor_ptrs[entry->input], (const uint8_t *)state + entry->offset,
+               entry->bytes);
+        if (entry->output != 0xFFFFu)
+            last_consumer[entry->output] = UINT16_MAX;
     }
 
     for (uint16_t s = 0; s < plan->header->num_stages; s++) {
@@ -3815,6 +3871,17 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
         mem->fast_reserved = caller_fast_used;
     }
 
+    for (uint16_t i = 0; i < plan->num_state; i++) {
+        const tigris_state_entry_t *entry = &plan->state_entries[i];
+        if (entry->output == 0xFFFFu)
+            continue;
+        if (mem->tensor_ptrs[entry->output] == NULL) {
+            result = TIGRIS_EXEC_ERR_MEM;
+            goto restore_fast_arena;
+        }
+        memcpy((uint8_t *)state + entry->offset, mem->tensor_ptrs[entry->output], entry->bytes);
+    }
+
 restore_fast_arena:
     mem->fast_used = caller_fast_used;
     mem->fast_reserved = caller_fast_reserved;
@@ -3859,6 +3926,7 @@ const char *tigris_exec_error_str(tigris_exec_error_t err)
         case TIGRIS_EXEC_ERR_NO_STAGES:  return "plan has no stages";
         case TIGRIS_EXEC_ERR_TILE:       return "tiled execution error";
         case TIGRIS_EXEC_ERR_WORKSPACE:  return "executor workspace unavailable";
+        case TIGRIS_EXEC_ERR_STATE:      return "state buffer missing or too small";
         default:                         return "unknown error";
     }
 }

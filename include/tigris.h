@@ -29,12 +29,13 @@ extern "C" {
 
 #define TIGRIS_MAGIC           0x53524754  /* "TGRS" in little-endian */
 #define TIGRIS_MAGIC_BYTES     "TGRS"
+#define TIGRIS_SCHEMA_VERSION_V10 10
 #define TIGRIS_SCHEMA_VERSION_V9 9
 #define TIGRIS_SCHEMA_VERSION_V8 8
 #define TIGRIS_SCHEMA_VERSION_V7 7
 #define TIGRIS_SCHEMA_VERSION_V6 6
 #define TIGRIS_SCHEMA_VERSION_V5 5
-#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V9
+#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V10
 #define TIGRIS_SCHEMA_VERSION_V4 4
 #define TIGRIS_SCHEMA_VERSION_V3 3
 #define TIGRIS_SCHEMA_VERSION_V2 2
@@ -59,6 +60,10 @@ extern "C" {
 /* A conversion's tile plan states which of the two swapped axes its band runs
  * along, instead of both sides deriving it from the extents. */
 #define TIGRIS_SCHEMA_VERSION_BAND_ORIENTATION TIGRIS_SCHEMA_VERSION_V9
+
+/* A plan may keep variables across invocations in a caller-supplied state
+ * buffer. Only a plan that does is written at this version. */
+#define TIGRIS_SCHEMA_VERSION_STATE TIGRIS_SCHEMA_VERSION_V10
 #define TIGRIS_QUANT_PAGE_ELEMS 65536u
 
 /* Section type IDs */
@@ -73,7 +78,8 @@ extern "C" {
 #define TIGRIS_SEC_QUANT_PARAMS   9
 #define TIGRIS_SEC_WEIGHT_BLOCKS  10
 #define TIGRIS_SEC_OP_ATTRIBUTES  11
-#define TIGRIS_SEC_MAX            12  /* one past the last valid section */
+#define TIGRIS_SEC_STATE          12
+#define TIGRIS_SEC_MAX            13  /* one past the last valid section */
 
 /* Auxiliary indices have terminal placement; bool tensors may occur anywhere. */
 static inline int tigris_dtype_terminal_only(uint8_t dtype)
@@ -259,6 +265,9 @@ typedef enum {
  * their boundaries follow the older rule of channels-last unless the graph
  * ends in a Transpose. */
 #define TIGRIS_TENSOR_LINEAR        0x08
+/* A variable's value entering or leaving an invocation through the state
+ * buffer; it is not part of the model's interface. */
+#define TIGRIS_TENSOR_STATE         0x10
 
 /* Error codes */
 
@@ -528,6 +537,21 @@ TIGRIS_LAYOUT_ASSERT(tigris_layout_op_fused_act_offset,
 TIGRIS_LAYOUT_ASSERT(tigris_layout_op_pad_offset,
                      offsetof(tigris_op_t, _pad1) == 37);
 
+/**
+ * State entry - 16 bytes, one per variable in TIGRIS_SEC_STATE. The section
+ * starts with count(u16), a zero u16 and state_bytes(u32); the entries follow,
+ * then the initial values they point at.
+ */
+typedef struct {
+    uint16_t    input;              /*  0: tensor holding the value on entry */
+    uint16_t    output;             /*  2: tensor holding the value on exit, 0xFFFF = unchanged */
+    uint32_t    offset;             /*  4: byte offset in the state buffer */
+    uint32_t    bytes;              /*  8: byte size of the value */
+    uint32_t    initial;            /* 12: offset of the initial value in the section */
+} tigris_state_entry_t;
+
+TIGRIS_LAYOUT_ASSERT(tigris_layout_state_entry_size, sizeof(tigris_state_entry_t) == 16);
+
 #undef TIGRIS_LAYOUT_ASSERT
 
 /* Parsed plan handle */
@@ -563,6 +587,12 @@ typedef struct {
     const tigris_quant_param_t  *quant_params;  /* [num_quant_params] or NULL */
     const int32_t               *quant_data;    /* multiplier/shift arrays or NULL */
     uint16_t                     num_quant_params;
+
+    /* Variables kept across invocations (optional, schema v10+) */
+    const tigris_state_entry_t  *state_entries;  /* [num_state] or NULL */
+    const uint8_t               *state_section;  /* initial values are read from here */
+    uint16_t                     num_state;
+    uint32_t                     state_bytes;    /* size of the caller's state buffer */
 
     /* Convenience: model I/O resolved from header */
     const uint16_t              *model_inputs;  /* [num_model_inputs] */

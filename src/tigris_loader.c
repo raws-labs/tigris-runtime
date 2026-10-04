@@ -384,6 +384,67 @@ int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
            metadata[row] == 0 && metadata[in->ndim + row] == shape[row];
 }
 
+int tigris_reshape_band(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                        tigris_reshape_band_t *view)
+{
+    if (stage->ops_count != 1u || stage->inputs_count != 1u ||
+        stage->outputs_count != 1u || stage->chain_len != 0u) return 0;
+    const tigris_op_t *op = &plan->ops[tigris_stage_ops(plan, stage)[0]];
+    if ((op->op_type != TIGRIS_OP_RESHAPE && op->op_type != TIGRIS_OP_FLATTEN) ||
+        op->num_inputs != 1u || op->num_outputs != 1u) return 0;
+    uint16_t x = tigris_op_inputs(plan, op)[0], y = tigris_op_outputs(plan, op)[0];
+    if (tigris_stage_inputs(plan, stage)[0] != x || tigris_stage_outputs(plan, stage)[0] != y) return 0;
+    const tigris_tensor_t *in = &plan->tensors[x], *out = &plan->tensors[y];
+    if ((in->dtype != 1u && in->dtype != 3u) || in->dtype != out->dtype ||
+        in->size_bytes != out->size_bytes || in->ndim < 2u || in->ndim > 6u ||
+        out->ndim < 2u || out->ndim > 6u) return 0;
+    const tigris_quant_param_t *iq = tigris_tensor_quant(plan, in);
+    const tigris_quant_param_t *oq = tigris_tensor_quant(plan, out);
+    if (iq != oq && (!iq || !oq || iq->scale != oq->scale || iq->zero_point != oq->zero_point)) return 0;
+    const int32_t *a = tigris_tensor_shape(plan, in), *b = tigris_tensor_shape(plan, out);
+    int own_in = in->ndim == 2u || (in->flags & TIGRIS_TENSOR_LINEAR) != 0u;
+    int own_out = out->ndim == 2u || (out->flags & TIGRIS_TENSOR_LINEAR) != 0u;
+    if (own_in != own_out || (!own_in && (a[0] != b[0] || a[in->ndim - 1u] != b[out->ndim - 1u]))) return 0;
+    for (int mode = own_in ? 0 : 1; mode < 2; mode++) {
+        uint8_t ia = mode == 0 ? (uint8_t)(in->ndim - 2u) : 1u;
+        uint8_t ib = mode == 0 ? (uint8_t)(out->ndim - 2u) : 1u;
+        int64_t blocks = 1, other = 1, ci = 1, co = 1;
+        for (uint8_t i = 0u; i < in->ndim; i++) {
+            if (a[i] <= 0) return 0;
+            if (i < ia) blocks *= a[i];
+            if (i > ia) ci *= a[i];
+            if (blocks > INT32_MAX || ci > INT32_MAX) return 0;
+        }
+        for (uint8_t i = 0u; i < out->ndim; i++) {
+            if (b[i] <= 0) return 0;
+            if (i < ib) other *= b[i];
+            if (i > ib) co *= b[i];
+            if (other > INT32_MAX || co > INT32_MAX) return 0;
+        }
+        if (blocks == other && (int64_t)a[ia] * ci == (int64_t)b[ib] * co && a[ia] > 1) {
+            view->blocks = (int32_t)blocks;
+            view->input_rows = a[ia];
+            view->input_width = (int32_t)ci;
+            view->output_rows = b[ib];
+            view->output_width = (int32_t)co;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int tigris_reshape_tile_valid(const tigris_tile_plan_t *tile,
+                              const tigris_reshape_band_t *view)
+{
+    return tile->tileable == 1u && tile->axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH &&
+           tile->tile_height > 0u && tile->tile_height <= view->input_rows &&
+           tile->original_height == view->input_rows && tile->halo == 0u &&
+           tile->receptive_field == 1u && tile->tile_width == 0u && tile->flags == 0u &&
+           tile->num_tiles == ((uint32_t)view->input_rows + tile->tile_height - 1u) / tile->tile_height &&
+           ((int64_t)tile->tile_height * view->input_width) % view->output_width == 0 &&
+           ((int64_t)view->input_rows * view->input_width) % view->output_width == 0;
+}
+
 static int is_axis1_binary_pointwise_op(uint8_t type)
 {
     return type == TIGRIS_OP_ADD || type == TIGRIS_OP_SUB ||
@@ -2763,7 +2824,11 @@ tigris_error_t tigris_plan_load_ex(
                     : (tile->tileable
                            ? TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH
                            : TIGRIS_TILE_AXIS_NONE);
-            if (tile->tileable &&
+            tigris_reshape_band_t reshape_view;
+            int reshape = tigris_reshape_band(&candidate, stage, &reshape_view);
+            if (reshape && tile->tileable && !tigris_reshape_tile_valid(tile, &reshape_view))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            if (!reshape && tile->tileable &&
                 axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) {
                 if (stage->inputs_count == 0 || stage->outputs_count == 0)
                     return TIGRIS_ERR_BAD_SECTION;
@@ -2867,8 +2932,10 @@ tigris_error_t tigris_plan_load_ex(
                 }
 
                 uint8_t rank = candidate.tensors[first_input].ndim;
+                int transpose = rank >= 3u && rank <= 6u && stage->ops_count == 1u && stage->chain_len == 0u &&
+                    candidate.ops[candidate.index_pool[stage->ops_off]].op_type == TIGRIS_OP_TRANSPOSE;
                 if (!row_banded &&
-                    ((rank != 3 && rank != 4) ||
+                    ((!transpose && rank != 3 && rank != 4) ||
                      candidate.tensors[first_output].ndim != rank))
                     return TIGRIS_ERR_BAD_SECTION;
                 /* A row band agrees on rows, not on rank: the Reshape pair

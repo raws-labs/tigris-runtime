@@ -14,6 +14,19 @@
 
 #include <stdint.h>
 
+typedef struct {
+    int32_t blocks;
+    int32_t input_rows;
+    int32_t input_width;
+    int32_t output_rows;
+    int32_t output_width;
+} tigris_reshape_band_t;
+
+int tigris_reshape_band(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                        tigris_reshape_band_t *view);
+int tigris_reshape_tile_valid(const tigris_tile_plan_t *tile,
+                              const tigris_reshape_band_t *view);
+
 /** Operands of up to this rank are read by output coordinate when a
  * broadcast is not a repetition; the others need no coordinates. */
 #define TIGRIS_BROADCAST_MAX_RANK 5u

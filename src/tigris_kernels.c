@@ -2595,6 +2595,63 @@ int tigris_transpose_execute(
     return 0;
 }
 
+/* SVDF: shift the state left by one element, write each filter's feature
+ * projection into its newest slot, then per unit add the bias and the time
+ * projections of its rank filters, in TFLite Micro's order of operations. */
+static int kern_svdf_f32(const tigris_plan_t *plan, const tigris_op_t *op,
+                         uint16_t op_index, tigris_mem_t *mem)
+{
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *x = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    const float *previous = (const float *)tigris_mem_tensor_ptr(mem, ins[1]);
+    float *y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    float *state = (float *)tigris_mem_tensor_ptr(mem, outs[1]);
+    const float *feature = (const float *)tigris_op_constant(plan, op_index, 0u);
+    const float *time = (const float *)tigris_op_constant(plan, op_index, 1u);
+    const float *bias = (const float *)tigris_op_constant(plan, op_index, 2u);
+    const uint8_t *params = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_SVDF, NULL);
+    if (!x || !previous || !y || !state || !feature || !time || !bias || !params)
+        return -1;
+    int32_t rank;
+    memcpy(&rank, params, sizeof(rank));
+    const int32_t *xs = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    const int32_t *ys = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+    const int32_t *ss = tigris_tensor_shape(plan, &plan->tensors[ins[1]]);
+    const size_t batch = (size_t)xs[0], features = (size_t)xs[1], units = (size_t)ys[1];
+    const size_t filters = units * (size_t)rank;
+    const size_t memory = (size_t)ss[1] / filters;
+    const size_t count = batch * filters * memory;
+    memmove(state, previous + 1, (count - 1u) * sizeof(float));
+    state[count - 1u] = previous[count - 1u];
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t f = 0; f < filters; f++) {
+            float dot = 0.0f;
+            for (size_t k = 0; k < features; k++)
+                dot += feature[f * features + k] * x[b * features + k];
+            state[(b * filters + f) * memory + memory - 1u] = dot;
+        }
+    }
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t u = 0; u < units; u++) {
+            float sum = bias[u];
+            for (size_t r = 0; r < (size_t)rank; r++) {
+                const size_t f = u * (size_t)rank + r;
+                float projection = 0.0f;
+                for (size_t j = 0; j < memory; j++)
+                    projection += time[f * memory + j] * state[(b * filters + f) * memory + j];
+                sum += projection;
+            }
+            if (op->fused_act == TIGRIS_ACT_RELU)
+                sum = sum > 0.0f ? sum : 0.0f;
+            else if (op->fused_act == TIGRIS_ACT_RELU6)
+                sum = sum > 0.0f ? (sum < 6.0f ? sum : 6.0f) : 0.0f;
+            y[b * units + u] = sum;
+        }
+    }
+    return 0;
+}
+
 /* Dispatch */
 
 int tigris_dispatch_kernel(
@@ -2691,6 +2748,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_ARG_MAX:
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CUMSUM: return kern_cumsum_f32(plan, op, op_index, mem);
+    case TIGRIS_OP_SVDF: return kern_svdf_f32(plan, op, op_index, mem);
     case TIGRIS_OP_SPLIT:       return kern_split(plan, op, mem);
     case TIGRIS_OP_PAD:         return kern_pad(plan, op, op_index, mem);
     default:

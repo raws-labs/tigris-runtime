@@ -2913,6 +2913,73 @@ static TIGRIS_KERNEL_NOINLINE int kern_cumsum_s8(
     return 0;
 }
 
+/* int8 SVDF with int16 state and time weights, as TFLite Micro's integer
+ * reference: the state shifts left by one element, each filter's projection of
+ * the input is requantized into its newest slot, and each unit's bias plus its
+ * filters' time projections is requantized to the output. TFLite Micro adds the
+ * accumulators in plain int32, which is undefined on overflow; here they wrap,
+ * which is what that code does on every target it runs on. */
+static int kern_svdf_s8(const tigris_plan_t *plan, const tigris_op_t *op,
+                        uint16_t op_index, tigris_mem_t *mem)
+{
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const int8_t *x = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    const int16_t *previous = (const int16_t *)tigris_mem_tensor_ptr(mem, ins[1]);
+    int8_t *y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    int16_t *state = (int16_t *)tigris_mem_tensor_ptr(mem, outs[1]);
+    const int8_t *feature = (const int8_t *)tigris_op_constant(plan, op_index, 0u);
+    const int16_t *time = (const int16_t *)tigris_op_constant(plan, op_index, 1u);
+    const int32_t *bias = (const int32_t *)tigris_op_constant(plan, op_index, 2u);
+    const uint8_t *params = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_SVDF, NULL);
+    const tigris_quant_param_t *xq = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    const tigris_quant_param_t *yq = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    if (!x || !previous || !y || !state || !feature || !time || !bias || !params || !xq || !yq)
+        return -1;
+    int32_t values[6];
+    memcpy(values, params, sizeof(values));
+    const int32_t rank = values[0], state_zero = values[1];
+    const int32_t *xs = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    const int32_t *ys = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+    const int32_t *ss = tigris_tensor_shape(plan, &plan->tensors[ins[1]]);
+    const size_t batch = (size_t)xs[0], features = (size_t)xs[1], units = (size_t)ys[1];
+    const size_t filters = units * (size_t)rank;
+    const size_t memory = (size_t)ss[1] / filters;
+    const size_t count = batch * filters * memory;
+    memmove(state, previous + 1, (count - 1u) * sizeof(int16_t));
+    state[count - 1u] = previous[count - 1u];
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t f = 0; f < filters; f++) {
+            int32_t dot = 0;
+            for (size_t c = 0; c < features; c++)
+                dot += (int32_t)feature[f * features + c] *
+                       ((int32_t)x[b * features + c] - xq->zero_point);
+            dot = multiply_by_quantized_multiplier(dot, values[2], values[3]);
+            dot = dot < INT16_MIN ? INT16_MIN : (dot > INT16_MAX ? INT16_MAX : dot);
+            state[(b * filters + f) * memory + memory - 1u] =
+                (int16_t)(uint16_t)(uint32_t)wrapping_add(state_zero, dot);
+        }
+    }
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t u = 0; u < units; u++) {
+            int32_t sum = bias[u];
+            for (size_t r = 0; r < (size_t)rank; r++) {
+                const size_t f = u * (size_t)rank + r;
+                int32_t projection = 0;
+                for (size_t j = 0; j < memory; j++)
+                    projection = wrapping_add(projection,
+                        (int32_t)time[f * memory + j] *
+                        ((int32_t)state[(b * filters + f) * memory + j] - state_zero));
+                sum = wrapping_add(sum, projection);
+            }
+            int32_t result = multiply_by_quantized_multiplier(sum, values[4], values[5]) +
+                             yq->zero_point;
+            y[b * units + u] = (int8_t)(result < -128 ? -128 : (result > 127 ? 127 : result));
+        }
+    }
+    return 0;
+}
+
 /* Dispatch */
 
 int tigris_dispatch_kernel_s8(
@@ -2993,6 +3060,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_CAST: return tigris_bool_execute(plan, op, op_index, mem);
     case TIGRIS_OP_ADD_N: return kern_add_n_s8(plan, op, mem);
     case TIGRIS_OP_REDUCE_ALL: return tigris_reduce_all_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_SVDF: return kern_svdf_s8(plan, op, op_index, mem);
     case TIGRIS_OP_ARG_MAX:
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CUMSUM: return kern_cumsum_s8(plan, op, op_index, mem);

@@ -242,6 +242,7 @@ int main(int argc, char **argv)
     unsigned long limits[5] = {0, 0, 0, 0, 0};
     int have_limits = 0;
     void *workspace = NULL;
+    void *state = NULL;
     char *pos_argv[5];
     int pos_argc = 1;
     int arg_index;
@@ -353,7 +354,20 @@ int main(int argc, char **argv)
     memset(&stats, 0, sizeof(stats));
     {
         tigris_exec_error_t error;
-        if (have_limits) {
+        if (tigris_state_required(&plan) > 0u) {
+            /* A plan that keeps state runs once from its initial state, as a
+             * fresh session does. */
+            size_t workspace_size = tigris_executor_workspace_required(&plan);
+            workspace = malloc(workspace_size);
+            state = malloc(tigris_state_required(&plan));
+            if (!workspace || !state ||
+                tigris_state_init(&plan, state, tigris_state_required(&plan)) != TIGRIS_EXEC_OK) {
+                fprintf(stderr, "could not prepare the state buffer\n");
+                goto cleanup;
+            }
+            error = tigris_run_with_state(&plan, &mem, dispatch, NULL, &stats, workspace,
+                                          workspace_size, state, tigris_state_required(&plan));
+        } else if (have_limits) {
             /* Exactly what generated code reserves for these limits. */
             size_t workspace_size = TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(
                 limits[0], limits[1], limits[2], limits[3], limits[4]);
@@ -397,6 +411,7 @@ int main(int argc, char **argv)
     result = 0;
 
 cleanup:
+    free(state);
     free(workspace);
     free(slow_buf);
     free(fast_buf);

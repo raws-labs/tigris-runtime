@@ -93,6 +93,7 @@ static inline uint32_t tigris_dtype_size(uint8_t dtype)
     switch (dtype) {
     case 1: case 6: return 4u;
     case 2: case 3: case 9: return 1u;
+    case 5: return 2u;
     case 7: return 8u;
     default: return 0u;
     }
@@ -125,7 +126,13 @@ static inline uint32_t tigris_dtype_size(uint8_t dtype)
  * the second data tensor or the operator weight, in the input's encoding. */
 #define TIGRIS_OP_ATTR_COMPARISON_REQUANT 13 /* int32[5]: left shift, two multiplier/shift pairs */
 #define TIGRIS_OP_ATTR_COMPARISON_REQUANT_LEN 20u
-#define TIGRIS_OP_ATTR_MAX            13
+#define TIGRIS_OP_ATTR_CONSTANTS      14 /* uint16 weight index per constant operand */
+/* In operand order, TIGRIS_NO_WEIGHT for an absent optional operand; an
+ * operator carrying it has neither weight_idx nor bias_idx. */
+#define TIGRIS_OP_ATTR_SVDF           15 /* int32 rank; int8 adds four more, below */
+/* Svdf: rank; an int8 Svdf adds the state zero point, then the input-to-state
+ * and state-to-output (multiplier, shift) pairs. */
+#define TIGRIS_OP_ATTR_MAX            15
 
 /* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
  * first operand's, the second operand's, and the result's. */
@@ -250,6 +257,9 @@ typedef enum {
     TIGRIS_OP_CAST                       = 82,
     TIGRIS_OP_ADD_N                      = 83,
     TIGRIS_OP_REDUCE_ALL                 = 84,
+    /* State in [batch, filters * memory], kept between runs; constants are
+     * feature [filters, features], time [filters, memory] and bias [units]. */
+    TIGRIS_OP_SVDF                       = 85,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 
@@ -805,6 +815,29 @@ static inline const void *tigris_op_bias(
     if (op->bias_idx == TIGRIS_NO_WEIGHT || !plan->weight_entries)
         return NULL;
     return tigris_weight_data(plan, &plan->weight_entries[op->bias_idx]);
+}
+
+/**
+ * Get the data of an operator's constant operand listed by
+ * TIGRIS_OP_ATTR_CONSTANTS.
+ *
+ * @param plan      Loaded plan.
+ * @param op_index  Operator index.
+ * @param k         Position among the operator's constant operands.
+ * @return Pointer to the constant's data, or NULL if it is absent.
+ */
+static inline const void *tigris_op_constant(
+    const tigris_plan_t *plan, uint16_t op_index, uint8_t k)
+{
+    uint8_t len = 0u;
+    const uint8_t *list = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_CONSTANTS, &len);
+    if (!list || (uint32_t)k * 2u + 2u > len || !plan->weight_entries)
+        return NULL;
+    uint16_t index = (uint16_t)((uint16_t)list[(uint32_t)k * 2u] |
+                                (uint16_t)((uint16_t)list[(uint32_t)k * 2u + 1u] << 8));
+    if (index == TIGRIS_NO_WEIGHT || index >= plan->header->num_weights)
+        return NULL;
+    return tigris_weight_data(plan, &plan->weight_entries[index]);
 }
 
 /**

@@ -16,9 +16,11 @@
 #include "tigris.h"
 #include "movement_golden.h"
 #include "bool_golden.h"
+#include "svdf_golden.h"
 #include "tigris_loader.h"
 #include "tigris_executor.h"
 #include "tigris_kernels.h"
+#include "tigris_kernels_s8.h"
 #include "tigris_iface.h"
 
 /* Test infrastructure */
@@ -3923,10 +3925,11 @@ static uint32_t state_section_offset(const uint8_t *buf)
     }
 }
 
-/* One invocation of the v10 fixture on input {1, 0.5}: out receives its
- * four outputs. */
-static tigris_exec_error_t run_state_fixture(const tigris_plan_t *plan, void *state,
-                                             size_t state_size, float *out)
+/* One stateful invocation of a plan with one input and one output, both in
+ * the plan's own encoding. */
+static tigris_exec_error_t run_with_state_once(const tigris_plan_t *plan, void *state,
+                                               size_t state_size, const void *x,
+                                               uint32_t x_bytes, void *out, uint32_t out_bytes)
 {
     const uint32_t fast_size = tigris_fast_arena_required(plan);
     uint32_t slow_size = 0u;
@@ -3942,17 +3945,17 @@ static tigris_exec_error_t run_state_fixture(const tigris_plan_t *plan, void *st
         uint8_t *fast = fast_raw + (TIGRIS_TENSOR_ALIGN - ((uintptr_t)fast_raw % TIGRIS_TENSOR_ALIGN)) % TIGRIS_TENSOR_ALIGN;
         uint8_t *slow = slow_raw + (TIGRIS_TENSOR_ALIGN - ((uintptr_t)slow_raw % TIGRIS_TENSOR_ALIGN)) % TIGRIS_TENSOR_ALIGN;
         tigris_mem_t mem;
-        const float x[2] = {1.0f, 0.5f};
         uint16_t input = plan->model_inputs[0];
+        tigris_kernel_fn dispatch = tigris_plan_data_dtype(plan) == 3u
+            ? tigris_dispatch_kernel_s8 : tigris_dispatch_kernel;
         if (tigris_mem_init(&mem, pointers, plan->header->num_tensors, fast, fast_size,
                             slow, slow_size) == TIGRIS_MEM_OK &&
             tigris_mem_alloc_slow(&mem, input, plan->tensors[input].size_bytes) == TIGRIS_MEM_OK &&
-            tigris_input_write(plan, &mem, input, x, sizeof(x)) == TIGRIS_OK) {
-            result = tigris_run_with_state(plan, &mem, tigris_dispatch_kernel, NULL, NULL,
+            tigris_input_write(plan, &mem, input, x, x_bytes) == TIGRIS_OK) {
+            result = tigris_run_with_state(plan, &mem, dispatch, NULL, NULL,
                                            workspace, workspace_size, state, state_size);
             if (result == TIGRIS_EXEC_OK &&
-                tigris_output_read(plan, &mem, plan->model_outputs[0], out,
-                                   4u * sizeof(float)) != TIGRIS_OK)
+                tigris_output_read(plan, &mem, plan->model_outputs[0], out, out_bytes) != TIGRIS_OK)
                 result = TIGRIS_EXEC_ERR_MEM;
         }
     }
@@ -3961,6 +3964,85 @@ static tigris_exec_error_t run_state_fixture(const tigris_plan_t *plan, void *st
     free(slow_raw);
     free(fast_raw);
     return result;
+}
+
+/* One invocation of the v10 fixture on input {1, 0.5}: out receives its
+ * four outputs. */
+static tigris_exec_error_t run_state_fixture(const tigris_plan_t *plan, void *state,
+                                             size_t state_size, float *out)
+{
+    const float x[2] = {1.0f, 0.5f};
+    return run_with_state_once(plan, state, state_size, x, sizeof(x), out, 4u * sizeof(float));
+}
+
+/* A copy of `golden` with `bytes` written at `offset`, loaded. */
+static tigris_error_t load_altered(const svdf_golden_t *golden, uint8_t *copy, size_t offset,
+                                   const void *bytes, size_t length)
+{
+    tigris_plan_t plan;
+    memcpy(copy, golden->plan, golden->plan_size);
+    memcpy(copy + offset, bytes, length);
+    return tigris_plan_load(copy, golden->plan_size, &plan);
+}
+
+static void test_svdf_goldens(void)
+{
+    printf("  test_svdf_goldens...\n");
+    for (size_t g = 0; g < sizeof(svdf_goldens) / sizeof(svdf_goldens[0]); g++) {
+        const svdf_golden_t *golden = &svdf_goldens[g];
+        uint8_t *buf = aligned_alloc(64u, ((size_t)golden->plan_size + 63u) / 64u * 64u);
+        uint8_t *copy = aligned_alloc(64u, ((size_t)golden->plan_size + 63u) / 64u * 64u);
+        TEST_ASSERT(buf != NULL && copy != NULL, "svdf plan buffers");
+        if (!buf || !copy) {
+            free(buf);
+            free(copy);
+            continue;
+        }
+        memcpy(buf, golden->plan, golden->plan_size);
+        tigris_plan_t plan;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, golden->plan_size, &plan), TIGRIS_OK, "svdf plan loads");
+        size_t state_size = tigris_state_required(&plan);
+        void *state = malloc(state_size);
+        uint8_t out[64];
+        TEST_ASSERT(state != NULL && golden->output_bytes <= sizeof(out), "svdf state buffer");
+        if (state && golden->output_bytes <= sizeof(out)) {
+            /* The state carries from run to run as TFLite Micro keeps it. */
+            TEST_ASSERT_EQ(tigris_state_init(&plan, state, state_size), TIGRIS_EXEC_OK, "svdf state init");
+            for (uint32_t run = 0; run < golden->runs; run++) {
+                const uint8_t *x = (const uint8_t *)golden->input + (size_t)run * golden->input_bytes;
+                const uint8_t *y = (const uint8_t *)golden->output + (size_t)run * golden->output_bytes;
+                TEST_ASSERT_EQ(run_with_state_once(&plan, state, state_size, x, golden->input_bytes,
+                                                   out, golden->output_bytes),
+                               TIGRIS_EXEC_OK, "svdf run");
+                TEST_ASSERT(memcmp(out, y, golden->output_bytes) == 0, "svdf matches TFLite Micro");
+            }
+        }
+        if (tigris_plan_data_dtype(&plan) == 3u) {
+            uint8_t len = 0u;
+            const uint8_t *params = tigris_op_attribute_data(&plan, 0u, TIGRIS_OP_ATTR_SVDF, &len);
+            const uint8_t *list = tigris_op_attribute_data(&plan, 0u, TIGRIS_OP_ATTR_CONSTANTS, &len);
+            size_t at = (size_t)(params - buf), listed = (size_t)(list - buf);
+            const int32_t zero = 0, positive = 1;
+            const uint16_t missing = 0xFFFEu;
+            const uint16_t swapped[3] = {1u, 0u, 2u};
+            TEST_ASSERT_EQ(load_altered(golden, copy, at, &zero, 4u), TIGRIS_ERR_BAD_SECTION,
+                           "svdf rank must be positive");
+            TEST_ASSERT_EQ(load_altered(golden, copy, at + 12u, &positive, 4u), TIGRIS_ERR_BAD_SECTION,
+                           "svdf requantization shifts right only");
+            TEST_ASSERT_EQ(load_altered(golden, copy, listed, &missing, 2u), TIGRIS_ERR_BAD_SECTION,
+                           "svdf constants name weights the plan has");
+            TEST_ASSERT_EQ(load_altered(golden, copy, listed, swapped, sizeof(swapped)),
+                           TIGRIS_ERR_BAD_OPERATOR, "svdf constants match their shapes");
+            const tigris_tensor_t *kept = &plan.tensors[tigris_op_outputs(&plan, &plan.ops[0])[1]];
+            uint8_t flags = (uint8_t)(kept->flags & ~TIGRIS_TENSOR_STATE);
+            TEST_ASSERT(load_altered(golden, copy, (size_t)((const uint8_t *)&kept->flags - buf),
+                                     &flags, 1u) != TIGRIS_OK,
+                        "int16 belongs to state tensors only");
+        }
+        free(state);
+        free(copy);
+        free(buf);
+    }
 }
 
 static void test_state_fixture(void)
@@ -4081,6 +4163,7 @@ int main(int argc, char *argv[])
     printf("\nSchema compatibility fixtures:\n");
     test_schema_compatibility_fixtures();
     test_state_fixture();
+    test_svdf_goldens();
     test_legacy_schema_validates_builtin_operators();
     test_quant_param_counts_are_reconciled();
 

@@ -1323,25 +1323,38 @@ static uint32_t movement_product(const int32_t *shape, uint8_t begin, uint8_t en
 }
 
 static int movement_gather(const tigris_plan_t *plan, const tigris_op_t *op,
-                           const int32_t *metadata, const uint8_t *input, uint8_t *output)
+                           const int32_t *metadata, const uint8_t *input, uint8_t *output,
+                           tigris_mem_t *mem)
 {
     const tigris_tensor_t *source = &plan->tensors[tigris_op_inputs(plan, op)[0]];
     const int32_t *shape = tigris_tensor_shape(plan, source);
-    const uint8_t *indices = (const uint8_t *)tigris_op_weight(plan, op);
+    const uint8_t *indices;
+    uint32_t count;
+    if (op->weight_idx == TIGRIS_NO_WEIGHT) {
+        if (op->num_inputs != 2u) return -1;
+        uint16_t index = tigris_op_inputs(plan, op)[1];
+        if (plan->tensors[index].dtype != 6u) return -1;
+        indices = (const uint8_t *)tigris_mem_tensor_ptr(mem, index);
+        count = plan->tensors[index].size_bytes / 4u;
+    } else {
+        indices = (const uint8_t *)tigris_op_weight(plan, op);
+        count = plan->weight_entries[op->weight_idx].size_bytes / 4u;
+    }
     if (!indices) return -1;
-    uint32_t count = plan->weight_entries[op->weight_idx].size_bytes / 4u;
     uint32_t element = tigris_dtype_size(source->dtype);
     if (op->op_type == TIGRIS_OP_GATHER_ND) {
         uint8_t depth = (uint8_t)metadata[metadata[0]];
+        if (depth == 0u || depth > 5u || depth > source->ndim) return -1;
         uint32_t inner = movement_product(shape, depth, source->ndim);
         for (uint32_t n = 0u; n < count / depth; n++) {
-            uint32_t offset = 0u;
+            int32_t coordinates[5];
             for (uint8_t a = 0u; a < depth; a++) {
-                int32_t coordinate;
-                memcpy(&coordinate, indices + ((size_t)n * depth + a) * 4u, 4u);
-                if (coordinate < 0 || coordinate >= shape[a]) return -1;
-                offset = offset * (uint32_t)shape[a] + (uint32_t)coordinate;
+                memcpy(&coordinates[a], indices + ((size_t)n * depth + a) * 4u, 4u);
+                if (coordinates[a] < 0 || coordinates[a] >= shape[a]) return -1;
             }
+            size_t offset = 0u;
+            for (uint8_t a = 0u; a < depth; a++)
+                offset = offset * (uint32_t)shape[a] + (uint32_t)coordinates[a];
             memcpy(output + (size_t)n * inner * element,
                    input + (size_t)offset * inner * element, (size_t)inner * element);
         }
@@ -1387,13 +1400,26 @@ int tigris_movement_execute(const tigris_plan_t *plan, const tigris_op_t *op,
         (source->dtype != 1u && source->dtype != 3u) || target->dtype != source->dtype) return -1;
     if (op->op_type == TIGRIS_OP_GATHER || op->op_type == TIGRIS_OP_GATHER_ND ||
         op->op_type == TIGRIS_OP_EMBEDDING_LOOKUP)
-        return movement_gather(plan, op, metadata, input, output);
+        return movement_gather(plan, op, metadata, input, output, mem);
     if (op->op_type == TIGRIS_OP_DYNAMIC_UPDATE_SLICE) {
-        if (length != (uint32_t)source->ndim * 8u) return -1;
+        int dynamic = length == (uint32_t)source->ndim * 4u;
+        uint8_t operands = op->weight_idx == TIGRIS_NO_WEIGHT ? 2u : 1u;
+        if ((!dynamic && length != (uint32_t)source->ndim * 8u) ||
+            op->num_inputs != operands + (dynamic ? 1u : 0u)) return -1;
+        if (dynamic) {
+            const uint8_t *starts = (const uint8_t *)tigris_mem_tensor_ptr(mem, tigris_op_inputs(plan, op)[operands]);
+            if (!starts) return -1;
+            memmove(metadata + source->ndim, metadata, (size_t)source->ndim * 4u);
+            for (uint8_t a = 0u; a < source->ndim; a++) {
+                int32_t start;
+                memcpy(&start, starts + (size_t)a * 4u, 4u);
+                int32_t limit = shape[a] - metadata[source->ndim + a];
+                metadata[a] = start < 0 ? 0 : start > limit ? limit : start;
+            }
+        }
         const int32_t *ushape = metadata + source->ndim;
         const uint8_t *values;
         if (op->weight_idx == TIGRIS_NO_WEIGHT) {
-            if (op->num_inputs != 2u) return -1;
             values = (const uint8_t *)tigris_mem_tensor_ptr(mem, tigris_op_inputs(plan, op)[1]);
         } else values = (const uint8_t *)tigris_op_weight(plan, op);
         if (!values) return -1;

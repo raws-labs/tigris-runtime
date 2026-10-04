@@ -3411,20 +3411,20 @@ static void test_movement_goldens(void)
     for (size_t g = 0; g < sizeof(movement_goldens) / sizeof(movement_goldens[0]); g++) {
         const movement_golden_t *gold = &movement_goldens[g];
         tigris_file_header_t header = {0};
-        tigris_tensor_t tensors[3] = {{0}};
+        tigris_tensor_t tensors[4] = {{0}};
         tigris_op_t op = {0};
         tigris_plan_t plan = {0};
         tigris_mem_t mem = {0};
         tigris_quant_param_t quant = {0};
         tigris_op_attribute_t attr = {0};
         tigris_weight_entry_t weight = {0};
-        uint16_t indices[] = {0, 1, 2};
+        uint16_t indices[] = {0, 1, 3, 2};
         uint32_t element = tigris_dtype_size(gold->dtype);
         void *output = calloc(gold->output_count, element);
-        void *pointers[] = {(void *)gold->input, (void *)gold->update, output};
+        void *pointers[] = {(void *)gold->input, (void *)gold->update, output, NULL};
         TEST_ASSERT(output != NULL, "movement output allocated");
         if (!output) return;
-        header.num_tensors = 3;
+        header.num_tensors = 4;
         header.num_ops = 1;
         header.num_weights = gold->index_count != 0u ? 1 : 0;
         header.num_quant_params = gold->dtype == 3 ? 1 : 0;
@@ -3443,7 +3443,7 @@ static void test_movement_goldens(void)
         op.op_type = gold->op;
         op.num_inputs = gold->update_count != 0u ? 2 : 1;
         op.num_outputs = 1;
-        op.outputs_off = 2;
+        op.outputs_off = 3;
         op.weight_idx = gold->index_count != 0u ? 0 : TIGRIS_NO_WEIGHT;
         op.bias_idx = TIGRIS_NO_WEIGHT;
         weight.size_bytes = gold->index_count * 4u;
@@ -3462,13 +3462,57 @@ static void test_movement_goldens(void)
         plan.weight_entries = &weight;
         plan.weight_blob = (const uint8_t *)gold->indices;
         mem.tensor_ptrs = pointers;
-        mem.num_tensors = 3;
+        mem.num_tensors = 4;
         tigris_kernel_fn kernel = gold->dtype == 3 ? tigris_dispatch_kernel_s8 : tigris_dispatch_kernel;
         int result = kernel(&plan, &op, 0, &mem, NULL);
         if (result != 0) fprintf(stderr, "movement golden %zu op %u failed\n", g, gold->op);
         TEST_ASSERT(result == 0, "movement golden executes");
         TEST_ASSERT(memcmp(output, gold->output, (size_t)gold->output_count * element) == 0, "movement bytes match TFLM");
+        if (gold->index_count != 0u) {
+            int32_t runtime_indices[64];
+            TEST_ASSERT(gold->index_count <= 64u, "index fixture fits buffer");
+            memcpy(runtime_indices, gold->indices, gold->index_count * 4u);
+            pointers[1] = runtime_indices;
+            tensors[1].dtype = 6u;
+            tensors[1].size_bytes = gold->index_count * 4u;
+            op.weight_idx = TIGRIS_NO_WEIGHT;
+            op.num_inputs = 2u;
+            memset(output, 0, (size_t)gold->output_count * element);
+            TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) == 0, "runtime indices execute");
+            TEST_ASSERT(memcmp(output, gold->output, (size_t)gold->output_count * element) == 0, "runtime indices match TFLM");
+            for (uint32_t i = 0u; i < gold->index_count; i++) {
+                int32_t saved = runtime_indices[i];
+                runtime_indices[i] = -1;
+                TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) != 0, "negative runtime component refused");
+                runtime_indices[i] = INT32_MAX;
+                TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) != 0, "oversized runtime component refused");
+                if (gold->op == TIGRIS_OP_GATHER_ND) {
+                    uint32_t depth = (uint32_t)gold->metadata[gold->metadata[0]];
+                    runtime_indices[i] = gold->shapes[i % depth];
+                    TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) != 0, "axis extent cannot alias the next row");
+                }
+                runtime_indices[i] = saved;
+            }
+        }
         if (gold->update_count != 0u) {
+            int32_t starts[6];
+            memcpy(starts, gold->metadata, (size_t)gold->rank * 4u);
+            pointers[3] = starts;
+            tensors[3].dtype = 6u;
+            tensors[3].size_bytes = (uint32_t)gold->rank * 4u;
+            op.num_inputs = 3u;
+            attr.data_len = (uint8_t)(gold->rank * 4u);
+            plan.op_attribute_data = (const uint8_t *)(gold->metadata + gold->rank);
+            TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) == 0, "runtime update starts execute");
+            TEST_ASSERT(memcmp(output, gold->output, (size_t)gold->output_count * element) == 0, "runtime starts match TFLM");
+            for (uint8_t a = 0u; a < gold->rank; a++) {
+                if (starts[a] == 0) starts[a] = INT32_MIN;
+                else if (starts[a] == gold->shapes[a] - gold->shapes[6u + a]) starts[a] = INT32_MAX;
+            }
+            TEST_ASSERT(kernel(&plan, &op, 0, &mem, NULL) == 0, "extreme starts clamp");
+            TEST_ASSERT(memcmp(output, gold->output, (size_t)gold->output_count * element) == 0, "clamped starts match TFLM");
+            attr.data_len = (uint8_t)(gold->metadata_count * 4u);
+            plan.op_attribute_data = (const uint8_t *)gold->metadata;
             header.num_weights = 1;
             op.weight_idx = 0;
             op.num_inputs = 1;

@@ -452,7 +452,14 @@ static void test_index_output(void)
     TEST_ASSERT(memcmp(indices, narrow, sizeof(indices)) == 0, "int32 bytes unchanged");
     tensor.iface_dtype = 7;
     tensor.flags |= TIGRIS_TENSOR_MODEL_INPUT;
-    TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, wide, sizeof(wide)), TIGRIS_ERR_BAD_INTERFACE, "index input conversion refused");
+    TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, wide, sizeof(wide)), TIGRIS_OK, "index input narrows exactly");
+    wide[0] = INT32_MIN;
+    TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, wide, sizeof(wide)), TIGRIS_OK, "int32 minimum is representable");
+    TEST_ASSERT_EQ(indices[0], INT32_MIN, "negative starts stay signed");
+    wide[0] = (int64_t)INT32_MAX + 1;
+    TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, wide, sizeof(wide)), TIGRIS_ERR_BAD_INTERFACE, "positive narrowing overflow refused");
+    wide[0] = (int64_t)INT32_MIN - 1;
+    TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, wide, sizeof(wide)), TIGRIS_ERR_BAD_INTERFACE, "negative narrowing overflow refused");
     tensor.size_bytes = UINT32_MAX - 3u;
     TEST_ASSERT_EQ(tigris_iface_bytes(&plan, 0), 0, "widening overflow refused");
     TEST_ASSERT_EQ(tigris_output_read(&plan, &mem, 0, wide, 0), TIGRIS_ERR_BAD_SIZE, "overflow cannot wrap buffer length");

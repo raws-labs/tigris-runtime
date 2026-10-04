@@ -34,6 +34,7 @@ uint32_t tigris_iface_bytes(const tigris_plan_t *plan, uint16_t tensor_idx);
 
 /**
  * Convert the caller's data into a model input tensor.
+ * Int64 index inputs must fit int32; narrowing overflow returns BAD_INTERFACE.
  *
  * @param plan        Loaded plan.
  * @param mem         Memory manager with the input tensor allocated.

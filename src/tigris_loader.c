@@ -773,15 +773,16 @@ static int svdf_valid(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t
 
 /* Lstm: sequence [batch, steps, features] ([steps, batch, features] when time
  * major), hidden and cell state [batch, units] in; the hidden sequence and
- * both states out. Float32 throughout; weights [units, features] then
- * [units, units], four of each, and four biases [units]. */
+ * both states out. Weights [units, features] then [units, units], four of
+ * each, and four biases [units]. Float32 throughout, or int8 sequence and
+ * hidden state with an int16 cell, int8 weights and int32 biases. */
 static int lstm_valid(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index)
 {
     uint8_t len = 0u;
     const uint8_t *params = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_LSTM, &len);
     uint8_t constants_len = 0u;
     if (op->num_inputs != 3u || op->num_outputs != 3u || op->weight_idx != TIGRIS_NO_WEIGHT ||
-        op->bias_idx != TIGRIS_NO_WEIGHT || !params || len != 8u ||
+        op->bias_idx != TIGRIS_NO_WEIGHT || !params ||
         !tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_CONSTANTS, &constants_len) ||
         constants_len != 24u)
         return 0;
@@ -791,8 +792,23 @@ static int lstm_valid(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t
     const tigris_tensor_t *y = &plan->tensors[outs[0]];
     int32_t time_major;
     memcpy(&time_major, params, sizeof(time_major));
-    if (x->ndim != 3u || y->ndim != 3u || x->dtype != 1u || y->dtype != 1u)
+    const int quantized = x->dtype == 3u;
+    if (x->ndim != 3u || y->ndim != 3u || (x->dtype != 1u && !quantized) || y->dtype != x->dtype ||
+        len != (quantized ? 112u : 8u) ||
+        (quantized && (!tigris_tensor_quant(plan, x) || !tigris_tensor_quant(plan, &plan->tensors[ins[1]]))))
         return 0;
+    if (quantized) {
+        int32_t v[28];
+        memcpy(v, params, sizeof(v));
+        /* Zero points in int8, a cell scale between 2^-30 and 2^15, a clip in
+         * cell units, and shifts the requantization can apply. */
+        if (v[2] < -128 || v[2] > 127 || v[3] < -128 || v[3] > 127 || v[4] < -30 || v[4] > 15 ||
+            v[5] < 0 || v[5] > 32767)
+            return 0;
+        for (uint8_t pair = 6u; pair < 28u; pair += 2u)
+            if (v[pair] < 0 || v[pair + 1u] < -31 || v[pair + 1u] > 30)
+                return 0;
+    }
     const int32_t *xs = tigris_tensor_shape(plan, x);
     const int32_t *ys = tigris_tensor_shape(plan, y);
     const int32_t batch = time_major ? xs[1] : xs[0];
@@ -803,15 +819,17 @@ static int lstm_valid(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t
         const tigris_tensor_t *held = &plan->tensors[ins[i]];
         const tigris_tensor_t *kept = &plan->tensors[outs[i]];
         const int32_t *hs = tigris_tensor_shape(plan, held);
-        if (held->ndim != 2u || held->dtype != 1u || hs[0] != batch || hs[1] != units ||
+        const uint8_t dtype = quantized ? (i == 1u ? 3u : 5u) : 1u;
+        if (held->ndim != 2u || held->dtype != dtype || hs[0] != batch || hs[1] != units ||
             (held->flags & TIGRIS_TENSOR_STATE) == 0u || (kept->flags & TIGRIS_TENSOR_STATE) == 0u ||
-            kept->dtype != 1u || !tensor_shapes_equal(plan, held, kept))
+            kept->dtype != dtype || !tensor_shapes_equal(plan, held, kept))
             return 0;
     }
     for (uint8_t k = 0u; k < 12u; k++) {
         const uint64_t columns = k < 4u ? (uint64_t)xs[2] : (k < 8u ? (uint64_t)units : 1u);
+        const uint64_t element = (quantized && k < 8u) ? 1u : 4u;
         if (!weight_size_is(plan, constant_index(plan, op_index, k),
-                            (uint64_t)units * columns * 4u))
+                            (uint64_t)units * columns * element))
             return 0;
     }
     return 1;
@@ -2549,7 +2567,8 @@ tigris_error_t tigris_plan_load_ex(
             case TIGRIS_OP_ATTR_LSTM: {
                 int32_t time_major;
                 float clip;
-                if (attr->data_len != 8u)
+                /* Float32, or int8 with its 26 integer parameters. */
+                if (attr->data_len != 8u && attr->data_len != 112u)
                     return TIGRIS_ERR_BAD_SECTION;
                 memcpy(&time_major, candidate.op_attribute_data + attr->data_offset, sizeof(time_major));
                 memcpy(&clip, candidate.op_attribute_data + attr->data_offset + 4u, sizeof(clip));

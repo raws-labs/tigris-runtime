@@ -2980,6 +2980,183 @@ static int kern_svdf_s8(const tigris_plan_t *plan, const tigris_op_t *op,
     return 0;
 }
 
+/* TFLite's sigmoid table for its int16 logistic and tanh: 256 samples of
+ * sigmoid over [0, 10.7) in Q0.16, interpolated linearly. */
+static const uint16_t lstm_sigmoid_table[256] = {
+    32768, 33451, 34133, 34813, 35493, 36169, 36843, 37513, 38180, 38841, 39498, 40149,
+    40794, 41432, 42064, 42688, 43304, 43912, 44511, 45102, 45683, 46255, 46817, 47369,
+    47911, 48443, 48964, 49475, 49975, 50464, 50942, 51409, 51865, 52311, 52745, 53169,
+    53581, 53983, 54374, 54755, 55125, 55485, 55834, 56174, 56503, 56823, 57133, 57433,
+    57724, 58007, 58280, 58544, 58800, 59048, 59288, 59519, 59743, 59959, 60168, 60370,
+    60565, 60753, 60935, 61110, 61279, 61441, 61599, 61750, 61896, 62036, 62172, 62302,
+    62428, 62549, 62666, 62778, 62886, 62990, 63090, 63186, 63279, 63368, 63454, 63536,
+    63615, 63691, 63765, 63835, 63903, 63968, 64030, 64090, 64148, 64204, 64257, 64308,
+    64357, 64405, 64450, 64494, 64536, 64576, 64614, 64652, 64687, 64721, 64754, 64786,
+    64816, 64845, 64873, 64900, 64926, 64950, 64974, 64997, 65019, 65039, 65060, 65079,
+    65097, 65115, 65132, 65149, 65164, 65179, 65194, 65208, 65221, 65234, 65246, 65258,
+    65269, 65280, 65291, 65301, 65310, 65319, 65328, 65337, 65345, 65352, 65360, 65367,
+    65374, 65381, 65387, 65393, 65399, 65404, 65410, 65415, 65420, 65425, 65429, 65433,
+    65438, 65442, 65445, 65449, 65453, 65456, 65459, 65462, 65465, 65468, 65471, 65474,
+    65476, 65479, 65481, 65483, 65485, 65488, 65489, 65491, 65493, 65495, 65497, 65498,
+    65500, 65501, 65503, 65504, 65505, 65507, 65508, 65509, 65510, 65511, 65512, 65513,
+    65514, 65515, 65516, 65517, 65517, 65518, 65519, 65520, 65520, 65521, 65522, 65522,
+    65523, 65523, 65524, 65524, 65525, 65525, 65526, 65526, 65526, 65527, 65527, 65528,
+    65528, 65528, 65529, 65529, 65529, 65529, 65530, 65530, 65530, 65530, 65531, 65531,
+    65531, 65531, 65531, 65532, 65532, 65532, 65532, 65532, 65532, 65533, 65533, 65533,
+    65533, 65533, 65533, 65533, 65533, 65534, 65534, 65534, 65534, 65534, 65534, 65534,
+    65534, 65534, 65534, 65535,
+};
+
+/* floor(x / 2^n), the arithmetic right shift TFLite relies on. */
+static int32_t floor_shift(int32_t x, int32_t n)
+{
+    return x >= 0 ? x >> n : -((-(x + 1)) >> n) - 1;
+}
+
+static int16_t saturate_s16(int32_t x)
+{
+    return (int16_t)(x < INT16_MIN ? INT16_MIN : (x > INT16_MAX ? INT16_MAX : x));
+}
+
+/* TFLite's int16 logistic on a Q3.12 input, giving Q0.15. */
+static int16_t lstm_sigmoid_s16(int16_t value)
+{
+    const int32_t input = (int32_t)value * 3;
+    const uint32_t magnitude = (uint32_t)(input < 0 ? -input : input);
+    const uint32_t index = magnitude >> 9;
+    uint32_t result;
+    if (index >= 255u) {
+        result = 0x7FFFu << 10;
+    } else {
+        const uint32_t low = lstm_sigmoid_table[index], high = lstm_sigmoid_table[index + 1u];
+        result = (low << 9) + (magnitude & 0x1FFu) * (high - low);
+    }
+    result = input >= 0 ? result + (1u << 9) : (1u << 25) - result + (1u << 9) - 1u;
+    return (int16_t)(result >> 10);
+}
+
+/* TFLite's int16 tanh: the input scaled by multiplier / 2^shift (3 * 2^shift
+ * when the multiplier is 0), giving Q0.15. */
+static int16_t lstm_tanh_s16(int16_t value, int32_t input_multiplier, int32_t input_shift)
+{
+    const int32_t multiplier = input_multiplier == 0 ? 3 << input_shift : input_multiplier;
+    const int32_t shift = input_multiplier == 0 ? 0 : input_shift;
+    const int32_t round = shift > 0 ? 1 << (shift - 1) : 0;
+    const int32_t input = floor_shift((int32_t)value * multiplier + round, shift);
+    const uint32_t magnitude = (uint32_t)(input < 0 ? -input : input);
+    const uint32_t index = magnitude >> 8;
+    int32_t result;
+    if (index >= 255u) {
+        result = 0xFFFF << 8;
+    } else {
+        const uint32_t low = lstm_sigmoid_table[index], high = lstm_sigmoid_table[index + 1u];
+        result = (int32_t)((low << 8) + (magnitude & 0xFFu) * (high - low));
+    }
+    result = input >= 0 ? result - (1 << 23) + (1 << 7) : -result + (1 << 23) + (1 << 7) - 1;
+    return (int16_t)floor_shift(result, 8);
+}
+
+/* One int8 projection into the 2^-12 gate scale, saturated to int16. */
+static int32_t lstm_projection_s8(const int8_t *weights, const int8_t *values, size_t width,
+                                  int32_t zero_point, const int32_t *bias, size_t unit,
+                                  const int32_t *pair)
+{
+    int32_t acc = 0;
+    for (size_t k = 0; k < width; k++)
+        acc += (int32_t)weights[unit * width + k] * ((int32_t)values[k] - zero_point);
+    if (bias) acc += bias[unit];
+    return saturate_s16(multiply_by_quantized_multiplier(acc, pair[0], pair[1]));
+}
+
+/* An int16 product requantized to int16, offset 0. */
+static int16_t lstm_product_s16(int16_t a, int16_t b, const int32_t *pair)
+{
+    return saturate_s16(multiply_by_quantized_multiplier((int32_t)a * (int32_t)b, pair[0], pair[1]));
+}
+
+/* int8 sequence LSTM with an int16 cell, as TFLite Micro's integer reference:
+ * gates in 2^-12 through int16 sigmoid or tanh into 2^-15, the cell f * c +
+ * i * g at its power-of-two scale, clipped when a clip is set, and the hidden
+ * state tanh(c) * o requantized to int8. */
+static int kern_lstm_s8(const tigris_plan_t *plan, const tigris_op_t *op,
+                        uint16_t op_index, tigris_mem_t *mem)
+{
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const int8_t *x = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    const int8_t *h_in = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[1]);
+    const int16_t *c_in = (const int16_t *)tigris_mem_tensor_ptr(mem, ins[2]);
+    int8_t *y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    int8_t *h = (int8_t *)tigris_mem_tensor_ptr(mem, outs[1]);
+    int16_t *c = (int16_t *)tigris_mem_tensor_ptr(mem, outs[2]);
+    uint8_t len = 0u;
+    const uint8_t *params = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_LSTM, &len);
+    const int8_t *w[8];
+    const int32_t *bias[4];
+    for (uint8_t k = 0u; k < 8u; k++) {
+        w[k] = (const int8_t *)tigris_op_constant(plan, op_index, k);
+        if (!w[k]) return -1;
+    }
+    for (uint8_t k = 0u; k < 4u; k++) {
+        bias[k] = (const int32_t *)tigris_op_constant(plan, op_index, (uint8_t)(8u + k));
+        if (!bias[k]) return -1;
+    }
+    if (!x || !h_in || !c_in || !y || !h || !c || !params || len != 112u)
+        return -1;
+    int32_t v[28];
+    memcpy(v, params, sizeof(v));
+    const int32_t time_major = v[0], x_zero = v[2], h_zero = v[3], power = v[4];
+    /* TFLite clips whenever the float clip is set, even at 0 cell units. */
+    float clip_set;
+    memcpy(&clip_set, &v[1], sizeof(clip_set));
+    const int16_t clip = (int16_t)v[5];
+    const int32_t *gate = &v[6];   /* per gate: input pair, recurrent pair */
+    const int32_t *forget_product = &v[22], *input_product = &v[24], *output_product = &v[26];
+    int32_t tanh_shift = 15 + power - 3, tanh_multiplier = 0;
+    if (tanh_shift < 0) {
+        tanh_shift = -tanh_shift;
+        tanh_multiplier = 3;
+    }
+    const int32_t *xs = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    const int32_t *ys = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+    const size_t steps = (size_t)(time_major ? xs[0] : xs[1]);
+    const size_t batch = (size_t)(time_major ? xs[1] : xs[0]);
+    const size_t features = (size_t)xs[2], units = (size_t)ys[2];
+    memmove(h, h_in, batch * units);
+    memmove(c, c_in, batch * units * sizeof(int16_t));
+    for (size_t b = 0; b < batch; b++) {
+        int8_t *hb = h + b * units;
+        int16_t *cb = c + b * units;
+        for (size_t t = 0; t < steps; t++) {
+            const size_t row = time_major ? t * batch + b : b * steps + t;
+            const int8_t *xt = x + row * features;
+            int8_t *yt = y + row * units;
+            for (size_t u = 0; u < units; u++) {
+                int16_t g[4];
+                for (uint8_t k = 0u; k < 4u; k++) {
+                    const int32_t *pair = &gate[4u * k];
+                    int32_t sum = lstm_projection_s8(w[k], xt, features, x_zero, bias[k], u, pair) +
+                                  lstm_projection_s8(w[4u + k], hb, units, h_zero, NULL, u, pair + 2);
+                    g[k] = saturate_s16(sum);
+                    g[k] = k == 2u ? lstm_tanh_s16(g[k], 0, 0) : lstm_sigmoid_s16(g[k]);
+                }
+                int16_t carried = lstm_product_s16(g[1], cb[u], forget_product);
+                const int16_t update = lstm_product_s16(g[0], g[2], input_product);
+                carried = saturate_s16((int32_t)carried + (int32_t)update);
+                if (clip_set > 0.0f)
+                    carried = carried > clip ? clip : (carried < (int16_t)-clip ? (int16_t)-clip : carried);
+                cb[u] = carried;
+                const int16_t squashed = lstm_tanh_s16(carried, tanh_multiplier, tanh_shift);
+                int32_t out = multiply_by_quantized_multiplier(
+                    (int32_t)squashed * (int32_t)g[3], output_product[0], output_product[1]) + h_zero;
+                yt[u] = (int8_t)(out < -128 ? -128 : (out > 127 ? 127 : out));
+            }
+            memcpy(hb, yt, units);
+        }
+    }
+    return 0;
+}
+
 /* Dispatch */
 
 int tigris_dispatch_kernel_s8(
@@ -3061,6 +3238,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_ADD_N: return kern_add_n_s8(plan, op, mem);
     case TIGRIS_OP_REDUCE_ALL: return tigris_reduce_all_execute(plan, op, op_index, mem);
     case TIGRIS_OP_SVDF: return kern_svdf_s8(plan, op, op_index, mem);
+    case TIGRIS_OP_LSTM: return kern_lstm_s8(plan, op, op_index, mem);
     case TIGRIS_OP_ARG_MAX:
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CUMSUM: return kern_cumsum_s8(plan, op, op_index, mem);

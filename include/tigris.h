@@ -132,7 +132,8 @@ static inline uint32_t tigris_dtype_size(uint8_t dtype)
 #define TIGRIS_OP_ATTR_SVDF           15 /* int32 rank; int8 adds four more, below */
 /* Svdf: rank; an int8 Svdf adds the state zero point, then the input-to-state
  * and state-to-output (multiplier, shift) pairs. */
-#define TIGRIS_OP_ATTR_MAX            15
+#define TIGRIS_OP_ATTR_LSTM           16 /* int32 time_major (0/1), float32 cell clip */
+#define TIGRIS_OP_ATTR_MAX            16
 
 /* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
  * first operand's, the second operand's, and the result's. */
@@ -260,6 +261,10 @@ typedef enum {
     /* State in [batch, filters * memory], kept between runs; constants are
      * feature [filters, features], time [filters, memory] and bias [units]. */
     TIGRIS_OP_SVDF                       = 85,
+    /* Sequence, hidden state and cell state in; hidden sequence and both
+     * states out. Constants: input weights, recurrent weights and biases of
+     * gates i, f, c, o, twelve in all. */
+    TIGRIS_OP_LSTM                       = 86,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

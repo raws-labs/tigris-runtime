@@ -432,8 +432,9 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     case TIGRIS_OP_ATTR_BINARY_REQUANT: return op_type == TIGRIS_OP_ADD ||
                                                op_type == TIGRIS_OP_SUB;
     case TIGRIS_OP_ATTR_CONSTANT_OPERAND: return is_binary_op(op_type);
-    case TIGRIS_OP_ATTR_CONSTANTS:
+    case TIGRIS_OP_ATTR_CONSTANTS:      return op_type == TIGRIS_OP_SVDF || op_type == TIGRIS_OP_LSTM;
     case TIGRIS_OP_ATTR_SVDF:           return op_type == TIGRIS_OP_SVDF;
+    case TIGRIS_OP_ATTR_LSTM:           return op_type == TIGRIS_OP_LSTM;
     default:                            return 0;
     }
 }
@@ -709,6 +710,52 @@ static int svdf_valid(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t
            weight_size_is(plan, bias, (uint64_t)ys[1] * 4u);
 }
 
+/* Lstm: sequence [batch, steps, features] ([steps, batch, features] when time
+ * major), hidden and cell state [batch, units] in; the hidden sequence and
+ * both states out. Float32 throughout; weights [units, features] then
+ * [units, units], four of each, and four biases [units]. */
+static int lstm_valid(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index)
+{
+    uint8_t len = 0u;
+    const uint8_t *params = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_LSTM, &len);
+    uint8_t constants_len = 0u;
+    if (op->num_inputs != 3u || op->num_outputs != 3u || op->weight_idx != TIGRIS_NO_WEIGHT ||
+        op->bias_idx != TIGRIS_NO_WEIGHT || !params || len != 8u ||
+        !tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_CONSTANTS, &constants_len) ||
+        constants_len != 24u)
+        return 0;
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const tigris_tensor_t *x = &plan->tensors[ins[0]];
+    const tigris_tensor_t *y = &plan->tensors[outs[0]];
+    int32_t time_major;
+    memcpy(&time_major, params, sizeof(time_major));
+    if (x->ndim != 3u || y->ndim != 3u || x->dtype != 1u || y->dtype != 1u)
+        return 0;
+    const int32_t *xs = tigris_tensor_shape(plan, x);
+    const int32_t *ys = tigris_tensor_shape(plan, y);
+    const int32_t batch = time_major ? xs[1] : xs[0];
+    const int32_t units = ys[2];
+    if (xs[0] != ys[0] || xs[1] != ys[1])
+        return 0;
+    for (uint8_t i = 1u; i < 3u; i++) {
+        const tigris_tensor_t *held = &plan->tensors[ins[i]];
+        const tigris_tensor_t *kept = &plan->tensors[outs[i]];
+        const int32_t *hs = tigris_tensor_shape(plan, held);
+        if (held->ndim != 2u || held->dtype != 1u || hs[0] != batch || hs[1] != units ||
+            (held->flags & TIGRIS_TENSOR_STATE) == 0u || (kept->flags & TIGRIS_TENSOR_STATE) == 0u ||
+            kept->dtype != 1u || !tensor_shapes_equal(plan, held, kept))
+            return 0;
+    }
+    for (uint8_t k = 0u; k < 12u; k++) {
+        const uint64_t columns = k < 4u ? (uint64_t)xs[2] : (k < 8u ? (uint64_t)units : 1u);
+        if (!weight_size_is(plan, constant_index(plan, op_index, k),
+                            (uint64_t)units * columns * 4u))
+            return 0;
+    }
+    return 1;
+}
+
 static int dtype_matches_slot(uint8_t dtype, uint8_t role, uint8_t data_dtype)
 {
     if (role == 254u) return dtype == data_dtype || dtype == 5u;
@@ -804,7 +851,7 @@ static int bool_and_sum_valid(const tigris_plan_t *plan, const tigris_op_t *op, 
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     /* Zero is the data dtype, 255 also permits bool; the final input slot repeats. */
-    static const dtype_signature_t dtype_signatures[TIGRIS_OP_SVDF + 1] = {
+    static const dtype_signature_t dtype_signatures[TIGRIS_OP_LSTM + 1] = {
         [TIGRIS_OP_CONV] = {{0, 0, 0}, 0},
         [TIGRIS_OP_DEPTHWISE] = {{0, 0, 0}, 0},
         [TIGRIS_OP_RELU] = {{0, 0, 0}, 0},
@@ -890,6 +937,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         [TIGRIS_OP_ADD_N] = {{0, 0, 0}, 0},
         [TIGRIS_OP_REDUCE_ALL] = {{9, 9, 9}, 9},
         [TIGRIS_OP_SVDF] = {{0, 254, 254}, 254},
+        [TIGRIS_OP_LSTM] = {{0, 254, 254}, 254},
     };
     const tigris_file_header_t *hdr = plan->header;
     const int legacy = hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES;
@@ -986,6 +1034,9 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             break;
         case TIGRIS_OP_SVDF:
             if (!svdf_valid(plan, op, op_index)) return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        case TIGRIS_OP_LSTM:
+            if (!lstm_valid(plan, op, op_index)) return TIGRIS_ERR_BAD_OPERATOR;
             break;
         case TIGRIS_OP_CONV:
         case TIGRIS_OP_DEPTHWISE: {
@@ -2264,9 +2315,10 @@ tigris_error_t tigris_plan_load_ex(
             if (attr->type > TIGRIS_OP_ATTR_TRANSPOSE_PERM &&
                 hdr->version < TIGRIS_SCHEMA_VERSION_V8)
                 return TIGRIS_ERR_BAD_SECTION;
-            /* Svdf alone writes a second output, its next state. */
+            /* Svdf and Lstm also write their next states. */
             if (op->num_inputs < 1u ||
-                (op->num_outputs != 1u && !(op->op_type == TIGRIS_OP_SVDF && op->num_outputs == 2u)))
+                (op->num_outputs != 1u && !(op->op_type == TIGRIS_OP_SVDF && op->num_outputs == 2u) &&
+                 !(op->op_type == TIGRIS_OP_LSTM && op->num_outputs == 3u)))
                 return TIGRIS_ERR_BAD_SECTION;
             /* A kind belongs to the operator that reads it, whether or not a
              * kernel for that operator exists yet, so a stray payload cannot
@@ -2431,6 +2483,17 @@ tigris_error_t tigris_plan_load_ex(
                     if (index != TIGRIS_NO_WEIGHT && index >= hdr->num_weights)
                         return TIGRIS_ERR_BAD_SECTION;
                 }
+                break;
+            }
+            case TIGRIS_OP_ATTR_LSTM: {
+                int32_t time_major;
+                float clip;
+                if (attr->data_len != 8u)
+                    return TIGRIS_ERR_BAD_SECTION;
+                memcpy(&time_major, candidate.op_attribute_data + attr->data_offset, sizeof(time_major));
+                memcpy(&clip, candidate.op_attribute_data + attr->data_offset + 4u, sizeof(clip));
+                if ((time_major != 0 && time_major != 1) || !isfinite(clip) || clip < 0.0f)
+                    return TIGRIS_ERR_BAD_SECTION;
                 break;
             }
             case TIGRIS_OP_ATTR_SVDF: {

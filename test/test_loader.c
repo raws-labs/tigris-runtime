@@ -16,7 +16,7 @@
 #include "tigris.h"
 #include "movement_golden.h"
 #include "bool_golden.h"
-#include "svdf_golden.h"
+#include "state_golden.h"
 #include "tigris_loader.h"
 #include "tigris_executor.h"
 #include "tigris_kernels.h"
@@ -3976,7 +3976,7 @@ static tigris_exec_error_t run_state_fixture(const tigris_plan_t *plan, void *st
 }
 
 /* A copy of `golden` with `bytes` written at `offset`, loaded. */
-static tigris_error_t load_altered(const svdf_golden_t *golden, uint8_t *copy, size_t offset,
+static tigris_error_t load_altered(const state_golden_t *golden, uint8_t *copy, size_t offset,
                                    const void *bytes, size_t length)
 {
     tigris_plan_t plan;
@@ -3985,14 +3985,14 @@ static tigris_error_t load_altered(const svdf_golden_t *golden, uint8_t *copy, s
     return tigris_plan_load(copy, golden->plan_size, &plan);
 }
 
-static void test_svdf_goldens(void)
+static void test_state_goldens(void)
 {
-    printf("  test_svdf_goldens...\n");
-    for (size_t g = 0; g < sizeof(svdf_goldens) / sizeof(svdf_goldens[0]); g++) {
-        const svdf_golden_t *golden = &svdf_goldens[g];
+    printf("  test_state_goldens...\n");
+    for (size_t g = 0; g < sizeof(state_goldens) / sizeof(state_goldens[0]); g++) {
+        const state_golden_t *golden = &state_goldens[g];
         uint8_t *buf = aligned_alloc(64u, ((size_t)golden->plan_size + 63u) / 64u * 64u);
         uint8_t *copy = aligned_alloc(64u, ((size_t)golden->plan_size + 63u) / 64u * 64u);
-        TEST_ASSERT(buf != NULL && copy != NULL, "svdf plan buffers");
+        TEST_ASSERT(buf != NULL && copy != NULL, "plan buffers");
         if (!buf || !copy) {
             free(buf);
             free(copy);
@@ -4000,22 +4000,42 @@ static void test_svdf_goldens(void)
         }
         memcpy(buf, golden->plan, golden->plan_size);
         tigris_plan_t plan;
-        TEST_ASSERT_EQ(tigris_plan_load(buf, golden->plan_size, &plan), TIGRIS_OK, "svdf plan loads");
+        TEST_ASSERT_EQ(tigris_plan_load(buf, golden->plan_size, &plan), TIGRIS_OK, "stateful plan loads");
         size_t state_size = tigris_state_required(&plan);
         void *state = malloc(state_size);
-        uint8_t out[64];
-        TEST_ASSERT(state != NULL && golden->output_bytes <= sizeof(out), "svdf state buffer");
+        uint8_t out[256];
+        TEST_ASSERT(state != NULL && golden->output_bytes <= sizeof(out), "state and output buffers");
         if (state && golden->output_bytes <= sizeof(out)) {
             /* The state carries from run to run as TFLite Micro keeps it. */
-            TEST_ASSERT_EQ(tigris_state_init(&plan, state, state_size), TIGRIS_EXEC_OK, "svdf state init");
+            TEST_ASSERT_EQ(tigris_state_init(&plan, state, state_size), TIGRIS_EXEC_OK, "state init");
             for (uint32_t run = 0; run < golden->runs; run++) {
                 const uint8_t *x = (const uint8_t *)golden->input + (size_t)run * golden->input_bytes;
                 const uint8_t *y = (const uint8_t *)golden->output + (size_t)run * golden->output_bytes;
                 TEST_ASSERT_EQ(run_with_state_once(&plan, state, state_size, x, golden->input_bytes,
                                                    out, golden->output_bytes),
-                               TIGRIS_EXEC_OK, "svdf run");
-                TEST_ASSERT(memcmp(out, y, golden->output_bytes) == 0, "svdf matches TFLite Micro");
+                               TIGRIS_EXEC_OK, "stateful run");
+                TEST_ASSERT(memcmp(out, y, golden->output_bytes) == 0, "stateful run matches TFLite Micro");
             }
+        }
+        uint16_t lstm = plan.header->num_ops;
+        for (uint16_t n = 0; n < plan.header->num_ops; n++)
+            if (plan.ops[n].op_type == TIGRIS_OP_LSTM) lstm = n;
+        if (lstm < plan.header->num_ops) {
+            uint8_t len = 0u;
+            const uint8_t *params = tigris_op_attribute_data(&plan, lstm, TIGRIS_OP_ATTR_LSTM, &len);
+            const uint8_t *list = tigris_op_attribute_data(&plan, lstm, TIGRIS_OP_ATTR_CONSTANTS, &len);
+            size_t at = (size_t)(params - buf), listed = (size_t)(list - buf);
+            const int32_t two = 2;
+            const float negative = -1.0f;
+            uint16_t swapped[5];
+            memcpy(swapped, list, sizeof(swapped));
+            swapped[0] = swapped[4];
+            TEST_ASSERT_EQ(load_altered(golden, copy, at, &two, 4u), TIGRIS_ERR_BAD_SECTION,
+                           "lstm time_major is 0 or 1");
+            TEST_ASSERT_EQ(load_altered(golden, copy, at + 4u, &negative, 4u), TIGRIS_ERR_BAD_SECTION,
+                           "lstm cell clip is not negative");
+            TEST_ASSERT_EQ(load_altered(golden, copy, listed, swapped, sizeof(swapped)),
+                           TIGRIS_ERR_BAD_OPERATOR, "lstm constants match their shapes");
         }
         if (tigris_plan_data_dtype(&plan) == 3u) {
             uint8_t len = 0u;
@@ -4163,7 +4183,7 @@ int main(int argc, char *argv[])
     printf("\nSchema compatibility fixtures:\n");
     test_schema_compatibility_fixtures();
     test_state_fixture();
-    test_svdf_goldens();
+    test_state_goldens();
     test_legacy_schema_validates_builtin_operators();
     test_quant_param_counts_are_reconciled();
 

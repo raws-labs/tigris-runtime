@@ -1,9 +1,9 @@
-"""Embed compiled SVDF plans with TFLite Micro's outputs over consecutive runs.
+"""Embed compiled stateful plans with TFLite Micro's outputs over consecutive runs.
 
 Each argument is NAME=PLAN.tgrs:GOLDEN.npz, a plan compiled from one of the
 compiler's TFLite corpus cases and that case's recorded inputs and outputs:
 
-    python test/generate_svdf_goldens.py float_svdf=float_svdf.tgrs:float_svdf.npz ...
+    python test/generate_state_goldens.py float_svdf=float_svdf.tgrs:float_svdf.npz ...
 """
 
 import sys
@@ -34,13 +34,13 @@ def main(arguments):
         body.append(array(f"{name}_output", y))
         entries.append(f"    {{{name}_plan, sizeof({name}_plan), {name}_input, {name}_output, "
                        f"{x[0].nbytes}u, {y[0].nbytes}u, {len(x)}u}},\n")
-    print("/* test/generate_svdf_goldens.py; outputs recorded from TFLite Micro. */")
-    print("#ifndef TIGRIS_SVDF_GOLDEN_H\n#define TIGRIS_SVDF_GOLDEN_H\n")
+    print("/* test/generate_state_goldens.py; outputs recorded from TFLite Micro. */")
+    print("#ifndef TIGRIS_STATE_GOLDEN_H\n#define TIGRIS_STATE_GOLDEN_H\n")
     print("typedef struct {\n    const uint8_t *plan;\n    uint32_t plan_size;\n"
           "    const void *input, *output;\n    uint32_t input_bytes, output_bytes, runs;\n"
-          "} svdf_golden_t;\n")
+          "} state_golden_t;\n")
     print("".join(body))
-    print("static const svdf_golden_t svdf_goldens[] = {\n" + "".join(entries) + "};\n")
+    print("static const state_golden_t state_goldens[] = {\n" + "".join(entries) + "};\n")
     print("#endif")
 
 

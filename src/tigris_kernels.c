@@ -439,6 +439,15 @@ static int kern_relu6(
     return 0;
 }
 
+/* TFLite's reference logistic: exp(x) below -9 and 1 above the cutoff where
+ * the float result rounds to 1. */
+static float logistic_f32(float x)
+{
+    if (x > 16.619047164916992188f) return 1.0f;
+    if (x < -9.0f) return expf(x);
+    return 1.0f / (1.0f + expf(-x));
+}
+
 static int kern_sigmoid(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -449,7 +458,7 @@ static int kern_sigmoid(
     uint32_t n = tile_aware_numel(plan, ins[0], mem);
     apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++)
-        Y[i] = 1.0f / (1.0f + expf(-X[i]));
+        Y[i] = logistic_f32(X[i]);
     return 0;
 }
 
@@ -2595,6 +2604,80 @@ int tigris_transpose_execute(
     return 0;
 }
 
+/* One LSTM gate for unit u: the input projection plus its bias, then the
+ * recurrent projection, added as TFLite Micro adds them. */
+static float lstm_gate_f32(const float *w_in, const float *w_rec, const float *bias,
+                           const float *x, const float *h, size_t features, size_t units,
+                           size_t u)
+{
+    float in = 0.0f, rec = 0.0f;
+    for (size_t k = 0; k < features; k++)
+        in += x[k] * w_in[u * features + k];
+    for (size_t k = 0; k < units; k++)
+        rec += h[k] * w_rec[u * units + k];
+    return (in + bias[u]) + (rec + 0.0f);
+}
+
+/* Unidirectional sequence LSTM in TFLite Micro's order of operations: per
+ * step, gates i, f, c, o from the input and the previous hidden state, the
+ * cell f * c + i * g, clipped when a clip is set, and the hidden state
+ * tanh(c) * o. Each step's hidden state is written to its output row first and
+ * becomes the state once every unit has read the previous one. */
+static int kern_lstm_f32(const tigris_plan_t *plan, const tigris_op_t *op,
+                         uint16_t op_index, tigris_mem_t *mem)
+{
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *x = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    const float *h_in = (const float *)tigris_mem_tensor_ptr(mem, ins[1]);
+    const float *c_in = (const float *)tigris_mem_tensor_ptr(mem, ins[2]);
+    float *y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    float *h = (float *)tigris_mem_tensor_ptr(mem, outs[1]);
+    float *c = (float *)tigris_mem_tensor_ptr(mem, outs[2]);
+    const uint8_t *params = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_LSTM, NULL);
+    const float *w[12];
+    for (uint8_t k = 0u; k < 12u; k++) {
+        w[k] = (const float *)tigris_op_constant(plan, op_index, k);
+        if (!w[k]) return -1;
+    }
+    if (!x || !h_in || !c_in || !y || !h || !c || !params)
+        return -1;
+    int32_t time_major;
+    float clip;
+    memcpy(&time_major, params, sizeof(time_major));
+    memcpy(&clip, params + 4, sizeof(clip));
+    const int32_t *xs = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
+    const int32_t *ys = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
+    const size_t steps = (size_t)(time_major ? xs[0] : xs[1]);
+    const size_t batch = (size_t)(time_major ? xs[1] : xs[0]);
+    const size_t features = (size_t)xs[2], units = (size_t)ys[2];
+    memmove(h, h_in, batch * units * sizeof(float));
+    memmove(c, c_in, batch * units * sizeof(float));
+    for (size_t b = 0; b < batch; b++) {
+        float *hb = h + b * units, *cb = c + b * units;
+        for (size_t t = 0; t < steps; t++) {
+            const size_t row = time_major ? t * batch + b : b * steps + t;
+            const float *xt = x + row * features;
+            float *yt = y + row * units;
+            for (size_t u = 0; u < units; u++) {
+                const float i = logistic_f32(lstm_gate_f32(w[0], w[4], w[8], xt, hb, features, units, u));
+                const float f = logistic_f32(lstm_gate_f32(w[1], w[5], w[9], xt, hb, features, units, u));
+                const float g = tanhf(lstm_gate_f32(w[2], w[6], w[10], xt, hb, features, units, u));
+                const float o = logistic_f32(lstm_gate_f32(w[3], w[7], w[11], xt, hb, features, units, u));
+                float carried = f * cb[u];
+                const float update = i * g;
+                carried = carried + update;
+                if (clip > 0.0f)
+                    carried = fmaxf(fminf(clip, carried), -clip);
+                cb[u] = carried;
+                yt[u] = tanhf(carried) * o;
+            }
+            memcpy(hb, yt, units * sizeof(float));
+        }
+    }
+    return 0;
+}
+
 /* SVDF: shift the state left by one element, write each filter's feature
  * projection into its newest slot, then per unit add the bias and the time
  * projections of its rank filters, in TFLite Micro's order of operations. */
@@ -2749,6 +2832,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CUMSUM: return kern_cumsum_f32(plan, op, op_index, mem);
     case TIGRIS_OP_SVDF: return kern_svdf_f32(plan, op, op_index, mem);
+    case TIGRIS_OP_LSTM: return kern_lstm_f32(plan, op, op_index, mem);
     case TIGRIS_OP_SPLIT:       return kern_split(plan, op, mem);
     case TIGRIS_OP_PAD:         return kern_pad(plan, op, op_index, mem);
     default:

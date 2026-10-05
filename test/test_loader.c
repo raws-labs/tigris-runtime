@@ -4101,6 +4101,7 @@ static void test_state_goldens(void)
         if (lstm < plan.header->num_ops) {
             uint8_t len = 0u;
             const uint8_t *params = tigris_op_attribute_data(&plan, lstm, TIGRIS_OP_ATTR_LSTM, &len);
+            const uint8_t params_len = len;
             const uint8_t *list = tigris_op_attribute_data(&plan, lstm, TIGRIS_OP_ATTR_CONSTANTS, &len);
             size_t at = (size_t)(params - buf), listed = (size_t)(list - buf);
             const int32_t two = 2;
@@ -4114,8 +4115,15 @@ static void test_state_goldens(void)
                            "lstm cell clip is not negative");
             TEST_ASSERT_EQ(load_altered(golden, copy, listed, swapped, sizeof(swapped)),
                            TIGRIS_ERR_BAD_OPERATOR, "lstm constants match their shapes");
+            if (params_len == 112u) {
+                const int32_t wide = 200, left = 31;
+                TEST_ASSERT_EQ(load_altered(golden, copy, at + 12u, &wide, 4u), TIGRIS_ERR_BAD_OPERATOR,
+                               "lstm hidden zero point is int8");
+                TEST_ASSERT_EQ(load_altered(golden, copy, at + 28u, &left, 4u), TIGRIS_ERR_BAD_OPERATOR,
+                               "lstm gate shifts stay applicable");
+            }
         }
-        if (tigris_plan_data_dtype(&plan) == 3u) {
+        if (tigris_plan_data_dtype(&plan) == 3u && plan.ops[0].op_type == TIGRIS_OP_SVDF) {
             uint8_t len = 0u;
             const uint8_t *params = tigris_op_attribute_data(&plan, 0u, TIGRIS_OP_ATTR_SVDF, &len);
             const uint8_t *list = tigris_op_attribute_data(&plan, 0u, TIGRIS_OP_ATTR_CONSTANTS, &len);

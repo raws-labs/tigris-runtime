@@ -1773,7 +1773,44 @@ static void test_reshape_band_contract(void)
     tile->num_tiles = 4;
     shapes[4] = 2; shapes[5] = 2;
     TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK,
-                "batch redistribution refused");
+                "non-integral contiguous endpoint refused");
+
+    shapes[0] = 1; shapes[1] = 4; shapes[2] = 8;
+    shapes[4] = 8; shapes[5] = 1; shapes[6] = 4;
+    tile->original_height = 4;
+    tile->tile_height = 3;
+    tile->num_tiles = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "height interval maps onto output axis zero");
+    check_reshape_band_execution(&plan, 96u);
+    tile->original_height = 8;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "output extent cannot replace input extent");
+
+    shapes[0] = 8; shapes[1] = 1; shapes[2] = 4;
+    shapes[4] = 1; shapes[5] = 4; shapes[6] = 8;
+    tile->tile_height = 2;
+    tile->num_tiles = 4;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "axis-zero interval maps onto output height");
+    check_reshape_band_execution(&plan, 32u);
+    tile->tile_height = 3;
+    tile->num_tiles = 3;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "axis-zero endpoint must map to a whole output row");
+
+    shapes[0] = 2; shapes[1] = 4; shapes[2] = 4;
+    tile->original_height = 4;
+    tile->tile_height = 2;
+    tile->num_tiles = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "multiple leading input blocks are not a contiguous height band");
+    shapes[0] = 1; shapes[1] = 4; shapes[2] = 8;
+    shapes[4] = 2; shapes[5] = 4; shapes[6] = 4;
+    tile->tile_height = 1;
+    tile->num_tiles = 4;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "multiple leading output blocks are not a contiguous height band");
 }
 
 static void test_operator_semantic_guards(void)

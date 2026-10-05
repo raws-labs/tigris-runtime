@@ -405,9 +405,16 @@ int tigris_reshape_band(const tigris_plan_t *plan, const tigris_stage_t *stage,
     int own_in = in->ndim == 2u || (in->flags & TIGRIS_TENSOR_LINEAR) != 0u;
     int own_out = out->ndim == 2u || (out->flags & TIGRIS_TENSOR_LINEAR) != 0u;
     if (own_in != own_out || (!own_in && (a[0] != b[0] || a[in->ndim - 1u] != b[out->ndim - 1u]))) return 0;
-    for (int mode = own_in ? 0 : 1; mode < 2; mode++) {
+    for (int mode = own_in ? 0 : 1; mode < 3; mode++) {
         uint8_t ia = mode == 0 ? (uint8_t)(in->ndim - 2u) : 1u;
         uint8_t ib = mode == 0 ? (uint8_t)(out->ndim - 2u) : 1u;
+        if (mode == 2) {
+            /* Unit prefixes leave a single contiguous interval on each side. */
+            ia = 0u;
+            ib = 0u;
+            while (ia + 1u < in->ndim && a[ia] == 1) ia++;
+            while (ib + 1u < out->ndim && b[ib] == 1) ib++;
+        }
         int64_t blocks = 1, other = 1, ci = 1, co = 1;
         for (uint8_t i = 0u; i < in->ndim; i++) {
             if (a[i] <= 0) return 0;

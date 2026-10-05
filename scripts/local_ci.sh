@@ -64,8 +64,8 @@ run_stack() {
   cmake --build build-stack \
         --target tigris_runtime cmsis_adapter_compile explicit_workspace_link_smoke \
         --parallel >/dev/null
-  python3 scripts/check_stack_usage.py --max-frame "$STACK_MAX_FRAME" build-stack
-  python3 scripts/check_workspace_link.py build-stack/explicit_workspace_link_smoke
+  python3 scripts/check_stack_usage.py --max-frame "$STACK_MAX_FRAME" build-stack &&
+    python3 scripts/check_workspace_link.py build-stack/explicit_workspace_link_smoke
 }
 if have gcc && have cmake; then
   if run_stack; then pass "stack usage"; else fail "stack usage"; fi

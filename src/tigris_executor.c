@@ -2616,6 +2616,83 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
 
 /* Whether a stage is a Reshape whose rows map onto the output's. Kept out of
  * line so the mapping it builds stays off the run loop's frame. */
+/* The If a stage holds alone, or NULL. */
+static const tigris_op_t *stage_if(const tigris_plan_t *plan, const tigris_stage_t *stage)
+{
+    if (plan->num_subgraphs == 0u || stage->ops_count != 1u)
+        return NULL;
+    const tigris_op_t *op = &plan->ops[tigris_stage_ops(plan, stage)[0]];
+    return op->op_type == TIGRIS_OP_IF ? op : NULL;
+}
+
+/* The graph an If runs: its then branch when the condition's one element is
+ * nonzero, else its else branch. The operands are copied into that graph's
+ * input tensors, placed in slow memory. */
+static TIGRIS_NOINLINE tigris_exec_error_t enter_branch(
+    const tigris_plan_t *plan, tigris_mem_t *mem, const tigris_op_t *op,
+    uint16_t op_index, uint16_t *graph_out)
+{
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint8_t *branches = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_SUBGRAPHS, NULL);
+    const uint8_t *condition = (const uint8_t *)mem->tensor_ptrs[ins[0]];
+    if (!branches || !condition)
+        return TIGRIS_EXEC_ERR_MEM;
+    const uint8_t slot = (*condition != 0u) ? 0u : 2u;
+    const uint16_t graph = (uint16_t)((uint16_t)branches[slot] |
+                                      (uint16_t)((uint16_t)branches[slot + 1u] << 8));
+    const tigris_subgraph_t *target = &plan->subgraphs[graph];
+    for (uint16_t i = 0; i < target->inputs_count; i++) {
+        const uint16_t dst = plan->index_pool[target->inputs_off + i];
+        const void *src = mem->tensor_ptrs[ins[i + 1u]];
+        if (!src || tigris_mem_alloc_slow(mem, dst, plan->tensors[dst].size_bytes) != TIGRIS_MEM_OK)
+            return TIGRIS_EXEC_ERR_MEM;
+        memcpy(mem->tensor_ptrs[dst], src, plan->tensors[dst].size_bytes);
+    }
+    *graph_out = graph;
+    return TIGRIS_EXEC_OK;
+}
+
+/* Copy a finished branch's outputs into its If's results and release them. */
+static TIGRIS_NOINLINE tigris_exec_error_t leave_branch(
+    const tigris_plan_t *plan, tigris_mem_t *mem, const tigris_op_t *op, uint16_t graph)
+{
+    const tigris_subgraph_t *source = &plan->subgraphs[graph];
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    for (uint16_t i = 0; i < source->outputs_count; i++) {
+        const uint16_t src = plan->index_pool[source->outputs_off + i];
+        if (!mem->tensor_ptrs[src] ||
+            tigris_mem_alloc_slow(mem, outs[i], plan->tensors[outs[i]].size_bytes) != TIGRIS_MEM_OK)
+            return TIGRIS_EXEC_ERR_MEM;
+        memcpy(mem->tensor_ptrs[outs[i]], mem->tensor_ptrs[src], plan->tensors[outs[i]].size_bytes);
+    }
+    for (uint16_t i = 0; i < source->outputs_count; i++)
+        mem->tensor_ptrs[plan->index_pool[source->outputs_off + i]] = NULL;
+    compact_slow(mem, plan);
+    return TIGRIS_EXEC_OK;
+}
+
+/* Release the slow tensors a stage in [first, s] read last, then compact. A
+ * graph frees only its own tensors: those last read in its own stage range. */
+static TIGRIS_NOINLINE void free_dead_tensors(const tigris_plan_t *plan, tigris_mem_t *mem,
+                                              const uint16_t *last_consumer,
+                                              uint16_t first, uint16_t s)
+{
+    int need_compact = 0;
+    for (uint16_t t = 0; t < plan->header->num_tensors; t++) {
+        if (last_consumer[t] >= first && last_consumer[t] <= s &&
+            last_consumer[t] != UINT16_MAX) {
+            uint8_t *p = (uint8_t *)mem->tensor_ptrs[t];
+            if (p && p >= mem->slow_base &&
+                p < mem->slow_base + mem->slow_size) {
+                mem->tensor_ptrs[t] = NULL;
+                need_compact = 1;
+            }
+        }
+    }
+    if (need_compact)
+        compact_slow(mem, plan);
+}
+
 static TIGRIS_NOINLINE int stage_is_reshape_band(const tigris_plan_t *plan,
                                                  const tigris_stage_t *stage)
 {
@@ -3674,8 +3751,26 @@ tigris_exec_error_t tigris_run_with_state(
             last_consumer[entry->output] = UINT16_MAX;
     }
 
-    for (uint16_t s = 0; s < plan->header->num_stages; s++) {
+    /* The graph running: its stage range, and while a branch runs, the If
+     * stage to resume after. */
+    uint16_t end = plan->num_subgraphs ? plan->subgraphs[0].num_stages : plan->header->num_stages;
+    uint16_t first = 0u, resume = UINT16_MAX, branch = 0u;
+    for (uint16_t s = 0; s < end; s++) {
         const tigris_stage_t *stage = &plan->stages[s];
+
+        if (resume == UINT16_MAX && stage_if(plan, stage)) {
+            const uint16_t op_index = tigris_stage_ops(plan, stage)[0];
+            tigris_exec_error_t err = enter_branch(plan, mem, &plan->ops[op_index], op_index, &branch);
+            if (err != TIGRIS_EXEC_OK) {
+                result = err;
+                goto restore_fast_arena;
+            }
+            resume = s;
+            first = plan->subgraphs[branch].first_stage;
+            end = (uint16_t)(first + plan->subgraphs[branch].num_stages);
+            s = (uint16_t)(first - 1u);
+            continue;
+        }
 
         /* Per-stage weight decompression (skip for chain heads) */
         tigris_plan_t stage_plan;
@@ -3949,24 +4044,28 @@ tigris_exec_error_t tigris_run_with_state(
             stats->slow_peak = mem->slow_used;
 
         /* Free dead tensors from slow and compact */
-        int need_compact = 0;
-        for (uint16_t t = 0; t < num_t; t++) {
-            if (last_consumer[t] <= s && last_consumer[t] != UINT16_MAX) {
-                uint8_t *p = (uint8_t *)mem->tensor_ptrs[t];
-                if (p && p >= mem->slow_base &&
-                    p < mem->slow_base + mem->slow_size) {
-                    mem->tensor_ptrs[t] = NULL;
-                    need_compact = 1;
-                }
-            }
-        }
-        if (need_compact)
-            compact_slow(mem, plan);
+        free_dead_tensors(plan, mem, last_consumer, first, s);
 
         /* Release stage/chain-local fast allocations before the next group,
          * retaining the caller's in-run reset floor. */
         mem->fast_used = caller_fast_used;
         mem->fast_reserved = caller_fast_used;
+
+        /* A finished branch hands its results to the If, and the main graph
+         * resumes after it. */
+        if (resume != UINT16_MAX && (uint16_t)(s + 1u) == end) {
+            const tigris_op_t *op = &plan->ops[tigris_stage_ops(plan, &plan->stages[resume])[0]];
+            tigris_exec_error_t err = leave_branch(plan, mem, op, branch);
+            if (err != TIGRIS_EXEC_OK) {
+                result = err;
+                goto restore_fast_arena;
+            }
+            s = resume;
+            first = 0u;
+            end = plan->subgraphs[0].num_stages;
+            resume = UINT16_MAX;
+            free_dead_tensors(plan, mem, last_consumer, first, s);
+        }
     }
 
     for (uint16_t i = 0; i < plan->num_state; i++) {

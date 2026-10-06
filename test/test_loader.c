@@ -4182,7 +4182,8 @@ static void test_state_goldens(void)
         tigris_plan_t plan;
         TEST_ASSERT_EQ(tigris_plan_load(buf, golden->plan_size, &plan), TIGRIS_OK, "stateful plan loads");
         size_t state_size = tigris_state_required(&plan);
-        void *state = malloc(state_size);
+        /* A plan without state still runs through the stateful entry. */
+        void *state = malloc(state_size > 0u ? state_size : 1u);
         uint8_t out[256];
         TEST_ASSERT(state != NULL && golden->output_bytes <= sizeof(out), "state and output buffers");
         if (state && golden->output_bytes <= sizeof(out)) {
@@ -4224,6 +4225,30 @@ static void test_state_goldens(void)
                 TEST_ASSERT_EQ(load_altered(golden, copy, at + 28u, &left, 4u), TIGRIS_ERR_BAD_OPERATOR,
                                "lstm gate shifts stay applicable");
             }
+        }
+        uint16_t branching = plan.header->num_ops;
+        for (uint16_t n = 0; n < plan.header->num_ops; n++)
+            if (plan.ops[n].op_type == TIGRIS_OP_IF) branching = n;
+        if (branching < plan.header->num_ops) {
+            uint8_t len = 0u;
+            const uint8_t *branches = tigris_op_attribute_data(&plan, branching, TIGRIS_OP_ATTR_SUBGRAPHS, &len);
+            const size_t at = (size_t)(branches - buf);
+            const size_t section = (size_t)((const uint8_t *)plan.subgraphs - buf);
+            const uint16_t main_graph = 0u, missing = 9u, one = 1u;
+            const uint16_t shifted = (uint16_t)(plan.subgraphs[1].first_stage + 1u);
+            const tigris_op_t *op = &plan.ops[branching];
+            const size_t operand = (size_t)((const uint8_t *)&tigris_op_inputs(&plan, op)[1] - buf);
+            const uint16_t borrowed = plan.index_pool[plan.subgraphs[1].inputs_off];
+            TEST_ASSERT_EQ(load_altered(golden, copy, at, &main_graph, 2u), TIGRIS_ERR_BAD_OPERATOR,
+                           "an If cannot run the main graph");
+            TEST_ASSERT_EQ(load_altered(golden, copy, at + 2u, &missing, 2u), TIGRIS_ERR_BAD_OPERATOR,
+                           "an If runs a graph the plan has");
+            TEST_ASSERT_EQ(load_altered(golden, copy, section - 4u, &one, 2u), TIGRIS_ERR_BAD_SECTION,
+                           "a plan with control flow has a subgraph besides the main graph");
+            TEST_ASSERT_EQ(load_altered(golden, copy, section + sizeof(tigris_subgraph_t), &shifted, 2u),
+                           TIGRIS_ERR_BAD_SECTION, "graphs cover consecutive stage ranges");
+            TEST_ASSERT_EQ(load_altered(golden, copy, operand, &borrowed, 2u), TIGRIS_ERR_BAD_TENSOR,
+                           "a subgraph's tensors belong to it alone");
         }
         if (tigris_plan_data_dtype(&plan) == 3u && plan.ops[0].op_type == TIGRIS_OP_SVDF) {
             uint8_t len = 0u;

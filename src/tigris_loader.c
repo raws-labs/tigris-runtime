@@ -552,6 +552,7 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     case TIGRIS_OP_ATTR_CONSTANTS:      return op_type == TIGRIS_OP_SVDF || op_type == TIGRIS_OP_LSTM;
     case TIGRIS_OP_ATTR_SVDF:           return op_type == TIGRIS_OP_SVDF;
     case TIGRIS_OP_ATTR_LSTM:           return op_type == TIGRIS_OP_LSTM;
+    case TIGRIS_OP_ATTR_SUBGRAPHS:      return op_type == TIGRIS_OP_IF;
     default:                            return 0;
     }
 }
@@ -983,10 +984,154 @@ static int bool_and_sum_valid(const tigris_plan_t *plan, const tigris_op_t *op, 
     return requant == NULL;
 }
 
+/* The graph whose stage range holds stage s; 0 is the main graph. */
+static uint16_t graph_of_stage(const tigris_plan_t *plan, uint16_t s)
+{
+    for (uint16_t g = 1; g < plan->num_subgraphs; g++) {
+        const tigris_subgraph_t *graph = &plan->subgraphs[g];
+        if (s >= graph->first_stage && s - graph->first_stage < graph->num_stages)
+            return g;
+    }
+    return 0u;
+}
+
+/* Whether tensor t is read or written only by stages of graph g, or not at all. */
+static int tensor_stays_in_graph(const tigris_plan_t *plan, uint16_t t, uint16_t g)
+{
+    for (uint16_t s = 0; s < plan->header->num_stages; s++) {
+        const tigris_stage_t *stage = &plan->stages[s];
+        const uint16_t *ops = tigris_stage_ops(plan, stage);
+        if (graph_of_stage(plan, s) == g)
+            continue;
+        for (uint16_t k = 0; k < stage->ops_count; k++) {
+            const tigris_op_t *op = &plan->ops[ops[k]];
+            const uint16_t *ins = tigris_op_inputs(plan, op);
+            const uint16_t *outs = tigris_op_outputs(plan, op);
+            for (uint8_t i = 0; i < op->num_inputs; i++)
+                if (ins[i] == t) return 0;
+            for (uint8_t i = 0; i < op->num_outputs; i++)
+                if (outs[i] == t) return 0;
+        }
+    }
+    return 1;
+}
+
+static int same_tensor_form(const tigris_plan_t *plan, uint16_t a, uint16_t b)
+{
+    const tigris_tensor_t *x = &plan->tensors[a];
+    const tigris_tensor_t *y = &plan->tensors[b];
+    /* Below rank 3 both layouts store the same bytes. */
+    return x->dtype == y->dtype && x->size_bytes == y->size_bytes &&
+           tensor_shapes_equal(plan, x, y) &&
+           (x->ndim < 3u ||
+            (x->flags & TIGRIS_TENSOR_LINEAR) == (y->flags & TIGRIS_TENSOR_LINEAR));
+}
+
+/* Control flow: graphs are consecutive stage ranges covering every stage, the
+ * main graph first and at stage 0; a subgraph's tensors belong to it alone; an
+ * If sits alone in a main-graph stage and its operands and results match both
+ * branches' inputs and outputs. A plan without the section has no If. */
+static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t index_count)
+{
+    const uint16_t num_stages = plan->header->num_stages;
+    if (plan->num_subgraphs == 0u) {
+        for (uint16_t n = 0; n < plan->header->num_ops; n++)
+            if (plan->ops[n].op_type == TIGRIS_OP_IF) return TIGRIS_ERR_BAD_OPERATOR;
+        return TIGRIS_OK;
+    }
+    uint32_t next = 0u;
+    for (uint16_t g = 0; g < plan->num_subgraphs; g++) {
+        const tigris_subgraph_t *graph = &plan->subgraphs[g];
+        if (graph->first_stage != next || (g > 0u && graph->num_stages == 0u) ||
+            !elements_ok(graph->inputs_off, graph->inputs_count, index_count) ||
+            !elements_ok(graph->outputs_off, graph->outputs_count, index_count))
+            return TIGRIS_ERR_BAD_SECTION;
+        next += graph->num_stages;
+        const uint16_t *ins = plan->index_pool + graph->inputs_off;
+        const uint16_t *outs = plan->index_pool + graph->outputs_off;
+        for (uint16_t i = 0; i < graph->inputs_count; i++)
+            if (ins[i] >= plan->header->num_tensors) return TIGRIS_ERR_BAD_SECTION;
+        for (uint16_t i = 0; i < graph->outputs_count; i++)
+            if (outs[i] >= plan->header->num_tensors) return TIGRIS_ERR_BAD_SECTION;
+    }
+    const tigris_subgraph_t *main = &plan->subgraphs[0];
+    if (next != num_stages || main->inputs_count != plan->header->num_model_inputs ||
+        main->outputs_count != plan->header->num_model_outputs ||
+        memcmp(plan->index_pool + main->inputs_off, plan->model_inputs,
+               (size_t)main->inputs_count * sizeof(uint16_t)) != 0 ||
+        memcmp(plan->index_pool + main->outputs_off, plan->model_outputs,
+               (size_t)main->outputs_count * sizeof(uint16_t)) != 0)
+        return TIGRIS_ERR_BAD_SECTION;
+    for (uint16_t t = 0; t < plan->header->num_tensors; t++) {
+        uint16_t owner = 0u;
+        for (uint16_t s = 0; s < num_stages; s++) {
+            const tigris_stage_t *stage = &plan->stages[s];
+            const uint16_t *ops = tigris_stage_ops(plan, stage);
+            for (uint16_t k = 0; k < stage->ops_count; k++) {
+                const tigris_op_t *op = &plan->ops[ops[k]];
+                const uint16_t *ins = tigris_op_inputs(plan, op);
+                const uint16_t *outs = tigris_op_outputs(plan, op);
+                for (uint8_t i = 0; i < op->num_inputs; i++)
+                    if (ins[i] == t) owner = graph_of_stage(plan, s);
+                for (uint8_t i = 0; i < op->num_outputs; i++)
+                    if (outs[i] == t) owner = graph_of_stage(plan, s);
+            }
+        }
+        for (uint16_t g = 1; g < plan->num_subgraphs; g++) {
+            const tigris_subgraph_t *graph = &plan->subgraphs[g];
+            for (uint16_t i = 0; i < graph->inputs_count; i++)
+                if (plan->index_pool[graph->inputs_off + i] == t) owner = g;
+            for (uint16_t i = 0; i < graph->outputs_count; i++)
+                if (plan->index_pool[graph->outputs_off + i] == t) owner = g;
+        }
+        const tigris_tensor_t *tensor = &plan->tensors[t];
+        if (!tensor_stays_in_graph(plan, t, owner) ||
+            (owner != 0u && (tensor->flags & (TIGRIS_TENSOR_MODEL_INPUT | TIGRIS_TENSOR_MODEL_OUTPUT |
+                                              TIGRIS_TENSOR_STATE)) != 0u))
+            return TIGRIS_ERR_BAD_TENSOR;
+    }
+    for (uint16_t s = 0; s < num_stages; s++) {
+        const tigris_stage_t *stage = &plan->stages[s];
+        const uint16_t *ops = tigris_stage_ops(plan, stage);
+        for (uint16_t k = 0; k < stage->ops_count; k++) {
+            const uint16_t op_index = ops[k];
+            const tigris_op_t *op = &plan->ops[op_index];
+            if (op->op_type != TIGRIS_OP_IF) continue;
+            uint8_t len = 0u;
+            const uint8_t *branches = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_SUBGRAPHS, &len);
+            if (graph_of_stage(plan, s) != 0u || stage->ops_count != 1u || stage->chain_len != 0u ||
+                stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN || !branches || len != 4u ||
+                op->num_inputs < 1u)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const uint16_t *ins = tigris_op_inputs(plan, op);
+            const uint16_t *outs = tigris_op_outputs(plan, op);
+            const tigris_tensor_t *condition = &plan->tensors[ins[0]];
+            if (condition->dtype != 9u || condition->size_bytes != 1u)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            for (uint8_t b = 0u; b < 2u; b++) {
+                uint16_t g = (uint16_t)((uint16_t)branches[2u * b] |
+                                        (uint16_t)((uint16_t)branches[2u * b + 1u] << 8));
+                if (g == 0u || g >= plan->num_subgraphs) return TIGRIS_ERR_BAD_OPERATOR;
+                const tigris_subgraph_t *graph = &plan->subgraphs[g];
+                if (graph->inputs_count + 1u != op->num_inputs ||
+                    graph->outputs_count != op->num_outputs)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                for (uint8_t i = 1u; i < op->num_inputs; i++)
+                    if (!same_tensor_form(plan, ins[i], plan->index_pool[graph->inputs_off + i - 1u]))
+                        return TIGRIS_ERR_BAD_OPERATOR;
+                for (uint8_t i = 0u; i < op->num_outputs; i++)
+                    if (!same_tensor_form(plan, outs[i], plan->index_pool[graph->outputs_off + i]))
+                        return TIGRIS_ERR_BAD_OPERATOR;
+            }
+        }
+    }
+    return TIGRIS_OK;
+}
+
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     /* Zero is the data dtype, 255 also permits bool; the final input slot repeats. */
-    static const dtype_signature_t dtype_signatures[TIGRIS_OP_LSTM + 1] = {
+    static const dtype_signature_t dtype_signatures[TIGRIS_OP_IF + 1] = {
         [TIGRIS_OP_CONV] = {{0, 0, 0}, 0},
         [TIGRIS_OP_DEPTHWISE] = {{0, 0, 0}, 0},
         [TIGRIS_OP_RELU] = {{0, 0, 0}, 0},
@@ -1073,6 +1218,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         [TIGRIS_OP_REDUCE_ALL] = {{9, 9, 9}, 9},
         [TIGRIS_OP_SVDF] = {{0, 254, 254}, 254},
         [TIGRIS_OP_LSTM] = {{0, 254, 254}, 254},
+        [TIGRIS_OP_IF] = {{9, 0, 0}, 0},
     };
     const tigris_file_header_t *hdr = plan->header;
     const int legacy = hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES;
@@ -1173,6 +1319,8 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         case TIGRIS_OP_LSTM:
             if (!lstm_valid(plan, op, op_index)) return TIGRIS_ERR_BAD_OPERATOR;
             break;
+        case TIGRIS_OP_IF:
+            break;  /* validated with the subgraph section */
         case TIGRIS_OP_CONV:
         case TIGRIS_OP_DEPTHWISE: {
             if (op->num_inputs != 1 || op->num_outputs != 1 ||
@@ -2358,6 +2506,22 @@ tigris_error_t tigris_plan_load_ex(
             return TIGRIS_ERR_BAD_TENSOR;
     }
 
+    if (section_offsets[TIGRIS_SEC_SUBGRAPHS]) {
+        uint32_t off = section_offsets[TIGRIS_SEC_SUBGRAPHS];
+        uint32_t end = section_ends[TIGRIS_SEC_SUBGRAPHS];
+        uint16_t count;
+        uint16_t reserved;
+        if (hdr->version < TIGRIS_SCHEMA_VERSION_STATE || !bounds_ok(off, 4u, end))
+            return TIGRIS_ERR_BAD_SECTION;
+        memcpy(&count, buf + off, sizeof(count));
+        memcpy(&reserved, buf + off + 2u, sizeof(reserved));
+        if (count < 2u || reserved != 0u ||
+            !bounds_ok(off + 4u, (uint32_t)count * sizeof(tigris_subgraph_t), end))
+            return TIGRIS_ERR_BAD_SECTION;
+        candidate.subgraphs = (const tigris_subgraph_t *)(buf + off + 4u);
+        candidate.num_subgraphs = count;
+    }
+
     /* Every state tensor is one variable's value on entry or on exit, the
      * two alike, sized as the entry states. */
     for (uint16_t tensor_idx = 0; tensor_idx < hdr->num_tensors; tensor_idx++) {
@@ -2450,10 +2614,12 @@ tigris_error_t tigris_plan_load_ex(
             if (attr->type > TIGRIS_OP_ATTR_TRANSPOSE_PERM &&
                 hdr->version < TIGRIS_SCHEMA_VERSION_V8)
                 return TIGRIS_ERR_BAD_SECTION;
-            /* Svdf and Lstm also write their next states. */
+            /* Svdf and Lstm also write their next states; If gives each
+             * result its branches compute. */
             if (op->num_inputs < 1u ||
                 (op->num_outputs != 1u && !(op->op_type == TIGRIS_OP_SVDF && op->num_outputs == 2u) &&
-                 !(op->op_type == TIGRIS_OP_LSTM && op->num_outputs == 3u)))
+                 !(op->op_type == TIGRIS_OP_LSTM && op->num_outputs == 3u) &&
+                 !(op->op_type == TIGRIS_OP_IF && op->num_outputs >= 1u)))
                 return TIGRIS_ERR_BAD_SECTION;
             /* A kind belongs to the operator that reads it, whether or not a
              * kernel for that operator exists yet, so a stray payload cannot
@@ -2620,6 +2786,11 @@ tigris_error_t tigris_plan_load_ex(
                 }
                 break;
             }
+            case TIGRIS_OP_ATTR_SUBGRAPHS:
+                /* Graph indices are checked with the section. */
+                if (attr->data_len != 4u)
+                    return TIGRIS_ERR_BAD_SECTION;
+                break;
             case TIGRIS_OP_ATTR_LSTM: {
                 int32_t time_major;
                 float clip;
@@ -3327,6 +3498,12 @@ tigris_error_t tigris_plan_load_ex(
                 }
             }
         }
+    }
+
+    {
+        tigris_error_t graph_error = validate_subgraphs(&candidate, index_count);
+        if (graph_error != TIGRIS_OK)
+            return graph_error;
     }
 
     {

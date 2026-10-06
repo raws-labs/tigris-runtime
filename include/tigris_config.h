@@ -30,6 +30,11 @@
 #define TIGRIS_MAX_CHAIN_STAGES 16u
 #endif
 
+/** Maximum graphs, the main graph included, in a plan with control flow. */
+#ifndef TIGRIS_MAX_SUBGRAPHS
+#define TIGRIS_MAX_SUBGRAPHS 16u
+#endif
+
 /** Maximum spatial operators composed within one chained stage. */
 #ifndef TIGRIS_MAX_SPATIAL_OPS_PER_STAGE
 #define TIGRIS_MAX_SPATIAL_OPS_PER_STAGE 8u

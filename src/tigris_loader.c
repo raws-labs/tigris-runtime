@@ -995,25 +995,11 @@ static uint16_t graph_of_stage(const tigris_plan_t *plan, uint16_t s)
     return 0u;
 }
 
-/* Whether tensor t is read or written only by stages of graph g, or not at all. */
-static int tensor_stays_in_graph(const tigris_plan_t *plan, uint16_t t, uint16_t g)
+/* Widen [lo, hi] to cover tensor t. */
+static void cover(uint16_t *lo, uint16_t *hi, uint16_t t)
 {
-    for (uint16_t s = 0; s < plan->header->num_stages; s++) {
-        const tigris_stage_t *stage = &plan->stages[s];
-        const uint16_t *ops = tigris_stage_ops(plan, stage);
-        if (graph_of_stage(plan, s) == g)
-            continue;
-        for (uint16_t k = 0; k < stage->ops_count; k++) {
-            const tigris_op_t *op = &plan->ops[ops[k]];
-            const uint16_t *ins = tigris_op_inputs(plan, op);
-            const uint16_t *outs = tigris_op_outputs(plan, op);
-            for (uint8_t i = 0; i < op->num_inputs; i++)
-                if (ins[i] == t) return 0;
-            for (uint8_t i = 0; i < op->num_outputs; i++)
-                if (outs[i] == t) return 0;
-        }
-    }
-    return 1;
+    if (t < *lo) *lo = t;
+    if (t > *hi) *hi = t;
 }
 
 static int same_tensor_form(const tigris_plan_t *plan, uint16_t a, uint16_t b)
@@ -1072,6 +1058,8 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
                 return TIGRIS_ERR_BAD_OPERATOR;
         return TIGRIS_OK;
     }
+    if (plan->num_subgraphs > TIGRIS_MAX_SUBGRAPHS)
+        return TIGRIS_ERR_BAD_SECTION;
     uint32_t next = 0u;
     for (uint16_t g = 0; g < plan->num_subgraphs; g++) {
         const tigris_subgraph_t *graph = &plan->subgraphs[g];
@@ -1095,33 +1083,44 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
         memcmp(plan->index_pool + main->outputs_off, plan->model_outputs,
                (size_t)main->outputs_count * sizeof(uint16_t)) != 0)
         return TIGRIS_ERR_BAD_SECTION;
-    for (uint16_t t = 0; t < plan->header->num_tensors; t++) {
-        uint16_t owner = 0u;
-        for (uint16_t s = 0; s < num_stages; s++) {
+    /* Each graph's tensors form one index range, the ranges disjoint, so no
+     * tensor is shared between graphs; the main graph's range also holds the
+     * model interface and the state. */
+    uint16_t lo[TIGRIS_MAX_SUBGRAPHS];
+    uint16_t hi[TIGRIS_MAX_SUBGRAPHS];
+    for (uint16_t g = 0; g < plan->num_subgraphs; g++) {
+        const tigris_subgraph_t *graph = &plan->subgraphs[g];
+        lo[g] = UINT16_MAX;
+        hi[g] = 0u;
+        for (uint16_t s = graph->first_stage; s < graph->first_stage + graph->num_stages; s++) {
             const tigris_stage_t *stage = &plan->stages[s];
             const uint16_t *ops = tigris_stage_ops(plan, stage);
             for (uint16_t k = 0; k < stage->ops_count; k++) {
                 const tigris_op_t *op = &plan->ops[ops[k]];
                 const uint16_t *ins = tigris_op_inputs(plan, op);
                 const uint16_t *outs = tigris_op_outputs(plan, op);
-                for (uint8_t i = 0; i < op->num_inputs; i++)
-                    if (ins[i] == t) owner = graph_of_stage(plan, s);
-                for (uint8_t i = 0; i < op->num_outputs; i++)
-                    if (outs[i] == t) owner = graph_of_stage(plan, s);
+                for (uint8_t i = 0; i < op->num_inputs; i++) cover(&lo[g], &hi[g], ins[i]);
+                for (uint8_t i = 0; i < op->num_outputs; i++) cover(&lo[g], &hi[g], outs[i]);
             }
         }
-        for (uint16_t g = 1; g < plan->num_subgraphs; g++) {
-            const tigris_subgraph_t *graph = &plan->subgraphs[g];
-            for (uint16_t i = 0; i < graph->inputs_count; i++)
-                if (plan->index_pool[graph->inputs_off + i] == t) owner = g;
-            for (uint16_t i = 0; i < graph->outputs_count; i++)
-                if (plan->index_pool[graph->outputs_off + i] == t) owner = g;
-        }
-        const tigris_tensor_t *tensor = &plan->tensors[t];
-        if (!tensor_stays_in_graph(plan, t, owner) ||
-            (owner != 0u && (tensor->flags & (TIGRIS_TENSOR_MODEL_INPUT | TIGRIS_TENSOR_MODEL_OUTPUT |
-                                              TIGRIS_TENSOR_STATE)) != 0u))
-            return TIGRIS_ERR_BAD_TENSOR;
+        for (uint16_t i = 0; i < graph->inputs_count; i++)
+            cover(&lo[g], &hi[g], plan->index_pool[graph->inputs_off + i]);
+        for (uint16_t i = 0; i < graph->outputs_count; i++)
+            cover(&lo[g], &hi[g], plan->index_pool[graph->outputs_off + i]);
+    }
+    for (uint16_t i = 0; i < plan->num_state; i++) {
+        cover(&lo[0], &hi[0], plan->state_entries[i].input);
+        if (plan->state_entries[i].output != 0xFFFFu)
+            cover(&lo[0], &hi[0], plan->state_entries[i].output);
+    }
+    for (uint16_t g = 0; g < plan->num_subgraphs; g++) {
+        for (uint16_t h = (uint16_t)(g + 1u); h < plan->num_subgraphs; h++)
+            if (lo[g] <= hi[g] && lo[h] <= hi[h] && lo[g] <= hi[h] && lo[h] <= hi[g])
+                return TIGRIS_ERR_BAD_TENSOR;
+        for (uint32_t t = lo[g]; g > 0u && t <= hi[g]; t++)
+            if ((plan->tensors[t].flags & (TIGRIS_TENSOR_MODEL_INPUT | TIGRIS_TENSOR_MODEL_OUTPUT |
+                                           TIGRIS_TENSOR_STATE)) != 0u)
+                return TIGRIS_ERR_BAD_TENSOR;
     }
     for (uint16_t s = 0; s < num_stages; s++) {
         const tigris_stage_t *stage = &plan->stages[s];

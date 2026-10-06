@@ -1077,11 +1077,12 @@ static int same_tensor_form(const tigris_plan_t *plan, uint16_t a, uint16_t b)
  * outputs all have one form, position by position; its condition gives one
  * bool. */
 static int while_graphs_valid(const tigris_plan_t *plan, const tigris_op_t *op,
-                              const uint8_t *graphs)
+                              const uint8_t *graphs, uint16_t container)
 {
     const uint16_t condition = (uint16_t)((uint16_t)graphs[0] | (uint16_t)((uint16_t)graphs[1] << 8));
     const uint16_t body = (uint16_t)((uint16_t)graphs[2] | (uint16_t)((uint16_t)graphs[3] << 8));
-    if (condition == 0u || body == 0u || condition == body ||
+    if (condition == 0u || body == 0u || condition == body || condition <= container ||
+        body <= container ||
         condition >= plan->num_subgraphs || body >= plan->num_subgraphs ||
         op->num_outputs != op->num_inputs)
         return 0;
@@ -1191,14 +1192,23 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
             if (op->op_type != TIGRIS_OP_IF && op->op_type != TIGRIS_OP_WHILE) continue;
             uint8_t len = 0u;
             const uint8_t *branches = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_SUBGRAPHS, &len);
-            if (graph_of_stage(plan, s) != 0u || stage->ops_count != 1u || stage->chain_len != 0u ||
+            /* A graph runs only graphs placed after it, so control flow
+             * cannot recurse. */
+            const uint16_t container = graph_of_stage(plan, s);
+            if (stage->ops_count != 1u || stage->chain_len != 0u ||
                 stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN || !branches || len != 4u ||
                 op->num_inputs < 1u)
                 return TIGRIS_ERR_BAD_OPERATOR;
+            for (uint8_t b = 0u; b < 2u; b++) {
+                uint16_t g = (uint16_t)((uint16_t)branches[2u * b] |
+                                        (uint16_t)((uint16_t)branches[2u * b + 1u] << 8));
+                if (g <= container)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
             const uint16_t *ins = tigris_op_inputs(plan, op);
             const uint16_t *outs = tigris_op_outputs(plan, op);
             if (op->op_type == TIGRIS_OP_WHILE) {
-                if (!while_graphs_valid(plan, op, branches))
+                if (!while_graphs_valid(plan, op, branches, container))
                     return TIGRIS_ERR_BAD_OPERATOR;
                 continue;
             }
@@ -1222,6 +1232,29 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
             }
         }
     }
+    /* Nesting depth: a graph's is one more than the deepest graph any of its
+     * control-flow operators runs; graphs after it are already known. */
+    uint16_t nesting[TIGRIS_MAX_SUBGRAPHS];
+    for (uint16_t k = 0; k < plan->num_subgraphs; k++) {
+        const uint16_t g = (uint16_t)(plan->num_subgraphs - 1u - k);
+        const tigris_subgraph_t *graph = &plan->subgraphs[g];
+        nesting[g] = 0u;
+        for (uint16_t s = graph->first_stage; s < graph->first_stage + graph->num_stages; s++) {
+            const tigris_stage_t *stage = &plan->stages[s];
+            if (stage->ops_count != 1u) continue;
+            const uint16_t op_index = tigris_stage_ops(plan, stage)[0];
+            const uint8_t type = plan->ops[op_index].op_type;
+            if (type != TIGRIS_OP_IF && type != TIGRIS_OP_WHILE) continue;
+            const uint8_t *runs = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_SUBGRAPHS, NULL);
+            for (uint8_t b = 0u; b < 2u; b++) {
+                uint16_t child = (uint16_t)((uint16_t)runs[2u * b] | (uint16_t)((uint16_t)runs[2u * b + 1u] << 8));
+                if ((uint16_t)(nesting[child] + 1u) > nesting[g])
+                    nesting[g] = (uint16_t)(nesting[child] + 1u);
+            }
+        }
+    }
+    if (nesting[0] > TIGRIS_MAX_SUBGRAPH_DEPTH)
+        return TIGRIS_ERR_BAD_OPERATOR;
     return TIGRIS_OK;
 }
 

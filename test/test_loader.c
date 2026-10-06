@@ -4259,8 +4259,23 @@ static void test_state_goldens(void)
             TEST_ASSERT_EQ(load_altered(golden, copy, at, swapped, sizeof(swapped)), TIGRIS_ERR_BAD_OPERATOR,
                            "a While's condition gives one bool");
         }
+        /* An If inside a branch runs graphs placed after its own, never its
+         * own graph or one before it. */
+        if (plan.num_subgraphs > 3u) {
+            uint16_t found = plan.header->num_ops;
+            for (uint16_t n = 0; n < plan.header->num_ops; n++)
+                if (plan.ops[n].op_type == TIGRIS_OP_IF) found = n;  /* the last If is the inner one */
+            uint8_t len = 0u;
+            const uint8_t *runs = tigris_op_attribute_data(&plan, found, TIGRIS_OP_ATTR_SUBGRAPHS, &len);
+            const uint16_t own = 1u, main_graph = 0u;
+            TEST_ASSERT_EQ(load_altered(golden, copy, (size_t)(runs - buf), &own, 2u),
+                           TIGRIS_ERR_BAD_OPERATOR, "an If cannot run its own graph");
+            TEST_ASSERT_EQ(load_altered(golden, copy, (size_t)(runs - buf) + 2u, &main_graph, 2u),
+                           TIGRIS_ERR_BAD_OPERATOR, "an If cannot run a graph placed before it");
+        }
+        /* The main graph's If: the first one placed. */
         uint16_t branching = plan.header->num_ops;
-        for (uint16_t n = 0; n < plan.header->num_ops; n++)
+        for (uint16_t n = plan.header->num_ops; n-- > 0u;)
             if (plan.ops[n].op_type == TIGRIS_OP_IF) branching = n;
         if (branching < plan.header->num_ops) {
             uint8_t len = 0u;

@@ -79,7 +79,8 @@ extern "C" {
 #define TIGRIS_SEC_WEIGHT_BLOCKS  10
 #define TIGRIS_SEC_OP_ATTRIBUTES  11
 #define TIGRIS_SEC_STATE          12
-#define TIGRIS_SEC_MAX            13  /* one past the last valid section */
+#define TIGRIS_SEC_SUBGRAPHS      13
+#define TIGRIS_SEC_MAX            14  /* one past the last valid section */
 
 /* Auxiliary tensor placement is constrained by operator dtype slots. */
 static inline int tigris_dtype_requires_source(uint8_t dtype)
@@ -133,7 +134,8 @@ static inline uint32_t tigris_dtype_size(uint8_t dtype)
 /* Svdf: rank; an int8 Svdf adds the state zero point, then the input-to-state
  * and state-to-output (multiplier, shift) pairs. */
 #define TIGRIS_OP_ATTR_LSTM           16 /* int32 time_major (0/1), float32 cell clip */
-#define TIGRIS_OP_ATTR_MAX            16
+#define TIGRIS_OP_ATTR_SUBGRAPHS      17 /* uint16 graphs a control-flow op runs (If: then, else) */
+#define TIGRIS_OP_ATTR_MAX            17
 
 /* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
  * first operand's, the second operand's, and the result's. */
@@ -265,6 +267,9 @@ typedef enum {
      * states out. Constants: input weights, recurrent weights and biases of
      * gates i, f, c, o, twelve in all. */
     TIGRIS_OP_LSTM                       = 86,
+    /* A one-element bool condition, then operands; runs the then or the else
+     * subgraph on copies of the operands and copies its results out. */
+    TIGRIS_OP_IF                         = 87,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 
@@ -567,6 +572,23 @@ typedef struct {
 
 TIGRIS_LAYOUT_ASSERT(tigris_layout_state_entry_size, sizeof(tigris_state_entry_t) == 16);
 
+/**
+ * Subgraph - 12 bytes, one per graph in TIGRIS_SEC_SUBGRAPHS, the main graph
+ * first. The section starts with count(u16) and a zero u16. A graph is a range
+ * of stages with its input and output tensors in the index pool; a subgraph's
+ * tensors belong to it alone.
+ */
+typedef struct {
+    uint16_t    first_stage;        /*  0 */
+    uint16_t    num_stages;         /*  2 */
+    uint16_t    inputs_off;         /*  4: index pool */
+    uint16_t    inputs_count;       /*  6 */
+    uint16_t    outputs_off;        /*  8: index pool */
+    uint16_t    outputs_count;      /* 10 */
+} tigris_subgraph_t;
+
+TIGRIS_LAYOUT_ASSERT(tigris_layout_subgraph_size, sizeof(tigris_subgraph_t) == 12);
+
 #undef TIGRIS_LAYOUT_ASSERT
 
 /* Parsed plan handle */
@@ -608,6 +630,8 @@ typedef struct {
     const uint8_t               *state_section;  /* initial values are read from here */
     uint16_t                     num_state;
     uint32_t                     state_bytes;    /* size of the caller's state buffer */
+    const tigris_subgraph_t     *subgraphs;      /* [num_subgraphs] or NULL */
+    uint16_t                     num_subgraphs;  /* 0 without control flow */
 
     /* Convenience: model I/O resolved from header */
     const uint16_t              *model_inputs;  /* [num_model_inputs] */

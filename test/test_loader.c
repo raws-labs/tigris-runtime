@@ -2344,6 +2344,71 @@ static void test_native_reduction_tiling_contract(void)
     }
 }
 
+static void test_leading_band_contract(void)
+{
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+    build_tiled_stage_plan(buf, TIGRIS_OP_REDUCE_MEAN, 3);
+    ((tigris_op_t *)(buf + TILED_OPS_OFF))->op_type = TIGRIS_OP_REDUCE_SUM;
+    tigris_tensor_t *t = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    int32_t *dims = (int32_t *)(buf + TILED_SHAPES_OFF);
+    dims[0] = 7; dims[1] = 1; dims[2] = 4;
+    dims[4] = 7; dims[5] = 1; dims[6] = 1;
+    t[0].size_bytes = 112u;
+    t[1].size_bytes = 28u;
+    buf[TILED_ATTR_DATA_OFF] = 2;
+    tigris_tile_plan_t *tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+    tile->original_height = 7;
+    tile->tile_height = 3;
+    tile->num_tiles = 3;
+    tile->receptive_field = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "leading band loads");
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[128], slow[256];
+    void *pointers[2] = {NULL, NULL};
+    float input[28], output[7];
+    for (uint32_t i = 0; i < 28u; i++) input[i] = (float)i - 10.0f;
+    memset(fast, 0xA5, sizeof(fast));
+    tigris_mem_t mem;
+    tigris_exec_stats_t stats;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, pointers, 2, fast, 96u, slow, sizeof(slow)), TIGRIS_MEM_OK, "arenas");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, sizeof(input)), TIGRIS_MEM_OK, "input storage");
+    TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, input, sizeof(input)), TIGRIS_OK, "input");
+    TEST_ASSERT_EQ(tigris_run(&plan, &mem, tigris_dispatch_kernel, NULL, &stats), TIGRIS_EXEC_OK, "leading execution");
+    TEST_ASSERT_EQ(stats.stages_tiled, 1u, "leading stage actually tiled");
+    TEST_ASSERT(mem.fast_peak <= 96u, "leading band fits arena");
+    TEST_ASSERT_EQ(tigris_output_read(&plan, &mem, 1, output, sizeof(output)), TIGRIS_OK, "output");
+    for (uint32_t i = 0; i < 7u; i++)
+        TEST_ASSERT(output[i] == input[4u*i] + input[4u*i+1u] + input[4u*i+2u] + input[4u*i+3u], "exact sums");
+    for (uint32_t i = 96u; i < sizeof(fast); i++) TEST_ASSERT_EQ(fast[i], 0xA5, "arena canary");
+    tile->original_height = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR, "wrong leading extent");
+    tile->original_height = 7;
+    tile->num_tiles = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR, "wrong leading count");
+    tile->num_tiles = 3;
+    tile->tile_height = 0;
+    TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "empty leading band");
+    tile->tile_height = 8;
+    TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "oversized leading band");
+    tile->tile_height = 3;
+    tile->halo = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR, "leading halo");
+    tile->halo = 0;
+    tile->receptive_field = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR, "leading receptive field");
+    tile->receptive_field = 1;
+    tile->flags = 1;
+    TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "leading flags");
+    tile->flags = 0;
+    tile->tile_width = 1;
+    TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "leading width");
+    tile->tile_width = 0;
+    buf[TILED_ATTR_DATA_OFF] = 0;
+    dims[4] = 1; dims[6] = 4; t[1].size_bytes = 16u;
+    TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "cannot reduce the leading band axis");
+}
+
+
 static void test_activation_attribute_contract(void)
 {
     _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
@@ -4295,6 +4360,7 @@ int main(int argc, char *argv[])
     test_reduce_all_contract();
     test_cumsum_loader_contract();
     test_native_reduction_tiling_contract();
+    test_leading_band_contract();
     test_activation_attribute_contract();
     test_activation_semantic_contract();
     test_prelu_loader_contract();

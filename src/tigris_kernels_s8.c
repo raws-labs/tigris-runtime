@@ -1107,7 +1107,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_reduce_mean_s8(
         !tigris_op_independent_band(plan, op, op_index, mem->tile.row_tiled))) return -1;
     int32_t shape[3];
     memcpy(shape, tigris_tensor_shape(plan, in), sizeof(shape));
-    if (mem->tile.active) shape[1] = mem->tile.in_h;
+    if (mem->tile.active) shape[tigris_band_axis(plan, in, mem->tile.row_tiled)] = mem->tile.in_h;
     int32_t outer = 1;
     int32_t inner = 1;
     for (uint8_t axis = 0; axis < 3u; axis++) {
@@ -2809,8 +2809,9 @@ static int reduction_s8_begin(
         for (uint8_t a = 0; a < 3u; a++) if (shape[a] != out_shape[a]) return 0;
     }
     if (mem->tile.active) {
-        if (axis[0] > 1u) view->outer = view->outer / shape[1] * mem->tile.in_h;
-        else view->inner = view->inner / shape[1] * mem->tile.in_h;
+        uint8_t band_axis = tigris_band_axis(plan, input, mem->tile.row_tiled);
+        if (axis[0] > band_axis) view->outer = view->outer / shape[band_axis] * mem->tile.in_h;
+        else view->inner = view->inner / shape[band_axis] * mem->tile.in_h;
     }
     view->input = (const int8_t *)tigris_mem_tensor_ptr(mem, x);
     view->output = (int8_t *)tigris_mem_tensor_ptr(mem, y);

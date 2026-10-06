@@ -552,7 +552,7 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     case TIGRIS_OP_ATTR_CONSTANTS:      return op_type == TIGRIS_OP_SVDF || op_type == TIGRIS_OP_LSTM;
     case TIGRIS_OP_ATTR_SVDF:           return op_type == TIGRIS_OP_SVDF;
     case TIGRIS_OP_ATTR_LSTM:           return op_type == TIGRIS_OP_LSTM;
-    case TIGRIS_OP_ATTR_SUBGRAPHS:      return op_type == TIGRIS_OP_IF;
+    case TIGRIS_OP_ATTR_SUBGRAPHS:      return op_type == TIGRIS_OP_IF || op_type == TIGRIS_OP_WHILE;
     default:                            return 0;
     }
 }
@@ -1027,6 +1027,38 @@ static int same_tensor_form(const tigris_plan_t *plan, uint16_t a, uint16_t b)
             (x->flags & TIGRIS_TENSOR_LINEAR) == (y->flags & TIGRIS_TENSOR_LINEAR));
 }
 
+/* A While's loop variables, results, condition inputs, body inputs and body
+ * outputs all have one form, position by position; its condition gives one
+ * bool. */
+static int while_graphs_valid(const tigris_plan_t *plan, const tigris_op_t *op,
+                              const uint8_t *graphs)
+{
+    const uint16_t condition = (uint16_t)((uint16_t)graphs[0] | (uint16_t)((uint16_t)graphs[1] << 8));
+    const uint16_t body = (uint16_t)((uint16_t)graphs[2] | (uint16_t)((uint16_t)graphs[3] << 8));
+    if (condition == 0u || body == 0u || condition == body ||
+        condition >= plan->num_subgraphs || body >= plan->num_subgraphs ||
+        op->num_outputs != op->num_inputs)
+        return 0;
+    const tigris_subgraph_t *c = &plan->subgraphs[condition];
+    const tigris_subgraph_t *b = &plan->subgraphs[body];
+    if (c->inputs_count != op->num_inputs || c->outputs_count != 1u ||
+        b->inputs_count != op->num_inputs || b->outputs_count != op->num_inputs)
+        return 0;
+    const tigris_tensor_t *verdict = &plan->tensors[plan->index_pool[c->outputs_off]];
+    if (verdict->dtype != 9u || verdict->size_bytes != 1u)
+        return 0;
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    for (uint8_t i = 0u; i < op->num_inputs; i++) {
+        if (!same_tensor_form(plan, ins[i], outs[i]) ||
+            !same_tensor_form(plan, ins[i], plan->index_pool[c->inputs_off + i]) ||
+            !same_tensor_form(plan, ins[i], plan->index_pool[b->inputs_off + i]) ||
+            !same_tensor_form(plan, ins[i], plan->index_pool[b->outputs_off + i]))
+            return 0;
+    }
+    return 1;
+}
+
 /* Control flow: graphs are consecutive stage ranges covering every stage, the
  * main graph first and at stage 0; a subgraph's tensors belong to it alone; an
  * If sits alone in a main-graph stage and its operands and results match both
@@ -1036,7 +1068,8 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
     const uint16_t num_stages = plan->header->num_stages;
     if (plan->num_subgraphs == 0u) {
         for (uint16_t n = 0; n < plan->header->num_ops; n++)
-            if (plan->ops[n].op_type == TIGRIS_OP_IF) return TIGRIS_ERR_BAD_OPERATOR;
+            if (plan->ops[n].op_type == TIGRIS_OP_IF || plan->ops[n].op_type == TIGRIS_OP_WHILE)
+                return TIGRIS_ERR_BAD_OPERATOR;
         return TIGRIS_OK;
     }
     uint32_t next = 0u;
@@ -1096,7 +1129,7 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
         for (uint16_t k = 0; k < stage->ops_count; k++) {
             const uint16_t op_index = ops[k];
             const tigris_op_t *op = &plan->ops[op_index];
-            if (op->op_type != TIGRIS_OP_IF) continue;
+            if (op->op_type != TIGRIS_OP_IF && op->op_type != TIGRIS_OP_WHILE) continue;
             uint8_t len = 0u;
             const uint8_t *branches = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_SUBGRAPHS, &len);
             if (graph_of_stage(plan, s) != 0u || stage->ops_count != 1u || stage->chain_len != 0u ||
@@ -1105,6 +1138,11 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
                 return TIGRIS_ERR_BAD_OPERATOR;
             const uint16_t *ins = tigris_op_inputs(plan, op);
             const uint16_t *outs = tigris_op_outputs(plan, op);
+            if (op->op_type == TIGRIS_OP_WHILE) {
+                if (!while_graphs_valid(plan, op, branches))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+                continue;
+            }
             const tigris_tensor_t *condition = &plan->tensors[ins[0]];
             if (condition->dtype != 9u || condition->size_bytes != 1u)
                 return TIGRIS_ERR_BAD_OPERATOR;
@@ -1131,7 +1169,7 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     /* Zero is the data dtype, 255 also permits bool; the final input slot repeats. */
-    static const dtype_signature_t dtype_signatures[TIGRIS_OP_IF + 1] = {
+    static const dtype_signature_t dtype_signatures[TIGRIS_OP_WHILE + 1] = {
         [TIGRIS_OP_CONV] = {{0, 0, 0}, 0},
         [TIGRIS_OP_DEPTHWISE] = {{0, 0, 0}, 0},
         [TIGRIS_OP_RELU] = {{0, 0, 0}, 0},
@@ -1219,6 +1257,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         [TIGRIS_OP_SVDF] = {{0, 254, 254}, 254},
         [TIGRIS_OP_LSTM] = {{0, 254, 254}, 254},
         [TIGRIS_OP_IF] = {{9, 0, 0}, 0},
+        [TIGRIS_OP_WHILE] = {{0, 0, 0}, 0},
     };
     const tigris_file_header_t *hdr = plan->header;
     const int legacy = hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES;
@@ -1320,6 +1359,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             if (!lstm_valid(plan, op, op_index)) return TIGRIS_ERR_BAD_OPERATOR;
             break;
         case TIGRIS_OP_IF:
+        case TIGRIS_OP_WHILE:
             break;  /* validated with the subgraph section */
         case TIGRIS_OP_CONV:
         case TIGRIS_OP_DEPTHWISE: {
@@ -2619,7 +2659,8 @@ tigris_error_t tigris_plan_load_ex(
             if (op->num_inputs < 1u ||
                 (op->num_outputs != 1u && !(op->op_type == TIGRIS_OP_SVDF && op->num_outputs == 2u) &&
                  !(op->op_type == TIGRIS_OP_LSTM && op->num_outputs == 3u) &&
-                 !(op->op_type == TIGRIS_OP_IF && op->num_outputs >= 1u)))
+                 !((op->op_type == TIGRIS_OP_IF || op->op_type == TIGRIS_OP_WHILE) &&
+                   op->num_outputs >= 1u)))
                 return TIGRIS_ERR_BAD_SECTION;
             /* A kind belongs to the operator that reads it, whether or not a
              * kernel for that operator exists yet, so a stray payload cannot

@@ -134,7 +134,8 @@ static inline uint32_t tigris_dtype_size(uint8_t dtype)
 /* Svdf: rank; an int8 Svdf adds the state zero point, then the input-to-state
  * and state-to-output (multiplier, shift) pairs. */
 #define TIGRIS_OP_ATTR_LSTM           16 /* int32 time_major (0/1), float32 cell clip */
-#define TIGRIS_OP_ATTR_SUBGRAPHS      17 /* uint16 graphs a control-flow op runs (If: then, else) */
+#define TIGRIS_OP_ATTR_SUBGRAPHS      17 /* uint16 graphs a control-flow op runs (If: then, else;
+                                          * While: condition, body) */
 #define TIGRIS_OP_ATTR_MAX            17
 
 /* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
@@ -270,6 +271,9 @@ typedef enum {
     /* A one-element bool condition, then operands; runs the then or the else
      * subgraph on copies of the operands and copies its results out. */
     TIGRIS_OP_IF                         = 87,
+    /* Loop variables in and out; runs its condition subgraph, and while that
+     * gives true, its body on the current values. */
+    TIGRIS_OP_WHILE                      = 88,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

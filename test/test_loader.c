@@ -4226,6 +4226,24 @@ static void test_state_goldens(void)
                                "lstm gate shifts stay applicable");
             }
         }
+        uint16_t looping = plan.header->num_ops;
+        for (uint16_t n = 0; n < plan.header->num_ops; n++)
+            if (plan.ops[n].op_type == TIGRIS_OP_WHILE) looping = n;
+        if (looping < plan.header->num_ops) {
+            uint8_t len = 0u;
+            const uint8_t *graphs = tigris_op_attribute_data(&plan, looping, TIGRIS_OP_ATTR_SUBGRAPHS, &len);
+            const size_t at = (size_t)(graphs - buf);
+            uint16_t same[2];
+            memcpy(&same[0], graphs, 2u);
+            same[1] = same[0];
+            uint16_t swapped[2];
+            memcpy(&swapped[0], graphs + 2, 2u);
+            memcpy(&swapped[1], graphs, 2u);
+            TEST_ASSERT_EQ(load_altered(golden, copy, at, same, sizeof(same)), TIGRIS_ERR_BAD_OPERATOR,
+                           "a While's condition and body are two graphs");
+            TEST_ASSERT_EQ(load_altered(golden, copy, at, swapped, sizeof(swapped)), TIGRIS_ERR_BAD_OPERATOR,
+                           "a While's condition gives one bool");
+        }
         uint16_t branching = plan.header->num_ops;
         for (uint16_t n = 0; n < plan.header->num_ops; n++)
             if (plan.ops[n].op_type == TIGRIS_OP_IF) branching = n;

@@ -86,6 +86,9 @@ typedef struct {
     int32_t *out_ge;           /* per op-output tensor: global row end held */
     uint16_t *last_use_op;
     uint16_t *last_consumer;
+    /* Per running control-flow operator: its stage, the range it was entered
+     * from, and the graph it runs. */
+    uint16_t *frames;
     uint16_t tensor_capacity;
     uint16_t input_capacity;
     uint16_t output_capacity;
@@ -304,7 +307,8 @@ static size_t workspace_bytes_for_limits(
     if (total > SIZE_MAX - (TIGRIS_EXECUTOR_UINT16_ALIGNMENT - 1u))
         return 0;
     total += TIGRIS_EXECUTOR_UINT16_ALIGNMENT - 1u;
-    count = 2u * (size_t)limits->tensors;
+    /* Two uint16 arrays indexed by tensor, then the control-flow frames. */
+    count = 2u * (size_t)limits->tensors + 4u * (size_t)TIGRIS_MAX_SUBGRAPH_DEPTH;
     if (count > (SIZE_MAX - total) / sizeof(uint16_t))
         return 0;
     return total + count * sizeof(uint16_t);
@@ -386,6 +390,8 @@ static int workspace_layout(
     cursor += (size_t)limits->tensors * sizeof(uint16_t);
     workspace->last_consumer = (uint16_t *)cursor;
     cursor += (size_t)limits->tensors * sizeof(uint16_t);
+    workspace->frames = (uint16_t *)cursor;
+    cursor += 4u * (size_t)TIGRIS_MAX_SUBGRAPH_DEPTH * sizeof(uint16_t);
 
     workspace->tensor_capacity = limits->tensors;
     workspace->input_capacity = limits->inputs;
@@ -3815,23 +3821,33 @@ tigris_exec_error_t tigris_run_with_state(
             last_consumer[entry->output] = UINT16_MAX;
     }
 
-    /* The graph running: its stage range, and while a branch runs, the If
-     * stage to resume after. */
+    /* The stage range of the graph running; each control-flow operator
+     * running keeps a frame of four: its stage, the range it was entered from,
+     * and the graph it runs. */
     uint16_t end = plan->num_subgraphs ? plan->subgraphs[0].num_stages : plan->header->num_stages;
-    uint16_t first = 0u, resume = UINT16_MAX, branch = 0u;
+    uint16_t first = 0u, depth = 0u;
+    uint16_t *frames = workspace->frames;
     for (uint16_t s = 0; s < end; s++) {
         const tigris_stage_t *stage = &plan->stages[s];
 
-        if (resume == UINT16_MAX && stage_control(plan, stage)) {
+        if (stage_control(plan, stage)) {
             const uint16_t op_index = tigris_stage_ops(plan, stage)[0];
-            tigris_exec_error_t err = start_control(plan, mem, &plan->ops[op_index], op_index, &branch);
+            uint16_t *frame = &frames[4u * depth];
+            if (depth >= TIGRIS_MAX_SUBGRAPH_DEPTH) {
+                result = TIGRIS_EXEC_ERR_WORKSPACE;
+                goto restore_fast_arena;
+            }
+            tigris_exec_error_t err = start_control(plan, mem, &plan->ops[op_index], op_index, &frame[3]);
             if (err != TIGRIS_EXEC_OK) {
                 result = err;
                 goto restore_fast_arena;
             }
-            resume = s;
-            first = plan->subgraphs[branch].first_stage;
-            end = (uint16_t)(first + plan->subgraphs[branch].num_stages);
+            frame[0] = s;
+            frame[1] = first;
+            frame[2] = end;
+            depth++;
+            first = plan->subgraphs[frame[3]].first_stage;
+            end = (uint16_t)(first + plan->subgraphs[frame[3]].num_stages);
             s = (uint16_t)(first - 1u);
             continue;
         }
@@ -4118,26 +4134,28 @@ tigris_exec_error_t tigris_run_with_state(
         /* A finished subgraph steps its control-flow operator: into the next
          * subgraph it runs, or, once the operator is done, back to the main
          * graph after it. */
-        if (resume != UINT16_MAX && (uint16_t)(s + 1u) == end) {
-            const uint16_t op_index = tigris_stage_ops(plan, &plan->stages[resume])[0];
+        while (depth > 0u && (uint16_t)(s + 1u) == end) {
+            uint16_t *frame = &frames[4u * (depth - 1u)];
+            const uint16_t op_index = tigris_stage_ops(plan, &plan->stages[frame[0]])[0];
             int done = 0;
             tigris_exec_error_t err = step_control(plan, mem, &plan->ops[op_index], op_index,
-                                                   &branch, &done);
+                                                   &frame[3], &done);
             if (err != TIGRIS_EXEC_OK) {
                 result = err;
                 goto restore_fast_arena;
             }
-            if (done) {
-                s = resume;
-                first = 0u;
-                end = plan->subgraphs[0].num_stages;
-                resume = UINT16_MAX;
-                free_dead_tensors(plan, mem, last_consumer, first, s);
-            } else {
-                first = plan->subgraphs[branch].first_stage;
-                end = (uint16_t)(first + plan->subgraphs[branch].num_stages);
+            if (!done) {
+                first = plan->subgraphs[frame[3]].first_stage;
+                end = (uint16_t)(first + plan->subgraphs[frame[3]].num_stages);
                 s = (uint16_t)(first - 1u);
+                break;
             }
+            /* Back in the graph that ran it, after its stage. */
+            s = frame[0];
+            first = frame[1];
+            end = frame[2];
+            depth--;
+            free_dead_tensors(plan, mem, last_consumer, first, s);
         }
     }
 

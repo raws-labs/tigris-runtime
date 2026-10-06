@@ -65,6 +65,11 @@ int tigris_binary_operands(
 uint32_t tigris_binary_general_index(const tigris_binary_operands_t *operands,
                                      uint8_t k, uint32_t i);
 
+/* The third in-memory band mode uses the first non-unit stored axis. */
+#define TIGRIS_BAND_LEADING 2u
+uint8_t tigris_band_axis(const tigris_plan_t *plan, const tigris_tensor_t *tensor, int mode);
+int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_t *stage);
+
 /* Whether a reduction or movement preserves the existing row-band geometry. */
 int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
                                 uint16_t op_index, int row_tiled);

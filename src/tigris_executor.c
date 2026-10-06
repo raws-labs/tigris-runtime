@@ -2144,6 +2144,18 @@ static int tensor_row_view(
     return 1;
 }
 
+static int tensor_band_view(const tigris_plan_t *plan, const tigris_tensor_t *tensor,
+                            int leading, int32_t *batch, int32_t *rows, int32_t *cols)
+{
+    if (!leading) return tensor_row_view(plan, tensor, batch, rows, cols);
+    uint8_t axis = tigris_band_axis(plan, tensor, TIGRIS_BAND_LEADING);
+    *batch = 1;
+    *rows = tigris_tensor_shape(plan, tensor)[axis];
+    *cols = (int32_t)(tensor->size_bytes / tigris_dtype_size(tensor->dtype) / (uint32_t)*rows);
+    return 1;
+}
+
+
 /**
  * Gather a band of rows out of a whole [batch, rows, cols] tensor, and the
  * mirror that writes one back.
@@ -2367,6 +2379,7 @@ static tigris_exec_error_t run_row_band(
     void                **in_slow_bases,
     void                **out_slow_bases,
     int32_t               rows,
+    int                   leading,
     int32_t               start,
     int32_t               end)
 {
@@ -2376,7 +2389,7 @@ static tigris_exec_error_t run_row_band(
 
     int32_t band = end - start;
     mem->tile.active = 1;
-    mem->tile.row_tiled = 1;
+    mem->tile.row_tiled = leading ? TIGRIS_BAND_LEADING : 1u;
     mem->tile.in_h = band;
     mem->tile.out_h = band;
     mem->tile.in_w = 1;
@@ -2388,7 +2401,7 @@ static tigris_exec_error_t run_row_band(
         int32_t b;
         int32_t r;
         int32_t c;
-        if (!tensor_row_view(plan, t, &b, &r, &c))
+        if (!tensor_band_view(plan, t, leading, &b, &r, &c))
             return TIGRIS_EXEC_ERR_TILE;
         if (r != rows || is_whole_band_operand(plan, stage, tidx)) {
             /* An operand the band does not cut is read whole, straight out of
@@ -2426,7 +2439,7 @@ static tigris_exec_error_t run_row_band(
         int32_t b;
         int32_t r;
         int32_t c;
-        if (!tensor_row_view(plan, t, &b, &r, &c) || r != rows)
+        if (!tensor_band_view(plan, t, leading, &b, &r, &c) || r != rows)
             return TIGRIS_EXEC_ERR_TILE;
         uint32_t row_bytes = t->size_bytes / (uint32_t)(b * r);
         scatter_row_band((uint8_t *)out_slow_bases[i],
@@ -2493,7 +2506,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
     executor_workspace_impl_t *workspace,
     const uint16_t           *last_consumer,
     uint16_t                  current_stage,
-    int32_t                   rows)
+    int32_t                   rows,
+    int                       leading)
 {
     const uint16_t *sops = tigris_stage_ops(plan, stage);
     const uint16_t *sin = tigris_stage_inputs(plan, stage);
@@ -2501,7 +2515,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
     void **out_slow_bases = workspace->output_ptrs;
     void **in_slow_bases = workspace->input_ptrs;
 
-    int aliased = row_band_output_may_alias_input(
+    int aliased = !leading && row_band_output_may_alias_input(
         plan, stage, last_consumer, current_stage);
 
     for (uint16_t i = 0; i < stage->inputs_count; i++) {
@@ -2571,7 +2585,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
     for (int32_t start = 0; start < rows; start += band) {
         int32_t end = rows - start < band ? rows : start + band;
         result = run_row_band(plan, stage, mem, kernel, user_ctx,
-                              in_slow_bases, out_slow_bases, rows, start, end);
+                              in_slow_bases, out_slow_bases, rows, leading, start, end);
         if (result != TIGRIS_EXEC_OK)
             break;
         tigris_mem_reset_fast(mem);
@@ -3741,6 +3755,19 @@ tigris_exec_error_t tigris_run_with_state(
                 goto restore_fast_arena;
             }
             if (stats) stats->stages_tiled++;
+        } else if (stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
+                   stage->tile_plan_idx < run_plan->header->num_tile_plans &&
+                   run_plan->tile_plans &&
+                   run_plan->tile_plans[stage->tile_plan_idx].tileable &&
+                   tigris_stage_leading_band(run_plan, stage)) {
+            tigris_exec_error_t err = exec_stage_tiled_rows(
+                run_plan, stage, mem, kernel, user_ctx, workspace, last_consumer, s,
+                tigris_stage_leading_band(run_plan, stage), 1);
+            if (err != TIGRIS_EXEC_OK) {
+                result = err;
+                goto restore_fast_arena;
+            }
+            if (stats) stats->stages_tiled++;
         } else {
             const uint16_t *sin  = tigris_stage_inputs(run_plan, stage);
             const uint16_t *sout = tigris_stage_outputs(run_plan, stage);
@@ -3843,7 +3870,7 @@ tigris_exec_error_t tigris_run_with_state(
             if (may_tile_rows) {
                 tigris_exec_error_t err = exec_stage_tiled_rows(
                     run_plan, stage, mem, kernel, user_ctx, workspace,
-                    last_consumer, s, band_rows);
+                    last_consumer, s, band_rows, 0);
                 if (err != TIGRIS_EXEC_OK) {
                     TIGRIS_PLATFORM_DBG("S%u rows ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
                         s, (int)err, (unsigned long)total_io,

@@ -1278,7 +1278,7 @@ static uint32_t independent_band_numel(const tigris_plan_t *plan, uint16_t index
     uint32_t count = tensor_numel(plan, index);
     if (!mem->tile.active) return count;
     const tigris_tensor_t *tensor = &plan->tensors[index];
-    uint8_t axis = mem->tile.row_tiled ? (uint8_t)(tensor->ndim - 2u) : 1u;
+    uint8_t axis = tigris_band_axis(plan, tensor, mem->tile.row_tiled);
     return count / (uint32_t)tigris_tensor_shape(plan, tensor)[axis] * (uint32_t)mem->tile.out_h;
 }
 
@@ -1302,7 +1302,7 @@ static int axis_extents(
     for (uint8_t axis = 0; axis < in->ndim; axis++) {
         if (shape[axis] <= 0)
             return -1;
-        int32_t extent = mem->tile.active && axis == (mem->tile.row_tiled ? in->ndim - 2u : 1u)
+        int32_t extent = mem->tile.active && axis == (tigris_band_axis(plan, in, mem->tile.row_tiled))
                        ? mem->tile.in_h : shape[axis];
         if (extent <= 0) return -1;
         if (axis < axes[0])
@@ -1350,7 +1350,7 @@ static int movement_gather(const tigris_plan_t *plan, const tigris_op_t *op,
     const tigris_tensor_t *source = &plan->tensors[tigris_op_inputs(plan, op)[0]];
     int32_t shape[6];
     memcpy(shape, tigris_tensor_shape(plan, source), (size_t)source->ndim * 4u);
-    if (mem->tile.active) shape[mem->tile.row_tiled ? source->ndim - 2u : 1u] = mem->tile.in_h;
+    if (mem->tile.active) shape[tigris_band_axis(plan, source, mem->tile.row_tiled)] = mem->tile.in_h;
     const uint8_t *indices;
     uint32_t count;
     if (op->weight_idx == TIGRIS_NO_WEIGHT) {
@@ -1421,8 +1421,8 @@ int tigris_movement_execute(const tigris_plan_t *plan, const tigris_op_t *op,
     memcpy(shape, tigris_tensor_shape(plan, source), (size_t)source->ndim * 4u);
     memcpy(out_shape, tigris_tensor_shape(plan, target), (size_t)target->ndim * 4u);
     if (mem->tile.active) {
-        shape[mem->tile.row_tiled ? source->ndim - 2u : 1u] = mem->tile.in_h;
-        out_shape[mem->tile.row_tiled ? target->ndim - 2u : 1u] = mem->tile.out_h;
+        shape[tigris_band_axis(plan, source, mem->tile.row_tiled)] = mem->tile.in_h;
+        out_shape[tigris_band_axis(plan, target, mem->tile.row_tiled)] = mem->tile.out_h;
     }
     const uint8_t *input = (const uint8_t *)tigris_mem_tensor_ptr(mem, in_idx);
     uint8_t *output = (uint8_t *)tigris_mem_tensor_ptr(mem, out_idx);
@@ -1449,7 +1449,7 @@ int tigris_movement_execute(const tigris_plan_t *plan, const tigris_op_t *op,
             }
         }
         if (mem->tile.active)
-            metadata[source->ndim + (mem->tile.row_tiled ? source->ndim - 2u : 1u)] = mem->tile.in_h;
+            metadata[source->ndim + (tigris_band_axis(plan, source, mem->tile.row_tiled))] = mem->tile.in_h;
         const int32_t *ushape = metadata + source->ndim;
         const uint8_t *values;
         if (op->weight_idx == TIGRIS_NO_WEIGHT) {

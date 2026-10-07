@@ -630,7 +630,7 @@ static int is_pure_reinterpretation(
     return a[0] == b[0] && a[in->ndim - 1u] == b[out->ndim - 1u];
 }
 
-static tigris_exec_error_t exec_stage_normal(
+static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal(
     const tigris_plan_t *plan,
     const tigris_stage_t *stage,
     tigris_mem_t        *mem,
@@ -901,7 +901,7 @@ static int stage_axis1_fast_bytes(
     return 1;
 }
 
-static tigris_exec_error_t exec_stage_tiled(
+static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled(
     const tigris_plan_t      *plan,
     const tigris_stage_t     *stage,
     tigris_mem_t             *mem,

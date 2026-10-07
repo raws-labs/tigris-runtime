@@ -105,7 +105,7 @@ typedef struct {
           (14u + 13u * (size_t)(spatial_ops)) +                                \
       2u * (size_t)(tensors)) * sizeof(int32_t) +                              \
      (TIGRIS_EXECUTOR_UINT16_ALIGNMENT - 1u) +                                 \
-     (2u * (size_t)(tensors) + 4u * (size_t)TIGRIS_MAX_SUBGRAPH_DEPTH) *       \
+     (2u * (size_t)(tensors) + 4u + 4u * (size_t)TIGRIS_MAX_SUBGRAPH_DEPTH) *  \
          sizeof(uint16_t))
 
 /**
@@ -116,7 +116,7 @@ typedef struct {
 #ifndef TIGRIS_EXECUTOR_WORKSPACE_BYTES
 #define TIGRIS_EXECUTOR_WORKSPACE_BYTES (                                      \
     64u +                                                                      \
-    (2u * TIGRIS_MAX_TENSORS + 4u * TIGRIS_MAX_SUBGRAPH_DEPTH) * sizeof(uint16_t) + \
+    (2u * TIGRIS_MAX_TENSORS + 4u + 4u * TIGRIS_MAX_SUBGRAPH_DEPTH) * sizeof(uint16_t) + \
     2u * TIGRIS_MAX_TENSORS * sizeof(int32_t) +                                \
     (TIGRIS_MAX_STAGE_INPUTS + TIGRIS_MAX_STAGE_OUTPUTS) * sizeof(void *) +     \
     TIGRIS_MAX_CHAIN_STAGES * (                                                \

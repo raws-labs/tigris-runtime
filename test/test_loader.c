@@ -4105,8 +4105,8 @@ static uint32_t state_section_offset(const uint8_t *buf)
     }
 }
 
-/* One stateful invocation of a plan with one input and one output, both in
- * the plan's own encoding. */
+/* One stateful invocation of a plan: its inputs one after another in x, its
+ * outputs one after another into out, each in its own encoding. */
 static tigris_exec_error_t run_with_state_once(const tigris_plan_t *plan, void *state,
                                                size_t state_size, const void *x,
                                                uint32_t x_bytes, void *out, uint32_t out_bytes)
@@ -4125,17 +4125,32 @@ static tigris_exec_error_t run_with_state_once(const tigris_plan_t *plan, void *
         uint8_t *fast = fast_raw + (TIGRIS_TENSOR_ALIGN - ((uintptr_t)fast_raw % TIGRIS_TENSOR_ALIGN)) % TIGRIS_TENSOR_ALIGN;
         uint8_t *slow = slow_raw + (TIGRIS_TENSOR_ALIGN - ((uintptr_t)slow_raw % TIGRIS_TENSOR_ALIGN)) % TIGRIS_TENSOR_ALIGN;
         tigris_mem_t mem;
-        uint16_t input = plan->model_inputs[0];
         tigris_kernel_fn dispatch = tigris_plan_data_dtype(plan) == 3u
             ? tigris_dispatch_kernel_s8 : tigris_dispatch_kernel;
-        if (tigris_mem_init(&mem, pointers, plan->header->num_tensors, fast, fast_size,
-                            slow, slow_size) == TIGRIS_MEM_OK &&
-            tigris_mem_alloc_slow(&mem, input, plan->tensors[input].size_bytes) == TIGRIS_MEM_OK &&
-            tigris_input_write(plan, &mem, input, x, x_bytes) == TIGRIS_OK) {
+        int ready = tigris_mem_init(&mem, pointers, plan->header->num_tensors, fast, fast_size,
+                                    slow, slow_size) == TIGRIS_MEM_OK;
+        uint32_t at = 0u;
+        for (uint16_t i = 0; ready && i < plan->header->num_model_inputs; i++) {
+            const uint16_t input = plan->model_inputs[i];
+            const uint32_t bytes = plan->tensors[input].size_bytes;
+            ready = at + bytes <= x_bytes &&
+                    tigris_mem_alloc_slow(&mem, input, bytes) == TIGRIS_MEM_OK &&
+                    tigris_input_write(plan, &mem, input, (const uint8_t *)x + at, bytes) == TIGRIS_OK;
+            at += bytes;
+        }
+        if (ready && at == x_bytes) {
             result = tigris_run_with_state(plan, &mem, dispatch, NULL, NULL,
                                            workspace, workspace_size, state, state_size);
-            if (result == TIGRIS_EXEC_OK &&
-                tigris_output_read(plan, &mem, plan->model_outputs[0], out, out_bytes) != TIGRIS_OK)
+            at = 0u;
+            for (uint16_t o = 0; result == TIGRIS_EXEC_OK && o < plan->header->num_model_outputs; o++) {
+                const uint16_t output = plan->model_outputs[o];
+                const uint32_t bytes = plan->tensors[output].size_bytes;
+                if (at + bytes > out_bytes ||
+                    tigris_output_read(plan, &mem, output, (uint8_t *)out + at, bytes) != TIGRIS_OK)
+                    result = TIGRIS_EXEC_ERR_MEM;
+                at += bytes;
+            }
+            if (result == TIGRIS_EXEC_OK && at != out_bytes)
                 result = TIGRIS_EXEC_ERR_MEM;
         }
     }
@@ -4267,6 +4282,44 @@ static void test_state_goldens(void)
                            TIGRIS_ERR_BAD_SECTION, "graphs cover consecutive stage ranges");
             TEST_ASSERT_EQ(load_altered(golden, copy, operand, &borrowed, 2u), TIGRIS_ERR_BAD_TENSOR,
                            "a subgraph's tensors belong to it alone");
+        }
+        uint16_t detecting = plan.header->num_ops;
+        for (uint16_t n = 0; n < plan.header->num_ops; n++)
+            if (plan.ops[n].op_type == TIGRIS_OP_DETECTION_POSTPROCESS) detecting = n;
+        if (detecting < plan.header->num_ops) {
+            uint8_t len = 0u;
+            const uint8_t *params = tigris_op_attribute_data(&plan, detecting, TIGRIS_OP_ATTR_DETECTION, &len);
+            const size_t at = (size_t)(params - buf);
+            const tigris_op_t *op = &plan.ops[detecting];
+            const tigris_tensor_t *work = &plan.tensors[tigris_op_outputs(&plan, op)[4]];
+            const tigris_tensor_t *count = &plan.tensors[tigris_op_outputs(&plan, op)[3]];
+            const uint32_t short_work = work->size_bytes - 4u;
+            const int32_t short_elements = (int32_t)(short_work / 4u);
+            const size_t work_shape = (size_t)((const uint8_t *)tigris_tensor_shape(&plan, work) - buf);
+            const uint16_t many_classes = 9u, no_detections = 0u;
+            const uint8_t three = 3u, int8 = 3u;
+            const float wide = 1.5f, zero = 0.0f, nan = NAN;
+            tigris_plan_t altered;
+            memcpy(copy, golden->plan, golden->plan_size);
+            memcpy(copy + work_shape, &short_elements, 4u);
+            memcpy(copy + ((const uint8_t *)&work->size_bytes - buf), &short_work, 4u);
+            TEST_ASSERT_EQ(tigris_plan_load(copy, golden->plan_size, &altered), TIGRIS_ERR_BAD_OPERATOR,
+                           "detection working memory covers its scratch");
+            TEST_ASSERT_EQ(load_altered(golden, copy, at + 4u, &many_classes, 2u), TIGRIS_ERR_BAD_OPERATOR,
+                           "detection classes fit the score columns");
+            TEST_ASSERT_EQ(load_altered(golden, copy, at, &no_detections, 2u), TIGRIS_ERR_BAD_OPERATOR,
+                           "detection keeps at least one result");
+            TEST_ASSERT_EQ(load_altered(golden, copy, at + 6u, &three, 1u), TIGRIS_ERR_BAD_OPERATOR,
+                           "detection suppression is fast or regular");
+            TEST_ASSERT_EQ(load_altered(golden, copy, at + 12u, &wide, 4u), TIGRIS_ERR_BAD_OPERATOR,
+                           "detection IoU threshold is at most 1");
+            TEST_ASSERT_EQ(load_altered(golden, copy, at + 8u, &nan, 4u), TIGRIS_ERR_BAD_OPERATOR,
+                           "detection score threshold is finite");
+            TEST_ASSERT_EQ(load_altered(golden, copy, at + 16u, &zero, 4u), TIGRIS_ERR_BAD_OPERATOR,
+                           "detection scales divide");
+            TEST_ASSERT(load_altered(golden, copy, (size_t)((const uint8_t *)&count->dtype - buf),
+                                     &int8, 1u) != TIGRIS_OK,
+                        "detection results are float32");
         }
         if (tigris_plan_data_dtype(&plan) == 3u && plan.ops[0].op_type == TIGRIS_OP_SVDF) {
             uint8_t len = 0u;

@@ -1506,6 +1506,273 @@ int tigris_movement_execute(const tigris_plan_t *plan, const tigris_op_t *op,
     return 0;
 }
 
+/* DetectionPostProcess: TFLite Micro's SSD box decoding and non-max
+ * suppression, operation for operation, so its results match bit for bit. */
+typedef struct {
+    const float *decoded;
+    uint32_t boxes;
+    float score_threshold;
+    float iou_threshold;
+    float *keep_scores;
+    uint32_t *keep_indices;
+    uint32_t *sorted;
+    uint8_t *active;
+} detection_t;
+
+/* An operand as TFLite Micro's DEQUANTIZE in front of the operator writes it. */
+static float detection_value(const void *data, uint8_t dtype, const tigris_quant_param_t *q,
+                             size_t i)
+{
+    if (dtype != 3u)
+        return ((const float *)data)[i];
+    const int32_t value = (int32_t)((const int8_t *)data)[i];
+    return (float)((double)q->scale * (double)(value - q->zero_point));
+}
+
+/* std::max and std::min, which keep the first operand when they compare equal. */
+static float detection_max(float a, float b) { return a < b ? b : a; }
+static float detection_min(float a, float b) { return b < a ? b : a; }
+
+static float detection_iou(const float *boxes, uint32_t i, uint32_t j)
+{
+    const float *a = &boxes[4u * i];
+    const float *b = &boxes[4u * j];
+    const float area_a = (a[2] - a[0]) * (a[3] - a[1]);
+    const float area_b = (b[2] - b[0]) * (b[3] - b[1]);
+    if (area_a <= 0.0f || area_b <= 0.0f)
+        return 0.0f;
+    const float height = detection_max(detection_min(a[2], b[2]) - detection_max(a[0], b[0]), 0.0f);
+    const float width = detection_max(detection_min(a[3], b[3]) - detection_max(a[1], b[1]), 0.0f);
+    const float intersection = height * width;
+    return intersection / (area_a + area_b - intersection);
+}
+
+/* Indices 0..n-1 by decreasing value, equal values in index order, which is
+ * the order TFLite Micro's stable merge sort leaves. */
+static void detection_argsort(const float *values, uint32_t n, uint32_t *indices,
+                              uint32_t *buffer)
+{
+    for (uint32_t i = 0u; i < n; i++)
+        indices[i] = i;
+    for (uint32_t width = 1u; width < n; width *= 2u) {
+        for (uint32_t lo = 0u; lo < n; lo += 2u * width) {
+            const uint32_t mid = (n - lo > width) ? lo + width : n;
+            const uint32_t hi = (n - mid > width) ? mid + width : n;
+            uint32_t left = lo;
+            uint32_t right = mid;
+            for (uint32_t k = lo; k < hi; k++) {
+                if (left < mid && (right >= hi || !(values[indices[right]] > values[indices[left]]))) {
+                    buffer[k] = indices[left];
+                    left++;
+                } else {
+                    buffer[k] = indices[right];
+                    right++;
+                }
+            }
+        }
+        memcpy(indices, buffer, (size_t)n * sizeof(uint32_t));
+    }
+}
+
+/* The first `count` of indices 0..n-1 by decreasing value, equal values in
+ * index order, as TFLite Micro's partial sort places them. */
+static void detection_partial_argsort(const float *values, uint32_t n, uint32_t count,
+                                      uint32_t *indices)
+{
+    for (uint32_t i = 0u; i < n; i++)
+        indices[i] = i;
+    for (uint32_t r = 0u; r < count; r++) {
+        uint32_t best = r;
+        for (uint32_t k = r + 1u; k < n; k++) {
+            const uint32_t a = indices[k];
+            const uint32_t b = indices[best];
+            if (values[a] > values[b] || (!(values[a] < values[b]) && a < b))
+                best = k;
+        }
+        const uint32_t held = indices[r];
+        indices[r] = indices[best];
+        indices[best] = held;
+    }
+}
+
+/* Non-max suppression of one score per box: boxes at or above the score
+ * threshold in decreasing score, each dropping the later ones it overlaps by
+ * more than the IoU threshold; at most `limit` are selected. */
+static uint32_t detection_single_class(const detection_t *d, const float *scores,
+                                       uint32_t limit, uint32_t *selected)
+{
+    uint32_t kept = 0u;
+    for (uint32_t i = 0u; i < d->boxes; i++) {
+        if (scores[i] >= d->score_threshold) {
+            d->keep_scores[kept] = scores[i];
+            kept++;
+        }
+    }
+    /* The sort borrows the kept indices as its buffer; they are written after. */
+    detection_argsort(d->keep_scores, kept, d->sorted, d->keep_indices);
+    kept = 0u;
+    for (uint32_t i = 0u; i < d->boxes; i++) {
+        if (scores[i] >= d->score_threshold) {
+            d->keep_indices[kept] = i;
+            kept++;
+        }
+    }
+    const uint32_t output_size = kept < limit ? kept : limit;
+    uint32_t active = kept;
+    uint32_t count = 0u;
+    for (uint32_t i = 0u; i < kept; i++)
+        d->active[i] = 1u;
+    for (uint32_t i = 0u; i < kept && active > 0u && count < output_size; i++) {
+        if (d->active[i] != 0u) {
+            const uint32_t box = d->keep_indices[d->sorted[i]];
+            selected[count] = box;
+            count++;
+            d->active[i] = 0u;
+            active--;
+            for (uint32_t j = i + 1u; j < kept; j++) {
+                if (d->active[j] != 0u &&
+                    detection_iou(d->decoded, box, d->keep_indices[d->sorted[j]]) > d->iou_threshold) {
+                    d->active[j] = 0u;
+                    active--;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+int tigris_detection_execute(const tigris_plan_t *plan, const tigris_op_t *op,
+                             uint16_t op_index, tigris_mem_t *mem)
+{
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    uint8_t len = 0u;
+    const uint8_t *params = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_DETECTION, &len);
+    const float *anchors = (const float *)tigris_op_constant(plan, op_index, 0u);
+    const void *encodings = tigris_mem_tensor_ptr(mem, ins[0]);
+    const void *scores = tigris_mem_tensor_ptr(mem, ins[1]);
+    float *out_boxes = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    float *out_classes = (float *)tigris_mem_tensor_ptr(mem, outs[1]);
+    float *out_scores = (float *)tigris_mem_tensor_ptr(mem, outs[2]);
+    float *out_count = (float *)tigris_mem_tensor_ptr(mem, outs[3]);
+    float *work = (float *)tigris_mem_tensor_ptr(mem, outs[4]);
+    if (op->num_inputs != 2u || op->num_outputs != 5u || !params ||
+        len != TIGRIS_OP_ATTR_DETECTION_LEN || !anchors || !encodings || !scores ||
+        !out_boxes || !out_classes || !out_scores || !out_count || !work)
+        return -1;
+    uint16_t limits[3];
+    float values[6];
+    memcpy(limits, params, sizeof(limits));
+    memcpy(values, params + 8, sizeof(values));
+    const uint32_t detections = limits[0], per_class = limits[1], classes = limits[2];
+    const int regular = params[6] != 0u;
+    const tigris_tensor_t *encoding_tensor = &plan->tensors[ins[0]];
+    const tigris_tensor_t *score_tensor = &plan->tensors[ins[1]];
+    const uint8_t dtype = encoding_tensor->dtype;
+    const tigris_quant_param_t *eq = tigris_tensor_quant(plan, encoding_tensor);
+    const tigris_quant_param_t *sq = tigris_tensor_quant(plan, score_tensor);
+    const uint32_t boxes = (uint32_t)tigris_tensor_shape(plan, encoding_tensor)[1];
+    const uint32_t columns = (uint32_t)tigris_tensor_shape(plan, score_tensor)[2];
+    const uint32_t offset = columns - classes;
+    const uint32_t candidates = detections + (regular ? per_class : 0u);
+    if (dtype == 3u && (!eq || !sq))
+        return -1;
+
+    /* Working memory as TIGRIS_DETECTION_SCRATCH_BYTES counts it. */
+    float *decoded = work;
+    float *column = decoded + 4u * boxes;
+    detection_t d = {decoded, boxes, values[0], values[1], column + boxes, NULL, NULL, NULL};
+    d.keep_indices = (uint32_t *)(void *)(d.keep_scores + boxes);
+    uint32_t *selected = d.keep_indices + boxes;
+    uint32_t *class_of = selected + boxes;
+    d.sorted = class_of + boxes;
+    uint32_t *after_index = d.sorted + (boxes > candidates ? boxes : candidates);
+    float *after_score = (float *)(void *)(after_index + candidates);
+    float *sorted_values = after_score + candidates;
+    d.active = (uint8_t *)(void *)(sorted_values + detections);
+
+    /* Center-size encodings against center-size anchors, in double. */
+    for (uint32_t i = 0u; i < boxes; i++) {
+        const double y = (double)detection_value(encodings, dtype, eq, 4u * (size_t)i);
+        const double x = (double)detection_value(encodings, dtype, eq, 4u * (size_t)i + 1u);
+        const double h = (double)detection_value(encodings, dtype, eq, 4u * (size_t)i + 2u);
+        const double w = (double)detection_value(encodings, dtype, eq, 4u * (size_t)i + 3u);
+        const float *anchor = &anchors[4u * i];
+        const float ycenter = (float)(y / (double)values[2] * (double)anchor[2] + (double)anchor[0]);
+        const float xcenter = (float)(x / (double)values[3] * (double)anchor[3] + (double)anchor[1]);
+        const float half_h = (float)(0.5 * exp(h / (double)values[4]) * (double)anchor[2]);
+        const float half_w = (float)(0.5 * exp(w / (double)values[5]) * (double)anchor[3]);
+        decoded[4u * i] = ycenter - half_h;
+        decoded[4u * i + 1u] = xcenter - half_w;
+        decoded[4u * i + 2u] = ycenter + half_h;
+        decoded[4u * i + 3u] = xcenter + half_w;
+        /* TFLite Micro fails on a box that is empty or inverted. */
+        if (!(decoded[4u * i] < decoded[4u * i + 2u]) || !(decoded[4u * i + 1u] < decoded[4u * i + 3u]))
+            return -1;
+    }
+
+    uint32_t count = 0u;
+    if (regular) {
+        /* Per class, its suppressed boxes join the best so far, which keep
+         * the highest `detections` scores. */
+        for (uint32_t c = 0u; c < classes; c++) {
+            for (uint32_t i = 0u; i < boxes; i++)
+                column[i] = detection_value(scores, dtype, sq, (size_t)i * columns + c + offset);
+            const uint32_t found = detection_single_class(&d, column, per_class, selected);
+            uint32_t total = count;
+            for (uint32_t i = 0u; i < found; i++) {
+                after_index[total] = selected[i] * columns + c + offset;
+                after_score[total] = column[selected[i]];
+                total++;
+            }
+            const uint32_t keep = total < detections ? total : detections;
+            detection_partial_argsort(after_score, total, keep, d.sorted);
+            for (uint32_t r = 0u; r < keep; r++) {
+                const uint32_t from = d.sorted[r];
+                d.sorted[r] = after_index[from];
+                sorted_values[r] = after_score[from];
+            }
+            for (uint32_t r = 0u; r < keep; r++) {
+                after_index[r] = d.sorted[r];
+                after_score[r] = sorted_values[r];
+            }
+            count = keep;
+        }
+        for (uint32_t r = 0u; r < count; r++) {
+            const uint32_t anchor = after_index[r] / columns;
+            memcpy(&out_boxes[4u * r], &decoded[4u * anchor], 4u * sizeof(float));
+            out_classes[r] = (float)(after_index[r] - anchor * columns - offset);
+            out_scores[r] = after_score[r];
+        }
+    } else {
+        /* Each box's best class, first on ties, then one suppression. */
+        for (uint32_t i = 0u; i < boxes; i++) {
+            uint32_t best = 0u;
+            for (uint32_t c = 1u; c < classes; c++) {
+                if (detection_value(scores, dtype, sq, (size_t)i * columns + offset + c) >
+                    detection_value(scores, dtype, sq, (size_t)i * columns + offset + best))
+                    best = c;
+            }
+            class_of[i] = best;
+            column[i] = detection_value(scores, dtype, sq, (size_t)i * columns + offset + best);
+        }
+        count = detection_single_class(&d, column, detections, selected);
+        for (uint32_t r = 0u; r < count; r++) {
+            memcpy(&out_boxes[4u * r], &decoded[4u * selected[r]], 4u * sizeof(float));
+            out_classes[r] = (float)class_of[selected[r]];
+            out_scores[r] = column[selected[r]];
+        }
+    }
+    /* Rows past the count are zero; TFLite Micro's fast form leaves them unwritten. */
+    for (uint32_t r = count; r < detections; r++) {
+        memset(&out_boxes[4u * r], 0, 4u * sizeof(float));
+        out_classes[r] = 0.0f;
+        out_scores[r] = 0.0f;
+    }
+    out_count[0] = (float)count;
+    return 0;
+}
+
 int tigris_arg_execute(const tigris_plan_t *plan, const tigris_op_t *op,
                        uint16_t op_index, tigris_mem_t *mem)
 {
@@ -2833,6 +3100,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_CUMSUM: return kern_cumsum_f32(plan, op, op_index, mem);
     case TIGRIS_OP_SVDF: return kern_svdf_f32(plan, op, op_index, mem);
     case TIGRIS_OP_LSTM: return kern_lstm_f32(plan, op, op_index, mem);
+    case TIGRIS_OP_DETECTION_POSTPROCESS: return tigris_detection_execute(plan, op, op_index, mem);
     case TIGRIS_OP_SPLIT:       return kern_split(plan, op, mem);
     case TIGRIS_OP_PAD:         return kern_pad(plan, op, op_index, mem);
     default:

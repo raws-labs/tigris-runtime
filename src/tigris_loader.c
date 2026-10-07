@@ -549,7 +549,9 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     case TIGRIS_OP_ATTR_BINARY_REQUANT: return op_type == TIGRIS_OP_ADD ||
                                                op_type == TIGRIS_OP_SUB;
     case TIGRIS_OP_ATTR_CONSTANT_OPERAND: return is_binary_op(op_type);
-    case TIGRIS_OP_ATTR_CONSTANTS:      return op_type == TIGRIS_OP_SVDF || op_type == TIGRIS_OP_LSTM;
+    case TIGRIS_OP_ATTR_CONSTANTS:      return op_type == TIGRIS_OP_SVDF || op_type == TIGRIS_OP_LSTM ||
+                                               op_type == TIGRIS_OP_DETECTION_POSTPROCESS;
+    case TIGRIS_OP_ATTR_DETECTION:      return op_type == TIGRIS_OP_DETECTION_POSTPROCESS;
     case TIGRIS_OP_ATTR_SVDF:           return op_type == TIGRIS_OP_SVDF;
     case TIGRIS_OP_ATTR_LSTM:           return op_type == TIGRIS_OP_LSTM;
     case TIGRIS_OP_ATTR_SUBGRAPHS:      return op_type == TIGRIS_OP_IF || op_type == TIGRIS_OP_WHILE;
@@ -759,15 +761,13 @@ typedef struct {
 
 uint8_t tigris_plan_data_dtype(const tigris_plan_t *plan)
 {
-    uint8_t dtype = 0u;
+    /* Float32 tensors in an int8 plan are admitted only by operator slots
+     * that state float32, which the dtype signatures check. */
     for (uint16_t i = 0; i < plan->header->num_tensors; i++) {
         const tigris_tensor_t *tensor = &plan->tensors[i];
-        if ((tensor->flags & TIGRIS_TENSOR_CONSTANT) != 0u ||
-            (tensor->dtype != 1u && tensor->dtype != 3u)) continue;
-        if (dtype != 0u && dtype != tensor->dtype) return 0u;
-        dtype = tensor->dtype;
+        if ((tensor->flags & TIGRIS_TENSOR_CONSTANT) == 0u && tensor->dtype == 3u) return 3u;
     }
-    return dtype == 0u ? 1u : dtype;
+    return 1u;
 }
 
 /* Role 0 is the plan's data dtype, 255 data or bool, 254 data or int16 state
@@ -780,6 +780,66 @@ static uint16_t constant_index(const tigris_plan_t *plan, uint16_t op_index, uin
     if (!list || (uint32_t)k * 2u + 2u > len) return TIGRIS_NO_WEIGHT;
     return (uint16_t)((uint16_t)list[(uint32_t)k * 2u] |
                       (uint16_t)((uint16_t)list[(uint32_t)k * 2u + 1u] << 8));
+}
+
+/* DetectionPostProcess: box encodings [1, boxes, 4] and scores [1, boxes,
+ * columns] in the data dtype, float32 anchors [boxes, 4] as its constant; float32
+ * boxes [1, detections, 4], classes and scores [1, detections], the count [1]
+ * and working memory of at least TIGRIS_DETECTION_SCRATCH_BYTES out. */
+static int detection_valid(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index)
+{
+    uint8_t len = 0u;
+    const uint8_t *params = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_DETECTION, &len);
+    uint8_t constants_len = 0u;
+    if (op->num_inputs != 2u || op->num_outputs != 5u || op->weight_idx != TIGRIS_NO_WEIGHT ||
+        op->bias_idx != TIGRIS_NO_WEIGHT || !params || len != TIGRIS_OP_ATTR_DETECTION_LEN ||
+        !tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_CONSTANTS, &constants_len) ||
+        constants_len != 2u)
+        return 0;
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const tigris_tensor_t *encodings = &plan->tensors[ins[0]];
+    const tigris_tensor_t *scores = &plan->tensors[ins[1]];
+    uint16_t limits[3];
+    float values[6];
+    memcpy(limits, params, sizeof(limits));
+    memcpy(values, params + 8, sizeof(values));
+    const uint8_t dtype = encodings->dtype;
+    if (encodings->ndim != 3u || scores->ndim != 3u || scores->dtype != dtype ||
+        (dtype == 3u && (!tigris_tensor_quant(plan, encodings) || !tigris_tensor_quant(plan, scores))))
+        return 0;
+    const int32_t *es = tigris_tensor_shape(plan, encodings);
+    const int32_t *ss = tigris_tensor_shape(plan, scores);
+    const int32_t boxes = es[1];
+    if (es[0] != 1 || es[2] != 4 || boxes <= 0 || boxes > 65535 || ss[0] != 1 || ss[1] != boxes ||
+        limits[0] == 0u || limits[2] == 0u || ss[2] < (int32_t)limits[2] || ss[2] > (int32_t)limits[2] + 1 ||
+        params[6] > 1u || params[7] != 0u || (params[6] == 1u && limits[1] == 0u))
+        return 0;
+    /* Thresholds and scales as TFLite Micro checks or divides by them. */
+    if (!isfinite(values[0]) || !(values[1] > 0.0f) || !(values[1] <= 1.0f))
+        return 0;
+    for (uint8_t k = 2u; k < 6u; k++)
+        if (!isfinite(values[k]) || values[k] == 0.0f)
+            return 0;
+    const int32_t expected[4][3] = {{1, (int32_t)limits[0], 4}, {1, (int32_t)limits[0], 0},
+                                    {1, (int32_t)limits[0], 0}, {1, 0, 0}};
+    const uint8_t ranks[4] = {3u, 2u, 2u, 1u};
+    for (uint8_t i = 0u; i < 5u; i++) {
+        const tigris_tensor_t *out = &plan->tensors[outs[i]];
+        if (out->dtype != 1u || out->quant_param_idx != TIGRIS_NO_QUANT_PARAM)
+            return 0;
+        if (i < 4u) {
+            const int32_t *shape = tigris_tensor_shape(plan, out);
+            if (out->ndim != ranks[i]) return 0;
+            for (uint8_t a = 0u; a < ranks[i]; a++)
+                if (shape[a] != expected[i][a]) return 0;
+        }
+    }
+    const size_t candidates = (size_t)limits[0] + (params[6] == 1u ? (size_t)limits[1] : 0u);
+    if ((size_t)plan->tensors[outs[4]].size_bytes <
+        TIGRIS_DETECTION_SCRATCH_BYTES(boxes, limits[0], candidates))
+        return 0;
+    return weight_size_is(plan, constant_index(plan, op_index, 0u), (uint64_t)boxes * 16u);
 }
 
 /* Svdf: input [batch, features] and state [batch, filters * memory] in, output
@@ -1168,7 +1228,7 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     /* Zero is the data dtype, 255 also permits bool; the final input slot repeats. */
-    static const dtype_signature_t dtype_signatures[TIGRIS_OP_WHILE + 1] = {
+    static const dtype_signature_t dtype_signatures[TIGRIS_OP_DETECTION_POSTPROCESS + 1] = {
         [TIGRIS_OP_CONV] = {{0, 0, 0}, 0},
         [TIGRIS_OP_DEPTHWISE] = {{0, 0, 0}, 0},
         [TIGRIS_OP_RELU] = {{0, 0, 0}, 0},
@@ -1257,6 +1317,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         [TIGRIS_OP_LSTM] = {{0, 254, 254}, 254},
         [TIGRIS_OP_IF] = {{9, 0, 0}, 0},
         [TIGRIS_OP_WHILE] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_DETECTION_POSTPROCESS] = {{0, 0, 0}, 1},
     };
     const tigris_file_header_t *hdr = plan->header;
     const int legacy = hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES;
@@ -1356,6 +1417,9 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             break;
         case TIGRIS_OP_LSTM:
             if (!lstm_valid(plan, op, op_index)) return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        case TIGRIS_OP_DETECTION_POSTPROCESS:
+            if (!detection_valid(plan, op, op_index)) return TIGRIS_ERR_BAD_OPERATOR;
             break;
         case TIGRIS_OP_IF:
         case TIGRIS_OP_WHILE:
@@ -2654,10 +2718,12 @@ tigris_error_t tigris_plan_load_ex(
                 hdr->version < TIGRIS_SCHEMA_VERSION_V8)
                 return TIGRIS_ERR_BAD_SECTION;
             /* Svdf and Lstm also write their next states; If gives each
-             * result its branches compute. */
+             * result its branches compute; DetectionPostProcess writes four
+             * results and its working memory. */
             if (op->num_inputs < 1u ||
                 (op->num_outputs != 1u && !(op->op_type == TIGRIS_OP_SVDF && op->num_outputs == 2u) &&
                  !(op->op_type == TIGRIS_OP_LSTM && op->num_outputs == 3u) &&
+                 !(op->op_type == TIGRIS_OP_DETECTION_POSTPROCESS && op->num_outputs == 5u) &&
                  !((op->op_type == TIGRIS_OP_IF || op->op_type == TIGRIS_OP_WHILE) &&
                    op->num_outputs >= 1u)))
                 return TIGRIS_ERR_BAD_SECTION;
@@ -2826,6 +2892,11 @@ tigris_error_t tigris_plan_load_ex(
                 }
                 break;
             }
+            case TIGRIS_OP_ATTR_DETECTION:
+                /* Its values are checked with the operator. */
+                if (attr->data_len != TIGRIS_OP_ATTR_DETECTION_LEN)
+                    return TIGRIS_ERR_BAD_SECTION;
+                break;
             case TIGRIS_OP_ATTR_SUBGRAPHS:
                 /* Graph indices are checked with the section. */
                 if (attr->data_len != 4u)

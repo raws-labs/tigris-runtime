@@ -136,7 +136,21 @@ static inline uint32_t tigris_dtype_size(uint8_t dtype)
 #define TIGRIS_OP_ATTR_LSTM           16 /* int32 time_major (0/1), float32 cell clip */
 #define TIGRIS_OP_ATTR_SUBGRAPHS      17 /* uint16 graphs a control-flow op runs (If: then, else;
                                           * While: condition, body) */
-#define TIGRIS_OP_ATTR_MAX            17
+#define TIGRIS_OP_ATTR_DETECTION      18 /* DetectionPostProcess options, below */
+#define TIGRIS_OP_ATTR_DETECTION_LEN  32u
+/* DetectionPostProcess: uint16 max detections, detections per class and
+ * classes, uint8 regular (1) or fast (0) suppression, a zero byte, then float32
+ * score threshold, IoU threshold and the y, x, h, w scales. */
+#define TIGRIS_OP_ATTR_MAX            18
+
+/* Working memory DetectionPostProcess takes in its last output, for `boxes`
+ * anchors, `detections` results and `candidates` scores kept across classes:
+ * the detections, plus the detections per class under regular suppression. */
+#define TIGRIS_DETECTION_SCRATCH_BYTES(boxes, detections, candidates)               \
+    (4u * (9u * (size_t)(boxes) +                                                   \
+           ((size_t)(boxes) > (size_t)(candidates) ? (size_t)(boxes) : (size_t)(candidates)) + \
+           2u * (size_t)(candidates) + (size_t)(detections)) +                      \
+     (size_t)(boxes))
 
 /* A binary requant payload is three (multiplier, shift) pairs in Q0.31: the
  * first operand's, the second operand's, and the result's. */
@@ -274,6 +288,11 @@ typedef enum {
     /* Loop variables in and out; runs its condition subgraph, and while that
      * gives true, its body on the current values. */
     TIGRIS_OP_WHILE                      = 88,
+    /* SSD box encodings [1, boxes, 4] and scores [1, boxes, classes] in the
+     * plan's data dtype, anchors [boxes, 4] in float32 as its constant; writes
+     * float32 boxes [1, detections, 4], classes and scores [1, detections],
+     * the count [1] and its working memory, as TFLite Micro does. */
+    TIGRIS_OP_DETECTION_POSTPROCESS      = 89,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

@@ -1,7 +1,9 @@
-"""Embed compiled stateful plans with TFLite Micro's outputs over consecutive runs.
+"""Embed compiled plans with TFLite Micro's outputs over consecutive runs.
 
 Each argument is NAME=PLAN.tgrs:GOLDEN.npz, a plan compiled from one of the
-compiler's TFLite corpus cases and that case's recorded inputs and outputs:
+compiler's TFLite corpus cases and that case's recorded inputs and outputs.
+Per run, the model inputs and outputs are stored one after another in plan
+order, as bytes:
 
     python test/generate_state_goldens.py float_svdf=float_svdf.tgrs:float_svdf.npz ...
 """
@@ -11,14 +13,12 @@ from pathlib import Path
 
 import numpy as np
 
-C_TYPES = {np.dtype("float32"): "float", np.dtype("int8"): "int8_t"}
 
 
-def array(name, values):
-    values = np.asarray(values).reshape(-1)
-    kind = C_TYPES[values.dtype]
-    text = ", ".join(f"{v:.9e}f" if kind == "float" else str(int(v)) for v in values)
-    return f"static const {kind} {name}[] = {{{text}}};\n"
+def array(name, runs):
+    """Per run, the arrays' bytes one after another."""
+    data = b"".join(np.ascontiguousarray(a[run]).tobytes() for run in range(len(runs[0])) for a in runs)
+    return f"static const uint8_t {name}[] = {{{', '.join(map(str, data))}}};\n"
 
 
 def main(arguments):
@@ -28,12 +28,15 @@ def main(arguments):
         plan_path, golden_path = paths.split(":", 1)
         plan = Path(plan_path).read_bytes()
         golden = np.load(golden_path)
-        x, y = golden["input_0"], golden["output_0"]
+        order = sorted(golden.files, key=lambda k: int(k.rsplit("_", 1)[1]))
+        xs = [golden[k] for k in order if k.startswith("input_")]
+        ys = [golden[k] for k in order if k.startswith("output_")]
         body.append(f"static const uint8_t {name}_plan[] = {{{', '.join(map(str, plan))}}};\n")
-        body.append(array(f"{name}_input", x))
-        body.append(array(f"{name}_output", y))
+        body.append(array(f"{name}_input", xs))
+        body.append(array(f"{name}_output", ys))
         entries.append(f"    {{{name}_plan, sizeof({name}_plan), {name}_input, {name}_output, "
-                       f"{x[0].nbytes}u, {y[0].nbytes}u, {len(x)}u}},\n")
+                       f"{sum(x[0].nbytes for x in xs)}u, {sum(y[0].nbytes for y in ys)}u, "
+                       f"{len(xs[0])}u}},\n")
     print("/* test/generate_state_goldens.py; outputs recorded from TFLite Micro. */")
     print("#ifndef TIGRIS_STATE_GOLDEN_H\n#define TIGRIS_STATE_GOLDEN_H\n")
     print("typedef struct {\n    const uint8_t *plan;\n    uint32_t plan_size;\n"

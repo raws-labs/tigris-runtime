@@ -79,6 +79,10 @@ int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
 int tigris_reduce_all_execute(const tigris_plan_t *plan, const tigris_op_t *op,
                               uint16_t op_index, tigris_mem_t *mem);
 
+/* Whether op computes on int32 operands: ADD, SUB, MUL, a comparison or a CAST. */
+int tigris_int32_operator(const tigris_plan_t *plan, const tigris_op_t *op);
+int tigris_int32_execute(const tigris_plan_t *plan, const tigris_op_t *op,
+                         uint16_t op_index, tigris_mem_t *mem);
 int tigris_bool_execute(const tigris_plan_t *plan, const tigris_op_t *op,
                         uint16_t op_index, tigris_mem_t *mem);
 

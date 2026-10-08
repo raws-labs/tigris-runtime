@@ -2695,11 +2695,18 @@ static TIGRIS_NOINLINE tigris_exec_error_t start_control(
         *graph_out = control_graph(plan, op_index, (*condition != 0u) ? 0u : 1u);
         return copy_into_graph(plan, mem, *graph_out, ins + 1);
     }
-    for (uint8_t i = 0; i < op->num_inputs; i++) {
-        if (!mem->tensor_ptrs[ins[i]] ||
+    /* Each loop variable starts from the next input, or from its constant. */
+    uint8_t next = 0u;
+    for (uint8_t i = 0; i < op->num_outputs; i++) {
+        const void *initial = tigris_op_constant(plan, op_index, i);
+        if (initial == NULL && next < op->num_inputs) {
+            initial = mem->tensor_ptrs[ins[next]];
+            next++;
+        }
+        if (initial == NULL ||
             tigris_mem_alloc_slow(mem, outs[i], plan->tensors[outs[i]].size_bytes) != TIGRIS_MEM_OK)
             return TIGRIS_EXEC_ERR_MEM;
-        memcpy(mem->tensor_ptrs[outs[i]], mem->tensor_ptrs[ins[i]], plan->tensors[outs[i]].size_bytes);
+        memcpy(mem->tensor_ptrs[outs[i]], initial, plan->tensors[outs[i]].size_bytes);
     }
     *graph_out = control_graph(plan, op_index, 0u);
     return copy_into_graph(plan, mem, *graph_out, outs);

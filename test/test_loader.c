@@ -4274,6 +4274,32 @@ static void test_state_goldens(void)
                            TIGRIS_ERR_BAD_OPERATOR, "an If cannot run a graph placed before it");
         }
         /* The main graph's If: the first one placed. */
+        if (looping < plan.header->num_ops) {
+            uint8_t len = 0u;
+            const uint8_t *list = tigris_op_attribute_data(&plan, looping, TIGRIS_OP_ATTR_CONSTANTS, &len);
+            if (list != NULL) {
+                const uint16_t none = TIGRIS_NO_WEIGHT;
+                TEST_ASSERT_EQ(load_altered(golden, copy, (size_t)(list - buf), &none, 2u),
+                               TIGRIS_ERR_BAD_OPERATOR, "a While's inputs supply the loop variables without constants");
+            }
+        }
+        uint16_t counting = plan.header->num_ops;
+        for (uint16_t n = 0; n < plan.header->num_ops; n++) {
+            const tigris_op_t *candidate = &plan.ops[n];
+            if (candidate->op_type == TIGRIS_OP_ADD &&
+                plan.tensors[tigris_op_outputs(&plan, candidate)[0]].dtype == 6u) counting = n;
+        }
+        if (counting < plan.header->num_ops) {
+            const tigris_op_t *op = &plan.ops[counting];
+            const tigris_tensor_t *sum = &plan.tensors[tigris_op_outputs(&plan, op)[0]];
+            const uint8_t float32 = 1u, relu = TIGRIS_ACT_RELU;
+            TEST_ASSERT(load_altered(golden, copy, (size_t)((const uint8_t *)&sum->dtype - buf),
+                                     &float32, 1u) != TIGRIS_OK,
+                        "int32 operands and result go together");
+            TEST_ASSERT_EQ(load_altered(golden, copy, (size_t)((const uint8_t *)&op->fused_act - buf),
+                                        &relu, 1u), TIGRIS_ERR_BAD_OPERATOR,
+                           "int32 arithmetic takes no activation");
+        }
         uint16_t branching = plan.header->num_ops;
         for (uint16_t n = plan.header->num_ops; n-- > 0u;)
             if (plan.ops[n].op_type == TIGRIS_OP_IF) branching = n;

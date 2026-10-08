@@ -3175,6 +3175,8 @@ int tigris_dispatch_kernel_s8(
         g_tigris_kernel_rows += (unsigned long)mem->tile.out_h;
 #endif
 
+    if (tigris_int32_operator(plan, op))
+        return tigris_int32_execute(plan, op, op_index, mem);
     switch ((tigris_op_type_t)op->op_type) {
     case TIGRIS_OP_CONV:        return kern_conv2d_s8(plan, op, mem);
     case TIGRIS_OP_DEPTHWISE:   return kern_depthwise_conv2d_s8(plan, op, mem);
@@ -3504,6 +3506,12 @@ int tigris_accel_try_s8_ref(
 {
     if (!plan || !op || !mem || !handled)
         return -1;
+
+    /* int32 arithmetic has no vendor kernel. */
+    if (tigris_int32_operator(plan, op)) {
+        *handled = 1;
+        return tigris_int32_execute(plan, op, op_index, mem);
+    }
 
     /* 2D tiles carry mem->tile.width_tiled and partition width via
      * pad_left/tile-in_w as well as height (see exec_stage_tiled_2d). The

@@ -912,7 +912,7 @@ int tigris_binary_operands(
         (plan->header == NULL) || (plan->tensors == NULL) ||
         (plan->index_pool == NULL) || (plan->shape_pool == NULL) ||
         (mem->tensor_ptrs == NULL) ||
-        (dtype != 1u && dtype != 3u && dtype != 9u) || op->num_outputs != 1u ||
+        (dtype != 1u && dtype != 3u && dtype != 9u && dtype != 6u) || op->num_outputs != 1u ||
         op->bias_idx != TIGRIS_NO_WEIGHT ||
         (op->num_inputs != count_inputs && op->num_inputs != count_inputs - 1u))
         return 0;
@@ -1059,6 +1059,74 @@ static inline uint32_t binary_index(const tigris_binary_operands_t *operands, ui
     if (operands->general[k] != 0u)
         return tigris_binary_general_index(operands, k, i);
     return (operands->period[k] != 0u) ? (i % operands->period[k]) : i;
+}
+
+int tigris_int32_operator(const tigris_plan_t *plan, const tigris_op_t *op)
+{
+    switch ((tigris_op_type_t)op->op_type) {
+    case TIGRIS_OP_ADD:
+    case TIGRIS_OP_SUB:
+    case TIGRIS_OP_MUL:
+    case TIGRIS_OP_EQUAL:
+    case TIGRIS_OP_LESS:
+    case TIGRIS_OP_LESS_EQUAL:
+    case TIGRIS_OP_GREATER:
+    case TIGRIS_OP_GREATER_EQUAL:
+    case TIGRIS_OP_CAST:
+        return op->num_inputs > 0u && plan->tensors[tigris_op_inputs(plan, op)[0]].dtype == 6u;
+    default:
+        return 0;
+    }
+}
+
+static int32_t load_i32(const uint8_t *data, uint32_t i)
+{
+    int32_t value;
+    memcpy(&value, data + (size_t)i * sizeof(value), sizeof(value));
+    return value;
+}
+
+int tigris_int32_execute(const tigris_plan_t *plan, const tigris_op_t *op,
+                         uint16_t op_index, tigris_mem_t *mem)
+{
+    const uint16_t result = tigris_op_outputs(plan, op)[0];
+    uint8_t *y = (uint8_t *)tigris_mem_tensor_ptr(mem, result);
+    const uint32_t count = tensor_numel(plan, result);
+    /* Counters and indices are never tiled. */
+    if (y == NULL || mem->tile.active) return -1;
+    if (op->op_type == TIGRIS_OP_CAST) {
+        const uint8_t *x = (const uint8_t *)tigris_mem_tensor_ptr(mem, tigris_op_inputs(plan, op)[0]);
+        if (x == NULL || plan->tensors[result].dtype != 1u) return -1;
+        for (uint32_t i = 0u; i < count; i++) {
+            const float value = (float)load_i32(x, i);
+            memcpy(y + (size_t)i * sizeof(value), &value, sizeof(value));
+        }
+        return 0;
+    }
+    tigris_binary_operands_t operands;
+    if (!tigris_binary_operands(plan, op, op_index, mem, 6u, &operands)) return -1;
+    for (uint32_t i = 0u; i < count; i++) {
+        const int32_t a = load_i32(operands.data[0], binary_index(&operands, 0u, i));
+        const int32_t b = load_i32(operands.data[1], binary_index(&operands, 1u, i));
+        int value = 0;
+        uint32_t word = 0u;
+        switch ((tigris_op_type_t)op->op_type) {
+        /* Arithmetic wraps, as two's complement does, rather than overflowing. */
+        case TIGRIS_OP_ADD: word = (uint32_t)a + (uint32_t)b; break;
+        case TIGRIS_OP_SUB: word = (uint32_t)a - (uint32_t)b; break;
+        case TIGRIS_OP_MUL: word = (uint32_t)a * (uint32_t)b; break;
+        case TIGRIS_OP_EQUAL: value = a == b; break;
+        case TIGRIS_OP_LESS: value = a < b; break;
+        case TIGRIS_OP_LESS_EQUAL: value = a <= b; break;
+        case TIGRIS_OP_GREATER: value = a > b; break;
+        default: value = a >= b; break;
+        }
+        if (op->op_type == TIGRIS_OP_ADD || op->op_type == TIGRIS_OP_SUB || op->op_type == TIGRIS_OP_MUL)
+            memcpy(y + (size_t)i * sizeof(word), &word, sizeof(word));
+        else
+            y[i] = value ? 1u : 0u;
+    }
+    return 0;
 }
 
 int tigris_bool_execute(const tigris_plan_t *plan, const tigris_op_t *op,
@@ -3018,6 +3086,8 @@ int tigris_dispatch_kernel(
         g_tigris_kernel_rows += (unsigned long)mem->tile.out_h;
 #endif
 
+    if (tigris_int32_operator(plan, op))
+        return tigris_int32_execute(plan, op, op_index, mem);
     switch ((tigris_op_type_t)op->op_type) {
     case TIGRIS_OP_CONV:        return kern_conv2d(plan, op, mem);
     case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose(plan, op, mem);

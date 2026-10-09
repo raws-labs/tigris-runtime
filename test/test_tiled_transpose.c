@@ -361,10 +361,10 @@ static void check_band_orientation(int32_t rows, int32_t cols)
                 "a plan from before schema 9 still converts");
 }
 
-/** A permutation that is not a layout conversion must not take the path. */
-static void check_unconvertible_perm_is_refused(void)
+/** A fixed axis can band a permutation outside the matrix-conversion path. */
+static void check_fixed_axis_permutation(void)
 {
-    printf("  check_unconvertible_perm_is_refused...\n");
+    printf("  check_fixed_axis_permutation...\n");
 
     transpose_fixture_t fx;
     build_fixture(&fx, TEST_SHORT, TEST_LONG);
@@ -380,12 +380,21 @@ static void check_unconvertible_perm_is_refused(void)
     uint16_t tiled = 0;
 
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t small[1024];
-    /* The plan still promises a height tile, and the runtime cannot honor it
-     * for this permutation, so it fails closed rather than guessing. */
     TEST_ASSERT_EQ(
         run_case(&fx, small, sizeof(small), input, out, &tiled),
-        TIGRIS_EXEC_ERR_TILE, "unconvertible permutation fails closed");
-    TEST_ASSERT_EQ(tiled, 0, "unconvertible permutation is not tiled");
+        TIGRIS_EXEC_OK, "fixed-axis permutation executes");
+    TEST_ASSERT_EQ(tiled, 1, "fixed-axis permutation is tiled");
+    for (int h = 0; h < 4; h++)
+        for (int w = 0; w < 4; w++)
+            for (int c = 0; c < 24; c++)
+                TEST_ASSERT(out[(c * 4 + w) * 4 + h] == input[(h * 4 + w) * 24 + c],
+                            "band preserves permutation coordinates");
+    fx.perm[0] = 3; fx.perm[1] = 2; fx.perm[2] = 1; fx.perm[3] = 0;
+    fx.shapes[4] = 24; fx.shapes[5] = 4; fx.shapes[6] = 4; fx.shapes[7] = 1;
+    tiled = 0u;
+    TEST_ASSERT_EQ(run_case(&fx, small, sizeof(small), input, out, &tiled),
+                   TIGRIS_EXEC_ERR_TILE, "permutation without a fixed axis is refused");
+    TEST_ASSERT_EQ(tiled, 0, "unsupported permutation is not tiled");
 }
 
 int main(void)
@@ -396,7 +405,7 @@ int main(void)
     check_band_orientation(TEST_SHORT, TEST_LONG);
     check_rank4(4, 4, 24, 1, "rank 4 to linear order");
     check_rank4(4, 4, 24, 0, "rank 4 back to spatial order");
-    check_unconvertible_perm_is_refused();
+    check_fixed_axis_permutation();
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);

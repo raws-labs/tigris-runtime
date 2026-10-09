@@ -4109,9 +4109,10 @@ static uint32_t state_section_offset(const uint8_t *buf)
  * outputs one after another into out, each in its own encoding. */
 static tigris_exec_error_t run_with_state_once(const tigris_plan_t *plan, void *state,
                                                size_t state_size, const void *x,
-                                               uint32_t x_bytes, void *out, uint32_t out_bytes)
+                                               uint32_t x_bytes, void *out, uint32_t out_bytes,
+                                               uint32_t fast_limit)
 {
-    const uint32_t fast_size = tigris_fast_arena_required(plan);
+    const uint32_t fast_size = fast_limit ? fast_limit : tigris_fast_arena_required(plan);
     uint32_t slow_size = 0u;
     for (uint16_t t = 0; t < plan->header->num_tensors; t++)
         slow_size += 2u * (plan->tensors[t].size_bytes + TIGRIS_TENSOR_ALIGN);
@@ -4167,7 +4168,76 @@ static tigris_exec_error_t run_state_fixture(const tigris_plan_t *plan, void *st
                                              size_t state_size, float *out)
 {
     const float x[2] = {1.0f, 0.5f};
-    return run_with_state_once(plan, state, state_size, x, sizeof(x), out, 4u * sizeof(float));
+    return run_with_state_once(plan, state, state_size, x, sizeof(x), out, 4u * sizeof(float), 0u);
+}
+
+static void check_state_batch_bands(const tigris_plan_t *original, const state_golden_t *golden)
+{
+    tigris_plan_t plan = *original;
+    tigris_file_header_t header = *plan.header;
+    tigris_stage_t stages[8] = {0};
+    tigris_op_t ops[8];
+    uint16_t indices[128];
+    tigris_tile_plan_t tile = {0};
+    if (header.num_ops > 8u) return;
+    int found = 0;
+    uint16_t at = 0u;
+    for (uint16_t j = 0u; j < header.num_ops; j++) {
+        ops[j] = original->ops[j];
+        const tigris_op_t *op = &original->ops[j];
+        TEST_ASSERT(at + op->num_inputs + op->num_outputs + 1u <= 128u, "batch test index capacity");
+        if (at + op->num_inputs + op->num_outputs + 1u > 128u) return;
+        ops[j].inputs_off = stages[j].inputs_off = at;
+        stages[j].inputs_count = op->num_inputs;
+        for (uint8_t k = 0u; k < op->num_inputs; k++) indices[at++] = tigris_op_inputs(original, op)[k];
+        ops[j].outputs_off = stages[j].outputs_off = at;
+        stages[j].outputs_count = op->num_outputs;
+        for (uint8_t k = 0u; k < op->num_outputs; k++) indices[at++] = tigris_op_outputs(original, op)[k];
+        stages[j].ops_off = at;
+        indices[at++] = j;
+        stages[j].ops_count = 1u;
+        stages[j].chain_id = TIGRIS_NO_CHAIN;
+        stages[j].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+        if (op->op_type == TIGRIS_OP_LSTM || op->op_type == TIGRIS_OP_SVDF) {
+            int32_t time_major = 0;
+            if (op->op_type == TIGRIS_OP_LSTM) {
+                const uint8_t *params = tigris_op_attribute_data(original, j, TIGRIS_OP_ATTR_LSTM, NULL);
+                memcpy(&time_major, params, sizeof(time_major));
+            }
+            const tigris_tensor_t *input = &plan.tensors[tigris_op_inputs(original, op)[0]];
+            int32_t batch = tigris_tensor_shape(original, input)[time_major ? 1u : 0u];
+            if (batch <= 1) return;
+            tile.original_height = (uint16_t)batch;
+            tile.num_tiles = (uint16_t)batch;
+            stages[j].tile_plan_idx = 0u;
+            found = 1;
+        }
+    }
+    if (!found) return;
+    tile.tileable = 1u;
+    tile.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    tile.tile_height = tile.receptive_field = 1u;
+    header.num_stages = header.num_ops;
+    header.num_tile_plans = 1u;
+    plan.header = &header;
+    plan.stages = stages;
+    plan.ops = ops;
+    plan.index_pool = indices;
+    plan.tile_plans = &tile;
+    size_t state_size = tigris_state_required(&plan);
+    void *state = malloc(state_size);
+    uint8_t output[256];
+    TEST_ASSERT(state != NULL && golden->output_bytes <= sizeof(output), "batch test storage");
+    if (!state || golden->output_bytes > sizeof(output)) { free(state); return; }
+    TEST_ASSERT_EQ(tigris_state_init(&plan, state, state_size), TIGRIS_EXEC_OK, "banded state init");
+    for (uint32_t run = 0u; run < golden->runs; run++) {
+        TEST_ASSERT_EQ(run_with_state_once(&plan, state, state_size,
+                       (const uint8_t *)golden->input + run * golden->input_bytes, golden->input_bytes,
+                       output, golden->output_bytes, 256u), TIGRIS_EXEC_OK, "256-byte batch run");
+        TEST_ASSERT(memcmp(output, (const uint8_t *)golden->output + run * golden->output_bytes,
+                           golden->output_bytes) == 0, "batch state sequence matches TFLite Micro");
+    }
+    free(state);
 }
 
 /* A copy of `golden` with `bytes` written at `offset`, loaded. */
@@ -4208,12 +4278,13 @@ static void test_state_goldens(void)
                 const uint8_t *x = (const uint8_t *)golden->input + (size_t)run * golden->input_bytes;
                 const uint8_t *y = (const uint8_t *)golden->output + (size_t)run * golden->output_bytes;
                 TEST_ASSERT_EQ(run_with_state_once(&plan, state, state_size, x, golden->input_bytes,
-                                                   out, golden->output_bytes),
+                                                   out, golden->output_bytes, 0u),
                                TIGRIS_EXEC_OK, "stateful run");
                 TEST_ASSERT(memcmp(out, y, golden->output_bytes) == 0, "stateful run matches TFLite Micro");
             }
         }
         uint16_t lstm = plan.header->num_ops;
+        check_state_batch_bands(&plan, golden);
         for (uint16_t n = 0; n < plan.header->num_ops; n++)
             if (plan.ops[n].op_type == TIGRIS_OP_LSTM) lstm = n;
         if (lstm < plan.header->num_ops) {

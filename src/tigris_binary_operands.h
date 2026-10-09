@@ -36,8 +36,9 @@ int tigris_reshape_tile_valid(const tigris_tile_plan_t *tile,
  * `output`. An operand is read densely (period 0, general 0) and follows a
  * tile; repeats every `period` elements, which is any broadcast over leading
  * axes, and is read whole under a tile; or, when `general` is set, by the
- * output coordinate through `stride` (0 on a broadcast axis) and is never
- * tiled. `dims` is the output's shape left-padded to the broadcast rank. */
+ * output coordinate through `stride` (0 on a broadcast axis). For an independent
+ * band, tensor strides describe packed data and constants retain global strides.
+ * `dims` is the output band's shape left-padded to the broadcast rank. */
 typedef struct {
     const uint8_t *data[3];
     uint32_t period[3];
@@ -67,8 +68,14 @@ uint32_t tigris_binary_general_index(const tigris_binary_operands_t *operands,
 
 /* The third in-memory band mode uses the first non-unit stored axis. */
 #define TIGRIS_BAND_LEADING 2u
+#define TIGRIS_BAND_BATCH 3u
+#define TIGRIS_BAND_TIME_MAJOR_BATCH 4u
+#define TIGRIS_BAND_TRAILING 5u
+#define TIGRIS_BAND_AXIS_BASE 6u
 uint8_t tigris_band_axis(const tigris_plan_t *plan, const tigris_tensor_t *tensor, int mode);
 int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_t *stage);
+int tigris_stage_band_mode(const tigris_plan_t *plan, const tigris_stage_t *stage);
+int tigris_band_whole_input(const tigris_op_t *op, uint8_t position);
 
 /* Whether a reduction or movement preserves the existing row-band geometry. */
 int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,

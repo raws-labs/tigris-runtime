@@ -796,6 +796,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal(
     /* Spill stage outputs to slow */
     for (uint16_t i = 0; i < stage->outputs_count; i++) {
         uint16_t tidx = sout[i];
+        uintptr_t ptr = (uintptr_t)mem->tensor_ptrs[tidx];
+        uintptr_t slow = (uintptr_t)mem->slow_base;
+        if (ptr && ptr >= slow && ptr - slow < mem->slow_used)
+            continue;
         tigris_mem_error_t merr = tigris_mem_spill(
             mem, tidx, plan->tensors[tidx].size_bytes);
         if (merr != TIGRIS_MEM_OK)
@@ -2155,10 +2159,12 @@ static int tensor_band_view(const tigris_plan_t *plan, const tigris_tensor_t *te
                             int leading, int32_t *batch, int32_t *rows, int32_t *cols)
 {
     if (!leading) return tensor_row_view(plan, tensor, batch, rows, cols);
-    uint8_t axis = tigris_band_axis(plan, tensor, TIGRIS_BAND_LEADING);
+    uint8_t axis = tigris_band_axis(plan, tensor, leading);
+    const int32_t *shape = tigris_tensor_shape(plan, tensor);
     *batch = 1;
+    for (uint8_t i = 0u; i < axis; i++) *batch *= shape[i];
     *rows = tigris_tensor_shape(plan, tensor)[axis];
-    *cols = (int32_t)(tensor->size_bytes / tigris_dtype_size(tensor->dtype) / (uint32_t)*rows);
+    *cols = (int32_t)(tensor->size_bytes / tigris_dtype_size(tensor->dtype) / (uint32_t)*rows / (uint32_t)*batch);
     return 1;
 }
 
@@ -2361,11 +2367,9 @@ static int is_whole_band_operand(
     const uint16_t *sops = tigris_stage_ops(plan, stage);
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         const tigris_op_t *op = &plan->ops[sops[j]];
-        if (!is_whole_operand_op(op->op_type))
-            continue;
         const uint16_t *ins = tigris_op_inputs(plan, op);
         for (uint8_t k = 1u; k < op->num_inputs; k++) {
-            if (ins[k] == tidx)
+            if (ins[k] == tidx && (is_whole_operand_op(op->op_type) || tigris_band_whole_input(op, k)))
                 return 1;
         }
     }
@@ -2396,9 +2400,10 @@ static tigris_exec_error_t run_row_band(
 
     int32_t band = end - start;
     mem->tile.active = 1;
-    mem->tile.row_tiled = leading ? TIGRIS_BAND_LEADING : 1u;
+    mem->tile.row_tiled = leading ? (uint8_t)leading : 1u;
     mem->tile.in_h = band;
     mem->tile.out_h = band;
+    mem->tile.out_row_origin = start;
     mem->tile.in_w = 1;
     mem->tile.out_w = 1;
 
@@ -2408,9 +2413,13 @@ static tigris_exec_error_t run_row_band(
         int32_t b;
         int32_t r;
         int32_t c;
+        if (is_whole_band_operand(plan, stage, tidx)) {
+            mem->tensor_ptrs[tidx] = in_slow_bases[i];
+            continue;
+        }
         if (!tensor_band_view(plan, t, leading, &b, &r, &c))
             return TIGRIS_EXEC_ERR_TILE;
-        if (r != rows || is_whole_band_operand(plan, stage, tidx)) {
+        if (r != rows) {
             /* An operand the band does not cut is read whole, straight out of
              * the arena it already lives in. Nothing to copy and nothing to
              * allocate. */
@@ -2429,13 +2438,14 @@ static tigris_exec_error_t run_row_band(
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         uint16_t op_idx = sops[j];
         const tigris_op_t *op = &plan->ops[op_idx];
-        uint16_t tidx = tigris_op_outputs(plan, op)[0];
-        const tigris_tensor_t *t = &plan->tensors[tidx];
-        uint32_t band_bytes =
-            (uint32_t)((uint64_t)(t->size_bytes / (uint32_t)rows) *
-                       (uint32_t)band);
-        if (tigris_mem_alloc_fast(mem, tidx, band_bytes) != TIGRIS_MEM_OK)
-            return TIGRIS_EXEC_ERR_MEM;
+        for (uint8_t k = 0u; k < op->num_outputs; k++) {
+            uint16_t tidx = tigris_op_outputs(plan, op)[k];
+            const tigris_tensor_t *t = &plan->tensors[tidx];
+            uint32_t band_bytes =
+                (uint32_t)((uint64_t)(t->size_bytes / (uint32_t)rows) * (uint32_t)band);
+            if (tigris_mem_alloc_fast(mem, tidx, band_bytes) != TIGRIS_MEM_OK)
+                return TIGRIS_EXEC_ERR_MEM;
+        }
         if (kernel(plan, op, op_idx, mem, user_ctx) != 0)
             return TIGRIS_EXEC_ERR_KERNEL;
     }
@@ -2561,22 +2571,27 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
         for (uint16_t i = 0; i < stage->inputs_count; i++) {
             const tigris_tensor_t *t = &plan->tensors[sin[i]];
             uint32_t bytes;
+            int32_t b, r, c;
+            int whole = is_whole_band_operand(plan, stage, sin[i]) ||
+                (tensor_band_view(plan, t, leading, &b, &r, &c) && r != rows);
+            uint32_t size = whole ? t->size_bytes :
+                (uint32_t)((uint64_t)(t->size_bytes / (uint32_t)rows) * (uint32_t)candidate);
             if (!align_tensor_size(
-                    (uint32_t)((uint64_t)(t->size_bytes / (uint32_t)rows) *
-                               (uint32_t)candidate), &bytes))
+                    size, &bytes))
                 return TIGRIS_EXEC_ERR_TILE;
             total += bytes;
         }
         for (uint16_t j = 0; j < stage->ops_count; j++) {
             const tigris_op_t *op = &plan->ops[sops[j]];
-            const tigris_tensor_t *t =
-                &plan->tensors[tigris_op_outputs(plan, op)[0]];
-            uint32_t bytes;
-            if (!align_tensor_size(
-                    (uint32_t)((uint64_t)(t->size_bytes / (uint32_t)rows) *
-                               (uint32_t)candidate), &bytes))
-                return TIGRIS_EXEC_ERR_TILE;
-            total += bytes;
+            for (uint8_t k = 0u; k < op->num_outputs; k++) {
+                const tigris_tensor_t *t = &plan->tensors[tigris_op_outputs(plan, op)[k]];
+                uint32_t bytes;
+                if (!align_tensor_size(
+                        (uint32_t)((uint64_t)(t->size_bytes / (uint32_t)rows) *
+                                   (uint32_t)candidate), &bytes))
+                    return TIGRIS_EXEC_ERR_TILE;
+                total += bytes;
+            }
         }
         if (total <= available) {
             band = candidate;
@@ -2610,13 +2625,16 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
         mem->tensor_ptrs[sin[0]] = NULL;
     /* Intermediates lived only inside a band. */
     for (uint16_t j = 0; j < stage->ops_count; j++) {
-        uint16_t tidx = tigris_op_outputs(plan, &plan->ops[sops[j]])[0];
-        int is_stage_out = 0;
-        for (uint16_t i = 0; i < stage->outputs_count; i++) {
-            if (tidx == sout[i]) { is_stage_out = 1; break; }
+        const tigris_op_t *op = &plan->ops[sops[j]];
+        for (uint8_t k = 0; k < op->num_outputs; k++) {
+            uint16_t tidx = tigris_op_outputs(plan, op)[k];
+            int is_stage_out = 0;
+            for (uint16_t i = 0; i < stage->outputs_count; i++) {
+                if (tidx == sout[i]) { is_stage_out = 1; break; }
+            }
+            if (!is_stage_out)
+                mem->tensor_ptrs[tidx] = NULL;
         }
-        if (!is_stage_out)
-            mem->tensor_ptrs[tidx] = NULL;
     }
     return result;
 }
@@ -3992,7 +4010,7 @@ tigris_exec_error_t tigris_run_with_state(
                    tigris_stage_leading_band(run_plan, stage)) {
             tigris_exec_error_t err = exec_stage_tiled_rows(
                 run_plan, stage, mem, kernel, user_ctx, workspace, last_consumer, s,
-                tigris_stage_leading_band(run_plan, stage), 1);
+                tigris_stage_leading_band(run_plan, stage), tigris_stage_band_mode(run_plan, stage));
             if (err != TIGRIS_EXEC_OK) {
                 result = err;
                 goto restore_fast_arena;

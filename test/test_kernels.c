@@ -2566,6 +2566,17 @@ static void test_constant_binary_f32(void)
                 "exact constant Add succeeds");
     assert_f32_array(fx.output, add_exact_expected,
                      "exact constant Add output");
+    fx.mem.tile.active = 1;
+    fx.mem.tile.row_tiled = 7u;
+    fx.mem.tile.in_h = fx.mem.tile.out_h = 1;
+    fx.mem.tile.out_row_origin = 1;
+    fx.ptrs[0] = fx.input + 2;
+    for (int i = 0; i < 4; i++) fx.output[i] = 123.0f;
+    TEST_ASSERT(tigris_dispatch_kernel(&fx.plan, &fx.op, 0, &fx.mem, NULL) == 0,
+                   "dense constant uses the band's global origin");
+    TEST_ASSERT(fx.output[0] == add_exact_expected[2] && fx.output[1] == add_exact_expected[3],
+                "constant band values");
+    TEST_ASSERT(fx.output[2] == 123.0f && fx.output[3] == 123.0f, "constant band canary");
 
     init_const_binary_fixture(
         &fx, TIGRIS_OP_MUL, exact, (uint32_t)sizeof(exact));

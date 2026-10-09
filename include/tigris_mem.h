@@ -76,8 +76,8 @@ typedef struct {
      * packed [N, out_h, out_w] output, so it walks the tile extents above
      * rather than the tensor's own. Zero on every other path. */
     uint8_t  transposed_tile;
-    /* Band geometry: 0 is height, 1 is matrix rows, 2 is the first non-unit
-     * stored axis. in_h/out_h hold the band extent in every mode. */
+    /* Band geometry: height, matrix rows, leading, batch, time-major batch,
+     * trailing, or a stored axis. in_h/out_h hold the band extent. */
     uint8_t  row_tiled;
     /* The batch a banded transpose spans. A transpose the band path accepts
      * swaps two adjacent groups of axes and leaves the rest in order, so the

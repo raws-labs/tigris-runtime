@@ -2845,6 +2845,21 @@ static void test_exec_compaction_preserves_data(void)
     TEST_ASSERT(mem.tensor_ptrs[2] != NULL, "compacted output remains live");
     TEST_ASSERT(((uint8_t *)mem.tensor_ptrs[2])[47] == 0x6b,
                 "output survives slow-arena compaction");
+    memset(slow, 0xa5, sizeof(slow));
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, 64u, slow, 96u), TIGRIS_MEM_OK,
+                   "output-overflow arenas");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes), TIGRIS_MEM_OK,
+                   "output-overflow input");
+    memset(ptrs[0], 0x11, tensors[0].size_bytes);
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&plan, &mem, compaction_kernel, &ctx,
+                   &stats, workspace, sizeof(workspace)), TIGRIS_EXEC_OK,
+                   "an output already in slow memory is not spilled again");
+    TEST_ASSERT_EQ(stats.slow_overflow_count, 1u, "output takes the slow fallback");
+    TEST_ASSERT_EQ(stats.slow_peak, 96u, "one slow output allocation");
+    TEST_ASSERT_EQ(stats.spills_bytes, 0u, "no redundant slow-to-slow copy");
+    TEST_ASSERT_EQ(((uint8_t *)ptrs[2])[47], 0x6b, "overflow output preserved");
+    for (size_t i = 96u; i < sizeof(slow); i++)
+        TEST_ASSERT_EQ(slow[i], 0xa5, "slow arena canary");
 }
 
 typedef struct {

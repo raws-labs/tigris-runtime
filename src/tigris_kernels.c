@@ -45,15 +45,11 @@ static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
         return tensor_numel(plan, tidx);
     const tigris_tensor_t *t = &plan->tensors[tidx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
-    /* A row band cuts the second to last axis, so out_h counts the rows in
-     * the band, the trailing axis is the row, and everything ahead of the
-     * pair is batch that the band spans rather than cuts. */
+    /* Only the selected independent axis shrinks inside a packed band. */
     if (mem->tile.row_tiled) {
-        uint32_t batch = 1;
-        for (uint8_t axis = 0; axis + 2u < t->ndim; axis++)
-            batch *= (uint32_t)shape[axis];
-        return batch * (uint32_t)mem->tile.out_h *
-               (uint32_t)shape[t->ndim - 1];
+        uint8_t axis = tigris_band_axis(plan, t, mem->tile.row_tiled);
+        return tensor_numel(plan, tidx) / (uint32_t)shape[axis] *
+               (uint32_t)mem->tile.out_h;
     }
     /* Serialized activations are NHWC or NLC. */
     uint32_t width = t->ndim == 4 ? (uint32_t)mem->tile.out_w : 1u;
@@ -1043,11 +1039,38 @@ int tigris_binary_operands(
             return 0;
         if (out->general[k] != 0u && rank > (count_inputs == 3u ? 5u : 4u))
             return 0;
+        if (mem->tile.active && mem->tile.row_tiled >= TIGRIS_BAND_AXIS_BASE) {
+            if (rank > TIGRIS_BROADCAST_MAX_RANK) return 0;
+            uint8_t band_axis = tigris_band_axis(plan, y, mem->tile.row_tiled);
+            uint32_t stride = 1u;
+            out->general[k] = 1u;
+            for (uint8_t a = TIGRIS_BROADCAST_MAX_RANK; a > 0u; a--) {
+                uint8_t axis = (uint8_t)(a - 1u);
+                if (axis < (uint8_t)(TIGRIS_BROADCAST_MAX_RANK - rank)) {
+                    out->stride[k][axis] = 0u;
+                } else {
+                    uint8_t d = (uint8_t)(axis + rank - TIGRIS_BROADCAST_MAX_RANK);
+                    out->stride[k][axis] = dims[d] == 1u ? 0u : stride;
+                    if (d == band_axis && dims[d] != 1u) {
+                        if (k == constant_position)
+                            out->data[k] += (size_t)mem->tile.out_row_origin * stride * element;
+                        else
+                            dims[d] = (uint32_t)mem->tile.out_h;
+                    }
+                    stride *= dims[d];
+                }
+            }
+            continue;
+        }
         /* A dense constant carries no row offset, and a general broadcast is
          * never tiled. */
         if (mem->tile.active && ((out->general[k] != 0u) ||
                                  ((k == constant_position) && (out->period[k] == 0u))))
             return 0;
+    }
+    if (mem->tile.active && mem->tile.row_tiled >= TIGRIS_BAND_AXIS_BASE) {
+        uint8_t axis = tigris_band_axis(plan, y, mem->tile.row_tiled);
+        out->dims[TIGRIS_BROADCAST_MAX_RANK - rank + axis] = (uint32_t)mem->tile.out_h;
     }
     return 1;
 }
@@ -1513,7 +1536,8 @@ int tigris_movement_execute(const tigris_plan_t *plan, const tigris_op_t *op,
                 int32_t start;
                 memcpy(&start, starts + (size_t)a * 4u, 4u);
                 int32_t limit = shape[a] - metadata[source->ndim + a];
-                metadata[a] = start < 0 ? 0 : start > limit ? limit : start;
+                metadata[a] = mem->tile.active && a == tigris_band_axis(plan, source, mem->tile.row_tiled)
+                            ? 0 : start < 0 ? 0 : start > limit ? limit : start;
             }
         }
         if (mem->tile.active)
@@ -2040,7 +2064,7 @@ int tigris_pad(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_ind
     uint8_t len = 0u;
     const uint8_t *pads = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_PADS, &len);
     if ((pads == NULL) || (op->num_inputs != 1u) || (op->num_outputs != 1u) ||
-        mem->tile.active || (fill == NULL))
+        (mem->tile.active && !tigris_op_independent_band(plan, op, op_index, mem->tile.row_tiled)) || (fill == NULL))
         return -1;
     const uint16_t x_index = tigris_op_inputs(plan, op)[0];
     const uint16_t y_index = tigris_op_outputs(plan, op)[0];
@@ -2052,8 +2076,9 @@ int tigris_pad(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_ind
     if ((src == NULL) || (dst == NULL) || (rank == 0u) || (rank != y->ndim) ||
         (rank > 8u) || ((uint32_t)len != 8u * rank))
         return -1;
-    const int32_t *in_shape = tigris_tensor_shape(plan, x);
-    const int32_t *out_shape = tigris_tensor_shape(plan, y);
+    int32_t in_shape[8], out_shape[8];
+    memcpy(in_shape, tigris_tensor_shape(plan, x), (size_t)rank * 4u);
+    memcpy(out_shape, tigris_tensor_shape(plan, y), (size_t)rank * 4u);
     int32_t lead[8];
     uint64_t out_count = 1u;
     for (uint8_t d = 0; d < rank; d++) {
@@ -2067,6 +2092,12 @@ int tigris_pad(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_ind
     }
     if (out_count * element != y->size_bytes)
         return -1;
+    if (mem->tile.active) {
+        uint8_t axis = tigris_band_axis(plan, x, mem->tile.row_tiled);
+        out_count = out_count / (uint32_t)out_shape[axis] * (uint32_t)mem->tile.out_h;
+        in_shape[axis] = mem->tile.in_h;
+        out_shape[axis] = mem->tile.out_h;
+    }
     for (uint64_t i = 0; i < out_count; i++)
         memcpy(dst + i * element, fill, element);
     /* Copy one innermost run per position of the outer input axes. */
@@ -2123,13 +2154,14 @@ static int kern_split(
     /* Each part is one run per position ahead of the split axis. */
     uint32_t positions = 1;
     for (uint32_t axis = 0; axis < op->spatial.kernel_h; axis++)
-        positions *= (uint32_t)in_shape[axis];
-    uint32_t stride = input->size_bytes / positions;
+        positions *= mem->tile.active && axis == tigris_band_axis(plan, input, mem->tile.row_tiled)
+                   ? (uint32_t)mem->tile.in_h : (uint32_t)in_shape[axis];
+    uint32_t stride = tile_aware_numel(plan, ins[0], mem) * tigris_dtype_size(input->dtype) / positions;
     uint32_t offset = 0;
     for (uint8_t i = 0; i < op->num_outputs; i++) {
         const tigris_tensor_t *part = &plan->tensors[outs[i]];
         uint8_t *destination = (uint8_t *)tigris_mem_tensor_ptr(mem, outs[i]);
-        uint32_t run = part->size_bytes / positions;
+        uint32_t run = tile_aware_numel(plan, outs[i], mem) * tigris_dtype_size(part->dtype) / positions;
         if (destination == NULL)
             return -1;
         for (uint32_t q = 0; q < positions; q++)
@@ -2464,13 +2496,17 @@ static int kern_concat(
     int inner = 1;
     int out_c_offset = 0;
 
-    if (axis == 0u || axis >= rank || (mem->tile.active && axis != rank - 1u))
+    if (axis == 0u || axis >= rank || (mem->tile.active && mem->tile.row_tiled < TIGRIS_BAND_LEADING && axis != rank - 1u))
         return -1;
     for (uint8_t j = 0; j < axis; j++)
-        positions *= y_shape[j];
+        positions *= mem->tile.active && mem->tile.row_tiled >= TIGRIS_BAND_LEADING &&
+                     j == tigris_band_axis(plan, &plan->tensors[outs[0]], mem->tile.row_tiled)
+                   ? mem->tile.out_h : y_shape[j];
     for (uint8_t j = (uint8_t)(axis + 1u); j < rank; j++)
-        inner *= y_shape[j];
-    if (mem->tile.active) {
+        inner *= mem->tile.active && mem->tile.row_tiled >= TIGRIS_BAND_LEADING &&
+                 j == tigris_band_axis(plan, &plan->tensors[outs[0]], mem->tile.row_tiled)
+               ? mem->tile.out_h : y_shape[j];
+    if (mem->tile.active && mem->tile.row_tiled < TIGRIS_BAND_LEADING) {
         positions = y_shape[0] * mem->tile.out_h;
         if (rank == 4u)
             positions *= mem->tile.out_w;
@@ -2849,8 +2885,11 @@ int tigris_transpose_execute(
     uint8_t *dst = (uint8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
     if (!src || !dst)
         return -1;
-    const int32_t *input_shape = tigris_tensor_shape(plan, input);
-    const int32_t *output_shape = tigris_tensor_shape(plan, output);
+    int32_t input_shape[TIGRIS_TRANSPOSE_MAX_RANK];
+    int32_t output_shape[TIGRIS_TRANSPOSE_MAX_RANK];
+    if (rank > TIGRIS_TRANSPOSE_MAX_RANK) return -1;
+    memcpy(input_shape, tigris_tensor_shape(plan, input), (size_t)rank * sizeof(int32_t));
+    memcpy(output_shape, tigris_tensor_shape(plan, output), (size_t)rank * sizeof(int32_t));
     uint32_t elements = 1;
     for (uint8_t axis = 0; axis < rank; axis++) {
         if (output_shape[axis] <= 0 || perm[axis] >= rank)
@@ -2860,6 +2899,13 @@ int tigris_transpose_execute(
     if (elements == 0 || input->size_bytes % elements != 0)
         return -1;
     uint32_t element_size = input->size_bytes / elements;
+    if (mem->tile.active && mem->tile.row_tiled >= TIGRIS_BAND_AXIS_BASE) {
+        if (!tigris_op_independent_band(plan, op, op_index, mem->tile.row_tiled)) return -1;
+        uint8_t axis = tigris_band_axis(plan, input, mem->tile.row_tiled);
+        elements = elements / (uint32_t)output_shape[axis] * (uint32_t)mem->tile.out_h;
+        input_shape[axis] = mem->tile.in_h;
+        output_shape[axis] = mem->tile.out_h;
+    }
 
     /* A conversion stage hands this kernel a packed [batch, in_h, in_w] slice
      * of the input and expects a packed [batch, out_h, out_w] slice of the
@@ -3013,7 +3059,8 @@ static int kern_lstm_f32(const tigris_plan_t *plan, const tigris_op_t *op,
     const int32_t *xs = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
     const int32_t *ys = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
     const size_t steps = (size_t)(time_major ? xs[0] : xs[1]);
-    const size_t batch = (size_t)(time_major ? xs[1] : xs[0]);
+    const size_t batch = mem->tile.active ? (size_t)mem->tile.out_h :
+                         (size_t)(time_major ? xs[1] : xs[0]);
     const size_t features = (size_t)xs[2], units = (size_t)ys[2];
     memmove(h, h_in, batch * units * sizeof(float));
     memmove(c, c_in, batch * units * sizeof(float));
@@ -3065,7 +3112,8 @@ static int kern_svdf_f32(const tigris_plan_t *plan, const tigris_op_t *op,
     const int32_t *xs = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
     const int32_t *ys = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
     const int32_t *ss = tigris_tensor_shape(plan, &plan->tensors[ins[1]]);
-    const size_t batch = (size_t)xs[0], features = (size_t)xs[1], units = (size_t)ys[1];
+    const size_t batch = mem->tile.active ? (size_t)mem->tile.out_h : (size_t)xs[0];
+    const size_t features = (size_t)xs[1], units = (size_t)ys[1];
     const size_t filters = units * (size_t)rank;
     const size_t memory = (size_t)ss[1] / filters;
     const size_t count = batch * filters * memory;

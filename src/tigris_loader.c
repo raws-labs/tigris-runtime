@@ -328,6 +328,13 @@ static int is_row_tiling_op(uint8_t type)
 
 uint8_t tigris_band_axis(const tigris_plan_t *plan, const tigris_tensor_t *tensor, int mode)
 {
+    if (mode == TIGRIS_BAND_BATCH) return 0u;
+    if (mode == TIGRIS_BAND_TIME_MAJOR_BATCH) return tensor->ndim == 3u ? 1u : 0u;
+    if (mode == TIGRIS_BAND_TRAILING) return (uint8_t)(tensor->ndim - 1u);
+    if (mode >= (int)TIGRIS_BAND_AXIS_BASE) {
+        int axis = mode - (int)TIGRIS_BAND_AXIS_BASE;
+        return (uint8_t)axis;
+    }
     if (mode != TIGRIS_BAND_LEADING) return mode ? (uint8_t)(tensor->ndim - 2u) : 1u;
     const int32_t *shape = tigris_tensor_shape(plan, tensor);
     uint8_t axis = 0u;
@@ -336,25 +343,85 @@ uint8_t tigris_band_axis(const tigris_plan_t *plan, const tigris_tensor_t *tenso
 }
 
 
+int tigris_band_whole_input(const tigris_op_t *op, uint8_t position)
+{
+    return (position == 1u && (op->op_type == TIGRIS_OP_GATHER ||
+           op->op_type == TIGRIS_OP_GATHER_ND || op->op_type == TIGRIS_OP_EMBEDDING_LOOKUP)) ||
+           (position == 2u && op->op_type == TIGRIS_OP_DYNAMIC_UPDATE_SLICE);
+}
+
 int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
                                 uint16_t op_index, int row_tiled)
 {
-    if (op->num_inputs == 0u || op->num_outputs != 1u) return 0;
+    if (op->num_inputs == 0u || op->num_outputs == 0u ||
+        (op->num_outputs != 1u && op->op_type != TIGRIS_OP_SPLIT)) return 0;
     const tigris_tensor_t *in = &plan->tensors[tigris_op_inputs(plan, op)[0]];
     const tigris_tensor_t *out = &plan->tensors[tigris_op_outputs(plan, op)[0]];
+    if (is_binary_op(op->op_type)) {
+        if (row_tiled < (int)TIGRIS_BAND_AXIS_BASE || out->ndim < 2u || out->ndim > 5u)
+            return 0;
+        uint8_t axis = tigris_band_axis(plan, out, row_tiled);
+        const int32_t *shape = tigris_tensor_shape(plan, out);
+        if (axis >= out->ndim || shape[axis] <= 1) return 0;
+        int broadcast = 0;
+        for (uint8_t i = 0u; i < op->num_inputs; i++) {
+            const tigris_tensor_t *t = &plan->tensors[tigris_op_inputs(plan, op)[i]];
+            if (t->ndim != out->ndim || t->dtype == 6u) return 0;
+            const int32_t *other = tigris_tensor_shape(plan, t);
+            int dense = 1, channel = i == 1u;
+            for (uint8_t a = 0u; a < out->ndim; a++) {
+                if (other[a] != 1 && other[a] != shape[a]) return 0;
+                if (other[a] != shape[a]) dense = 0;
+                if (a + 1u < out->ndim && other[a] != 1) channel = 0;
+            }
+            if (!dense && !channel) broadcast = 1;
+        }
+        if (op->weight_idx != TIGRIS_NO_WEIGHT) {
+            if (!plan->weight_entries || op->weight_idx >= plan->header->num_weights) return 0;
+            uint32_t bytes = plan->weight_entries[op->weight_idx].size_bytes;
+            if (bytes == out->size_bytes && bytes > tigris_dtype_size(out->dtype)) broadcast = 1;
+            uint8_t len = 0u;
+            const uint8_t *attr = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_CONSTANT_OPERAND, &len);
+            if (attr && len == TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN + 4u * out->ndim) {
+                for (uint8_t a = 0u; a + 1u < out->ndim; a++) {
+                    int32_t extent;
+                    memcpy(&extent, attr + TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN + 4u * a, 4u);
+                    if (extent > 1) broadcast = 1;
+                }
+            }
+        }
+        return broadcast;
+    }
     if (in->ndim < 2u || in->ndim > 6u || out->ndim < 2u || out->ndim > 6u) return 0;
     int32_t ib, ir, ic, ob, orows, oc;
     uint8_t row = tigris_band_axis(plan, in, row_tiled);
-    if (row_tiled == TIGRIS_BAND_LEADING) {
+    if (row >= in->ndim) return 0;
+    if (op->op_type == TIGRIS_OP_TRANSPOSE && row_tiled < (int)TIGRIS_BAND_AXIS_BASE) return 0;
+    if (row_tiled < (int)TIGRIS_BAND_LEADING && (op->op_type == TIGRIS_OP_SPLIT ||
+        op->op_type == TIGRIS_OP_CONCAT || op->op_type == TIGRIS_OP_PAD)) return 0;
+    if (row_tiled < (int)TIGRIS_BAND_LEADING && op->num_inputs > 1u &&
+        tigris_band_whole_input(op, 1u)) return 0;
+    if (row_tiled == TIGRIS_BAND_LEADING || row_tiled == TIGRIS_BAND_TRAILING ||
+        row_tiled >= (int)TIGRIS_BAND_AXIS_BASE) {
+        int trailing = row_tiled == TIGRIS_BAND_TRAILING;
+        int explicit_axis = row_tiled >= (int)TIGRIS_BAND_AXIS_BASE;
+        uint8_t axes_len = 0u;
+        const uint8_t *axes = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_AXES, &axes_len);
+        int drop_after = (op->op_type == TIGRIS_OP_ARG_MAX || op->op_type == TIGRIS_OP_ARG_MIN) &&
+            axes != NULL && axes_len == 1u && axes[0] > row;
         const int32_t *first = tigris_tensor_shape(plan, in);
-        if (first[row] <= 1 || out->ndim != in->ndim) return 0;
-        for (uint8_t i = 0u; i <= op->num_inputs; i++) {
-            const tigris_tensor_t *t = i == op->num_inputs ? out :
+        if (first[row] <= 1 || (!trailing && out->ndim != in->ndim &&
+            !(drop_after && out->ndim + 1u == in->ndim))) return 0;
+        for (uint8_t i = 0u; i < op->num_inputs + op->num_outputs; i++) {
+            if (i < op->num_inputs && tigris_band_whole_input(op, i)) continue;
+            const tigris_tensor_t *t = i >= op->num_inputs ?
+                &plan->tensors[tigris_op_outputs(plan, op)[i - op->num_inputs]] :
                 &plan->tensors[tigris_op_inputs(plan, op)[i]];
-            if (t->ndim != in->ndim) return 0;
+            if (t->ndim < 2u || (!trailing && t->ndim != in->ndim &&
+                !(drop_after && i >= op->num_inputs && t->ndim + 1u == in->ndim))) return 0;
             const int32_t *shape = tigris_tensor_shape(plan, t);
-            for (uint8_t a = 0u; a < row; a++) if (shape[a] != 1) return 0;
-            if (shape[row] != first[row]) return 0;
+            if (!trailing && !explicit_axis) for (uint8_t a = 0u; a < row; a++) if (shape[a] != 1) return 0;
+            if (shape[tigris_band_axis(plan, t, row_tiled)] != first[row]) return 0;
         }
     } else if (row_tiled) {
         if (!tensor_row_view(plan, in, &ib, &ir, &ic) ||
@@ -377,6 +444,31 @@ int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
     }
     uint8_t length = 0u;
     uint8_t type = op->op_type;
+    if (type == TIGRIS_OP_TRANSPOSE) {
+        uint8_t prefix, split, middle;
+        const uint8_t *perm = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_TRANSPOSE_PERM, &length);
+        return perm && length == in->ndim && perm[row] == row &&
+            !transpose_band_groups(perm, length, &prefix, &split, &middle);
+    }
+    if (type == TIGRIS_OP_SPLIT || type == TIGRIS_OP_CONCAT) {
+        uint8_t axis = type == TIGRIS_OP_CONCAT && in->ndim == 4u && op->spatial.kernel_h == 0u
+                     ? 3u : (uint8_t)op->spatial.kernel_h;
+        return axis != row && (type == TIGRIS_OP_SPLIT ||
+            ((axis + 1u != in->ndim || (in->flags & TIGRIS_TENSOR_LINEAR) != 0u) &&
+             op->weight_idx == TIGRIS_NO_WEIGHT));
+    }
+    if (type == TIGRIS_OP_PAD) {
+        const uint8_t *pads = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_PADS, &length);
+        int32_t lead = -1, trail = -1;
+        if (!pads || length != (uint32_t)in->ndim * 8u) return 0;
+        memcpy(&lead, pads + (uint32_t)row * 8u, 4u);
+        memcpy(&trail, pads + (uint32_t)row * 8u + 4u, 4u);
+        return lead == 0 && trail == 0;
+    }
+    if (op->num_inputs == 1u && is_axis1_unary_pointwise_op(type) &&
+        type != TIGRIS_OP_SOFTMAX && type != TIGRIS_OP_LOG_SOFTMAX &&
+        type != TIGRIS_OP_L2_NORMALIZATION && type != TIGRIS_OP_LAYER_NORM && in->dtype != 6u)
+        return in->ndim == 2u && row_tiled >= (int)TIGRIS_BAND_LEADING && tensor_shapes_equal(plan, in, out);
     if (type == TIGRIS_OP_REDUCE_MEAN || type == TIGRIS_OP_REDUCE_MAX ||
         type == TIGRIS_OP_REDUCE_MIN || type == TIGRIS_OP_REDUCE_SUM ||
         type == TIGRIS_OP_REDUCE_ALL || type == TIGRIS_OP_CUMSUM ||
@@ -390,7 +482,7 @@ int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
     memcpy(metadata, payload, length);
     const int32_t *shape = tigris_tensor_shape(plan, in);
     if (type == TIGRIS_OP_GATHER || type == TIGRIS_OP_GATHER_ND || type == TIGRIS_OP_EMBEDDING_LOOKUP) {
-        if (op->num_inputs != 1u || op->weight_idx == TIGRIS_NO_WEIGHT) return 0;
+        if (op->num_inputs != (op->weight_idx == TIGRIS_NO_WEIGHT ? 2u : 1u)) return 0;
         if (type == TIGRIS_OP_GATHER_ND)
             return metadata[0] > 0 && metadata[0] <= 6 && metadata[metadata[0]] <= row;
         return metadata[0] != row && metadata[1] <= row;
@@ -404,20 +496,102 @@ int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
         return metadata[1u + 2u * row] == 0 && metadata[2u + 2u * row] == 0;
     if (type == TIGRIS_OP_REVERSE_V2)
         return ((uint32_t)metadata[0] & (1u << row)) == 0u;
+    if (type == TIGRIS_OP_DYNAMIC_UPDATE_SLICE && op->num_inputs == 3u &&
+        op->weight_idx == TIGRIS_NO_WEIGHT && length == (uint32_t)in->ndim * 4u)
+        return metadata[row] == shape[row];
     return type == TIGRIS_OP_DYNAMIC_UPDATE_SLICE && op->weight_idx == TIGRIS_NO_WEIGHT &&
            op->num_inputs == 2u && length == (uint32_t)in->ndim * 8u &&
            metadata[row] == 0 && metadata[in->ndim + row] == shape[row];
 }
 
+int tigris_stage_band_mode(const tigris_plan_t *plan, const tigris_stage_t *stage)
+{
+    uint16_t index = tigris_stage_ops(plan, stage)[0];
+    const tigris_op_t *op = &plan->ops[index];
+    if (op->op_type == TIGRIS_OP_SPLIT || op->op_type == TIGRIS_OP_CONCAT ||
+        op->op_type == TIGRIS_OP_PAD || op->op_type == TIGRIS_OP_TRANSPOSE || is_binary_op(op->op_type) ||
+        (op->num_inputs > 1u && tigris_band_whole_input(op, 1u)) ||
+        (op->num_inputs > 2u && tigris_band_whole_input(op, 2u))) {
+        const tigris_tensor_t *input = &plan->tensors[is_binary_op(op->op_type) ?
+            tigris_op_outputs(plan, op)[0] : tigris_op_inputs(plan, op)[0]];
+        const int32_t *shape = tigris_tensor_shape(plan, input);
+        int mode = TIGRIS_BAND_LEADING;
+        int32_t extent = 1;
+        uint64_t best_cost = UINT64_MAX;
+        for (uint8_t axis = 0u; axis < input->ndim; axis++) {
+            int candidate = (int)TIGRIS_BAND_AXIS_BASE + axis;
+            uint64_t cost = 0u;
+            if (is_binary_op(op->op_type)) {
+                for (uint8_t i = 0u; i < op->num_inputs + op->num_outputs; i++) {
+                    uint16_t tidx = i < op->num_inputs ? tigris_op_inputs(plan, op)[i] :
+                        tigris_op_outputs(plan, op)[i - op->num_inputs];
+                    int repeated = 0;
+                    for (uint8_t j = 0u; j < i && j < op->num_inputs; j++)
+                        if (tigris_op_inputs(plan, op)[j] == tidx) repeated = 1;
+                    if (repeated) continue;
+                    const tigris_tensor_t *t = &plan->tensors[tidx];
+                    int32_t divisor = t->ndim == input->ndim ? tigris_tensor_shape(plan, t)[axis] : 1;
+                    if (divisor <= 0) return TIGRIS_BAND_LEADING;
+                    uint64_t bytes = t->size_bytes / (uint32_t)divisor;
+                    cost += ((bytes + 31u) / 32u) * 32u;
+                }
+            }
+            if ((cost < best_cost || (cost == best_cost && shape[axis] > extent)) &&
+                tigris_op_independent_band(plan, op, index, candidate)) {
+                extent = shape[axis];
+                best_cost = cost;
+                mode = candidate;
+            }
+        }
+        if (best_cost != UINT64_MAX) return mode;
+    }
+    if (op->op_type == TIGRIS_OP_SVDF) return TIGRIS_BAND_BATCH;
+    if (op->op_type == TIGRIS_OP_LSTM) {
+        const uint8_t *params = tigris_op_attribute_data(plan, index, TIGRIS_OP_ATTR_LSTM, NULL);
+        int32_t time_major = 0;
+        if (params) memcpy(&time_major, params, sizeof(time_major));
+        return time_major ? TIGRIS_BAND_TIME_MAJOR_BATCH : TIGRIS_BAND_BATCH;
+    }
+    return !tigris_op_independent_band(plan, op, index, TIGRIS_BAND_LEADING) &&
+        tigris_op_independent_band(plan, op, index, TIGRIS_BAND_TRAILING) ?
+        TIGRIS_BAND_TRAILING : TIGRIS_BAND_LEADING;
+}
+
 int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_t *stage)
 {
     if (!plan->shape_pool || stage->ops_count != 1u || stage->chain_len != 0u ||
-        stage->inputs_count == 0u || stage->outputs_count != 1u) return 0;
+        stage->inputs_count == 0u || stage->outputs_count == 0u) return 0;
     uint16_t index = tigris_stage_ops(plan, stage)[0];
     const tigris_op_t *op = &plan->ops[index];
-    if (op->num_inputs != stage->inputs_count || op->num_outputs != 1u ||
-        tigris_op_outputs(plan, op)[0] != tigris_stage_outputs(plan, stage)[0] ||
-        !tigris_op_independent_band(plan, op, index, TIGRIS_BAND_LEADING)) return 0;
+    if (op->op_type == TIGRIS_OP_SVDF || op->op_type == TIGRIS_OP_LSTM) {
+        if (op->num_inputs != stage->inputs_count || op->num_outputs != stage->outputs_count)
+            return 0;
+        int mode = tigris_stage_band_mode(plan, stage);
+        int32_t rows = 0;
+        for (uint8_t i = 0; i < op->num_inputs + op->num_outputs; i++) {
+            uint16_t tidx = i < op->num_inputs ? tigris_op_inputs(plan, op)[i] :
+                tigris_op_outputs(plan, op)[i - op->num_inputs];
+            const tigris_tensor_t *t = &plan->tensors[tidx];
+            if (t->ndim < 2u || t->ndim > 3u) return 0;
+            int32_t r = tigris_tensor_shape(plan, t)[tigris_band_axis(plan, t, mode)];
+            if (r <= 1 || (rows && rows != r)) return 0;
+            rows = r;
+        }
+        return rows;
+    }
+    if (!tigris_op_independent_band(plan, op, index, tigris_stage_band_mode(plan, stage))) return 0;
+    for (uint16_t i = 0u; i < stage->inputs_count; i++) {
+        int found = 0;
+        for (uint8_t j = 0u; j < op->num_inputs; j++)
+            if (tigris_stage_inputs(plan, stage)[i] == tigris_op_inputs(plan, op)[j]) found = 1;
+        if (!found) return 0;
+    }
+    for (uint16_t i = 0u; i < stage->outputs_count; i++) {
+        int found = 0;
+        for (uint8_t j = 0u; j < op->num_outputs; j++)
+            if (tigris_stage_outputs(plan, stage)[i] == tigris_op_outputs(plan, op)[j]) found = 1;
+        if (!found) return 0;
+    }
     for (uint8_t i = 0u; i < op->num_inputs; i++) {
         int found = 0;
         for (uint16_t j = 0u; j < stage->inputs_count; j++)
@@ -427,9 +601,11 @@ int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_
     const tigris_tensor_t *in = &plan->tensors[tigris_op_inputs(plan, op)[0]];
     const int32_t *shape = tigris_tensor_shape(plan, in);
     /* Preserve the meaning of existing matrix-row and height records. */
+    if (in->ndim == 2u && shape[0] > 1 && is_row_tiling_op(op->op_type)) return 0;
     if ((shape[in->ndim - 2u] > 1 && tigris_op_independent_band(plan, op, index, 1)) ||
         tigris_op_independent_band(plan, op, index, 0)) return 0;
-    return shape[tigris_band_axis(plan, in, TIGRIS_BAND_LEADING)];
+    const tigris_tensor_t *out = &plan->tensors[tigris_op_outputs(plan, op)[0]];
+    return tigris_tensor_shape(plan, out)[tigris_band_axis(plan, out, tigris_stage_band_mode(plan, stage))];
 }
 
 

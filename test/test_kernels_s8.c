@@ -2547,6 +2547,18 @@ static void test_pad_s8(void)
     mem.tile.active = 1;
     TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
                 "pad refuses a tile");
+    test_shapes[test_tensors[t_x].shape_off + 3u] = 2;
+    test_shapes[test_tensors[t_y].shape_off + 3u] = 2;
+    test_tensors[t_x].size_bytes = 8u;
+    test_tensors[t_y].size_bytes = 18u;
+    mem.tile.row_tiled = 9u;
+    mem.tile.in_h = mem.tile.out_h = 1;
+    memset(ptrs[t_y], 0x55, 18u);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "pad bands an unpadded channel axis");
+    TEST_ASSERT(memcmp(ptrs[t_y], stated_fill, 9u) == 0, "channel band retains fill and coordinates");
+    for (size_t i = 9u; i < 18u; i++)
+        TEST_ASSERT_EQ(((uint8_t *)ptrs[t_y])[i], 0x55, "pad band output canary");
     mem.tile.active = 0;
     plan.num_op_attributes = 0;
     TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,

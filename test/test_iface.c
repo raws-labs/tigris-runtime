@@ -139,6 +139,21 @@ static void test_float_roundtrips_through_the_quantized_boundary(void)
     free(ptrs);
 }
 
+static void test_quantization_rounds_as_tflite_does(void)
+{
+    const tigris_quant_param_t unit = {1.0f, 0, 1u, 0u, 0u, 0u};
+    const tigris_quant_param_t shifted = {0.5f, -3, 1u, 0u, 0u, 0u};
+    printf("  test_quantization_rounds_as_tflite_does...\n");
+    /* Just below one half rounds down; adding 0.5 first would give 1. */
+    TEST_ASSERT_EQ(tigris_quantize_value(0.49999997f, &unit), 0, "below a half rounds down");
+    TEST_ASSERT_EQ(tigris_quantize_value(-0.49999997f, &unit), 0, "above minus a half rounds up");
+    TEST_ASSERT_EQ(tigris_quantize_value(0.5f, &unit), 1, "a half rounds away from zero");
+    TEST_ASSERT_EQ(tigris_quantize_value(-2.5f, &unit), -3, "minus two and a half rounds away");
+    TEST_ASSERT_EQ(tigris_quantize_value(1.25f, &shifted), 0, "the zero point follows rounding");
+    TEST_ASSERT_EQ(tigris_quantize_value(3.0e9f, &unit), 127, "beyond int32 clamps high");
+    TEST_ASSERT_EQ(tigris_quantize_value(-3.0e9f, &unit), -128, "beyond int32 clamps low");
+}
+
 static void test_output_is_read_back_in_the_declared_dtype(void)
 {
     uint16_t out_idx = fixture_plan.model_outputs[0];
@@ -477,6 +492,7 @@ int main(void)
 
     test_declared_interface_sizes_the_caller_buffer();
     test_float_roundtrips_through_the_quantized_boundary();
+    test_quantization_rounds_as_tflite_does();
     test_output_is_read_back_in_the_declared_dtype();
     test_non_boundary_tensors_are_refused();
     test_plain_interface_copies();

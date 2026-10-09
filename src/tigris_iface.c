@@ -44,18 +44,17 @@ uint32_t tigris_iface_bytes(const tigris_plan_t *plan, uint16_t tensor_idx)
 }
 
 /* Half away from zero, matching the rounding the compiler quantizes with. */
-static int32_t round_half_away(float value)
+int8_t tigris_quantize_value(float value, const tigris_quant_param_t *quant)
 {
-    return (value >= 0.0f) ? (int32_t)floorf(value + 0.5f)
-                           : (int32_t)ceilf(value - 0.5f);
+    /* roundf rounds half away from zero exactly, as std::round does; adding
+     * 0.5 first would round values just below one half up. The level is
+     * clamped as a float, which a value beyond int32 would overflow. */
+    float level = roundf(value / quant->scale) + (float)quant->zero_point;
+    if (!(level >= -128.0f)) level = -128.0f;
+    if (level > 127.0f) level = 127.0f;
+    return (int8_t)level;
 }
 
-static int8_t clamp_s8(int32_t value)
-{
-    if (value < -128) return (int8_t)-128;
-    if (value > 127) return (int8_t)127;
-    return (int8_t)value;
-}
 
 /* Common preamble: resolve the boundary tensor, its element count, and the
  * quantization that relates the declared dtype to the stored one. */
@@ -151,8 +150,7 @@ tigris_error_t tigris_input_write(
     const float *in = (const float *)src;
     int8_t *out = (int8_t *)dst;
     for (uint32_t i = 0u; i < elements; i++)
-        out[i] = clamp_s8(round_half_away(in[i] / quant->scale) +
-                          quant->zero_point);
+        out[i] = tigris_quantize_value(in[i], quant);
     return TIGRIS_OK;
 }
 

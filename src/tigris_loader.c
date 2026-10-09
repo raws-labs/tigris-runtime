@@ -773,7 +773,8 @@ uint8_t tigris_plan_data_dtype(const tigris_plan_t *plan)
 
 /* Role 0 is the plan's data dtype, 255 data or bool, 254 data or int16 state
  * (the tensor table admits int16 only on state tensors), 253 data or int32,
- * 252 bool or int32. */
+ * 252 bool or int32, 251 data, int32 or float32 (control flow carries float32
+ * across the boundary of an int8 plan's subgraph). */
 /* The weight index of an operator's constant operand k, or TIGRIS_NO_WEIGHT. */
 static uint16_t constant_index(const tigris_plan_t *plan, uint16_t op_index, uint8_t k)
 {
@@ -958,6 +959,7 @@ static int dtype_matches_slot(uint8_t dtype, uint8_t role, uint8_t data_dtype)
 {
     if (role == 253u) return dtype == data_dtype || dtype == 6u;
     if (role == 252u) return dtype == 9u || dtype == 6u;
+    if (role == 251u) return dtype == data_dtype || dtype == 6u || dtype == 1u;
     if (role == 254u) return dtype == data_dtype || dtype == 5u;
     return role == 255u ? dtype == data_dtype || dtype == 9u : dtype == (role == 0u ? data_dtype : role);
 }
@@ -1294,7 +1296,7 @@ static int subgraph_input(const tigris_plan_t *plan, uint16_t t)
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     /* Zero is the data dtype, 255 also permits bool; the final input slot repeats. */
-    static const dtype_signature_t dtype_signatures[TIGRIS_OP_DETECTION_POSTPROCESS + 1] = {
+    static const dtype_signature_t dtype_signatures[TIGRIS_OP_DEQUANTIZE + 1] = {
         [TIGRIS_OP_CONV] = {{0, 0, 0}, 0},
         [TIGRIS_OP_DEPTHWISE] = {{0, 0, 0}, 0},
         [TIGRIS_OP_RELU] = {{0, 0, 0}, 0},
@@ -1381,9 +1383,11 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         [TIGRIS_OP_REDUCE_ALL] = {{9, 9, 9}, 9},
         [TIGRIS_OP_SVDF] = {{0, 254, 254}, 254},
         [TIGRIS_OP_LSTM] = {{0, 254, 254}, 254},
-        [TIGRIS_OP_IF] = {{9, 253, 253}, 253},
-        [TIGRIS_OP_WHILE] = {{253, 253, 253}, 253},
+        [TIGRIS_OP_IF] = {{9, 251, 251}, 251},
+        [TIGRIS_OP_WHILE] = {{251, 251, 251}, 251},
         [TIGRIS_OP_DETECTION_POSTPROCESS] = {{0, 0, 0}, 1},
+        [TIGRIS_OP_QUANTIZE] = {{1, 1, 1}, 0},
+        [TIGRIS_OP_DEQUANTIZE] = {{0, 0, 0}, 1},
     };
     const tigris_file_header_t *hdr = plan->header;
     const int legacy = hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES;
@@ -1490,6 +1494,22 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         case TIGRIS_OP_DETECTION_POSTPROCESS:
             if (!detection_valid(plan, op, op_index)) return TIGRIS_ERR_BAD_OPERATOR;
             break;
+        case TIGRIS_OP_QUANTIZE:
+        case TIGRIS_OP_DEQUANTIZE: {
+            /* One tensor in and one out of the same shape; the int8 side has
+             * a quantization (a producer's record may add per-channel
+             * requantization, its scale and zero point stay per tensor), the
+             * float32 side has none. */
+            const tigris_tensor_t *encoded = op->op_type == TIGRIS_OP_QUANTIZE ? output : input;
+            const tigris_tensor_t *real = op->op_type == TIGRIS_OP_QUANTIZE ? input : output;
+            const tigris_quant_param_t *q = tigris_tensor_quant(plan, encoded);
+            if (!op_has_plain_io(op, 1, 1) || !tensor_shapes_equal(plan, input, output) ||
+                q == NULL || !isfinite(q->scale) || !(q->scale > 0.0f) ||
+                q->zero_point < -128 || q->zero_point > 127 ||
+                real->quant_param_idx != TIGRIS_NO_QUANT_PARAM)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            break;
+        }
         case TIGRIS_OP_IF:
         case TIGRIS_OP_WHILE:
             break;  /* validated with the subgraph section */

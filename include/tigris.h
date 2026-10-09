@@ -293,6 +293,13 @@ typedef enum {
      * float32 boxes [1, detections, 4], classes and scores [1, detections],
      * the count [1] and its working memory, as TFLite Micro does. */
     TIGRIS_OP_DETECTION_POSTPROCESS      = 89,
+    /* float32 to the int8 encoding of its output, as TFLite Micro's QUANTIZE:
+     * a float32 division by the scale, rounded half away from zero. */
+    TIGRIS_OP_QUANTIZE                   = 90,
+    /* int8 to float32, as TFLite Micro's DEQUANTIZE: the scale times the
+     * offset value, in double. Both carry float32 across the boundary of a
+     * control-flow subgraph in an int8 plan. */
+    TIGRIS_OP_DEQUANTIZE                 = 91,
     TIGRIS_OP_UNKNOWN           = 255,
 } tigris_op_type_t;
 

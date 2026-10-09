@@ -1574,6 +1574,35 @@ int tigris_movement_execute(const tigris_plan_t *plan, const tigris_op_t *op,
     return 0;
 }
 
+int tigris_quantize_execute(const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t x_index = tigris_op_inputs(plan, op)[0];
+    const uint16_t y_index = tigris_op_outputs(plan, op)[0];
+    const int quantize = op->op_type == TIGRIS_OP_QUANTIZE;
+    const tigris_quant_param_t *q =
+        tigris_tensor_quant(plan, &plan->tensors[quantize ? y_index : x_index]);
+    const void *x = tigris_mem_tensor_ptr(mem, x_index);
+    void *y = tigris_mem_tensor_ptr(mem, y_index);
+    const uint32_t count = tensor_numel(plan, y_index);
+    if (q == NULL || x == NULL || y == NULL || mem->tile.active) return -1;
+    for (uint32_t i = 0u; i < count; i++) {
+        if (quantize) {
+            float value;
+            memcpy(&value, (const uint8_t *)x + (size_t)i * sizeof(value), sizeof(value));
+            /* Clamped before the conversion, which a value beyond int32 would overflow. */
+            float level = roundf(value / q->scale) + (float)q->zero_point;
+            if (!(level >= -128.0f)) level = -128.0f;
+            if (level > 127.0f) level = 127.0f;
+            ((int8_t *)y)[i] = (int8_t)level;
+        } else {
+            const int32_t level = (int32_t)((const int8_t *)x)[i];
+            const float value = (float)((double)q->scale * (double)(level - q->zero_point));
+            memcpy((uint8_t *)y + (size_t)i * sizeof(value), &value, sizeof(value));
+        }
+    }
+    return 0;
+}
+
 /* DetectionPostProcess: TFLite Micro's SSD box decoding and non-max
  * suppression, operation for operation, so its results match bit for bit. */
 typedef struct {
@@ -3171,6 +3200,8 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_SVDF: return kern_svdf_f32(plan, op, op_index, mem);
     case TIGRIS_OP_LSTM: return kern_lstm_f32(plan, op, op_index, mem);
     case TIGRIS_OP_DETECTION_POSTPROCESS: return tigris_detection_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_QUANTIZE:
+    case TIGRIS_OP_DEQUANTIZE: return tigris_quantize_execute(plan, op, mem);
     case TIGRIS_OP_SPLIT:       return kern_split(plan, op, mem);
     case TIGRIS_OP_PAD:         return kern_pad(plan, op, op_index, mem);
     default:

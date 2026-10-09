@@ -3243,6 +3243,8 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_SVDF: return kern_svdf_s8(plan, op, op_index, mem);
     case TIGRIS_OP_LSTM: return kern_lstm_s8(plan, op, op_index, mem);
     case TIGRIS_OP_DETECTION_POSTPROCESS: return tigris_detection_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_QUANTIZE:
+    case TIGRIS_OP_DEQUANTIZE: return tigris_quantize_execute(plan, op, mem);
     case TIGRIS_OP_ARG_MAX:
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
     case TIGRIS_OP_CUMSUM: return kern_cumsum_s8(plan, op, op_index, mem);

@@ -4300,6 +4300,21 @@ static void test_state_goldens(void)
                                         &relu, 1u), TIGRIS_ERR_BAD_OPERATOR,
                            "int32 arithmetic takes no activation");
         }
+        uint16_t converting = plan.header->num_ops;
+        for (uint16_t n = 0; n < plan.header->num_ops; n++)
+            if (plan.ops[n].op_type == TIGRIS_OP_QUANTIZE) converting = n;
+        if (converting < plan.header->num_ops) {
+            const tigris_op_t *op = &plan.ops[converting];
+            const tigris_tensor_t *real = &plan.tensors[tigris_op_inputs(&plan, op)[0]];
+            const tigris_tensor_t *encoded = &plan.tensors[tigris_op_outputs(&plan, op)[0]];
+            const uint16_t quantized = encoded->quant_param_idx, none = TIGRIS_NO_QUANT_PARAM;
+            TEST_ASSERT(load_altered(golden, copy, (size_t)((const uint8_t *)&real->quant_param_idx - buf),
+                                     &quantized, 2u) != TIGRIS_OK,
+                        "a Quantize reads float32 without a quantization");
+            TEST_ASSERT(load_altered(golden, copy, (size_t)((const uint8_t *)&encoded->quant_param_idx - buf),
+                                     &none, 2u) != TIGRIS_OK,
+                        "a Quantize writes a quantized int8 tensor");
+        }
         uint16_t branching = plan.header->num_ops;
         for (uint16_t n = plan.header->num_ops; n-- > 0u;)
             if (plan.ops[n].op_type == TIGRIS_OP_IF) branching = n;

@@ -46,6 +46,9 @@ int tigris_movement_execute(const tigris_plan_t *plan, const tigris_op_t *op,
 int tigris_arg_execute(const tigris_plan_t *plan, const tigris_op_t *op,
                        uint16_t op_index, tigris_mem_t *mem);
 
+/** Convert between float32 and an int8 encoding, as TFLite Micro does. */
+int tigris_quantize_execute(const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem);
+
 /** Decode SSD boxes and select detections from float32 or int8 operands. */
 int tigris_detection_execute(const tigris_plan_t *plan, const tigris_op_t *op,
                              uint16_t op_index, tigris_mem_t *mem);

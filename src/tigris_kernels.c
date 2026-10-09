@@ -7,6 +7,7 @@
  */
 
 #include "tigris_kernels.h"
+#include "tigris_iface.h"
 
 #include "tigris_kernel_window.h"
 #include "tigris_binary_operands.h"
@@ -1613,11 +1614,7 @@ int tigris_quantize_execute(const tigris_plan_t *plan, const tigris_op_t *op, ti
         if (quantize) {
             float value;
             memcpy(&value, (const uint8_t *)x + (size_t)i * sizeof(value), sizeof(value));
-            /* Clamped before the conversion, which a value beyond int32 would overflow. */
-            float level = roundf(value / q->scale) + (float)q->zero_point;
-            if (!(level >= -128.0f)) level = -128.0f;
-            if (level > 127.0f) level = 127.0f;
-            ((int8_t *)y)[i] = (int8_t)level;
+            ((int8_t *)y)[i] = tigris_quantize_value(value, q);
         } else {
             const int32_t level = (int32_t)((const int8_t *)x)[i];
             const float value = (float)((double)q->scale * (double)(level - q->zero_point));

@@ -33,6 +33,13 @@ extern "C" {
 uint32_t tigris_iface_bytes(const tigris_plan_t *plan, uint16_t tensor_idx);
 
 /**
+ * A float32 value in an int8 encoding, as TFLite's QUANTIZE computes it: a
+ * float32 division by the scale, rounded half away from zero, plus the zero
+ * point, clamped to int8.
+ */
+int8_t tigris_quantize_value(float value, const tigris_quant_param_t *quant);
+
+/**
  * Convert the caller's data into a model input tensor.
  * Int64 index inputs must fit int32; narrowing overflow returns BAD_INTERFACE.
  *

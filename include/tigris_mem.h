@@ -136,8 +136,8 @@ typedef struct {
  * Record a new fast-arena high-water mark if fast_used grew.
  * Called at every site that increases fast_used (the bump allocator and the
  * executor's direct scratch/weight bumps) so fast_peak is the observed arena
- * high-water mark, not a compile-time estimate. Normal execution compacts on
- * memory pressure, so a roomier arena can intentionally report a higher peak.
+ * high-water mark, not a compile-time estimate. Execution honors serialized
+ * stage working sets even when the caller supplies a larger arena.
  */
 static inline void tigris_mem_note_fast_peak(tigris_mem_t *mem)
 {

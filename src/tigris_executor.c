@@ -637,7 +637,25 @@ static int is_pure_reinterpretation(
     return a[0] == b[0] && a[in->ndim - 1u] == b[out->ndim - 1u];
 }
 
-static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal(
+/* Keep a roomy caller arena within the serialized stage working set. */
+static uint32_t stage_fast_capacity(const tigris_plan_t *plan,
+                                   const tigris_stage_t *stage,
+                                   const tigris_mem_t *mem)
+{
+    uint32_t available = mem->fast_size - mem->fast_reserved;
+    /* Older schemas can state unaligned activation sizes. */
+    if (plan->header->version < TIGRIS_SCHEMA_VERSION_V4)
+        return available;
+    uint32_t peak = stage->peak_bytes;
+    if (stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN && plan->tile_plans &&
+        stage->tile_plan_idx < plan->header->num_tile_plans &&
+        plan->tile_plans[stage->tile_plan_idx].tileable)
+        peak = plan->tile_plans[stage->tile_plan_idx].tiled_peak_bytes;
+    /* Hand-built and older plans may omit the working-set estimate. */
+    return peak != 0u && peak < available ? peak : available;
+}
+
+static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
     const tigris_plan_t *plan,
     const tigris_stage_t *stage,
     tigris_mem_t        *mem,
@@ -833,6 +851,23 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal(
     return TIGRIS_EXEC_OK;
 }
 
+static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal(
+    const tigris_plan_t *plan,
+    const tigris_stage_t *stage,
+    tigris_mem_t        *mem,
+    tigris_kernel_fn     kernel,
+    void                *user_ctx,
+    tigris_exec_stats_t *stats,
+    executor_workspace_impl_t *workspace)
+{
+    uint32_t capacity = mem->fast_size;
+    mem->fast_size = mem->fast_reserved + stage_fast_capacity(plan, stage, mem);
+    tigris_exec_error_t result = exec_stage_normal_impl(
+        plan, stage, mem, kernel, user_ctx, stats, workspace);
+    mem->fast_size = capacity;
+    return result;
+}
+
 /* Tiled stage execution */
 
 static int axis1_allocation_bytes(
@@ -1014,7 +1049,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled(
     /* (Spatial op + image dims computed up front, above.) */
 
     const uint16_t *sops = tigris_stage_ops(plan, stage);
-    uint32_t available = mem->fast_size - mem->fast_reserved;
+    uint32_t available = stage_fast_capacity(plan, stage, mem);
     int32_t low = 1;
     int32_t high = full_out_h;
     int32_t out_tile_h = 0;
@@ -1742,13 +1777,16 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_by_input(
         return TIGRIS_EXEC_ERR_MEM;
 
     const uint32_t entry_reserved = mem->fast_reserved;
+    uint32_t available = stage_fast_capacity(plan, stage, mem);
+    if (acc_bytes > available)
+        return TIGRIS_EXEC_ERR_MEM;
+    available -= acc_bytes;
     void *acc = mem->fast_base + mem->fast_used;
     mem->fast_used += acc_bytes;
     tigris_mem_note_fast_peak(mem);
     mem->fast_reserved = mem->fast_used;
 
     /* Largest band whose rows plus the output tensor fit what is left. */
-    uint32_t available = mem->fast_size - mem->fast_reserved;
     uint32_t out_bytes;
     int32_t band = 0;
     if (tile2d_allocation_bytes(plan, out_idx, 1, 1, &out_bytes)) {
@@ -1989,7 +2027,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
     /* Largest band of output rows whose gathered input rectangle and packed
      * output tile fit together. Both hold the same element count, aligned
      * separately because they are two arena allocations. */
-    uint32_t available = mem->fast_size - mem->fast_reserved;
+    uint32_t available = stage_fast_capacity(plan, stage, mem);
     int32_t band = 0;
     int32_t low = 1;
     int32_t high = banded;
@@ -2559,7 +2597,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
      * is its own aligned allocation, so the alignment is paid per tensor
      * rather than once on the total, and the search recomputes it per
      * candidate rather than scaling one figure. */
-    uint32_t available = mem->fast_size - mem->fast_reserved;
+    uint32_t available = stage_fast_capacity(plan, stage, mem);
     int32_t band = 0;
     int32_t low = 1;
     int32_t high = rows;
@@ -4064,7 +4102,7 @@ tigris_exec_error_t tigris_run_with_state(
                  stage_supports_axis1_tiling(run_plan, stage, rank));
             int needs_tiling =
                 (common_tile_rank || row_tiled || transposed) &&
-                total_io > (mem->fast_size - mem->fast_reserved);
+                total_io > stage_fast_capacity(run_plan, stage, mem);
 
             /* Schema-v5 stages may serialize the height/length axis (1D) or the
              * combined HW axis (2D). Both are accepted here; WIDTH and any other

@@ -67,6 +67,7 @@ typedef struct {
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[TEST_SLOW_SIZE];
     uint32_t baseline_used;
     uint32_t baseline_reserved;
+    uint32_t baseline_capacity;
 } arena_fixture_t;
 
 typedef struct {
@@ -78,6 +79,7 @@ static void build_chain_plan(plan_fixture_t *fx)
 {
     memset(fx, 0, sizeof(*fx));
 
+    fx->header.version = TIGRIS_SCHEMA_VERSION;
     fx->header.num_tensors = 3;
     fx->header.num_ops = 2;
     fx->header.num_stages = 2;
@@ -176,6 +178,7 @@ static void make_standalone(plan_fixture_t *fx)
     fx->tensors[1].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
     fx->stages[0].chain_id = TIGRIS_NO_CHAIN;
     fx->stages[0].chain_len = 0;
+    fx->stages[0].peak_bytes = 2u * TIGRIS_TENSOR_ALIGN;
     fx->blocks[0].compressed_size = STANDALONE_BLOCK_SIZE;
     fx->blocks[0].uncompressed_size = STANDALONE_BLOCK_SIZE;
     fx->plan.num_weight_blocks = 1;
@@ -187,6 +190,7 @@ static void make_two_standalone_stages(plan_fixture_t *fx)
     for (uint16_t i = 0; i < 2; i++) {
         fx->stages[i].chain_id = TIGRIS_NO_CHAIN;
         fx->stages[i].chain_len = 0;
+        fx->stages[i].peak_bytes = 2u * TIGRIS_TENSOR_ALIGN;
     }
 }
 
@@ -206,6 +210,7 @@ static int init_arena(arena_fixture_t *fx, uint32_t fast_capacity,
 
     /* Simulate caller-owned fast bytes above the reset reservation. */
     fx->baseline_reserved = fx->mem.fast_reserved;
+    fx->baseline_capacity = fx->mem.fast_size;
     if (fx->mem.fast_used > fx->mem.fast_size ||
         TIGRIS_TENSOR_ALIGN > fx->mem.fast_size - fx->mem.fast_used)
         return 0;
@@ -218,7 +223,8 @@ static int init_arena(arena_fixture_t *fx, uint32_t fast_capacity,
 static int fast_state_restored(const arena_fixture_t *fx)
 {
     if (fx->mem.fast_used != fx->baseline_used ||
-        fx->mem.fast_reserved != fx->baseline_reserved)
+        fx->mem.fast_reserved != fx->baseline_reserved ||
+        fx->mem.fast_size != fx->baseline_capacity)
         return 0;
     for (uint32_t i = fx->baseline_reserved; i < fx->baseline_used; i++) {
         if (fx->mem.fast_base[i] != 0xa5)

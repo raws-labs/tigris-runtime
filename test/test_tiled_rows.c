@@ -67,6 +67,8 @@ typedef struct {
 } rows_fixture_t;
 
 /** One [rows, IN] x [OUT, IN] product followed by a Relu, all rank 2. */
+#include "trace_assert.h"
+
 static void build_fixture(rows_fixture_t *fx)
 {
     memset(fx, 0, sizeof(*fx));
@@ -642,6 +644,11 @@ int main(void)
     test_row_band_failures_are_reported();
     test_a_band_writes_over_an_input_that_dies();
     test_a_band_never_writes_over_a_model_input();
+
+#ifdef TIGRIS_TRACE
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_ROWS)) != 0u,
+                   1, "rows path checked against trace");
+#endif
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);

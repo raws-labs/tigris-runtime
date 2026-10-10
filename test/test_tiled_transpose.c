@@ -67,6 +67,8 @@ typedef struct {
 } transpose_fixture_t;
 
 /** One Transpose stage permuting [N, rows, cols] to [N, cols, rows]. */
+#include "trace_assert.h"
+
 static void build_fixture(transpose_fixture_t *fx, int32_t rows, int32_t cols)
 {
     memset(fx, 0, sizeof(*fx));
@@ -406,6 +408,11 @@ int main(void)
     check_rank4(4, 4, 24, 1, "rank 4 to linear order");
     check_rank4(4, 4, 24, 0, "rank 4 back to spatial order");
     check_fixed_axis_permutation();
+
+#ifdef TIGRIS_TRACE
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_TRANSPOSE)) != 0u,
+                   1, "transpose path checked against trace");
+#endif
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);

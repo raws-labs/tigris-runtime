@@ -409,6 +409,39 @@ static size_t spatial_index(
     return (size_t)chain * workspace->spatial_capacity + op;
 }
 
+#ifdef TIGRIS_TRACE
+static void trace_stage_begin(tigris_mem_t *mem, uint16_t stage, tigris_trace_path_t path)
+{
+    mem->trace_stage = stage;
+    mem->trace_path = (uint8_t)path;
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_STAGE_BEGIN, TIGRIS_TRACE_POOL_NONE,
+        TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_NONE_U16, 0u, 0u, 0u, -1, -1, -1, -1);
+}
+
+static void trace_stage_end(tigris_mem_t *mem, uint16_t stage)
+{
+    mem->trace_stage = stage;
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_STAGE_END, TIGRIS_TRACE_POOL_NONE,
+        TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_NONE_U16, 0u, 0u, 0u, -1, -1, -1, -1);
+}
+
+static TIGRIS_NOINLINE int traced_kernel(tigris_kernel_fn kernel,
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t index,
+    tigris_mem_t *mem, void *ctx)
+{
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_OP, TIGRIS_TRACE_POOL_NONE,
+        TIGRIS_TRACE_NONE_U16, index, 0u, 0u, 0u, -1, -1, -1, -1);
+    return kernel(plan, op, index, mem, ctx);
+}
+#define TRACE_STAGE_BEGIN(...) trace_stage_begin(__VA_ARGS__)
+#define TRACE_STAGE_END(...) trace_stage_end(__VA_ARGS__)
+#define TRACED_KERNEL(...) traced_kernel(__VA_ARGS__)
+#else
+#define TRACE_STAGE_BEGIN(...) ((void)0)
+#define TRACE_STAGE_END(...) ((void)0)
+#define TRACED_KERNEL(fn, plan, op, index, mem, ctx) ((fn)((plan), (op), (index), (mem), (ctx)))
+#endif
+
 /* Memory compaction */
 
 /**
@@ -442,8 +475,13 @@ static uint32_t compact_pool(
         uint32_t sz = TILE_ALIGN_UP(plan->tensors[tidx].size_bytes);
         uint8_t *src = (uint8_t *)next;
         uint8_t *dst = base + wp;
-        if (dst != src)
+        if (dst != src) {
             memmove(dst, src, sz);
+            TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_MOVE,
+                base == mem->fast_base ? TIGRIS_TRACE_POOL_FAST : TIGRIS_TRACE_POOL_SLOW,
+                tidx, TIGRIS_TRACE_NONE_U16, wp, TIGRIS_TRACE_OFFSET(src, base),
+                sz, -1, -1, -1, -1);
+        }
 
         /* Preserve in-place aliases that point at the same allocation. */
         for (uint16_t i = 0; i < mem->num_tensors; i++) {
@@ -458,6 +496,7 @@ static uint32_t compact_pool(
 
 static void compact_fast(tigris_mem_t *mem, const tigris_plan_t *plan)
 {
+    if (mem->stats) mem->stats->compactions++;
     mem->fast_used = compact_pool(
         mem, plan, mem->fast_base, mem->fast_reserved, mem->fast_size);
 }
@@ -469,6 +508,7 @@ static void compact_fast(tigris_mem_t *mem, const tigris_plan_t *plan)
  */
 static void compact_slow(tigris_mem_t *mem, const tigris_plan_t *plan)
 {
+    if (mem->stats) mem->stats->compactions++;
     mem->slow_used = compact_pool(mem, plan, mem->slow_base, 0, mem->slow_size);
 }
 
@@ -638,11 +678,9 @@ static int is_pure_reinterpretation(
 }
 
 /* Keep a roomy caller arena within the serialized stage working set. */
-static uint32_t stage_fast_capacity(const tigris_plan_t *plan,
-                                   const tigris_stage_t *stage,
-                                   const tigris_mem_t *mem)
+static uint32_t stage_fast_limit(const tigris_plan_t *plan,
+                                 const tigris_stage_t *stage, uint32_t available)
 {
-    uint32_t available = mem->fast_size - mem->fast_reserved;
     /* Older schemas can state unaligned activation sizes. */
     if (plan->header->version < TIGRIS_SCHEMA_VERSION_V4)
         return available;
@@ -653,6 +691,13 @@ static uint32_t stage_fast_capacity(const tigris_plan_t *plan,
         peak = plan->tile_plans[stage->tile_plan_idx].tiled_peak_bytes;
     /* Hand-built and older plans may omit the working-set estimate. */
     return peak != 0u && peak < available ? peak : available;
+}
+
+static uint32_t stage_fast_capacity(const tigris_plan_t *plan,
+                                   const tigris_stage_t *stage,
+                                   const tigris_mem_t *mem)
+{
+    return stage_fast_limit(plan, stage, mem->fast_size - mem->fast_reserved);
 }
 
 static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
@@ -732,7 +777,6 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
             mem, tidx, plan->tensors[tidx].size_bytes);
         if (merr != TIGRIS_MEM_OK)
             return TIGRIS_EXEC_ERR_MEM;
-        if (stats) stats->loads_bytes += plan->tensors[tidx].size_bytes;
     }
 
     /* Execute ops with intra-stage reclamation */
@@ -763,7 +807,6 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
                 if (merr != TIGRIS_MEM_OK) {
                     /* Try compacting fast memory and retry */
                     compact_fast(mem, plan);
-                    if (stats) stats->compactions++;
                     merr = tigris_mem_alloc_fast(
                         mem, tidx, plan->tensors[tidx].size_bytes);
                     if (merr != TIGRIS_MEM_OK) {
@@ -782,7 +825,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
             }
         }
 
-        int kret = kernel(plan, op, op_idx, mem, user_ctx);
+        int kret = TRACED_KERNEL(kernel, plan, op, op_idx, mem, user_ctx);
         if (kret != 0)
             return TIGRIS_EXEC_ERR_KERNEL;
 
@@ -822,7 +865,6 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
             mem, tidx, plan->tensors[tidx].size_bytes);
         if (merr != TIGRIS_MEM_OK)
             return TIGRIS_EXEC_ERR_MEM;
-        if (stats) stats->spills_bytes += plan->tensors[tidx].size_bytes;
     }
 
     /* Dropping the fast arena invalidates every pointer into it. A tensor
@@ -955,7 +997,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled(
     void                     *user_ctx,
     const uint16_t           *last_consumer,
     uint16_t                  current_stage,
-    executor_workspace_impl_t *workspace)
+    executor_workspace_impl_t *workspace,
+    tigris_exec_stats_t *stats)
 {
     /* 1. Pre-allocate full output tensors in slow (or reuse input for in-place) */
     const uint16_t *sout = tigris_stage_outputs(plan, stage);
@@ -1120,6 +1163,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled(
             in_end   = out_end;
         }
 
+        if (stats) stats->total_tiles++;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_TILE_BEGIN, TIGRIS_TRACE_POOL_NONE,
+            TIGRIS_TRACE_NONE_U16, (uint16_t)(tile), 0u, 0u, 0u,
+            in_start, in_end, -1, -1);
         int32_t tile_in_h = in_end - in_start;
 
         /* c. Activate tiling. The per-op tile context (in/out h+w, pad) is set
@@ -1205,7 +1252,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled(
                     return TIGRIS_EXEC_ERR_MEM;
             }
 
-            int kret = kernel(plan, op, op_idx, mem, user_ctx);
+            int kret = TRACED_KERNEL(kernel, plan, op, op_idx, mem, user_ctx);
             if (kret != 0)
                 return TIGRIS_EXEC_ERR_KERNEL;
 
@@ -1409,7 +1456,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_2d(
     tigris_mem_t             *mem,
     tigris_kernel_fn          kernel,
     void                     *user_ctx,
-    executor_workspace_impl_t *workspace)
+    executor_workspace_impl_t *workspace,
+    tigris_exec_stats_t *stats)
 {
     const uint16_t *sout = tigris_stage_outputs(plan, stage);
     const uint16_t *sin  = tigris_stage_inputs(plan, stage);
@@ -1536,6 +1584,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_2d(
             }
             if (ih1 <= ih0 || iw1 <= iw0)
                 return TIGRIS_EXEC_ERR_TILE;
+            if (stats) stats->total_tiles++;
+            TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_TILE_BEGIN, TIGRIS_TRACE_POOL_NONE,
+                TIGRIS_TRACE_NONE_U16, (uint16_t)(tr * num_tiles_w + tc), 0u, 0u, 0u,
+                ih0, ih1, iw0, iw1);
             int32_t tile_in_h = ih1 - ih0;
             int32_t tile_in_w = iw1 - iw0;
 
@@ -1608,7 +1660,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_2d(
                         return TIGRIS_EXEC_ERR_MEM;
                 }
 
-                int kret = kernel(plan, op, op_idx, mem, user_ctx);
+                int kret = TRACED_KERNEL(kernel, plan, op, op_idx, mem, user_ctx);
                 if (kret != 0)
                     return TIGRIS_EXEC_ERR_KERNEL;
 
@@ -1741,7 +1793,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_by_input(
     const tigris_stage_t     *stage,
     tigris_mem_t             *mem,
     tigris_kernel_fn          kernel,
-    void                     *user_ctx)
+    void                     *user_ctx,
+    tigris_exec_stats_t *stats)
 {
     uint16_t in_idx = tigris_stage_inputs(plan, stage)[0];
     uint16_t out_idx = tigris_stage_outputs(plan, stage)[0];
@@ -1784,6 +1837,9 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_by_input(
     void *acc = mem->fast_base + mem->fast_used;
     mem->fast_used += acc_bytes;
     tigris_mem_note_fast_peak(mem);
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_ALLOC, TIGRIS_TRACE_POOL_FAST,
+        TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_NONE_U16, mem->fast_used - acc_bytes,
+        0u, acc_bytes, -1, -1, -1, -1);
     mem->fast_reserved = mem->fast_used;
 
     /* Largest band whose rows plus the output tensor fit what is left. */
@@ -1818,6 +1874,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_by_input(
     for (int32_t start = 0; start < full_in_h; start += band) {
         int32_t end = full_in_h - start < band ? full_in_h : start + band;
 
+        if (stats) stats->total_tiles++;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_TILE_BEGIN, TIGRIS_TRACE_POOL_NONE,
+            TIGRIS_TRACE_NONE_U16, (uint16_t)(start / band), 0u, 0u, 0u,
+            start, end, -1, -1);
         mem->tile.active = 1;
         mem->tile.in_h = end - start;
         mem->tile.out_h = 1;
@@ -1840,7 +1900,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_by_input(
             break;
         }
 
-        if (kernel(plan, op, op_idx, mem, user_ctx) != 0) {
+        if (TRACED_KERNEL(kernel, plan, op, op_idx, mem, user_ctx) != 0) {
             result = TIGRIS_EXEC_ERR_KERNEL;
             break;
         }
@@ -1967,7 +2027,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
     const tigris_stage_t     *stage,
     tigris_mem_t             *mem,
     tigris_kernel_fn          kernel,
-    void                     *user_ctx)
+    void                     *user_ctx,
+    tigris_exec_stats_t *stats)
 {
     uint16_t in_idx = tigris_stage_inputs(plan, stage)[0];
     uint16_t out_idx = tigris_stage_outputs(plan, stage)[0];
@@ -2064,6 +2125,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
                                          (uint32_t)width * elem_size);
         uint32_t strip = (uint32_t)width * elem_size;
 
+        if (stats) stats->total_tiles++;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_TILE_BEGIN, TIGRIS_TRACE_POOL_NONE,
+            TIGRIS_TRACE_NONE_U16, (uint16_t)(start / band), 0u, 0u, 0u,
+            band_on_cols ? 0 : start, band_on_cols ? rows : end, band_on_cols ? start : 0, band_on_cols ? end : cols);
         mem->tile.active = 1;
         mem->tile.transposed_tile = 1;
         mem->tile.transpose_outer = batch;
@@ -2102,12 +2167,19 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
             }
         }
 
+        if (stats) stats->loads_bytes += tile_bytes;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_LOAD, TIGRIS_TRACE_POOL_FAST,
+            in_idx, TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_OFFSET(in_tile, mem->fast_base),
+            TIGRIS_TRACE_OFFSET(src, mem->slow_base) +
+                (uint32_t)start * (band_on_cols ? 1u : (uint32_t)other) * elem_size,
+            tile_bytes, band_on_cols ? 0 : start, band_on_cols ? rows : end,
+            band_on_cols ? start : 0, band_on_cols ? end : cols);
         if (tigris_mem_alloc_fast(mem, out_idx, tile_bytes) != TIGRIS_MEM_OK) {
             result = TIGRIS_EXEC_ERR_MEM;
             break;
         }
 
-        if (kernel(plan, op, op_idx, mem, user_ctx) != 0) {
+        if (TRACED_KERNEL(kernel, plan, op, op_idx, mem, user_ctx) != 0) {
             result = TIGRIS_EXEC_ERR_KERNEL;
             break;
         }
@@ -2136,6 +2208,13 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
             }
         }
 
+        if (stats) stats->spills_bytes += tile_bytes;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_SPILL, TIGRIS_TRACE_POOL_SLOW,
+            out_idx, TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_OFFSET(dst, mem->slow_base) +
+                (uint32_t)start * (band_on_cols ? (uint32_t)other : 1u) * elem_size,
+            TIGRIS_TRACE_OFFSET(out_tile, mem->fast_base), tile_bytes,
+            band_on_cols ? start : 0, band_on_cols ? end : cols,
+            band_on_cols ? 0 : start, band_on_cols ? rows : end);
         tigris_mem_reset_fast(mem);
     }
 
@@ -2218,7 +2297,8 @@ static int tensor_band_view(const tigris_plan_t *plan, const tigris_tensor_t *te
  */
 static void gather_row_band(
     uint8_t *band_buf, const uint8_t *whole, int32_t batch, int32_t rows,
-    int32_t start, int32_t band, uint32_t row_bytes)
+    int32_t start, int32_t band, uint32_t row_bytes,
+    tigris_mem_t *mem, uint16_t tensor)
 {
     size_t whole_stride = (size_t)rows * (size_t)row_bytes;
     size_t band_stride = (size_t)band * (size_t)row_bytes;
@@ -2226,11 +2306,21 @@ static void gather_row_band(
     for (int32_t n = 0; n < batch; n++)
         memcpy(band_buf + (size_t)n * band_stride,
                whole + (size_t)n * whole_stride + offset, band_stride);
+    if (mem->stats) mem->stats->loads_bytes += (uint32_t)((size_t)batch * band_stride);
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_LOAD, TIGRIS_TRACE_POOL_FAST,
+        tensor, TIGRIS_TRACE_NONE_U16,
+        TIGRIS_TRACE_OFFSET(band_buf, mem->fast_base),
+        TIGRIS_TRACE_OFFSET(whole, mem->slow_base) + (uint32_t)offset,
+        (uint32_t)((size_t)batch * band_stride), start, start + band, -1, -1);
+#ifndef TIGRIS_TRACE
+    (void)tensor;
+#endif
 }
 
 static void scatter_row_band(
     uint8_t *whole, const uint8_t *band_buf, int32_t batch, int32_t rows,
-    int32_t start, int32_t band, uint32_t row_bytes)
+    int32_t start, int32_t band, uint32_t row_bytes,
+    tigris_mem_t *mem, uint16_t tensor)
 {
     size_t whole_stride = (size_t)rows * (size_t)row_bytes;
     size_t band_stride = (size_t)band * (size_t)row_bytes;
@@ -2238,6 +2328,15 @@ static void scatter_row_band(
     for (int32_t n = 0; n < batch; n++)
         memcpy(whole + (size_t)n * whole_stride + offset,
                band_buf + (size_t)n * band_stride, band_stride);
+    if (mem->stats) mem->stats->spills_bytes += (uint32_t)((size_t)batch * band_stride);
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_SPILL, TIGRIS_TRACE_POOL_SLOW,
+        tensor, TIGRIS_TRACE_NONE_U16,
+        TIGRIS_TRACE_OFFSET(whole, mem->slow_base) + (uint32_t)offset,
+        TIGRIS_TRACE_OFFSET(band_buf, mem->fast_base),
+        (uint32_t)((size_t)batch * band_stride), start, start + band, -1, -1);
+#ifndef TIGRIS_TRACE
+    (void)tensor;
+#endif
 }
 
 /**
@@ -2470,7 +2569,7 @@ static tigris_exec_error_t run_row_band(
         if (tigris_mem_alloc_fast(mem, tidx, band_bytes) != TIGRIS_MEM_OK)
             return TIGRIS_EXEC_ERR_MEM;
         gather_row_band((uint8_t *)mem->tensor_ptrs[tidx], whole, b, r,
-                        start, band, row_bytes);
+                        start, band, row_bytes, mem, tidx);
     }
 
     for (uint16_t j = 0; j < stage->ops_count; j++) {
@@ -2484,7 +2583,7 @@ static tigris_exec_error_t run_row_band(
             if (tigris_mem_alloc_fast(mem, tidx, band_bytes) != TIGRIS_MEM_OK)
                 return TIGRIS_EXEC_ERR_MEM;
         }
-        if (kernel(plan, op, op_idx, mem, user_ctx) != 0)
+        if (TRACED_KERNEL(kernel, plan, op, op_idx, mem, user_ctx) != 0)
             return TIGRIS_EXEC_ERR_KERNEL;
     }
 
@@ -2499,7 +2598,7 @@ static tigris_exec_error_t run_row_band(
         uint32_t row_bytes = t->size_bytes / (uint32_t)(b * r);
         scatter_row_band((uint8_t *)out_slow_bases[i],
                          (const uint8_t *)mem->tensor_ptrs[tidx],
-                         b, r, start, band, row_bytes);
+                         b, r, start, band, row_bytes, mem, tidx);
         mem->tensor_ptrs[tidx] = out_slow_bases[i];
     }
     return TIGRIS_EXEC_OK;
@@ -2562,7 +2661,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
     const uint16_t           *last_consumer,
     uint16_t                  current_stage,
     int32_t                   rows,
-    int                       leading)
+    int                       leading,
+    tigris_exec_stats_t *stats)
 {
     const uint16_t *sops = tigris_stage_ops(plan, stage);
     const uint16_t *sin = tigris_stage_inputs(plan, stage);
@@ -2644,6 +2744,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
     tigris_exec_error_t result = TIGRIS_EXEC_OK;
     for (int32_t start = 0; start < rows; start += band) {
         int32_t end = rows - start < band ? rows : start + band;
+        if (stats) stats->total_tiles++;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_TILE_BEGIN, TIGRIS_TRACE_POOL_NONE,
+            TIGRIS_TRACE_NONE_U16, (uint16_t)(start / band), 0u, 0u, 0u,
+            start, end, -1, -1);
         result = run_row_band(plan, stage, mem, kernel, user_ctx,
                               in_slow_bases, out_slow_bases, rows, leading, start, end);
         if (result != TIGRIS_EXEC_OK)
@@ -2708,6 +2812,11 @@ static tigris_exec_error_t copy_into_graph(const tigris_plan_t *plan, tigris_mem
             tigris_mem_alloc_slow(mem, dst, plan->tensors[dst].size_bytes) != TIGRIS_MEM_OK)
             return TIGRIS_EXEC_ERR_MEM;
         memcpy(mem->tensor_ptrs[dst], mem->tensor_ptrs[src[i]], plan->tensors[dst].size_bytes);
+        if (mem->stats) mem->stats->copy_bytes += plan->tensors[dst].size_bytes;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_COPY, TIGRIS_TRACE_POOL_SLOW,
+            dst, TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_OFFSET(mem->tensor_ptrs[dst], mem->slow_base),
+            TIGRIS_TRACE_OFFSET(mem->tensor_ptrs[src[i]], mem->slow_base),
+            plan->tensors[dst].size_bytes, -1, -1, -1, -1);
     }
     return TIGRIS_EXEC_OK;
 }
@@ -2726,6 +2835,11 @@ static tigris_exec_error_t copy_out_of_graph(const tigris_plan_t *plan, tigris_m
              tigris_mem_alloc_slow(mem, dst[i], plan->tensors[dst[i]].size_bytes) != TIGRIS_MEM_OK))
             return TIGRIS_EXEC_ERR_MEM;
         memcpy(mem->tensor_ptrs[dst[i]], mem->tensor_ptrs[src], plan->tensors[dst[i]].size_bytes);
+        if (mem->stats) mem->stats->copy_bytes += plan->tensors[dst[i]].size_bytes;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_COPY, TIGRIS_TRACE_POOL_SLOW,
+            dst[i], TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_OFFSET(mem->tensor_ptrs[dst[i]], mem->slow_base),
+            TIGRIS_TRACE_OFFSET(mem->tensor_ptrs[src], mem->slow_base),
+            plan->tensors[dst[i]].size_bytes, -1, -1, -1, -1);
     }
     for (uint16_t i = 0; i < graph->inputs_count; i++)
         mem->tensor_ptrs[plan->index_pool[graph->inputs_off + i]] = NULL;
@@ -2763,6 +2877,12 @@ static TIGRIS_NOINLINE tigris_exec_error_t start_control(
             tigris_mem_alloc_slow(mem, outs[i], plan->tensors[outs[i]].size_bytes) != TIGRIS_MEM_OK)
             return TIGRIS_EXEC_ERR_MEM;
         memcpy(mem->tensor_ptrs[outs[i]], initial, plan->tensors[outs[i]].size_bytes);
+        if (mem->stats) mem->stats->copy_bytes += plan->tensors[outs[i]].size_bytes;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_COPY, TIGRIS_TRACE_POOL_SLOW,
+            outs[i], TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_OFFSET(mem->tensor_ptrs[outs[i]], mem->slow_base),
+            tigris_op_constant(plan, op_index, i) != NULL ? 0u :
+                TIGRIS_TRACE_OFFSET(initial, mem->slow_base),
+            plan->tensors[outs[i]].size_bytes, -1, -1, -1, -1);
     }
     *graph_out = control_graph(plan, op_index, 0u);
     return copy_into_graph(plan, mem, *graph_out, outs);
@@ -2844,6 +2964,9 @@ static TIGRIS_NOINLINE tigris_exec_error_t unwind_control(
         uint16_t *frame = &flow[4u * flow[0]];
         const uint16_t op_index = tigris_stage_ops(plan, &plan->stages[frame[0]])[0];
         int done = 0;
+#ifdef TIGRIS_TRACE
+        mem->trace_stage = frame[0];
+#endif
         tigris_exec_error_t err = step_control(plan, mem, &plan->ops[op_index], op_index,
                                                &frame[3], &done);
         if (err != TIGRIS_EXEC_OK)
@@ -2859,6 +2982,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t unwind_control(
         flow[2] = frame[2];
         flow[0]--;
         free_dead_tensors(plan, mem, last_consumer, flow[1], flow[3]);
+        TRACE_STAGE_END(mem, flow[3]);
     }
     return TIGRIS_EXEC_OK;
 }
@@ -2894,7 +3018,8 @@ static TIGRIS_NOINLINE int stage_is_reshape_band(const tigris_plan_t *plan,
 
 static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_reshape(
     const tigris_plan_t *plan, const tigris_stage_t *stage, tigris_mem_t *mem,
-    const uint16_t *last_consumer, uint16_t current_stage)
+    const uint16_t *last_consumer, uint16_t current_stage,
+    tigris_exec_stats_t *stats)
 {
     tigris_reshape_band_t view;
     const tigris_tile_plan_t *tile = &plan->tile_plans[stage->tile_plan_idx];
@@ -2917,6 +3042,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_reshape(
         if (count > tile->tile_height) count = tile->tile_height;
         int32_t target_start = (int32_t)((int64_t)start * view.input_width / view.output_width);
         int32_t target_count = (int32_t)((int64_t)count * view.input_width / view.output_width);
+        if (stats) stats->total_tiles++;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_TILE_BEGIN, TIGRIS_TRACE_POOL_NONE,
+            TIGRIS_TRACE_NONE_U16, (uint16_t)(start / tile->tile_height), 0u, 0u, 0u,
+            start, start + count, -1, -1);
         uint32_t bytes = (uint32_t)view.blocks * (uint32_t)count * input_width;
         if (tigris_mem_alloc_fast(mem, src, bytes) != TIGRIS_MEM_OK) {
             result = TIGRIS_EXEC_ERR_MEM;
@@ -2924,10 +3053,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_reshape(
         }
         void *band = mem->tensor_ptrs[src];
         gather_row_band((uint8_t *)band, (const uint8_t *)input, view.blocks,
-                        view.input_rows, start, count, input_width);
+                        view.input_rows, start, count, input_width, mem, src);
         /* Both intervals name the same bytes; the output aliases this band. */
         scatter_row_band((uint8_t *)output, (const uint8_t *)band, view.blocks,
-                         view.output_rows, target_start, target_count, output_width);
+                         view.output_rows, target_start, target_count, output_width, mem, dst);
         tigris_mem_reset_fast(mem);
     }
     mem->tensor_ptrs[src] = alias ? NULL : input;
@@ -2946,7 +3075,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t chain_kernel(
     int binary = op->num_inputs == 2 &&
         is_axis1_binary_pointwise_op(op->op_type);
     if (!binary)
-        return kernel(plan, op, op_idx, mem, user_ctx) != 0
+        return TRACED_KERNEL(kernel, plan, op, op_idx, mem, user_ctx) != 0
             ? TIGRIS_EXEC_ERR_KERNEL : TIGRIS_EXEC_OK;
 
     const uint16_t *ins = tigris_op_inputs(plan, op);
@@ -2972,7 +3101,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t chain_kernel(
         if (offsets[k])
             mem->tensor_ptrs[ins[k]] = (uint8_t *)bases[k] + offsets[k];
     }
-    int result = kernel(plan, op, op_idx, mem, user_ctx);
+    int result = TRACED_KERNEL(kernel, plan, op, op_idx, mem, user_ctx);
     for (unsigned k = 0; k < 2; k++)
         mem->tensor_ptrs[ins[k]] = bases[k];
     return result != 0 ? TIGRIS_EXEC_ERR_KERNEL : TIGRIS_EXEC_OK;
@@ -2999,8 +3128,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
     tigris_mem_t        *mem,
     tigris_kernel_fn     kernel,
     void                *user_ctx,
-    executor_workspace_impl_t *workspace)
+    executor_workspace_impl_t *workspace,
+    tigris_exec_stats_t *stats)
 {
+    TRACE_STAGE_BEGIN(mem, first_idx, TIGRIS_TRACE_PATH_CHAIN);
     if (num_chain < 2 || num_chain > workspace->chain_capacity)
         return TIGRIS_EXEC_ERR_TILE;
 
@@ -3098,6 +3229,9 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
             const tigris_weight_block_t *wb =
                 find_weight_block(plan, first_idx + c);
             if (!wb || wb->compressed_size == 0) continue;
+#ifdef TIGRIS_TRACE
+            mem->trace_stage = (uint16_t)(first_idx + c);
+#endif
 
             uint8_t *scratch = mem->fast_base + mem->fast_used;
             const uint8_t *csrc =
@@ -3126,9 +3260,20 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
             weight_bases[c] = scratch;
             mem->fast_used += needed;
             tigris_mem_note_fast_peak(mem);
+            if (stats) stats->weight_bytes += wb->uncompressed_size;
+            TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_ALLOC, TIGRIS_TRACE_POOL_FAST,
+                TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_NONE_U16,
+                TIGRIS_TRACE_OFFSET(scratch, mem->fast_base), 0u, needed, -1, -1, -1, -1);
+            TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_WEIGHTS, TIGRIS_TRACE_POOL_FAST,
+                TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_NONE_U16,
+                TIGRIS_TRACE_OFFSET(scratch, mem->fast_base), wb->compressed_size,
+                wb->uncompressed_size, -1, -1, -1, -1);
         }
         mem->fast_reserved = mem->fast_used;
     }
+#ifdef TIGRIS_TRACE
+    mem->trace_stage = first_idx;
+#endif
 
     /* 0b. Validate chain_tile_h against effective fast budget.
      *     Decompressed weights may have reduced available space. */
@@ -3452,6 +3597,13 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
             }
         }
 
+        if (stats) stats->total_tiles++;
+#ifdef TIGRIS_TRACE
+        mem->trace_stage = first_idx;
+#endif
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_TILE_BEGIN, TIGRIS_TRACE_POOL_NONE,
+            TIGRIS_TRACE_NONE_U16, (uint16_t)(tile), 0u, 0u, 0u,
+            in_starts[0], in_ends[0], -1, -1);
         /* c. Load first stage's input tile from slow -> fast */
         for (uint16_t i = 0; i < first_stage->inputs_count; i++) {
             uint16_t tidx = first_sin[i];
@@ -3471,6 +3623,9 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
         /* d. Run each stage in the chain */
         for (uint16_t c = 0; c < num_chain; c++) {
             const tigris_stage_t *st = stages[c];
+#ifdef TIGRIS_TRACE
+            mem->trace_stage = (uint16_t)(first_idx + c);
+#endif
             int32_t tile_in_h  = in_ends[c] - in_starts[c];
             int32_t tile_out_h = out_ends[c] - out_starts[c];
 
@@ -3680,6 +3835,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                             memmove(base,
                                     base + (size_t)src_row * row_bytes,
                                     (size_t)overlap * row_bytes);
+                            TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_MOVE, TIGRIS_TRACE_POOL_FAST,
+                                otid, TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_OFFSET(base, mem->fast_base),
+                                TIGRIS_TRACE_OFFSET(base, mem->fast_base) + (uint32_t)src_row * row_bytes,
+                                (uint32_t)overlap * row_bytes, op_gs, op_gs + overlap, -1, -1);
                             mem->tile.out_row_start = overlap;
                             /* Spatial kernels reconstruct the global input row
                              * from the output row, so they read the full input
@@ -3859,6 +4018,59 @@ tigris_exec_error_t tigris_state_init(const tigris_plan_t *plan, void *state, si
     return TIGRIS_EXEC_OK;
 }
 
+static TIGRIS_NOINLINE tigris_exec_error_t prepare_stage_weights(
+    const tigris_plan_t *plan, uint16_t stage, tigris_mem_t *mem,
+    tigris_plan_t *prepared, const tigris_plan_t **run_plan,
+    tigris_exec_stats_t *stats)
+{
+    const tigris_weight_block_t *wb = find_weight_block(plan, stage);
+    if (!wb || wb->compressed_size == 0u)
+        return TIGRIS_EXEC_OK;
+    uint32_t needed;
+    if (!align_tensor_size(wb->uncompressed_size, &needed) ||
+        mem->fast_used > mem->fast_size || needed > mem->fast_size - mem->fast_used)
+        return TIGRIS_EXEC_ERR_MEM;
+    uint8_t *scratch = mem->fast_base + mem->fast_used;
+    const uint8_t *source = plan->weight_blocks_data + wb->blob_offset;
+    if (plan->weight_compression == TIGRIS_COMPRESS_LZ4) {
+        int32_t decoded = tigris_lz4_decompress(source, wb->compressed_size,
+                                             scratch, wb->uncompressed_size);
+        if (decoded < 0 || (uint32_t)decoded != wb->uncompressed_size)
+            return TIGRIS_EXEC_ERR_KERNEL;
+    } else {
+        memcpy(scratch, source, wb->uncompressed_size);
+    }
+    mem->fast_used += needed;
+    mem->fast_reserved = mem->fast_used;
+    tigris_mem_note_fast_peak(mem);
+    if (stats) stats->weight_bytes += wb->uncompressed_size;
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_ALLOC, TIGRIS_TRACE_POOL_FAST,
+        TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_NONE_U16,
+        TIGRIS_TRACE_OFFSET(scratch, mem->fast_base), 0u, needed, -1, -1, -1, -1);
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_WEIGHTS, TIGRIS_TRACE_POOL_FAST,
+        TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_NONE_U16,
+        TIGRIS_TRACE_OFFSET(scratch, mem->fast_base), wb->compressed_size,
+        wb->uncompressed_size, -1, -1, -1, -1);
+    *prepared = *plan;
+    prepared->weight_blob = scratch;
+    *run_plan = prepared;
+    return TIGRIS_EXEC_OK;
+}
+
+static uint32_t stage_dispatch_capacity(const tigris_plan_t *plan,
+    const tigris_stage_t *stage, const tigris_mem_t *mem)
+{
+    uint32_t available = mem->fast_size - mem->fast_reserved;
+    const tigris_weight_block_t *wb = find_weight_block(plan, (uint16_t)(stage - plan->stages));
+    if (wb && wb->compressed_size > 0u) {
+        uint32_t needed;
+        if (!align_tensor_size(wb->uncompressed_size, &needed) || needed > available)
+            return 0u;
+        available -= needed;
+    }
+    return stage_fast_limit(plan, stage, available);
+}
+
 tigris_exec_error_t tigris_run_with_state(
     const tigris_plan_t *plan,
     tigris_mem_t        *mem,
@@ -3902,6 +4114,12 @@ tigris_exec_error_t tigris_run_with_state(
 
     /* Zero stats if provided */
     if (stats) memset(stats, 0, sizeof(*stats));
+    mem->stats = stats;
+    mem->fast_peak = mem->fast_used;
+    mem->slow_peak = mem->slow_used;
+#ifdef TIGRIS_TRACE
+    mem->trace_stage = TIGRIS_TRACE_NONE_U16;
+#endif
 
     /* Pre-compute last_consumer[t] = last stage that reads tensor t.
      * After that stage completes, t's slow memory can be reclaimed. */
@@ -3939,6 +4157,11 @@ tigris_exec_error_t tigris_run_with_state(
         }
         memcpy(mem->tensor_ptrs[entry->input], (const uint8_t *)state + entry->offset,
                entry->bytes);
+        if (stats) stats->copy_bytes += entry->bytes;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_COPY, TIGRIS_TRACE_POOL_SLOW,
+            entry->input, TIGRIS_TRACE_NONE_U16,
+            TIGRIS_TRACE_OFFSET(mem->tensor_ptrs[entry->input], mem->slow_base),
+            entry->offset, entry->bytes, -1, -1, -1, -1);
         if (entry->output != 0xFFFFu)
             last_consumer[entry->output] = UINT16_MAX;
     }
@@ -3954,6 +4177,7 @@ tigris_exec_error_t tigris_run_with_state(
         const tigris_stage_t *stage = &plan->stages[s];
 
         if (stage_control(plan, stage)) {
+            TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_CONTROL);
             tigris_exec_error_t err = enter_control(plan, mem, flow, s);
             if (err != TIGRIS_EXEC_OK) {
                 result = err;
@@ -3967,52 +4191,13 @@ tigris_exec_error_t tigris_run_with_state(
         tigris_plan_t stage_plan;
         const tigris_plan_t *run_plan = plan;
 
-        /* Chain stages decompress internally in exec_chain_tiled */
-        if (plan->weight_blocks && plan->num_weight_blocks > 0
-            && !(stage->chain_len >= 2 && stage->chain_id == s)) {
-            const tigris_weight_block_t *wb = find_weight_block(plan, s);
-            if (wb && wb->compressed_size > 0) {
-                /* Decompress into fast arena prefix */
-                uint8_t *scratch = mem->fast_base + mem->fast_used;
-                const uint8_t *csrc = plan->weight_blocks_data + wb->blob_offset;
-                uint32_t needed;
-
-                if (!align_tensor_size(wb->uncompressed_size, &needed) ||
-                    mem->fast_used > mem->fast_size ||
-                    needed > mem->fast_size - mem->fast_used) {
-                    result = TIGRIS_EXEC_ERR_MEM;
-                    goto restore_fast_arena;
-                }
-
-                if (plan->weight_compression == TIGRIS_COMPRESS_LZ4) {
-                    int32_t dec = tigris_lz4_decompress(
-                        csrc, wb->compressed_size,
-                        scratch, wb->uncompressed_size);
-                    if (dec < 0 || (uint32_t)dec != wb->uncompressed_size) {
-                        result = TIGRIS_EXEC_ERR_KERNEL;
-                        goto restore_fast_arena;
-                    }
-                } else {
-                    memcpy(scratch, csrc, wb->uncompressed_size);
-                }
-
-                mem->fast_used += needed;
-                mem->fast_reserved = mem->fast_used;  /* lock weights in arena */
-                tigris_mem_note_fast_peak(mem);
-
-                stage_plan = *plan;  /* shallow copy */
-                stage_plan.weight_blob = scratch;
-                run_plan = &stage_plan;
-            }
-        }
-
         /* Decide: chain, tile, or normal */
 
         if (stage->chain_len >= 2 && stage->chain_id == s) {
             /* First stage of a chain - execute entire chain */
             tigris_exec_error_t err = exec_chain_tiled(
                 run_plan, s, stage->chain_len, mem, kernel, user_ctx,
-                workspace);
+                workspace, stats);
             if (err != TIGRIS_EXEC_OK) {
                 TIGRIS_PLATFORM_DBG("S%u chain(%u) ERR=%d fast=%lu/%lu slow=%lu/%lu\n",
                     s, stage->chain_len, (int)err,
@@ -4034,8 +4219,12 @@ tigris_exec_error_t tigris_run_with_state(
             /* A Reshape banded along rows that map onto the output's. Decided
              * here, apart from the stripe contract below, which it shares no
              * state with. */
+            TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_RESHAPE);
+            result = prepare_stage_weights(plan, s, mem, &stage_plan, &run_plan, stats);
+            if (result != TIGRIS_EXEC_OK)
+                goto restore_fast_arena;
             tigris_exec_error_t err = exec_stage_tiled_reshape(
-                run_plan, stage, mem, last_consumer, s);
+                run_plan, stage, mem, last_consumer, s, stats);
             if (err != TIGRIS_EXEC_OK) {
                 result = err;
                 goto restore_fast_arena;
@@ -4046,9 +4235,13 @@ tigris_exec_error_t tigris_run_with_state(
                    run_plan->tile_plans &&
                    run_plan->tile_plans[stage->tile_plan_idx].tileable &&
                    tigris_stage_leading_band(run_plan, stage)) {
+            TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_ROWS);
+            result = prepare_stage_weights(plan, s, mem, &stage_plan, &run_plan, stats);
+            if (result != TIGRIS_EXEC_OK)
+                goto restore_fast_arena;
             tigris_exec_error_t err = exec_stage_tiled_rows(
                 run_plan, stage, mem, kernel, user_ctx, workspace, last_consumer, s,
-                tigris_stage_leading_band(run_plan, stage), tigris_stage_band_mode(run_plan, stage));
+                tigris_stage_leading_band(run_plan, stage), tigris_stage_band_mode(run_plan, stage), stats);
             if (err != TIGRIS_EXEC_OK) {
                 result = err;
                 goto restore_fast_arena;
@@ -4102,7 +4295,7 @@ tigris_exec_error_t tigris_run_with_state(
                  stage_supports_axis1_tiling(run_plan, stage, rank));
             int needs_tiling =
                 (common_tile_rank || row_tiled || transposed) &&
-                total_io > stage_fast_capacity(run_plan, stage, mem);
+                total_io > stage_dispatch_capacity(run_plan, stage, mem);
 
             /* Schema-v5 stages may serialize the height/length axis (1D) or the
              * combined HW axis (2D). Both are accepted here; WIDTH and any other
@@ -4154,9 +4347,13 @@ tigris_exec_error_t tigris_run_with_state(
                   tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH));
 
             if (may_tile_rows) {
+                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_ROWS);
+                result = prepare_stage_weights(plan, s, mem, &stage_plan, &run_plan, stats);
+                if (result != TIGRIS_EXEC_OK)
+                    goto restore_fast_arena;
                 tigris_exec_error_t err = exec_stage_tiled_rows(
                     run_plan, stage, mem, kernel, user_ctx, workspace,
-                    last_consumer, s, band_rows, 0);
+                    last_consumer, s, band_rows, 0, stats);
                 if (err != TIGRIS_EXEC_OK) {
                     TIGRIS_PLATFORM_DBG("S%u rows ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
                         s, (int)err, (unsigned long)total_io,
@@ -4167,8 +4364,12 @@ tigris_exec_error_t tigris_run_with_state(
                 }
                 if (stats) stats->stages_tiled++;
             } else if (may_tile_transpose) {
+                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_TRANSPOSE);
+                result = prepare_stage_weights(plan, s, mem, &stage_plan, &run_plan, stats);
+                if (result != TIGRIS_EXEC_OK)
+                    goto restore_fast_arena;
                 tigris_exec_error_t err = exec_stage_tiled_transpose(
-                    run_plan, stage, mem, kernel, user_ctx);
+                    run_plan, stage, mem, kernel, user_ctx, stats);
                 if (err != TIGRIS_EXEC_OK) {
                     TIGRIS_PLATFORM_DBG("S%u convert ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
                         s, (int)err, (unsigned long)total_io,
@@ -4179,8 +4380,12 @@ tigris_exec_error_t tigris_run_with_state(
                 }
                 if (stats) stats->stages_tiled++;
             } else if (may_tile_by_input) {
+                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_BY_INPUT);
+                result = prepare_stage_weights(plan, s, mem, &stage_plan, &run_plan, stats);
+                if (result != TIGRIS_EXEC_OK)
+                    goto restore_fast_arena;
                 tigris_exec_error_t err = exec_stage_tiled_by_input(
-                    run_plan, stage, mem, kernel, user_ctx);
+                    run_plan, stage, mem, kernel, user_ctx, stats);
                 if (err != TIGRIS_EXEC_OK) {
                     TIGRIS_PLATFORM_DBG("S%u reduce ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
                         s, (int)err, (unsigned long)total_io,
@@ -4191,8 +4396,12 @@ tigris_exec_error_t tigris_run_with_state(
                 }
                 if (stats) stats->stages_tiled++;
             } else if (may_tile_2d) {
+                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_TILED_2D);
+                result = prepare_stage_weights(plan, s, mem, &stage_plan, &run_plan, stats);
+                if (result != TIGRIS_EXEC_OK)
+                    goto restore_fast_arena;
                 tigris_exec_error_t err = exec_stage_tiled_2d(
-                    run_plan, stage, mem, kernel, user_ctx, workspace);
+                    run_plan, stage, mem, kernel, user_ctx, workspace, stats);
                 if (err != TIGRIS_EXEC_OK) {
                     TIGRIS_PLATFORM_DBG("S%u tiled2d ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
                         s, (int)err, (unsigned long)total_io,
@@ -4203,9 +4412,13 @@ tigris_exec_error_t tigris_run_with_state(
                 }
                 if (stats) stats->stages_tiled++;
             } else if (needs_tiling && may_tile) {
+                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_TILED);
+                result = prepare_stage_weights(plan, s, mem, &stage_plan, &run_plan, stats);
+                if (result != TIGRIS_EXEC_OK)
+                    goto restore_fast_arena;
                 tigris_exec_error_t err = exec_stage_tiled(
                     run_plan, stage, mem, kernel, user_ctx,
-                    last_consumer, s, workspace);
+                    last_consumer, s, workspace, stats);
                 if (err != TIGRIS_EXEC_OK) {
                     TIGRIS_PLATFORM_DBG("S%u tiled ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
                         s, (int)err, (unsigned long)total_io,
@@ -4216,6 +4429,10 @@ tigris_exec_error_t tigris_run_with_state(
                 }
                 if (stats) stats->stages_tiled++;
             } else {
+                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_NORMAL);
+                result = prepare_stage_weights(plan, s, mem, &stage_plan, &run_plan, stats);
+                if (result != TIGRIS_EXEC_OK)
+                    goto restore_fast_arena;
                 tigris_exec_error_t err = exec_stage_normal(
                     run_plan, stage, mem, kernel, user_ctx, stats, workspace);
                 if (err != TIGRIS_EXEC_OK) {
@@ -4230,17 +4447,15 @@ tigris_exec_error_t tigris_run_with_state(
             }
         }
 
-        /* Track slow high-water mark */
-        if (stats && mem->slow_used > stats->slow_peak)
-            stats->slow_peak = mem->slow_used;
-
         /* Free dead tensors from slow and compact */
         free_dead_tensors(plan, mem, last_consumer, flow[1], s);
 
         /* Release stage/chain-local fast allocations before the next group,
          * retaining the caller's in-run reset floor. */
-        mem->fast_used = caller_fast_used;
         mem->fast_reserved = caller_fast_used;
+        tigris_mem_reset_fast(mem);
+        TRACE_STAGE_END(mem, stage->chain_len >= 2u ?
+            (uint16_t)(s + 1u - stage->chain_len) : s);
 
         /* A finished subgraph steps its control-flow operator: into the next
          * subgraph it runs, or, once the operator is done, back to the main
@@ -4255,6 +4470,9 @@ tigris_exec_error_t tigris_run_with_state(
         }
     }
 
+#ifdef TIGRIS_TRACE
+    mem->trace_stage = TIGRIS_TRACE_NONE_U16;
+#endif
     for (uint16_t i = 0; i < plan->num_state; i++) {
         const tigris_state_entry_t *entry = &plan->state_entries[i];
         if (entry->output == 0xFFFFu)
@@ -4264,11 +4482,22 @@ tigris_exec_error_t tigris_run_with_state(
             goto restore_fast_arena;
         }
         memcpy((uint8_t *)state + entry->offset, mem->tensor_ptrs[entry->output], entry->bytes);
+        if (stats) stats->copy_bytes += entry->bytes;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_COPY, TIGRIS_TRACE_POOL_NONE,
+            entry->output, TIGRIS_TRACE_NONE_U16, entry->offset,
+            TIGRIS_TRACE_OFFSET(mem->tensor_ptrs[entry->output], mem->slow_base),
+            entry->bytes, -1, -1, -1, -1);
     }
 
 restore_fast_arena:
-    mem->fast_used = caller_fast_used;
+    if (stats) stats->slow_peak = mem->slow_peak;
+    mem->stats = NULL;
+    mem->fast_reserved = caller_fast_used;
+    tigris_mem_reset_fast(mem);
     mem->fast_reserved = caller_fast_reserved;
+#ifdef TIGRIS_TRACE
+    mem->trace_stage = TIGRIS_TRACE_NONE_U16;
+#endif
     return result;
 }
 

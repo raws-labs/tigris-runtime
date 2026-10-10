@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 
+option(TIGRIS_TRACE "Enable execution trace callbacks" OFF)
+if(TIGRIS_TRACE)
+    add_compile_definitions(TIGRIS_TRACE=1)
+endif()
+
 set(TIGRIS_RUNTIME_SRCS
     src/tigris_loader.c
     src/tigris_iface.c
@@ -20,6 +25,9 @@ if(COMMAND idf_component_register)
         REQUIRES esp-nn
     )
     target_compile_definitions(${COMPONENT_LIB} PUBLIC TIGRIS_HAS_ESP_NN)
+    if(TIGRIS_TRACE)
+        target_compile_definitions(${COMPONENT_LIB} PUBLIC TIGRIS_TRACE=1)
+    endif()
     target_compile_options(${COMPONENT_LIB} PRIVATE -Werror=vla)
     target_link_libraries(${COMPONENT_LIB} PUBLIC m)
     return()
@@ -42,6 +50,9 @@ option(TIGRIS_STACK_USAGE
 
 add_library(tigris_runtime STATIC ${TIGRIS_RUNTIME_SRCS})
 add_library(tigris::runtime ALIAS tigris_runtime)
+if(TIGRIS_TRACE)
+    target_compile_definitions(tigris_runtime PUBLIC TIGRIS_TRACE=1)
+endif()
 set_target_properties(tigris_runtime PROPERTIES EXPORT_NAME runtime)
 target_include_directories(tigris_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

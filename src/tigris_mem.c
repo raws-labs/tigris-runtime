@@ -4,6 +4,7 @@
  */
 
 #include "tigris_mem.h"
+#include "tigris_executor.h"
 
 #include <string.h>
 
@@ -29,6 +30,30 @@ static uint32_t saturating_add_u32(uint32_t a, uint32_t b)
 {
     return (b > UINT32_MAX - a) ? UINT32_MAX : a + b;
 }
+
+#ifdef TIGRIS_TRACE
+void tigris_mem_set_trace(tigris_mem_t *mem, tigris_trace_fn fn, void *ctx)
+{
+    if (mem) {
+        mem->trace_fn = fn;
+        mem->trace_ctx = ctx;
+    }
+}
+
+void tigris_trace_emit(tigris_mem_t *mem, tigris_trace_kind_t kind, uint8_t pool,
+    uint16_t tensor, uint16_t op, uint32_t offset, uint32_t src_offset,
+    uint32_t bytes, int32_t row0, int32_t row1, int32_t col0, int32_t col1)
+{
+    if (mem->trace_fn) {
+        const tigris_trace_event_t event = {
+            (uint8_t)kind, pool, mem->trace_path, 0u, mem->trace_stage, tensor, op, 0u,
+            offset, src_offset, bytes, row0, row1, col0, col1,
+            mem->fast_used, mem->slow_used
+        };
+        mem->trace_fn(&event, mem->trace_ctx);
+    }
+}
+#endif
 
 /* Public API */
 
@@ -61,6 +86,14 @@ tigris_mem_error_t tigris_mem_init(
     mem->fast_reserved = fast_adj;
     mem->fast_peak     = fast_adj;
     mem->slow_used     = slow_adj;
+    mem->slow_peak     = slow_adj;
+    mem->stats         = NULL;
+#ifdef TIGRIS_TRACE
+    mem->trace_fn = NULL;
+    mem->trace_ctx = NULL;
+    mem->trace_stage = TIGRIS_TRACE_NONE_U16;
+    mem->trace_path = TIGRIS_TRACE_PATH_NORMAL;
+#endif
 
     memset(tensor_ptrs, 0, (size_t)num_tensors * sizeof(void *));
     memset(&mem->tile, 0, sizeof(mem->tile));
@@ -85,6 +118,14 @@ static tigris_mem_error_t alloc_bump(
     *used += aligned;
     if (used == &mem->fast_used)
         tigris_mem_note_fast_peak(mem);
+    else {
+        if (mem->slow_used > mem->slow_peak)
+            mem->slow_peak = mem->slow_used;
+    }
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_ALLOC,
+        used == &mem->fast_used ? TIGRIS_TRACE_POOL_FAST : TIGRIS_TRACE_POOL_SLOW,
+        tensor_idx, TIGRIS_TRACE_NONE_U16, *used - aligned, 0u, aligned,
+        -1, -1, -1, -1);
     return TIGRIS_MEM_OK;
 }
 
@@ -117,6 +158,11 @@ tigris_mem_error_t tigris_mem_load(
     if (err != TIGRIS_MEM_OK) return err;
 
     memcpy(mem->tensor_ptrs[tensor_idx], src, size_bytes);
+    if (mem->stats) mem->stats->loads_bytes += size_bytes;
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_LOAD, TIGRIS_TRACE_POOL_FAST,
+        tensor_idx, TIGRIS_TRACE_NONE_U16,
+        TIGRIS_TRACE_OFFSET(mem->tensor_ptrs[tensor_idx], mem->fast_base),
+        TIGRIS_TRACE_OFFSET(src, mem->slow_base), size_bytes, -1, -1, -1, -1);
     return TIGRIS_MEM_OK;
 }
 
@@ -133,6 +179,11 @@ tigris_mem_error_t tigris_mem_spill(
     if (err != TIGRIS_MEM_OK) return err;
 
     memcpy(mem->tensor_ptrs[tensor_idx], src, size_bytes);
+    if (mem->stats) mem->stats->spills_bytes += size_bytes;
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_SPILL, TIGRIS_TRACE_POOL_SLOW,
+        tensor_idx, TIGRIS_TRACE_NONE_U16,
+        TIGRIS_TRACE_OFFSET(mem->tensor_ptrs[tensor_idx], mem->slow_base),
+        TIGRIS_TRACE_OFFSET(src, mem->fast_base), size_bytes, -1, -1, -1, -1);
     return TIGRIS_MEM_OK;
 }
 
@@ -191,6 +242,10 @@ tigris_mem_error_t tigris_mem_load_tile(
                tile_rows_bytes);
     }
 
+    if (mem->stats) mem->stats->loads_bytes += tile_bytes;
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_LOAD, TIGRIS_TRACE_POOL_FAST,
+        tensor_idx, TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_OFFSET(fast_ptr, mem->fast_base),
+        TIGRIS_TRACE_OFFSET(slow_ptr, mem->slow_base) + src_row_off, tile_bytes, h_start, h_end, -1, -1);
     return TIGRIS_MEM_OK;
 }
 
@@ -241,6 +296,10 @@ tigris_mem_error_t tigris_mem_spill_tile(
 
     /* Restore pointer to slow base */
     mem->tensor_ptrs[tensor_idx] = slow_base;
+    if (mem->stats) mem->stats->spills_bytes += (uint32_t)N * tile_rows_bytes;
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_SPILL, TIGRIS_TRACE_POOL_SLOW,
+        tensor_idx, TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_OFFSET(slow_ptr, mem->slow_base) + dst_row_off,
+        TIGRIS_TRACE_OFFSET(fast_ptr, mem->fast_base), (uint32_t)N * tile_rows_bytes, h_start, h_end, -1, -1);
     return TIGRIS_MEM_OK;
 }
 
@@ -301,6 +360,10 @@ tigris_mem_error_t tigris_mem_load_tile_2d(
         }
     }
 
+    if (mem->stats) mem->stats->loads_bytes += tile_bytes;
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_LOAD, TIGRIS_TRACE_POOL_FAST,
+        tidx, TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_OFFSET(fast_ptr, mem->fast_base),
+        TIGRIS_TRACE_OFFSET(slow_ptr, mem->slow_base) + (uint32_t)h0 * full_row_bytes + src_col_off, tile_bytes, h0, h1, w0, w1);
     return TIGRIS_MEM_OK;
 }
 
@@ -355,13 +418,21 @@ tigris_mem_error_t tigris_mem_spill_tile_2d(
 
     /* Restore pointer to slow base */
     mem->tensor_ptrs[tidx] = slow_base;
+    if (mem->stats) mem->stats->spills_bytes += (uint32_t)N * tile_rows_bytes;
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_SPILL, TIGRIS_TRACE_POOL_SLOW,
+        tidx, TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_OFFSET(slow_ptr, mem->slow_base) + (uint32_t)h0 * full_row_bytes + dst_col_off,
+        TIGRIS_TRACE_OFFSET(fast_ptr, mem->fast_base), (uint32_t)N * tile_rows_bytes, h0, h1, w0, w1);
     return TIGRIS_MEM_OK;
 }
 
 void tigris_mem_reset_fast(tigris_mem_t *mem)
 {
-    if (mem)
+    if (mem) {
         mem->fast_used = mem->fast_reserved;
+        TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_RESET, TIGRIS_TRACE_POOL_FAST,
+            TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_NONE_U16, mem->fast_used,
+            0u, 0u, -1, -1, -1, -1);
+    }
 }
 
 const char *tigris_mem_error_str(tigris_mem_error_t err)

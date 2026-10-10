@@ -29,16 +29,20 @@ SOURCES = (
     "src/tigris_kernels_s8.c",
     "src/tigris_lz4.c",
 )
-# Each accelerator adapter compiles only with its vendor define, so it is
-# scanned separately with that define; the CMSIS-NN stub stands in for the
-# vendor header, and ESP-NN's own headers are simply absent.
+# Each accelerator adapter compiles only with its vendor define; scan it
+# with the runtime that uses its shared declarations. The CMSIS-NN stub
+# stands in for the vendor header, and ESP-NN's own headers are absent.
 ADAPTER_SCANS = (
     (("src/tigris_kernels_cmsis_nn.c",),
      ("-DTIGRIS_HAS_CMSIS_NN", "-Itest/cmsis_stub",
       "--suppress=*:test/cmsis_stub/arm_nnfunctions.h")),
     (("src/tigris_kernels_esp_nn.c",), ("-DTIGRIS_HAS_ESP_NN",)),
 )
-SCANS = ((SOURCES, ()),) + ADAPTER_SCANS
+# Scan the full runtime with callbacks enabled so event construction is checked.
+SCANS = ((SOURCES, ("-DTIGRIS_TRACE=1",)),) + tuple(
+    (SOURCES + sources, ("-DTIGRIS_TRACE=1",) + extra)
+    for sources, extra in ADAPTER_SCANS
+)
 ACCEPTED_PATH = Path(__file__).with_name("static_analysis_accepted.txt")
 
 

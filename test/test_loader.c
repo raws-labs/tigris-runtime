@@ -52,6 +52,8 @@ static int tests_failed = 0;
 
 /* Error tests (no fixtures needed) */
 
+#include "trace_assert.h"
+
 static void test_null_args(void)
 {
     printf("  test_null_args...\n");
@@ -4628,8 +4630,18 @@ int main(int argc, char *argv[])
         printf("\n(No fixture files provided - pass .tgrs paths as arguments)\n");
     }
 
+#ifdef TIGRIS_TRACE
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_NORMAL)) != 0u,
+                   1, "normal path checked against trace");
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_RESHAPE)) != 0u,
+                   1, "reshape path checked against trace");
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_ROWS)) != 0u,
+                   1, "rows path checked against trace");
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_CONTROL)) != 0u,
+                   1, "control path checked against trace");
+#endif
+
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);
-
     return tests_failed > 0 ? 1 : 0;
 }

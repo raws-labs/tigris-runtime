@@ -52,6 +52,8 @@ static int tests_failed = 0;
 
 /* File loader helper */
 
+#include "trace_assert.h"
+
 static uint8_t *load_file(const char *path, uint32_t *out_len)
 {
     FILE *f = fopen(path, "rb");
@@ -2840,14 +2842,18 @@ static void test_exec_compaction_preserves_data(void)
                        &plan, &mem, compaction_kernel, &ctx, &stats,
                        workspace, sizeof(workspace)),
                    TIGRIS_EXEC_OK, "compaction execution");
-    TEST_ASSERT_EQ(stats.compactions, 1, "fast arena compacted once");
+    TEST_ASSERT_EQ(stats.compactions, 2, "fast retry and slow cleanup both compact");
     TEST_ASSERT(ctx.preserved, "live tensor data survives compaction");
     TEST_ASSERT(mem.tensor_ptrs[2] != NULL, "compacted output remains live");
     TEST_ASSERT(((uint8_t *)mem.tensor_ptrs[2])[47] == 0x6b,
                 "output survives slow-arena compaction");
+    TEST_ASSERT_EQ(mem.fast_peak, 96u, "first run fast peak");
+    /* Reuse the manager with a smaller arena; peaks must describe this run. */
     memset(slow, 0xa5, sizeof(slow));
-    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, 64u, slow, 96u), TIGRIS_MEM_OK,
-                   "output-overflow arenas");
+    memset(ptrs, 0, sizeof(ptrs));
+    mem.fast_size = 64u;
+    mem.slow_size = 96u;
+    mem.slow_used = 0u;
     TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes), TIGRIS_MEM_OK,
                    "output-overflow input");
     memset(ptrs[0], 0x11, tensors[0].size_bytes);
@@ -2855,6 +2861,7 @@ static void test_exec_compaction_preserves_data(void)
                    &stats, workspace, sizeof(workspace)), TIGRIS_EXEC_OK,
                    "an output already in slow memory is not spilled again");
     TEST_ASSERT_EQ(stats.slow_overflow_count, 1u, "output takes the slow fallback");
+    TEST_ASSERT_EQ(mem.fast_peak, 64u, "second run resets the fast peak");
     TEST_ASSERT_EQ(stats.slow_peak, 96u, "one slow output allocation");
     TEST_ASSERT_EQ(stats.spills_bytes, 0u, "no redundant slow-to-slow copy");
     TEST_ASSERT_EQ(((uint8_t *)ptrs[2])[47], 0x6b, "overflow output preserved");
@@ -3141,8 +3148,18 @@ int main(int argc, char *argv[])
         printf("\n(No fixture files provided - pass .tgrs paths as arguments)\n");
     }
 
+#ifdef TIGRIS_TRACE
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_NORMAL)) != 0u,
+                   1, "normal path checked against trace");
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_TILED)) != 0u,
+                   1, "tiled path checked against trace");
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_TILED_2D)) != 0u,
+                   1, "tiled_2d path checked against trace");
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_CHAIN)) != 0u,
+                   1, "chain path checked against trace");
+#endif
+
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);
-
     return tests_failed > 0 ? 1 : 0;
 }

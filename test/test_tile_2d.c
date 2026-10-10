@@ -60,6 +60,8 @@ static int tests_failed = 0;
     } \
 } while (0)
 
+#include "trace_assert.h"
+
 /* Same pattern as test_loader.c: malloc gives sufficiently aligned storage
  * for tigris_plan_load, which only requires natural alignment of the typed
  * pool sections within the buffer. */
@@ -183,6 +185,64 @@ static void t2d_build_plan(tigris_tensor_t *tensor, int32_t *shape, tigris_plan_
     plan->tensors = tensor;
     plan->shape_pool = shape;
 }
+
+#ifdef TIGRIS_TRACE
+typedef struct {
+    tigris_trace_event_t events[4];
+    unsigned count;
+} rectangle_trace_t;
+
+static void rectangle_trace(const tigris_trace_event_t *event, void *ctx)
+{
+    rectangle_trace_t *trace = ctx;
+    if (trace->count < 4u) trace->events[trace->count] = *event;
+    trace->count++;
+}
+
+static void test_trace_rectangle_offsets(void)
+{
+    tigris_tensor_t tensor;
+    int32_t shape[4];
+    tigris_plan_t plan;
+    t2d_build_plan(&tensor, shape, &plan);
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[128];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[192];
+    void *ptrs[1];
+    tigris_mem_t mem;
+    rectangle_trace_t trace = {0};
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 1, fast, sizeof(fast), slow,
+                                  sizeof(slow)), TIGRIS_MEM_OK, "trace arena init");
+    mem.fast_used = 32u;
+    mem.tensor_ptrs[0] = slow + 32u;
+    memset(slow, 0, sizeof(slow));
+    tigris_mem_set_trace(&mem, rectangle_trace, &trace);
+    TEST_ASSERT_EQ(tigris_mem_load_tile_2d(&mem, &plan, 0, 2, 6, 3, 7),
+                   TIGRIS_MEM_OK, "traced rectangle load");
+    TEST_ASSERT_EQ(trace.count, 2u, "one allocation and one rectangle load");
+    TEST_ASSERT_EQ(trace.events[0].kind, TIGRIS_TRACE_ALLOC, "allocation precedes load");
+    TEST_ASSERT_EQ(trace.events[0].offset, 32u, "allocation offset");
+    TEST_ASSERT_EQ(trace.events[0].bytes, 32u, "allocation bytes");
+    TEST_ASSERT_EQ(trace.events[1].kind, TIGRIS_TRACE_LOAD, "rectangle load event");
+    TEST_ASSERT_EQ(trace.events[1].offset, 32u, "load destination offset");
+    TEST_ASSERT_EQ(trace.events[1].src_offset, 70u, "load first source byte");
+    TEST_ASSERT_EQ(trace.events[1].bytes, 32u, "load bytes exclude row gaps");
+    TEST_ASSERT_EQ(trace.events[1].row0, 2, "load row start");
+    TEST_ASSERT_EQ(trace.events[1].row1, 6, "load row end");
+    TEST_ASSERT_EQ(trace.events[1].col0, 3, "load column start");
+    TEST_ASSERT_EQ(trace.events[1].col1, 7, "load column end");
+    TEST_ASSERT_EQ(tigris_mem_spill_tile_2d(&mem, &plan, 0, slow + 32u, 2, 6, 3, 7),
+                   TIGRIS_MEM_OK, "traced rectangle spill");
+    TEST_ASSERT_EQ(trace.count, 3u, "one rectangle spill event");
+    TEST_ASSERT_EQ(trace.events[2].kind, TIGRIS_TRACE_SPILL, "rectangle spill event");
+    TEST_ASSERT_EQ(trace.events[2].offset, 70u, "spill first destination byte");
+    TEST_ASSERT_EQ(trace.events[2].src_offset, 32u, "spill source offset");
+    TEST_ASSERT_EQ(trace.events[2].bytes, 32u, "spill bytes exclude row gaps");
+    TEST_ASSERT_EQ(trace.events[2].row0, 2, "spill row start");
+    TEST_ASSERT_EQ(trace.events[2].row1, 6, "spill row end");
+    TEST_ASSERT_EQ(trace.events[2].col0, 3, "spill column start");
+    TEST_ASSERT_EQ(trace.events[2].col1, 7, "spill column end");
+}
+#endif
 
 static void test_load_tile_2d_roundtrip(void)
 {
@@ -1723,6 +1783,9 @@ int main(void)
 {
     printf("TiGrIS 2D Tiling Runtime Tests\n\n");
 
+#ifdef TIGRIS_TRACE
+    test_trace_rectangle_offsets();
+#endif
     test_tile_ctx_has_width_fields();
     test_loader_accepts_hw_axis();
     test_load_tile_2d_roundtrip();
@@ -1746,8 +1809,12 @@ int main(void)
     test_exec_2d_tiled_matches_whole_s8();
     test_exec_2d_shape_exceeds_arena_fails();
 
+#ifdef TIGRIS_TRACE
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_TILED_2D)) != 0u,
+                   1, "tiled_2d path checked against trace");
+#endif
+
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);
-
     return tests_failed > 0 ? 1 : 0;
 }

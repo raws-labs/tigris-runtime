@@ -75,6 +75,8 @@ typedef struct {
     int fail_on_call;
 } kernel_ctx_t;
 
+#include "trace_assert.h"
+
 static void build_chain_plan(plan_fixture_t *fx)
 {
     memset(fx, 0, sizeof(*fx));
@@ -463,6 +465,13 @@ int main(void)
     test_chain_oom_restores_state();
     test_chain_rejects_unsafe_operator();
     test_standalone_success_and_errors();
+
+#ifdef TIGRIS_TRACE
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_CHAIN)) != 0u,
+                   1, "chain path checked against trace");
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_NORMAL)) != 0u,
+                   1, "normal path checked against trace");
+#endif
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);

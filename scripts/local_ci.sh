@@ -109,7 +109,7 @@ fi
 
 echo "== coverage floors =="
 run_coverage() {
-  cmake -S . -B build-coverage -DCMAKE_BUILD_TYPE=Debug \
+  cmake -S . -B build-coverage -DCMAKE_BUILD_TYPE=Debug -DTIGRIS_TRACE=ON \
         -DCMAKE_C_COMPILER="$COVERAGE_CC" \
         -DCMAKE_C_FLAGS="-O0 -g --coverage" \
         -DCMAKE_EXE_LINKER_FLAGS="--coverage" >/dev/null

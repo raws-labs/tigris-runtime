@@ -9,6 +9,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef TIGRIS_TRACE
+#include "tigris_trace.h"
+#endif
+
 #include "tigris.h"  /* tigris_plan_t needed by tile load/spill */
 
 #ifdef __cplusplus
@@ -129,6 +133,14 @@ typedef struct {
     uint8_t     *slow_base;         /* slow buffer */
     uint32_t     slow_size;         /* capacity in bytes */
     uint32_t     slow_used;         /* bump offset */
+    uint32_t     slow_peak;         /* observed high-water mark for slow_used */
+    struct tigris_exec_stats *stats; /* active run only; NULL outside execution */
+#ifdef TIGRIS_TRACE
+    tigris_trace_fn trace_fn;
+    void *trace_ctx;
+    uint16_t trace_stage;
+    uint8_t trace_path;
+#endif
     tigris_tile_ctx_t tile;         /* per-tile context (active during tiled execution) */
 } tigris_mem_t;
 
@@ -144,6 +156,21 @@ static inline void tigris_mem_note_fast_peak(tigris_mem_t *mem)
     if (mem && mem->fast_used > mem->fast_peak)
         mem->fast_peak = mem->fast_used;
 }
+
+#ifdef TIGRIS_TRACE
+/* Called synchronously; the event is valid only during the callback. NULL disables it. */
+void tigris_mem_set_trace(tigris_mem_t *mem, tigris_trace_fn fn, void *ctx);
+
+/* Shared by the allocator and executor; offsets describe actual transfers. */
+void tigris_trace_emit(tigris_mem_t *mem, tigris_trace_kind_t kind, uint8_t pool,
+    uint16_t tensor, uint16_t op, uint32_t offset, uint32_t src_offset,
+    uint32_t bytes, int32_t row0, int32_t row1, int32_t col0, int32_t col1);
+#define TIGRIS_TRACE_OFFSET(ptr, base) \
+    ((uint32_t)((uintptr_t)(const void *)(ptr) - (uintptr_t)(const void *)(base)))
+#define TIGRIS_TRACE_EMIT(...) tigris_trace_emit(__VA_ARGS__)
+#else
+#define TIGRIS_TRACE_EMIT(...) ((void)0)
+#endif
 
 /* API */
 

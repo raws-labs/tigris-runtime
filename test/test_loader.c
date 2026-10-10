@@ -3412,34 +3412,21 @@ static uint8_t *load_file(const char *path, uint32_t *out_len)
     return buf;
 }
 
-static void test_fixture(const char *path)
+static void test_fixture(const uint8_t *buf, uint32_t buf_len)
 {
-    printf("  test_fixture(%s)...\n", path);
-
-    uint32_t buf_len = 0;
-    uint8_t *buf = load_file(path, &buf_len);
-    if (!buf) {
-        tests_run++;
-        tests_failed++;
-        fprintf(stderr, "  FAIL: could not load fixture\n");
-        return;
-    }
-
     tigris_plan_t plan;
     tigris_error_t err = tigris_plan_load(buf, buf_len, &plan);
     TEST_ASSERT_EQ(err, TIGRIS_OK, "load succeeds");
 
     if (err != TIGRIS_OK) {
         fprintf(stderr, "  Load error: %s\n", tigris_error_str(err));
-        free(buf);
         return;
     }
 
     /* Header checks */
     TEST_ASSERT(memcmp(plan.header->magic, "TGRS", 4) == 0, "magic");
-    TEST_ASSERT(plan.header->version == TIGRIS_SCHEMA_VERSION ||
-                plan.header->version == TIGRIS_SCHEMA_VERSION_V3 ||
-                plan.header->version == TIGRIS_SCHEMA_VERSION_V2,
+    TEST_ASSERT(plan.header->version >= TIGRIS_SCHEMA_VERSION_MIN &&
+                plan.header->version <= TIGRIS_SCHEMA_VERSION,
                 "supported version");
     TEST_ASSERT_EQ(plan.header->file_size, buf_len, "file_size");
     TEST_ASSERT(plan.header->num_ops > 0, "has ops");
@@ -3456,12 +3443,15 @@ static void test_fixture(const char *path)
         const char *tname = tigris_tensor_name(&plan, t);
         TEST_ASSERT(strlen(tname) > 0, "tensor has name");
         TEST_ASSERT(t->size_bytes > 0, "tensor has size");
-        TEST_ASSERT(t->ndim > 0, "tensor has dims");
-
+        /* Rank zero is a scalar: the empty shape product is one element. */
+        uint64_t elements = 1u;
         const int32_t *shape = tigris_tensor_shape(&plan, t);
         for (uint8_t d = 0; d < t->ndim; d++) {
             TEST_ASSERT(shape[d] > 0, "shape dim positive");
+            elements *= (uint32_t)shape[d];
         }
+        TEST_ASSERT_EQ(t->size_bytes, elements * tigris_dtype_size(t->dtype),
+                       "tensor size matches shape and dtype");
     }
 
     /* Ops are accessible */
@@ -3533,7 +3523,17 @@ static void test_fixture(const char *path)
             }
         }
     }
+}
 
+static void test_fixture_file(const char *path)
+{
+    printf("  test_fixture_file(%s)...\n", path);
+    uint32_t buf_len = 0;
+    uint8_t *buf = load_file(path, &buf_len);
+    TEST_ASSERT(buf != NULL, "fixture is readable");
+    if (!buf)
+        return;
+    test_fixture(buf, buf_len);
     free(buf);
 }
 
@@ -3687,6 +3687,7 @@ static void test_schema_compatibility_fixtures(void)
         if (path_len <= 0 || (size_t)path_len >= sizeof(path))
             continue;
 
+        test_fixture_file(path);
         uint32_t buf_len = 0;
         uint8_t *buf = load_file(path, &buf_len);
         TEST_ASSERT(buf != NULL, "schema fixture is readable");
@@ -4016,6 +4017,20 @@ static void build_bool_plan(uint8_t *buf, const bool_golden_t *gold)
         attr->type = TIGRIS_OP_ATTR_COMPARISON_REQUANT; attr->data_len = 20;
         memcpy(buf + 684, gold->requant, 20);
     }
+}
+
+static void test_scalar_fixture(void)
+{
+    printf("  test_scalar_fixture...\n");
+    const bool_golden_t scalar = {
+        .op = TIGRIS_OP_LOGICAL_NOT, .inputs = 1,
+        .dtypes = {9, 0, 0, 9}, .sizes = {1, 0, 0, 1},
+        .scales = {1.0f, 1.0f, 1.0f, 1.0f}
+    };
+    _Alignas(4) uint8_t buf[BOOL_PLAN_SIZE];
+    build_bool_plan(buf, &scalar);
+    memcpy(buf + 528, "scalar", sizeof("scalar"));
+    test_fixture(buf, sizeof(buf));
 }
 
 static void test_bool_contract(void)
@@ -4544,6 +4559,7 @@ int main(int argc, char *argv[])
     test_movement_contract();
     test_runtime_index_contract();
     test_bool_contract();
+    test_scalar_fixture();
     printf("TiGrIS Plan Loader Tests\n\n");
 
     printf("Error handling tests:\n");
@@ -4606,7 +4622,7 @@ int main(int argc, char *argv[])
     if (argc > 1) {
         printf("\nFixture tests:\n");
         for (int i = 1; i < argc; i++) {
-            test_fixture(argv[i]);
+            test_fixture_file(argv[i]);
         }
     } else {
         printf("\n(No fixture files provided - pass .tgrs paths as arguments)\n");

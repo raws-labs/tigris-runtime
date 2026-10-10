@@ -6,7 +6,7 @@ target_include_directories(tigris_host PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_include_directories(tigris_host PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(tigris_host PRIVATE
     TIGRIS_HOST_BUILD TIGRIS_HOST_VERSION="${PROJECT_VERSION}"
-    TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE=0 TIGRIS_TENSOR_ALIGN=32)
+    TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE=0 TIGRIS_TENSOR_ALIGN=32 TIGRIS_TRACE=1)
 set_target_properties(tigris_host PROPERTIES
     C_VISIBILITY_PRESET hidden
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -16,6 +16,7 @@ endif()
 
 add_executable(test_host test_host.c)
 target_link_libraries(test_host PRIVATE tigris_host)
+target_include_directories(test_host PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_compile_definitions(test_host PRIVATE
     TIGRIS_SCHEMA_COMPAT_DIR="${PROJECT_SOURCE_DIR}/test/schema_compat")
 enable_testing()

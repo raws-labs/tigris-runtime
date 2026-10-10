@@ -52,7 +52,7 @@ typedef int (*tigris_kernel_fn)(
 /* Execution statistics */
 
 /** Per-inference execution statistics populated by tigris_run(). */
-typedef struct {
+typedef struct tigris_exec_stats {
     uint16_t stages_normal;        /* stages executed without tiling */
     uint16_t stages_tiled;         /* stages executed with spatial tiling */
     uint16_t stages_chain;         /* stages executed as chain tiles */
@@ -61,8 +61,10 @@ typedef struct {
     uint32_t slow_overflow_bytes;  /* total bytes overflowed to slow */
     uint32_t loads_bytes;          /* total bytes loaded slow -> fast */
     uint32_t spills_bytes;         /* total bytes spilled fast -> slow */
-    uint32_t compactions;          /* number of fast-pool compactions */
+    uint32_t compactions;          /* number of fast and slow pool compactions */
     uint32_t slow_peak;            /* high-water mark for slow_used */
+    uint32_t weight_bytes;         /* uncompressed weight bytes written to fast */
+    uint32_t copy_bytes;           /* state and control-flow bytes copied */
 } tigris_exec_stats_t;
 
 /* Executor workspace */

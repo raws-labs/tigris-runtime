@@ -67,6 +67,8 @@ typedef struct {
     tigris_plan_t plan;
 } reduce_fixture_t;
 
+#include "trace_assert.h"
+
 /** One GlobalAveragePool stage carrying a height tile plan. */
 static void build_fixture(reduce_fixture_t *fx, uint32_t elem_size)
 {
@@ -269,6 +271,11 @@ int main(void)
     printf("Global reduction tiling tests:\n");
     test_float_reduction_is_band_invariant();
     test_s8_reduction_is_band_invariant();
+
+#ifdef TIGRIS_TRACE
+    TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_BY_INPUT)) != 0u,
+                   1, "by_input path checked against trace");
+#endif
 
     printf("\nResults: %d passed, %d failed, %d total\n",
            tests_passed, tests_failed, tests_run);

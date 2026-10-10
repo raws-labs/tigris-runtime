@@ -48,10 +48,23 @@ TIGRIS_HOST_API const char *tigris_host_run(
 enum {
     TIGRIS_HOST_FAST_CAPACITY = 0, TIGRIS_HOST_SLOW_CAPACITY = 1,
     TIGRIS_HOST_FAST_PEAK = 2, TIGRIS_HOST_SLOW_PEAK = 3,
-    TIGRIS_HOST_WORKSPACE_BYTES = 4
+    TIGRIS_HOST_WORKSPACE_BYTES = 4,
+    TIGRIS_HOST_LOAD_BYTES = 5, TIGRIS_HOST_SPILL_BYTES = 6,
+    TIGRIS_HOST_WEIGHT_BYTES = 7, TIGRIS_HOST_COPY_BYTES = 8,
+    TIGRIS_HOST_COMPACTIONS = 9, TIGRIS_HOST_TILES = 10,
+    TIGRIS_HOST_TENSOR_ALIGN = 11
 };
-/* Peaks cover execution arenas, not process memory. */
+/* Peaks cover execution arenas, not process memory. Metrics 5 to 10 describe
+ * the last run. */
 TIGRIS_HOST_API uint64_t tigris_host_metric(const tigris_host_t *host, uint32_t metric);
+/* Records the next runs' execution events into a caller-owned array of
+ * `capacity` tigris_trace_event_t records (include/tigris_trace.h); NULL or a
+ * zero capacity stops recording. A run never writes past `capacity`, and
+ * tigris_host_trace_count reports how many events the last run emitted, so a
+ * count above the capacity means the array was too small. */
+TIGRIS_HOST_API void tigris_host_trace_buffer(tigris_host_t *host, void *events, uint32_t capacity);
+TIGRIS_HOST_API uint32_t tigris_host_trace_count(const tigris_host_t *host);
+
 /* Returns every variable a stateful plan keeps to its initial value; NULL on
  * success, else an error message. A stateless plan has nothing to reset. */
 TIGRIS_HOST_API const char *tigris_host_reset_state(tigris_host_t *host);

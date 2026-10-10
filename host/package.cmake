@@ -6,7 +6,7 @@ configure_file("${LIBRARY}" "${stage}/${library_name}" COPYONLY)
 configure_file("${HEADER}" "${stage}/tigris_host.h" COPYONLY)
 configure_file("${LICENSE}" "${stage}/LICENSE" COPYONLY)
 file(WRITE "${stage}/manifest.json"
-    "{\n  \"version\": \"${VERSION}\",\n  \"abi\": 1,\n  \"platform\": \"${PLATFORM}\",\n  \"source_revision\": \"${REVISION}\",\n  \"library\": \"${library_name}\",\n  \"sha256\": \"${library_hash}\"\n}\n")
+    "{\n  \"version\": \"${VERSION}\",\n  \"abi\": 2,\n  \"platform\": \"${PLATFORM}\",\n  \"source_revision\": \"${REVISION}\",\n  \"library\": \"${library_name}\",\n  \"sha256\": \"${library_hash}\"\n}\n")
 set(archive "tigris-host-${VERSION}-${PLATFORM}.tar.gz")
 execute_process(COMMAND "${CMAKE_COMMAND}" -E tar czf "${OUTPUT}/${archive}"
     "${library_name}" tigris_host.h LICENSE manifest.json

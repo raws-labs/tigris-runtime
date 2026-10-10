@@ -8,6 +8,7 @@
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
 #include "tigris_loader.h"
+#include "tigris_trace.h"
 
 struct tigris_host {
     tigris_plan_t plan;
@@ -21,7 +22,19 @@ struct tigris_host {
     size_t workspace_size;
     void *state;          /* variables kept across runs, NULL for a stateless plan */
     size_t state_size;
+    tigris_trace_event_t *trace;   /* caller-owned event array, NULL when not recording */
+    uint32_t trace_capacity;
+    uint32_t trace_count;          /* events the last run emitted */
 };
+
+static void record_event(const tigris_trace_event_t *event, void *ctx)
+{
+    tigris_host_t *host = (tigris_host_t *)ctx;
+    if (host->trace_count < host->trace_capacity)
+        host->trace[host->trace_count] = *event;
+    if (host->trace_count < UINT32_MAX)
+        host->trace_count++;
+}
 
 static void *allocate_aligned(uint32_t size, void **allocation)
 {
@@ -36,7 +49,7 @@ static void *allocate_aligned(uint32_t size, void **allocation)
     return (void *)((address + alignment - 1u) & ~(uintptr_t)(alignment - 1u));
 }
 
-uint32_t tigris_host_abi(void) { return 1u; }
+uint32_t tigris_host_abi(void) { return 2u; }
 const char *tigris_host_version(void) { return TIGRIS_HOST_VERSION; }
 
 void tigris_host_destroy(tigris_host_t *host)
@@ -210,6 +223,8 @@ const char *tigris_host_run(
                        host->mem.fast_base, host->mem.fast_size,
                        host->mem.slow_base, host->mem.slow_size) != TIGRIS_MEM_OK)
         return "Host arena reset failed";
+    host->trace_count = 0u;
+    tigris_mem_set_trace(&host->mem, host->trace ? record_event : NULL, host);
     for (uint32_t i = 0; i < input_count; ++i) {
         uint16_t index = host->plan.model_inputs[i];
         tigris_error_t written;
@@ -252,6 +267,26 @@ uint64_t tigris_host_metric(const tigris_host_t *host, uint32_t metric)
     case TIGRIS_HOST_FAST_PEAK: return host->mem.fast_peak;
     case TIGRIS_HOST_SLOW_PEAK: return host->stats.slow_peak;
     case TIGRIS_HOST_WORKSPACE_BYTES: return host->workspace_size;
+    case TIGRIS_HOST_LOAD_BYTES: return host->stats.loads_bytes;
+    case TIGRIS_HOST_SPILL_BYTES: return host->stats.spills_bytes;
+    case TIGRIS_HOST_WEIGHT_BYTES: return host->stats.weight_bytes;
+    case TIGRIS_HOST_COPY_BYTES: return host->stats.copy_bytes;
+    case TIGRIS_HOST_COMPACTIONS: return host->stats.compactions;
+    case TIGRIS_HOST_TILES: return host->stats.total_tiles;
+    case TIGRIS_HOST_TENSOR_ALIGN: return TIGRIS_TENSOR_ALIGN;
     default: return 0u;
     }
+}
+
+void tigris_host_trace_buffer(tigris_host_t *host, void *events, uint32_t capacity)
+{
+    if (!host)
+        return;
+    host->trace = capacity ? (tigris_trace_event_t *)events : NULL;
+    host->trace_capacity = host->trace ? capacity : 0u;
+}
+
+uint32_t tigris_host_trace_count(const tigris_host_t *host)
+{
+    return host ? host->trace_count : 0u;
 }

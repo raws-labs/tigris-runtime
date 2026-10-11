@@ -1569,6 +1569,56 @@ static void test_hardswish_s8(void)
         TEST_ASSERT_EQ(out[i], expected[i], "hardswish_s8 value");
 }
 
+/* An int8 Quantize from int8 requantizes as TFLite's Requantize does:
+ * (x - in_zp) * in_scale / out_scale through the gemmlowp multiplier, plus
+ * out_zp. A ratio of 2 is exact; a ratio of 1/2 rounds a half up, so 3 gives 2
+ * and -3 gives -1. */
+static void run_requantize_s8(float in_scale, int32_t in_zp, float out_scale, int32_t out_zp,
+                              const int8_t *input, const int8_t *expected)
+{
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t in_qp = add_quant_param(in_scale, in_zp, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(out_scale, out_zp, 1, NULL, NULL);
+    int32_t shape[] = {1, 5};
+    uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, 5, in_qp);
+    uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, 5, out_qp);
+    test_ops[0].op_type = TIGRIS_OP_QUANTIZE;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in}; uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[1024], slow[1024];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, t_in, 5);
+    memcpy(ptrs[t_in], input, 5);
+    tigris_mem_alloc_fast(&mem, t_out, 5);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "requantize_s8 returns 0");
+    int8_t *out = (int8_t *)ptrs[t_out];
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT_EQ(out[i], expected[i], "requantize_s8 value");
+}
+
+static void test_requantize_s8(void)
+{
+    printf("  test_requantize_s8...\n");
+    const int8_t wide_in[] = {-100, 0, 1, 3, 60};
+    const int8_t wide_out[] = {-128, -5, -3, 1, 115};
+    run_requantize_s8(0.5f, 1, 0.25f, -3, wide_in, wide_out);
+    const int8_t narrow_in[] = {3, -3, 4, -128, 127};
+    const int8_t narrow_out[] = {2, -1, 2, -64, 64};
+    run_requantize_s8(0.25f, 0, 0.5f, 0, narrow_in, narrow_out);
+}
+
 /* A per-channel second operand repeats every C elements of the first. */
 static void run_per_channel_binary_s8(uint8_t op_type, const int8_t *expected,
                                       const char *what)
@@ -2973,6 +3023,7 @@ int main(void)
     test_max_pool_s8_requantizes();
     test_matmul_s8_row_band();
     test_hardswish_s8();
+    test_requantize_s8();
     test_per_channel_binary_s8();
     test_resize_linear_s8();
     test_tanh_s8();

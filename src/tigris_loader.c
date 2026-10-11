@@ -1133,6 +1133,7 @@ static int lstm_valid(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t
 
 static int dtype_matches_slot(uint8_t dtype, uint8_t role, uint8_t data_dtype)
 {
+    if (role == 250u) return dtype == 1u || dtype == data_dtype;
     if (role == 253u) return dtype == data_dtype || dtype == 6u;
     if (role == 252u) return dtype == 9u || dtype == 6u;
     if (role == 251u) return dtype == data_dtype || dtype == 6u || dtype == 1u;
@@ -1562,7 +1563,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         [TIGRIS_OP_IF] = {{9, 251, 251}, 251},
         [TIGRIS_OP_WHILE] = {{251, 251, 251}, 251},
         [TIGRIS_OP_DETECTION_POSTPROCESS] = {{0, 0, 0}, 1},
-        [TIGRIS_OP_QUANTIZE] = {{1, 1, 1}, 0},
+        [TIGRIS_OP_QUANTIZE] = {{250, 250, 250}, 0},
         [TIGRIS_OP_DEQUANTIZE] = {{0, 0, 0}, 1},
     };
     const tigris_file_header_t *hdr = plan->header;
@@ -1675,14 +1676,19 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             /* One tensor in and one out of the same shape; the int8 side has
              * a quantization (a producer's record may add per-channel
              * requantization, its scale and zero point stay per tensor), the
-             * float32 side has none. */
+             * float32 side has none. A Quantize from int8 requantizes, so
+             * both sides are int8 with a quantization each. */
             const tigris_tensor_t *encoded = op->op_type == TIGRIS_OP_QUANTIZE ? output : input;
             const tigris_tensor_t *real = op->op_type == TIGRIS_OP_QUANTIZE ? input : output;
+            const int requantize = op->op_type == TIGRIS_OP_QUANTIZE && input->dtype == 3u;
             const tigris_quant_param_t *q = tigris_tensor_quant(plan, encoded);
+            const tigris_quant_param_t *source = requantize ? tigris_tensor_quant(plan, input) : NULL;
             if (!op_has_plain_io(op, 1, 1) || !tensor_shapes_equal(plan, input, output) ||
                 q == NULL || !isfinite(q->scale) || !(q->scale > 0.0f) ||
                 q->zero_point < -128 || q->zero_point > 127 ||
-                real->quant_param_idx != TIGRIS_NO_QUANT_PARAM)
+                (requantize ? source == NULL || !isfinite(source->scale) || !(source->scale > 0.0f) ||
+                              source->zero_point < -128 || source->zero_point > 127
+                            : real->quant_param_idx != TIGRIS_NO_QUANT_PARAM))
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
         }

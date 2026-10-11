@@ -2356,6 +2356,31 @@ static inline int32_t int16_multiplier(int32_t multiplier)
     return (multiplier + (1 << 15)) >> 16;
 }
 
+/* An int8 Quantize from int8: TFLite's Requantize, the input minus its zero
+ * point scaled by in_scale / out_scale, the multiplier formed in double. */
+static TIGRIS_KERNEL_NOINLINE int kern_requantize_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+{
+    const uint16_t x_index = tigris_op_inputs(plan, op)[0];
+    const uint16_t y_index = tigris_op_outputs(plan, op)[0];
+    const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, &plan->tensors[x_index]);
+    const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[y_index]);
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, x_index);
+    int8_t *Y = (int8_t *)tigris_mem_tensor_ptr(mem, y_index);
+    if (in_qp == NULL || out_qp == NULL || X == NULL || Y == NULL || mem->tile.active)
+        return -1;
+    int32_t multiplier;
+    int shift;
+    compute_quant_mult((double)in_qp->scale / (double)out_qp->scale, &multiplier, &shift);
+    const uint32_t count = tensor_numel(plan, y_index);
+    for (uint32_t i = 0u; i < count; i++) {
+        int32_t value = multiply_by_quantized_multiplier((int32_t)X[i] - in_qp->zero_point,
+                                                         multiplier, shift);
+        Y[i] = clamp_s8(value + out_qp->zero_point);
+    }
+    return 0;
+}
+
 /* HardSwish via a 256-entry LUT, each entry as TFLite's int8 HARD_SWISH
  * computes it: 16-bit fixed point on an input scale 128 times finer, a
  * "relu-ish" factor x/3 saturated to [-1, 1] and mapped to [0, 1], and its
@@ -3298,6 +3323,9 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_LSTM: return kern_lstm_s8(plan, op, op_index, mem);
     case TIGRIS_OP_DETECTION_POSTPROCESS: return tigris_detection_execute(plan, op, op_index, mem);
     case TIGRIS_OP_QUANTIZE:
+        if (plan->tensors[tigris_op_inputs(plan, op)[0]].dtype == 3u)
+            return kern_requantize_s8(plan, op, mem);
+        return tigris_quantize_execute(plan, op, mem);
     case TIGRIS_OP_DEQUANTIZE: return tigris_quantize_execute(plan, op, mem);
     case TIGRIS_OP_ARG_MAX:
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);

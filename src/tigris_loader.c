@@ -225,6 +225,7 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
            type == TIGRIS_OP_NEG || type == TIGRIS_OP_LOGICAL_NOT || type == TIGRIS_OP_CAST ||
+           type == TIGRIS_OP_QUANTIZE || type == TIGRIS_OP_DEQUANTIZE ||
            type == TIGRIS_OP_EXP ||
            type == TIGRIS_OP_LOG ||
            type == TIGRIS_OP_SQRT ||
@@ -293,6 +294,7 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
            type == TIGRIS_OP_NEG || type == TIGRIS_OP_LOGICAL_NOT || type == TIGRIS_OP_CAST ||
+           type == TIGRIS_OP_QUANTIZE || type == TIGRIS_OP_DEQUANTIZE ||
            type == TIGRIS_OP_EXP ||
            type == TIGRIS_OP_LOG ||
            type == TIGRIS_OP_SQRT ||
@@ -3725,6 +3727,8 @@ tigris_error_t tigris_plan_load_ex(
                                     * of: shape-preserving and halo-free. */
                                    type != TIGRIS_OP_ERF &&
                                    type != TIGRIS_OP_HARDSWISH &&
+                                   type != TIGRIS_OP_QUANTIZE &&
+                                   type != TIGRIS_OP_DEQUANTIZE &&
                                    type != TIGRIS_OP_ABS &&
                                    type != TIGRIS_OP_RSQRT &&
                                    type != TIGRIS_OP_NEG &&
@@ -3824,6 +3828,8 @@ tigris_error_t tigris_plan_load_ex(
                            op_type != TIGRIS_OP_L2_NORMALIZATION &&
                            op_type != TIGRIS_OP_ERF &&
                            op_type != TIGRIS_OP_HARDSWISH &&
+                           op_type != TIGRIS_OP_QUANTIZE &&
+                           op_type != TIGRIS_OP_DEQUANTIZE &&
                            op_type != TIGRIS_OP_ABS &&
                            op_type != TIGRIS_OP_RSQRT &&
                            op_type != TIGRIS_OP_NEG &&

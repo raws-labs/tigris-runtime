@@ -160,6 +160,7 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
            type == TIGRIS_OP_NEG || type == TIGRIS_OP_LOGICAL_NOT || type == TIGRIS_OP_CAST ||
+           type == TIGRIS_OP_QUANTIZE || type == TIGRIS_OP_DEQUANTIZE ||
            type == TIGRIS_OP_EXP ||
            type == TIGRIS_OP_LOG ||
            type == TIGRIS_OP_SQRT ||
@@ -205,6 +206,7 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
            type == TIGRIS_OP_NEG || type == TIGRIS_OP_LOGICAL_NOT || type == TIGRIS_OP_CAST ||
+           type == TIGRIS_OP_QUANTIZE || type == TIGRIS_OP_DEQUANTIZE ||
            type == TIGRIS_OP_EXP ||
            type == TIGRIS_OP_LOG ||
            type == TIGRIS_OP_SQRT ||
@@ -2360,6 +2362,7 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
            type == TIGRIS_OP_NEG || type == TIGRIS_OP_LOGICAL_NOT || type == TIGRIS_OP_CAST ||
+           type == TIGRIS_OP_QUANTIZE || type == TIGRIS_OP_DEQUANTIZE ||
            type == TIGRIS_OP_EXP ||
            type == TIGRIS_OP_LOG ||
            type == TIGRIS_OP_SQRT ||

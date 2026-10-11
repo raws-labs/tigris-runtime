@@ -1606,19 +1606,25 @@ int tigris_quantize_execute(const tigris_plan_t *plan, const tigris_op_t *op, ti
     const int quantize = op->op_type == TIGRIS_OP_QUANTIZE;
     const tigris_quant_param_t *q =
         tigris_tensor_quant(plan, &plan->tensors[quantize ? y_index : x_index]);
-    const void *x = tigris_mem_tensor_ptr(mem, x_index);
-    void *y = tigris_mem_tensor_ptr(mem, y_index);
-    const uint32_t count = tensor_numel(plan, y_index);
-    if (q == NULL || x == NULL || y == NULL || mem->tile.active) return -1;
+    const uint8_t *x = (const uint8_t *)tigris_mem_tensor_ptr(mem, x_index);
+    uint8_t *y = (uint8_t *)tigris_mem_tensor_ptr(mem, y_index);
+    const uint32_t count = tile_aware_numel(plan, y_index, mem);
+    if (q == NULL || x == NULL || y == NULL) return -1;
+    /* A tile covers the same rows of both; their elements differ in size. */
+    if (mem->tile.active) {
+        const size_t row = tile_row_elems(plan, y_index, mem);
+        x += (size_t)mem->tile.in_row_start * row * (quantize ? sizeof(float) : 1u);
+        y += (size_t)mem->tile.out_row_start * row * (quantize ? 1u : sizeof(float));
+    }
     for (uint32_t i = 0u; i < count; i++) {
         if (quantize) {
             float value;
-            memcpy(&value, (const uint8_t *)x + (size_t)i * sizeof(value), sizeof(value));
+            memcpy(&value, x + (size_t)i * sizeof(value), sizeof(value));
             ((int8_t *)y)[i] = tigris_quantize_value(value, q);
         } else {
             const int32_t level = (int32_t)((const int8_t *)x)[i];
             const float value = (float)((double)q->scale * (double)(level - q->zero_point));
-            memcpy((uint8_t *)y + (size_t)i * sizeof(value), &value, sizeof(value));
+            memcpy(y + (size_t)i * sizeof(value), &value, sizeof(value));
         }
     }
     return 0;

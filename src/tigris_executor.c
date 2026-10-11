@@ -702,6 +702,37 @@ static uint32_t stage_fast_capacity(const tigris_plan_t *plan,
     return stage_fast_limit(plan, stage, mem->fast_size - mem->fast_reserved);
 }
 
+/* Drop a dead tensor's buffer. Another tensor may hold the same buffer
+ * through an in-place reshape, an op output or a stage input the reshape
+ * read; its pointer would read to compaction as a live allocation, so the
+ * whole group goes at once. Stage inputs get their slow pointers back after
+ * the stage. */
+static void release_stage_tensor(const tigris_plan_t *plan,
+                                 const tigris_stage_t *stage,
+                                 tigris_mem_t *mem, uint16_t tidx)
+{
+    const uint16_t *sops = tigris_stage_ops(plan, stage);
+    const uint16_t *sin = tigris_stage_inputs(plan, stage);
+    uint16_t num_t = plan->header->num_tensors;
+    void *dead = mem->tensor_ptrs[tidx];
+
+    if (!dead)
+        return;
+    mem->tensor_ptrs[tidx] = NULL;
+    for (uint16_t q = 0; q < stage->ops_count; q++) {
+        const tigris_op_t *other = &plan->ops[sops[q]];
+        const uint16_t *oouts = tigris_op_outputs(plan, other);
+        for (uint8_t r = 0; r < other->num_outputs; r++) {
+            if (oouts[r] < num_t && mem->tensor_ptrs[oouts[r]] == dead)
+                mem->tensor_ptrs[oouts[r]] = NULL;
+        }
+    }
+    for (uint16_t q = 0; q < stage->inputs_count; q++) {
+        if (sin[q] < num_t && mem->tensor_ptrs[sin[q]] == dead)
+            mem->tensor_ptrs[sin[q]] = NULL;
+    }
+}
+
 static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
     const tigris_plan_t *plan,
     const tigris_stage_t *stage,
@@ -731,6 +762,18 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
             uint16_t tidx = ins[k];
             if (tidx < num_t)
                 last_use_op[tidx] = j;  /* update to latest op that reads this tensor */
+        }
+    }
+
+    /* An output no op of the stage reads dies where it is written, as the
+     * compiler's lifetimes have it; held to the end of the stage it takes
+     * fast memory the schedule gave to later outputs. */
+    for (uint16_t j = 0; j < stage->ops_count; j++) {
+        const tigris_op_t *op = &plan->ops[sops[j]];
+        const uint16_t *outs = tigris_op_outputs(plan, op);
+        for (uint8_t k = 0; k < op->num_outputs; k++) {
+            if (outs[k] < num_t && last_use_op[outs[k]] == UINT16_MAX)
+                last_use_op[outs[k]] = j;
         }
     }
 
@@ -796,6 +839,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
             uint16_t src = tigris_op_inputs(plan, op)[0];
             if (!mem->tensor_ptrs[outs[0]] && mem->tensor_ptrs[src]) {
                 mem->tensor_ptrs[outs[0]] = mem->tensor_ptrs[src];
+                if (last_use_op[outs[0]] == j)
+                    release_stage_tensor(plan, stage, mem, outs[0]);
                 continue;
             }
         }
@@ -834,25 +879,12 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
         /* Free tensors whose last use was this op */
         const uint16_t *ins = tigris_op_inputs(plan, op);
         for (uint8_t k = 0; k < op->num_inputs; k++) {
-            uint16_t tidx = ins[k];
-            void *dead;
-            if (tidx >= num_t || last_use_op[tidx] != j ||
-                !mem->tensor_ptrs[tidx])
-                continue;
-            dead = mem->tensor_ptrs[tidx];
-            mem->tensor_ptrs[tidx] = NULL;
-            /* Another tensor may hold the same buffer through an in-place
-             * reshape. Its pointer would read to compaction as a live
-             * allocation, so the whole group goes at once. */
-            for (uint16_t q = 0; q < stage->ops_count; q++) {
-                const tigris_op_t *other = &plan->ops[sops[q]];
-                const uint16_t *oouts = tigris_op_outputs(plan, other);
-                for (uint8_t r = 0; r < other->num_outputs; r++) {
-                    if (oouts[r] < num_t &&
-                        mem->tensor_ptrs[oouts[r]] == dead)
-                        mem->tensor_ptrs[oouts[r]] = NULL;
-                }
-            }
+            if (ins[k] < num_t && last_use_op[ins[k]] == j)
+                release_stage_tensor(plan, stage, mem, ins[k]);
+        }
+        for (uint8_t k = 0; k < op->num_outputs; k++) {
+            if (outs[k] < num_t && last_use_op[outs[k]] == j)
+                release_stage_tensor(plan, stage, mem, outs[k]);
         }
     }
 

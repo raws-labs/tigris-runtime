@@ -2325,8 +2325,42 @@ static TIGRIS_KERNEL_NOINLINE int kern_elementwise_binary_s8(
     return 0;
 }
 
-/* HardSwish via a 256-entry LUT, mirroring kern_sigmoid_s8:
- * x * relu6(x + 3) / 6 on the dequantized input, requantized to the output. */
+/* gemmlowp's 16-bit SaturatingRoundingDoublingHighMul, and TFLite's variant
+ * that truncates instead of rounding (SQDMULH). */
+static inline int32_t sat_round_dbl_high_mul16(int32_t a, int32_t b)
+{
+    if (a == INT16_MIN && b == INT16_MIN) return INT16_MAX;
+    int32_t ab = a * b;
+    int32_t nudge = ab >= 0 ? (1 << 14) : (1 - (1 << 14));
+    return (ab + nudge) / (1 << 15);
+}
+
+static inline int32_t sat_dbl_high_mul16(int32_t a, int32_t b)
+{
+    if (a == INT16_MIN && b == INT16_MIN) return INT16_MAX;
+    return (a * b) / (1 << 15);
+}
+
+static inline int32_t sat_left_shift16(int32_t value, int amount)
+{
+    int64_t result = (int64_t)value * ((int64_t)1 << amount);
+    if (result > INT16_MAX) return INT16_MAX;
+    if (result < INT16_MIN) return INT16_MIN;
+    return (int32_t)result;
+}
+
+/* TFLite's DownScaleInt32ToInt16Multiplier. */
+static inline int32_t int16_multiplier(int32_t multiplier)
+{
+    if (multiplier >= INT32_MAX - (1 << 15)) return INT16_MAX;
+    return (multiplier + (1 << 15)) >> 16;
+}
+
+/* HardSwish via a 256-entry LUT, each entry as TFLite's int8 HARD_SWISH
+ * computes it: 16-bit fixed point on an input scale 128 times finer, a
+ * "relu-ish" factor x/3 saturated to [-1, 1] and mapped to [0, 1], and its
+ * product with x requantized to the output. The multipliers are formed in
+ * float32, as TFLite forms them. */
 static TIGRIS_KERNEL_NOINLINE int kern_hardswish_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -2344,15 +2378,32 @@ static TIGRIS_KERNEL_NOINLINE int kern_hardswish_s8(
     float out_scale = out_qp ? out_qp->scale : 1.0f;
     int32_t out_zp = out_qp ? out_qp->zero_point : 0;
 
+    const float hires_scale = (1.0f / 128.0f) * in_scale;
+    int32_t out_mult, reluish_mult;
+    int out_exp, reluish_exp;
+    compute_quant_mult((double)(hires_scale / out_scale), &out_mult, &out_exp);
+    compute_quant_mult((double)(hires_scale / (3.0f / 32768.0f)), &reluish_mult, &reluish_exp);
+    /* TFLite refuses an output multiplier of 1 or more; so does this kernel. */
+    if (out_exp > 0)
+        return -1;
+    out_mult = int16_multiplier(out_mult);
+    reluish_mult = int16_multiplier(reluish_mult);
+
     int8_t lut[256];
     for (int i = 0; i < 256; i++) {
-        int8_t x_val = (int8_t)i;
-        float real = in_scale * (float)((int32_t)x_val - in_zp);
-        float gate = real + 3.0f;
-        if (gate < 0.0f) gate = 0.0f;
-        if (gate > 6.0f) gate = 6.0f;
-        int32_t q = (int32_t)roundf(real * gate / 6.0f / out_scale) + out_zp;
-        lut[i] = clamp_s8(q);
+        int32_t hires = ((int32_t)(int8_t)i - in_zp) * (1 << 7);
+        int32_t preshift = sat_round_dbl_high_mul16(hires, out_mult);
+        int32_t reluish = hires;
+        if (reluish_exp > 0)
+            reluish = sat_left_shift16(reluish, reluish_exp - 1);
+        reluish = sat_round_dbl_high_mul16(reluish, reluish_mult);
+        if (reluish_exp > 0)
+            reluish = sat_left_shift16(reluish, 1);
+        if (reluish_exp < 0)
+            reluish = round_div_by_pot(reluish, -reluish_exp);
+        reluish = (reluish + (1 << 15)) >> 1;
+        int32_t value = round_div_by_pot(sat_dbl_high_mul16(reluish, preshift), -out_exp);
+        lut[i] = clamp_s8(value + out_zp);
     }
 
     uint32_t n = tile_aware_numel(plan, ins[0], mem);

@@ -3337,9 +3337,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                             workspace, c, (uint16_t)sp_j);
                         int32_t ekh = workspace->sp_eff_khs[spi];
                         int32_t sh  = workspace->sp_strides[spi];
-                        int32_t pt  = workspace->sp_pad_tops[spi];
-                        /* Worst case (with full padding at boundary) */
-                        int32_t oh = (cur_h + pt - ekh) / sh + 1;
+                        int32_t overlap = ekh > sh ? ekh - sh : 0;
+                        int32_t oh = (cur_h - overlap) / sh;
                         cur_h = oh;
                         sp_j++;
                     }
@@ -3482,8 +3481,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                     size_t spi = spatial_index(workspace, c, (uint16_t)sp_j);
                     int32_t ekh = workspace->sp_eff_khs[spi];
                     int32_t sh  = workspace->sp_strides[spi];
-                    int32_t pt  = workspace->sp_pad_tops[spi];
-                    cur_h = (cur_h + pt - ekh) / sh + 1;
+                    int32_t overlap = ekh > sh ? ekh - sh : 0;
+                    cur_h = (cur_h - overlap) / sh;
                     sp_j++;
                 }
                 const uint16_t *outs = tigris_op_outputs(plan, op);

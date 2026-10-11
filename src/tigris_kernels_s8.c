@@ -2367,12 +2367,13 @@ static TIGRIS_KERNEL_NOINLINE int kern_requantize_s8(
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[y_index]);
     const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, x_index);
     int8_t *Y = (int8_t *)tigris_mem_tensor_ptr(mem, y_index);
-    if (in_qp == NULL || out_qp == NULL || X == NULL || Y == NULL || mem->tile.active)
+    if (in_qp == NULL || out_qp == NULL || X == NULL || Y == NULL)
         return -1;
     int32_t multiplier;
     int shift;
     compute_quant_mult((double)in_qp->scale / (double)out_qp->scale, &multiplier, &shift);
-    const uint32_t count = tensor_numel(plan, y_index);
+    const uint32_t count = tile_aware_numel(plan, x_index, mem);
+    apply_pointwise_row_offset_s8(plan, x_index, mem, &X, &Y);
     for (uint32_t i = 0u; i < count; i++) {
         int32_t value = multiply_by_quantized_multiplier((int32_t)X[i] - in_qp->zero_point,
                                                          multiplier, shift);

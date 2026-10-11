@@ -3809,6 +3809,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                  * falls back to full compute. */
                 mem->tile.out_row_start = 0;
                 mem->tile.in_row_start  = 0;
+                int fully_rolled = 0;
                 if (line_buffered && stage_rollable && op->num_outputs == 1) {
                     uint16_t otid = outs[0];
                     const tigris_tensor_t *ot = &cplan->tensors[otid];
@@ -3849,6 +3850,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                              * the output does. */
                             mem->tile.in_row_start  = is_spatial ? 0 : overlap;
                             mem->tile.out_h = existing_out_h - overlap;
+                            fully_rolled = mem->tile.out_h == 0;
                         }
                     }
                 }
@@ -3863,11 +3865,14 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                     workspace->out_ge[outs[k]] = op_ge;
                 }
 
-                tigris_exec_error_t kernel_error = chain_kernel(
-                    cplan, op, op_idx, mem, kernel, user_ctx,
-                    workspace, op_gs, op_ge);
-                if (kernel_error != TIGRIS_EXEC_OK)
-                    return kernel_error;
+                /* A fully carried band has no new rows to compute. */
+                if (!fully_rolled) {
+                    tigris_exec_error_t kernel_error = chain_kernel(
+                        cplan, op, op_idx, mem, kernel, user_ctx,
+                        workspace, op_gs, op_ge);
+                    if (kernel_error != TIGRIS_EXEC_OK)
+                        return kernel_error;
+                }
 
                 /* Undo any roll narrowing so the next op sees this op's full
                  * height and offsets 0 (a following pointwise op inherits this

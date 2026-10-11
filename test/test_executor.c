@@ -806,7 +806,7 @@ extern int32_t g_tigris_interior_clamps;
  * float32, input [1,3,64,64] -> [1,8,64,64]. Each stage composes a halo of 2
  * (eff_kh - stride), so intermediate tiles overlap and the recompute path
  * re-derives those halo rows every tile. Compiled from the sibling compiler
- * (feature/linebuffer-chains) at a 32K budget; the runtime re-derives a tile
+ * with a 28K execution budget; the runtime re-derives a tile
  * height of 3 against that budget, giving 22 tiles of output height 64 - tile
  * 0, interior tiles, and a partial last tile of 1 row. Regenerate with
  * (from ../tigris, same branch):
@@ -821,7 +821,7 @@ extern int32_t g_tigris_interior_clamps;
  *   case = _tiled_chain_case()
  *   with tempfile.TemporaryDirectory() as d:
  *       p = os.path.join(d, 'm.onnx'); onnx.save(case.compile_model, p)
- *       ag, _ = _run_pipeline(p, ('32K',))
+ *       ag, _ = _run_pipeline(p, ('28K',))
  *       emit_binary(ag, 'linebuf_conv_chain.tgrs')
  *   "
  *
@@ -832,7 +832,7 @@ extern int32_t g_tigris_interior_clamps;
 static const uint8_t k_linebuf_conv_chain_plan[] = {
     0x54, 0x47, 0x52, 0x53, 0x05, 0x00, 0x00, 0x00, 0xf0, 0x0a, 0x00, 0x00,
     0x30, 0x00, 0x00, 0x00, 0x04, 0x00, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00,
-    0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x01, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x01, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
     0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00,
@@ -1134,7 +1134,7 @@ static uint8_t *run_chain_plan_with_flag(
  * rows, approaching the unique output-row count.
  *
  * linebuf_conv_chain: three padded 3x3-stride-1 Conv stages (composed halo 2
- * per stage), output H=64. Compiled at a 32K budget; the runtime re-derives a
+ * per stage), output H=64. Uses a 28K execution budget; the runtime re-derives a
  * small tile height against that budget (chain_tile_h=3 -> 22 tiles with a
  * partial last tile of 1 row), so a single run exercises tile 0, interior
  * tiles, and a partial last tile.
@@ -1210,6 +1210,27 @@ static void test_exec_chain_tiled_line_buffered_rolls(void)
 #endif
     free(out_on);
     free(out_off);
+}
+
+static void test_exec_chain_buffer_bound(void)
+{
+    uint8_t bytes[sizeof(k_linebuf_conv_chain_plan)];
+    memcpy(bytes, k_linebuf_conv_chain_plan, sizeof(bytes));
+    /* The 28K run keeps partial-band coverage; 32K must fit four rows. */
+    bytes[24] = 0x00;
+    bytes[25] = 0x80;
+    uint32_t length = 0;
+    unsigned long rows = 0;
+    uint8_t *output = run_chain_plan_with_flag(
+        bytes, sizeof(bytes), 1, &length, &rows, tigris_dispatch_kernel);
+    TEST_ASSERT(output != NULL, "padded chain fits the 32K arena");
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+    TEST_ASSERT_EQ(g_tigris_chain_tile_h, 4,
+                   "backward halo already supplies padded boundary rows");
+    TEST_ASSERT_EQ(g_tigris_chain_num_tiles, 16,
+                   "four-row bands cover the 64-row output");
+#endif
+    free(output);
 }
 
 /*
@@ -3150,6 +3171,7 @@ int main(int argc, char *argv[])
     test_exec_line_buffered_flag_is_noop_for_sizing();
     test_exec_chain_tiled_line_buffered_flag_is_noop();
     test_exec_chain_tiled_line_buffered_rolls();
+    test_exec_chain_buffer_bound();
     test_exec_chain_tiled_line_buffered_rolls_pointwise();
     test_exec_chain_tiled_line_buffered_rolls_pointwise_s8();
     test_exec_chain_fully_carried_band();

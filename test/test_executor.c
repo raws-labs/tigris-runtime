@@ -1570,12 +1570,45 @@ static const uint8_t k_linebuf_s8_conv_sig_chain_plan[] = {
 };
 
 
-/*
- * s8 twin of test_exec_chain_tiled_line_buffered_rolls_pointwise. The int8
- * roll path was entirely uncovered and carries the same input-offset bug in
- * the fused post-spatial Sigmoid. Same flag-on == flag-off byte-identity
- * assertion, dispatched through the s8 reference kernels.
- */
+static int reject_empty_band(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t index,
+    tigris_mem_t *mem, void *ctx)
+{
+    if (mem->tile.active && mem->tile.out_h == 0)
+        return -1;
+    return tigris_dispatch_kernel(plan, op, index, mem, ctx);
+}
+
+static void test_exec_chain_fully_carried_band(void)
+{
+    printf("  test_exec_chain_fully_carried_band...\n");
+    uint8_t bytes[sizeof(k_linebuf_conv_sig_chain_plan)];
+    memcpy(bytes, k_linebuf_conv_sig_chain_plan, sizeof(bytes));
+    /* Small bands carry the complete boundary halo into the final tile. */
+    bytes[24] = 0;
+    bytes[25] = 0x64;
+    uint32_t length_on = 0, length_off = 0;
+    unsigned long rows_on = 0, rows_off = 0;
+    uint8_t *on = run_chain_plan_with_flag(
+        bytes, sizeof(bytes), 1, &length_on, &rows_on, reject_empty_band);
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+    TEST_ASSERT_EQ(g_tigris_chain_tile_h, 3,
+                   "the partial last band reuses the complete upstream halo");
+#endif
+    uint8_t *off = run_chain_plan_with_flag(
+        bytes, sizeof(bytes), 0, &length_off, &rows_off, reject_empty_band);
+    TEST_ASSERT(on != NULL && off != NULL,
+                "carried rows need no empty kernel dispatch");
+    if (on && off) {
+        TEST_ASSERT_EQ(length_on, length_off, "carried output length matches");
+        TEST_ASSERT(length_on == length_off && memcmp(on, off, length_on) == 0,
+                    "carried boundary rows match recomputation");
+    }
+    free(on);
+    free(off);
+}
+
+/* The int8 pointwise roll must match recomputation byte for byte. */
 static void test_exec_chain_tiled_line_buffered_rolls_pointwise_s8(void)
 {
     printf("  test_exec_chain_tiled_line_buffered_rolls_pointwise_s8...\n");
@@ -3119,6 +3152,7 @@ int main(int argc, char *argv[])
     test_exec_chain_tiled_line_buffered_rolls();
     test_exec_chain_tiled_line_buffered_rolls_pointwise();
     test_exec_chain_tiled_line_buffered_rolls_pointwise_s8();
+    test_exec_chain_fully_carried_band();
     test_exec_padding_range();
     test_exec_height_tiling_contract();
     test_exec_half_pixel_bilinear_bands_match_one_band();

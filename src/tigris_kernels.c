@@ -1460,34 +1460,46 @@ static uint32_t movement_product(const int32_t *shape, uint8_t begin, uint8_t en
 
 static int movement_gather(const tigris_plan_t *plan, const tigris_op_t *op,
                            const int32_t *metadata, const uint8_t *input, uint8_t *output,
-                           tigris_mem_t *mem)
+                           tigris_mem_t *mem, uint16_t op_index)
 {
-    const tigris_tensor_t *source = &plan->tensors[tigris_op_inputs(plan, op)[0]];
+    uint8_t table_length = 0u;
+    const uint8_t *table = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_TABLE_SHAPE, &table_length);
+    const tigris_tensor_t *source = &plan->tensors[tigris_op_outputs(plan, op)[0]];
+    if (!table) source = &plan->tensors[tigris_op_inputs(plan, op)[0]];
+    uint8_t rank = table ? (uint8_t)(table_length / 4u) : source->ndim;
     int32_t shape[6];
-    memcpy(shape, tigris_tensor_shape(plan, source), (size_t)source->ndim * 4u);
-    if (mem->tile.active) shape[tigris_band_axis(plan, source, mem->tile.row_tiled)] = mem->tile.in_h;
+    if (rank == 0u || rank > 6u) return -1;
+    memcpy(shape, table ? (const void *)table : tigris_tensor_shape(plan, source), (size_t)rank * 4u);
+    if (mem->tile.active && !table) shape[tigris_band_axis(plan, source, mem->tile.row_tiled)] = mem->tile.in_h;
     const uint8_t *indices;
     uint32_t count;
-    if (op->weight_idx == TIGRIS_NO_WEIGHT) {
-        if (op->num_inputs != 2u) return -1;
-        uint16_t index = tigris_op_inputs(plan, op)[1];
+    uint16_t index_weight = table ? op->bias_idx : op->weight_idx;
+    if (index_weight == TIGRIS_NO_WEIGHT) {
+        if (op->num_inputs != (table ? 1u : 2u)) return -1;
+        uint16_t index = tigris_op_inputs(plan, op)[table ? 0u : 1u];
         if (plan->tensors[index].dtype != 6u) return -1;
         indices = (const uint8_t *)tigris_mem_tensor_ptr(mem, index);
         count = plan->tensors[index].size_bytes / 4u;
+        if (table && mem->tile.active) {
+            uint8_t axis = tigris_band_axis(plan, &plan->tensors[index], mem->tile.row_tiled);
+            const int32_t *index_shape = tigris_tensor_shape(plan, &plan->tensors[index]);
+            count = count / (uint32_t)index_shape[axis] * (uint32_t)mem->tile.in_h;
+        }
     } else {
-        indices = (const uint8_t *)tigris_op_weight(plan, op);
-        count = plan->weight_entries[op->weight_idx].size_bytes / 4u;
+        indices = (const uint8_t *)tigris_weight_data(plan, &plan->weight_entries[index_weight]);
+        count = plan->weight_entries[index_weight].size_bytes / 4u;
     }
     if (!indices) return -1;
     uint32_t element = tigris_dtype_size(source->dtype);
     if (op->op_type == TIGRIS_OP_GATHER_ND) {
         uint8_t depth = (uint8_t)metadata[metadata[0]];
-        if (depth == 0u || depth > 5u || depth > source->ndim) return -1;
-        uint32_t inner = movement_product(shape, depth, source->ndim);
+        if (depth == 0u || depth > 5u || depth > rank) return -1;
+        uint32_t inner = movement_product(shape, depth, rank);
         for (uint32_t n = 0u; n < count / depth; n++) {
             int32_t coordinates[5];
             for (uint8_t a = 0u; a < depth; a++) {
                 memcpy(&coordinates[a], indices + ((size_t)n * depth + a) * 4u, 4u);
+                if (table && coordinates[a] < 0) coordinates[a] += shape[a];
                 if (coordinates[a] < 0 || coordinates[a] >= shape[a]) return -1;
             }
             size_t offset = 0u;
@@ -1501,13 +1513,14 @@ static int movement_gather(const tigris_plan_t *plan, const tigris_op_t *op,
     uint8_t axis = (uint8_t)metadata[0], batch = (uint8_t)metadata[1];
     uint32_t batches = movement_product(shape, 0u, batch);
     uint32_t outer = movement_product(shape, batch, axis);
-    uint32_t inner = movement_product(shape, (uint8_t)(axis + 1u), source->ndim);
+    uint32_t inner = movement_product(shape, (uint8_t)(axis + 1u), rank);
     uint32_t per_batch = count / batches;
     for (uint32_t b = 0u; b < batches; b++) {
         for (uint32_t o = 0u; o < outer; o++) {
             for (uint32_t n = 0u; n < per_batch; n++) {
                 int32_t coordinate;
                 memcpy(&coordinate, indices + ((size_t)b * per_batch + n) * 4u, 4u);
+                if (table && coordinate < 0) coordinate += shape[axis];
                 if (coordinate < 0 || coordinate >= shape[axis]) return -1;
                 size_t from = ((size_t)b * outer + o) * (uint32_t)shape[axis] + (uint32_t)coordinate;
                 size_t to = ((size_t)b * outer + o) * per_batch + n;
@@ -1527,8 +1540,16 @@ int tigris_movement_execute(const tigris_plan_t *plan, const tigris_op_t *op,
     if ((mem->tile.active &&
          !tigris_op_independent_band(plan, op, op_index, mem->tile.row_tiled)) ||
         !payload || length == 0u || length > sizeof(metadata) || length % 4u != 0u ||
-        op->num_inputs == 0u || op->num_outputs != 1u) return -1;
+        op->num_outputs != 1u) return -1;
     memcpy(metadata, payload, length);
+    uint8_t table_length = 0u;
+    if (tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_TABLE_SHAPE, &table_length)) {
+        uint8_t *output = (uint8_t *)tigris_mem_tensor_ptr(mem, tigris_op_outputs(plan, op)[0]);
+        const uint8_t *input = (const uint8_t *)tigris_op_weight(plan, op);
+        if (!input || !output) return -1;
+        return movement_gather(plan, op, metadata, input, output, mem, op_index);
+    }
+    if (op->num_inputs == 0u) return -1;
     uint16_t in_idx = tigris_op_inputs(plan, op)[0], out_idx = tigris_op_outputs(plan, op)[0];
     const tigris_tensor_t *source = &plan->tensors[in_idx], *target = &plan->tensors[out_idx];
     int32_t shape[6], out_shape[6];
@@ -1546,7 +1567,7 @@ int tigris_movement_execute(const tigris_plan_t *plan, const tigris_op_t *op,
         (source->dtype != 1u && source->dtype != 3u) || target->dtype != source->dtype) return -1;
     if (op->op_type == TIGRIS_OP_GATHER || op->op_type == TIGRIS_OP_GATHER_ND ||
         op->op_type == TIGRIS_OP_EMBEDDING_LOOKUP)
-        return movement_gather(plan, op, metadata, input, output, mem);
+        return movement_gather(plan, op, metadata, input, output, mem, op_index);
     if (op->op_type == TIGRIS_OP_DYNAMIC_UPDATE_SLICE) {
         int dynamic = length == (uint32_t)source->ndim * 4u;
         uint8_t operands = op->weight_idx == TIGRIS_NO_WEIGHT ? 2u : 1u;

@@ -3967,6 +3967,58 @@ static void test_runtime_index_contract(void)
     }
 }
 
+static void test_constant_gather_contract(void)
+{
+    uint8_t buf[MOVEMENT_PLAN_SIZE];
+    tigris_plan_t plan;
+    for (size_t g = 0u; g < sizeof(movement_goldens) / sizeof(movement_goldens[0]); g++) {
+        const movement_golden_t *gold = &movement_goldens[g];
+        if (gold->op != TIGRIS_OP_GATHER && gold->op != TIGRIS_OP_GATHER_ND &&
+            gold->op != TIGRIS_OP_EMBEDDING_LOOKUP) continue;
+        build_movement_plan(buf, gold);
+        tigris_tensor_t *t = (tigris_tensor_t *)(buf + 144);
+        tigris_op_t *op = (tigris_op_t *)(buf + 192);
+        uint8_t irank = (uint8_t)(gold->op == TIGRIS_OP_GATHER_ND ? gold->metadata[0] : gold->metadata[2]);
+        uint8_t head = gold->op == TIGRIS_OP_GATHER_ND ? 1u : 3u;
+        t[0].dtype = 6u; t[0].ndim = irank;
+        t[0].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        t[0].size_bytes = gold->index_count * 4u;
+        memcpy(buf + 288, gold->metadata + head, (size_t)irank * 4u);
+        tigris_weight_entry_t *weight = (tigris_weight_entry_t *)(buf + 368);
+        weight->size_bytes = gold->input_count * tigris_dtype_size(gold->dtype);
+        memcpy(buf + 368 + sizeof(*weight), gold->input, weight->size_bytes);
+        uint16_t count = 2u;
+        memcpy(buf + 1152, &count, 2u);
+        tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + 1156);
+        attr[1] = (tigris_op_attribute_t){0u, TIGRIS_OP_ATTR_TABLE_SHAPE, (uint8_t)(gold->rank * 4u), (uint32_t)gold->metadata_count * 4u};
+        memcpy(buf + 1172, gold->metadata, (size_t)gold->metadata_count * 4u);
+        memcpy(buf + 1172 + attr[1].data_offset, gold->shapes, attr[1].data_len);
+        tigris_error_t error = tigris_plan_load(buf, sizeof(buf), &plan);
+        TEST_ASSERT_EQ(error, TIGRIS_OK, "constant Gather table loads");
+        if (error != TIGRIS_OK) continue;
+        uint8_t output[1024] = {0};
+        tigris_mem_t mem;
+        memset(&mem, 0, sizeof(mem));
+        void *pointers[3] = {(void *)(uintptr_t)gold->indices, NULL, output};
+        mem.tensor_ptrs = pointers;
+        mem.num_tensors = 3u;
+        TEST_ASSERT_EQ(tigris_movement_execute(&plan, &plan.ops[0], 0u, &mem), 0, "constant table executes");
+        TEST_ASSERT(memcmp(output, gold->output, gold->output_count * tigris_dtype_size(gold->dtype)) == 0,
+                    "constant table matches Micro values");
+        weight->size_bytes--;
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "table byte count mismatch refused");
+        weight->size_bytes++;
+        attr[1].data_len = 0u;
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "empty table shape refused");
+        attr[1].data_len = (uint8_t)(gold->rank * 4u);
+        int32_t zero = 0;
+        memcpy(buf + 1172 + attr[1].data_offset, &zero, 4u);
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "zero table extent refused");
+        op->num_inputs = 0u;
+        TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "missing table indices refused");
+    }
+}
+
 static void test_movement_contract(void)
 {
     _Alignas(4) uint8_t buf[MOVEMENT_PLAN_SIZE];
@@ -4599,6 +4651,7 @@ static void test_state_fixture(void)
 int main(int argc, char *argv[])
 {
     test_movement_contract();
+    test_constant_gather_contract();
     test_runtime_index_contract();
     test_bool_contract();
     test_scalar_fixture();

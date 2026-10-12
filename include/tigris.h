@@ -142,7 +142,8 @@ static inline uint32_t tigris_dtype_size(uint8_t dtype)
  * classes, uint8 regular (1) or fast (0) suppression, a zero byte, then float32
  * score threshold, IoU threshold and the y, x, h, w scales. */
 #define TIGRIS_OP_ATTR_GELU_APPROXIMATE 19 /* uint8 exact (0) or tanh approximation (1) */
-#define TIGRIS_OP_ATTR_MAX            19
+#define TIGRIS_OP_ATTR_TABLE_SHAPE    20 /* int32 extents of a constant Gather data operand */
+#define TIGRIS_OP_ATTR_MAX            20
 
 /* Working memory DetectionPostProcess takes in its last output, for `boxes`
  * anchors, `detections` results and `candidates` scores kept across classes:

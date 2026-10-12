@@ -2440,8 +2440,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_hardswish_s8(
     return 0;
 }
 
-/* Tanh via a 256-entry LUT, mirroring kern_sigmoid_s8 (tanh in place of the
- * logistic). int8 input -> int8 output with its own output quant. */
+/* GELU via a 256-entry LUT: exact (erf) or tanh approximation by attribute.
+ * The clamp stays in float so tiny output scales cannot overflow int32. */
 static TIGRIS_KERNEL_NOINLINE int kern_gelu_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
     tigris_mem_t *mem)
@@ -2472,6 +2472,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_gelu_s8(
     return 0;
 }
 
+/* Tanh via a 256-entry LUT, mirroring kern_sigmoid_s8 (tanh in place of the
+ * logistic). int8 input -> int8 output with its own output quant. */
 static TIGRIS_KERNEL_NOINLINE int kern_tanh_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {

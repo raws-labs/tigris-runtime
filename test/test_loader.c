@@ -2411,6 +2411,46 @@ static void test_leading_band_contract(void)
 }
 
 
+static void test_gelu_attribute_contract(void)
+{
+    _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
+    tigris_plan_t plan;
+    build_transpose_plan(buf);
+    tigris_op_t *op = (tigris_op_t *)(buf + TRANSPOSE_OPS_OFF);
+    op->op_type = TIGRIS_OP_GELU;
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
+    tensors[1].shape_off = tensors[0].shape_off;
+    tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
+    attr->type = TIGRIS_OP_ATTR_GELU_APPROXIMATE;
+    attr->data_len = 1;
+    for (uint8_t mode = 0; mode < 2; mode++) {
+        buf[TRANSPOSE_ATTR_DATA_OFF] = mode;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "GELU options load");
+    }
+    for (uint16_t i = 0; i < 2; i++) {
+        tensors[i].dtype = 3;
+        tensors[i].size_bytes /= 4u;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR, "int8 GELU requires quantization");
+    for (uint16_t i = 0; i < 2; i++) {
+        tensors[i].dtype = 1;
+        tensors[i].size_bytes *= 4u;
+    }
+    buf[TRANSPOSE_ATTR_DATA_OFF] = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION, "invalid GELU mode");
+    buf[TRANSPOSE_ATTR_DATA_OFF] = 0;
+    attr->data_len = 2;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION, "invalid GELU payload length");
+    attr->data_len = 1;
+    op->op_type = TIGRIS_OP_ERF;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION, "GELU options belong to GELU");
+    op->op_type = TIGRIS_OP_GELU;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+    memset(&dir[6], 0, sizeof(dir[6]));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR, "GELU requires options");
+}
+
 static void test_activation_attribute_contract(void)
 {
     _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
@@ -4603,6 +4643,7 @@ int main(int argc, char *argv[])
     test_native_reduction_tiling_contract();
     test_leading_band_contract();
     test_activation_attribute_contract();
+    test_gelu_attribute_contract();
     test_activation_semantic_contract();
     test_prelu_loader_contract();
     test_prelu_tiling_contract();

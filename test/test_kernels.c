@@ -2241,6 +2241,71 @@ static void test_erf(void)
         TEST_ASSERT_NEAR(out_buf[i], expected[i], 1e-5f, "erf output");
 }
 
+static void test_gelu(void)
+{
+    printf("  test_gelu...\n");
+
+    float X[4] = {0.0f, 0.5f, -1.0f, 2.0f};
+    float expected[4] = {0.0f, 0.34573123f, -0.15865525f, 1.9544997f};
+    int32_t shape[] = {1, 2, 2, 1};
+
+    tigris_tensor_t tensors[2];
+    memset(tensors, 0, sizeof(tensors));
+    for (int i = 0; i < 2; i++) {
+        tensors[i].shape_off = 0; tensors[i].ndim = 4;
+        tensors[i].size_bytes = sizeof(X); tensors[i].dtype = 1;
+    }
+    uint16_t index_pool[2] = {0, 1};
+
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_GELU;
+    op.num_inputs = 1; op.num_outputs = 1;
+    op.inputs_off = 0; op.outputs_off = 1;
+    op.weight_idx = TIGRIS_NO_WEIGHT;
+    op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    tigris_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.num_tensors = 2; header.num_ops = 1;
+
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = &op;
+    plan.index_pool = index_pool;
+    plan.shape_pool = shape;
+    plan.strings = g_strings;
+
+    uint8_t approximate = 0;
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_GELU_APPROXIMATE, 1, 0};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = &approximate;
+    plan.num_op_attributes = 1;
+
+    void *ptrs[2];
+    float out_buf[4];
+    ptrs[0] = X; ptrs[1] = out_buf;
+
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0,
+                "dispatch returns 0");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(out_buf[i], expected[i], 1e-5f, "exact GELU output");
+    approximate = 1;
+    const float approx[4] = {0.0f, 0.3457140f, -0.1588080f, 1.9545977f};
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) == 0, "approximate dispatch");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_NEAR(out_buf[i], approx[i], 1e-5f, "approximate GELU output");
+    plan.num_op_attributes = 0;
+    TEST_ASSERT(tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL) != 0, "missing GELU options");
+}
+
 /**
  * Layer normalization over the trailing axis, checked against the definition
  * rather than against a recorded output: each row must come out zero-mean and
@@ -3856,6 +3921,7 @@ int main(void)
     test_resize_linear();
     test_sigmoid();
     test_erf();
+    test_gelu();
     test_layer_norm();
     test_reduce_mean();
     test_split();

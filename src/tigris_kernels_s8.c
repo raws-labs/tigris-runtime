@@ -2442,6 +2442,36 @@ static TIGRIS_KERNEL_NOINLINE int kern_hardswish_s8(
 
 /* Tanh via a 256-entry LUT, mirroring kern_sigmoid_s8 (tanh in place of the
  * logistic). int8 input -> int8 output with its own output quant. */
+static TIGRIS_KERNEL_NOINLINE int kern_gelu_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    int8_t *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    const tigris_quant_param_t *iq = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
+    const tigris_quant_param_t *oq = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
+    uint8_t len = 0u;
+    const uint8_t *mode = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_GELU_APPROXIMATE, &len);
+    if (mode == NULL || len != 1u || iq == NULL || oq == NULL) return -1;
+    int8_t lut[256];
+    float inverse_scale = 1.0f / oq->scale;
+    for (int32_t i = -128; i <= 127; i++) {
+        float x = iq->scale * (float)(i - iq->zero_point);
+        float value = mode[0] ? 0.5f * x * (1.0f + tanhf(
+            0.7978845608028654f * (x + 0.044715f * x * x * x)))
+            : 0.5f * x * erfcf(-0.7071067811865475f * x);
+        float code = roundf(value * inverse_scale) + (float)oq->zero_point;
+        lut[(uint8_t)(int8_t)i] = code > 127.0f ? 127 : code < -128.0f ? -128 : (int8_t)code;
+    }
+    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
+    for (uint32_t i = 0; i < n; i++) Y[i] = lut[(uint8_t)X[i]];
+    return 0;
+}
+
 static TIGRIS_KERNEL_NOINLINE int kern_tanh_s8(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -3272,6 +3302,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_CONCAT:      return kern_concat_s8(plan, op, mem);
     case TIGRIS_OP_RESIZE:      return kern_resize_nearest_s8(plan, op, mem);
     case TIGRIS_OP_SIGMOID:     return kern_sigmoid_s8(plan, op, mem);
+    case TIGRIS_OP_GELU:        return kern_gelu_s8(plan, op, op_index, mem);
     case TIGRIS_OP_TANH:        return kern_tanh_s8(plan, op, mem);
     case TIGRIS_OP_SOFTMAX:     return kern_softmax_s8(plan, op, mem);
     case TIGRIS_OP_LEAKY_RELU: return kern_leaky_relu_s8(plan, op, op_index, mem);

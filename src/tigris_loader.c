@@ -220,7 +220,7 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_ELU ||
            type == TIGRIS_OP_LOG_SOFTMAX ||
            type == TIGRIS_OP_L2_NORMALIZATION ||
-           type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_ERF || type == TIGRIS_OP_GELU ||
            type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
@@ -289,7 +289,7 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_RELU6 ||
            type == TIGRIS_OP_SIGMOID ||
            type == TIGRIS_OP_TANH ||
-           type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_ERF || type == TIGRIS_OP_GELU ||
            type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
@@ -704,6 +704,7 @@ static int is_axis1_binary_pointwise_op(uint8_t type)
 static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
 {
     switch (kind) {
+    case TIGRIS_OP_ATTR_GELU_APPROXIMATE: return op_type == TIGRIS_OP_GELU;
     case TIGRIS_OP_ATTR_COMPARISON_REQUANT: return op_type >= TIGRIS_OP_EQUAL && op_type <= TIGRIS_OP_GREATER_EQUAL;
     case TIGRIS_OP_ATTR_MOVEMENT: return op_type >= TIGRIS_OP_GATHER && op_type <= TIGRIS_OP_DYNAMIC_UPDATE_SLICE;
     case TIGRIS_OP_ATTR_TRANSPOSE_PERM: return op_type == TIGRIS_OP_TRANSPOSE;
@@ -1475,7 +1476,7 @@ static int subgraph_input(const tigris_plan_t *plan, uint16_t t)
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     /* Zero is the data dtype, 255 also permits bool; the final input slot repeats. */
-    static const dtype_signature_t dtype_signatures[TIGRIS_OP_DEQUANTIZE + 1] = {
+    static const dtype_signature_t dtype_signatures[TIGRIS_OP_GELU + 1] = {
         [TIGRIS_OP_CONV] = {{0, 0, 0}, 0},
         [TIGRIS_OP_DEPTHWISE] = {{0, 0, 0}, 0},
         [TIGRIS_OP_RELU] = {{0, 0, 0}, 0},
@@ -1510,6 +1511,7 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         [TIGRIS_OP_CONV1D] = {{0, 0, 0}, 0},
         [TIGRIS_OP_LAYER_NORM] = {{0, 0, 0}, 0},
         [TIGRIS_OP_ERF] = {{0, 0, 0}, 0},
+        [TIGRIS_OP_GELU] = {{0, 0, 0}, 0},
         [TIGRIS_OP_SPLIT] = {{0, 0, 0}, 0},
         [TIGRIS_OP_RESIZE_LINEAR] = {{0, 0, 0}, 0},
         [TIGRIS_OP_HARDSWISH] = {{0, 0, 0}, 0},
@@ -1961,6 +1963,26 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             break;
         }
 
+        case TIGRIS_OP_GELU: {
+            uint8_t len = 0u;
+            const uint8_t *mode = tigris_op_attribute_data(
+                plan, op_index, TIGRIS_OP_ATTR_GELU_APPROXIMATE, &len);
+            if (mode == NULL || len != 1u || !op_has_plain_io(op, 1, 1) ||
+                input->ndim != output->ndim || input->size_bytes != output->size_bytes)
+                return TIGRIS_ERR_BAD_OPERATOR;
+            const int32_t *in_shape = tigris_tensor_shape(plan, input);
+            const int32_t *out_shape = tigris_tensor_shape(plan, output);
+            for (uint8_t d = 0; d < input->ndim; d++) {
+                if (in_shape[d] != out_shape[d]) return TIGRIS_ERR_BAD_OPERATOR;
+            }
+            if (dtype == 3u) {
+                const tigris_quant_param_t *iq = tigris_tensor_quant(plan, input);
+                const tigris_quant_param_t *oq = tigris_tensor_quant(plan, output);
+                if (iq == NULL || oq == NULL || iq->num_channels != 1u || oq->num_channels != 1u)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            }
+            break;
+        }
         case TIGRIS_OP_HARDSWISH:
         case TIGRIS_OP_ERF:
             if (!op_has_plain_io(op, 1, 1) ||
@@ -3015,6 +3037,11 @@ tigris_error_t tigris_plan_load_ex(
             const tigris_tensor_t *input = &candidate.tensors[input_idx];
             const tigris_tensor_t *output = &candidate.tensors[output_idx];
             switch (attr->type) {
+            case TIGRIS_OP_ATTR_GELU_APPROXIMATE:
+                if (attr->data_len != 1u ||
+                    candidate.op_attribute_data[attr->data_offset] > 1u)
+                    return TIGRIS_ERR_BAD_SECTION;
+                break;
             case TIGRIS_OP_ATTR_TRANSPOSE_PERM: {
                 if (op->num_inputs != 1u ||
                     attr->data_len != input->ndim ||
@@ -3725,7 +3752,7 @@ tigris_error_t tigris_plan_load_ex(
                                    /* Elementwise, and a normalization whose
                                     * reduced axis both tile axes are ahead
                                     * of: shape-preserving and halo-free. */
-                                   type != TIGRIS_OP_ERF &&
+                                   type != TIGRIS_OP_ERF && type != TIGRIS_OP_GELU &&
                                    type != TIGRIS_OP_HARDSWISH &&
                                    type != TIGRIS_OP_QUANTIZE &&
                                    type != TIGRIS_OP_DEQUANTIZE &&
@@ -3826,7 +3853,7 @@ tigris_error_t tigris_plan_load_ex(
                            op_type != TIGRIS_OP_ELU &&
                            op_type != TIGRIS_OP_LOG_SOFTMAX &&
                            op_type != TIGRIS_OP_L2_NORMALIZATION &&
-                           op_type != TIGRIS_OP_ERF &&
+                           op_type != TIGRIS_OP_ERF && op_type != TIGRIS_OP_GELU &&
                            op_type != TIGRIS_OP_HARDSWISH &&
                            op_type != TIGRIS_OP_QUANTIZE &&
                            op_type != TIGRIS_OP_DEQUANTIZE &&

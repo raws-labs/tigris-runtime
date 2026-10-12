@@ -155,7 +155,7 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_ELU ||
            type == TIGRIS_OP_LOG_SOFTMAX ||
            type == TIGRIS_OP_L2_NORMALIZATION ||
-           type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_ERF || type == TIGRIS_OP_GELU ||
            type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
@@ -201,7 +201,7 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
            type == TIGRIS_OP_ELU ||
            type == TIGRIS_OP_LOG_SOFTMAX ||
            type == TIGRIS_OP_L2_NORMALIZATION ||
-           type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_ERF || type == TIGRIS_OP_GELU ||
            type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||
@@ -2389,7 +2389,7 @@ static int is_row_tiling_op(uint8_t type)
            type == TIGRIS_OP_RELU6 ||
            type == TIGRIS_OP_SIGMOID ||
            type == TIGRIS_OP_TANH ||
-           type == TIGRIS_OP_ERF ||
+           type == TIGRIS_OP_ERF || type == TIGRIS_OP_GELU ||
            type == TIGRIS_OP_HARDSWISH ||
            type == TIGRIS_OP_ABS ||
            type == TIGRIS_OP_RSQRT ||

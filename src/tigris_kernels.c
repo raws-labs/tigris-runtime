@@ -600,6 +600,29 @@ static int kern_hardswish(
     return 0;
 }
 
+static int kern_gelu(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem)
+{
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    const uint16_t *outs = tigris_op_outputs(plan, op);
+    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
+    float *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    uint8_t len = 0u;
+    const uint8_t *mode = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_GELU_APPROXIMATE, &len);
+    if (mode == NULL || len != 1u) return -1;
+    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
+    for (uint32_t i = 0; i < n; i++) {
+        float x = X[i];
+        Y[i] = mode[0] ? 0.5f * x * (1.0f + tanhf(
+            0.7978845608028654f * (x + 0.044715f * x * x * x)))
+            : 0.5f * x * erfcf(-0.7071067811865475f * x);
+    }
+    return 0;
+}
+
 static int kern_erf(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -3200,6 +3223,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_GLOBAL_MAX: return kern_global_max_pool(plan, op, mem);
     case TIGRIS_OP_MATMUL:      return kern_matmul(plan, op, mem);
     case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
+    case TIGRIS_OP_GELU:        return kern_gelu(plan, op, op_index, mem);
     case TIGRIS_OP_ERF:         return kern_erf(plan, op, mem);
     case TIGRIS_OP_ABS: return kern_elementwise_unary_f32(plan, op, mem);
     case TIGRIS_OP_RSQRT: return kern_elementwise_unary_f32(plan, op, mem);

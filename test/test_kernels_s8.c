@@ -1529,6 +1529,58 @@ static void test_tanh_s8(void)
     TEST_ASSERT_EQ(out[2], -122, "tanh(-2.0) = -122");
 }
 
+static void test_gelu_s8(void)
+{
+    printf("  test_gelu_s8...\n");
+    plan_reset();
+    tigris_plan_t plan;
+
+    uint16_t in_qp = add_quant_param(0.1f, 0, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(0.01f, 0, 1, NULL, NULL);
+    int32_t shape[] = {1, 3};
+    uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, 3, in_qp);
+    uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, 3, out_qp);
+
+    test_ops[0].op_type = TIGRIS_OP_GELU;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in}; uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_header.num_ops = 1;
+    build_plan(&plan);
+
+    uint8_t approximate = 0;
+    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_GELU_APPROXIMATE, 1, 0};
+    plan.op_attributes = &attr;
+    plan.op_attribute_data = &approximate;
+    plan.num_op_attributes = 1;
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[1024], slow[1024];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    int8_t input_data[] = {0, 20, -20};   /* real 0, +2.0, -2.0 */
+    tigris_mem_alloc_fast(&mem, t_in, 3);
+    memcpy(ptrs[t_in], input_data, 3);
+    tigris_mem_alloc_fast(&mem, t_out, 3);
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "gelu_s8 returns 0");
+    int8_t *out = (int8_t *)ptrs[t_out];
+    TEST_ASSERT_EQ(out[0], 0, "gelu(0)");
+    TEST_ASSERT_EQ(out[1], 127, "positive tail saturates");
+    TEST_ASSERT_EQ(out[2], -5, "negative tail rounds");
+    approximate = 1;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0, "approximate GELU");
+    TEST_ASSERT_EQ(out[2], -5, "approximate negative tail rounds");
+    plan.num_op_attributes = 0;
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0, "missing GELU options");
+}
+
+
 /* HardSwish: x * relu6(x + 3) / 6 through the LUT. Real inputs -4, -1, 0, 2, 4
  * at scale 0.1 give 0, -1/3, 0, 5/3, 4; at output scale 0.05 that is 0, -7,
  * 0, 33, 80 (half away from zero). */
@@ -3027,6 +3079,7 @@ int main(void)
     test_per_channel_binary_s8();
     test_resize_linear_s8();
     test_tanh_s8();
+    test_gelu_s8();
     test_softmax_s8();
     test_softmax_s8_fixed_point();
     test_conv1d_s8();

@@ -71,6 +71,9 @@ static inline int32_t sat_round_dbl_high_mul(int32_t a, int32_t b)
 static inline int32_t round_div_by_pot(int32_t x, int exponent)
 {
     if (exponent <= 0) return x;
+    /* Beyond 31 bits |x / 2^exponent| <= 1/2, and only -2^31 / 2^32 is a tie,
+     * which rounds away from zero. Shifting a uint32 that far is undefined. */
+    if (exponent > 31) return (exponent == 32 && x == INT32_MIN) ? -1 : 0;
     uint32_t mask = ((uint32_t)1u << exponent) - 1u;
     uint32_t remainder = (uint32_t)x & mask;
     uint32_t threshold = (mask >> 1) + (x < 0 ? 1u : 0u);

@@ -1123,6 +1123,63 @@ static void test_fc_s8(void)
     TEST_ASSERT_EQ(out[1], 22, "fc[1] = 22");
 }
 
+static void test_fc_s8_shift_beyond_31_bits(void)
+{
+    printf("  test_fc_s8_shift_beyond_31_bits...\n");
+
+    plan_reset();
+    tigris_plan_t plan;
+
+    /* Plans from older compilers carry shifts below -31 for effective scales
+     * under 2^-32. acc = +-2^30 gives a high product of +-2^29, which rounds
+     * to 0 at either shift, so both outputs are the zero point. */
+    int32_t mults[] = {1073741824, 1073741824};
+    int32_t shifts[] = {-32, -35};
+    uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(1.0f, 5, 2, mults, shifts);
+
+    int32_t x_shape[] = {1, 1};
+    int32_t y_shape[] = {1, 2};
+    uint16_t t_in = add_tensor(&plan, "x", x_shape, 2, 3, 1, in_qp);
+    uint16_t t_out = add_tensor(&plan, "y", y_shape, 2, 3, 2, out_qp);
+
+    int8_t weight[] = {0, 0};
+    uint16_t w_idx = add_weight(weight, 2, "w");
+    int32_t bias[] = {1073741824, -1073741824};
+    uint16_t b_idx = add_weight(bias, 8, "b");
+
+    test_ops[0].op_type = TIGRIS_OP_FULLY_CONN;
+    test_ops[0].num_inputs = 1;
+    test_ops[0].num_outputs = 1;
+    uint16_t inp[] = {t_in};
+    uint16_t outp[] = {t_out};
+    test_ops[0].inputs_off = add_indices(inp, 1);
+    test_ops[0].outputs_off = add_indices(outp, 1);
+    test_ops[0].weight_idx = w_idx;
+    test_ops[0].bias_idx = b_idx;
+    test_ops[0].act_min = -128;
+    test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+
+    build_plan(&plan);
+
+    void *ptrs[MAX_TENSORS];
+    uint8_t fast[4096], slow_buf[4096];
+    tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
+
+    tigris_mem_alloc_fast(&mem, t_in, 1);
+    ((int8_t *)ptrs[t_in])[0] = 1;
+    tigris_mem_alloc_fast(&mem, t_out, 2);
+
+    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+    TEST_ASSERT_EQ(ret, 0, "fc_s8 returns 0");
+
+    int8_t *out = (int8_t *)ptrs[t_out];
+    TEST_ASSERT_EQ(out[0], 5, "shift -32 rounds to the zero point");
+    TEST_ASSERT_EQ(out[1], 5, "shift -35 rounds to the zero point");
+}
+
 static void test_global_avg_pool_s8(void)
 {
     printf("  test_global_avg_pool_s8...\n");
@@ -3069,6 +3126,7 @@ int main(void)
     test_conv_transpose_s8_out_of_range_skip();
     test_conv_transpose_s8_tile_2d();
     test_fc_s8();
+    test_fc_s8_shift_beyond_31_bits();
     test_global_avg_pool_s8();
     test_global_avg_pool_s8_average_rounding();
     test_global_max_pool_s8();

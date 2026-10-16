@@ -195,12 +195,12 @@ static void esp_conv_tile_input_dims(
             th = (int32_t)plan->stages[st->chain_id].chain_tile_h +
                  (int32_t)(eff_kh - 1) * (int32_t)st->chain_len;
         } else {
-            const tigris_tile_plan_t *tp = tigris_stage_tile_plan(plan, st);
-            if (!tp || !tp->tileable)
+            tigris_tile_plan_v10_t tp = tigris_stage_tiles(plan, st);
+            if (!tp.tileable)
                 return;             /* untiled stage: keep full dims */
-            th = (int32_t)tp->tile_height;
-            if (tp->axis == TIGRIS_TILE_AXIS_HW)   /* 2D: width also tiled */
-                tw = (int32_t)tp->tile_width;
+            th = (int32_t)(tp.output_band_extent ? tp.output_band_extent : tp.input_band_extent);
+            if (tp.axis == TIGRIS_TILE_AXIS_HW)   /* 2D: width also tiled */
+                tw = (int32_t)tp.output_width_extent;
         }
         if (th <= 0)
             th = (int32_t)IH;

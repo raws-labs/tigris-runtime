@@ -470,7 +470,7 @@ typedef struct {
 } tigris_stage_t;                   /* 28 bytes total */
 
 /**
- * Tile plan - 24 bytes.
+ * Tile plan through schema 9 - 24 bytes.
  */
 typedef struct {
     uint8_t     tileable;           /*  0: 1=tileable, 0=not */
@@ -485,6 +485,20 @@ typedef struct {
     uint16_t    tile_width;         /* 20: 2D tile width, 0 when the plan is 1D */
     uint16_t    flags;              /* 22: TIGRIS_TILE_FLAG_* (v9+), else 0 */
 } tigris_tile_plan_t;               /* 24 bytes total */
+
+/** Schema-10 scheduling choices, 32 bytes. Zero extents are derived. */
+typedef struct {
+    uint8_t tileable;                 /*  0 */
+    uint8_t axis;                     /*  1 */
+    uint16_t flags;                   /*  2 */
+    uint32_t input_band_extent;       /*  4: input rows */
+    uint32_t output_band_extent;      /*  8: output rows */
+    uint32_t output_width_extent;     /* 12: output columns */
+    uint32_t input_channel_group;     /* 16: input channels */
+    uint32_t input_spatial_interval;  /* 20: positions within one input batch */
+    uint32_t output_linear_segment;   /* 24: output elements */
+    uint32_t tiled_peak_bytes;        /* 28: fast working-set ceiling */
+} tigris_tile_plan_v10_t;
 
 /* Which of the two axes a layout conversion's band runs along. Both sides
  * used to pick the longer one and agree only by coincidence when the two are
@@ -562,6 +576,8 @@ TIGRIS_LAYOUT_ASSERT(tigris_layout_op_size,
                      sizeof(tigris_op_t) == 38);
 TIGRIS_LAYOUT_ASSERT(tigris_layout_stage_size,
                      sizeof(tigris_stage_t) == 28);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_tile_plan_v10_size,
+                     sizeof(tigris_tile_plan_v10_t) == 32);
 TIGRIS_LAYOUT_ASSERT(tigris_layout_tile_plan_size,
                      sizeof(tigris_tile_plan_t) == 24);
 TIGRIS_LAYOUT_ASSERT(tigris_layout_weight_entry_size,
@@ -665,6 +681,8 @@ typedef struct {
     uint32_t                     state_bytes;    /* size of the caller's state buffer */
     const tigris_subgraph_t     *subgraphs;      /* [num_subgraphs] or NULL */
     uint16_t                     num_subgraphs;  /* 0 without control flow */
+
+    const tigris_tile_plan_v10_t *tile_plans_v10; /* schema 10+, otherwise NULL */
 
     /* Convenience: model I/O resolved from header */
     const uint16_t              *model_inputs;  /* [num_model_inputs] */
@@ -798,18 +816,57 @@ static inline const uint16_t *tigris_stage_outputs(
 }
 
 /**
- * Get the tile plan for a stage.
+ * Get a legacy tile record for a stage.
  *
  * @param plan   Loaded plan.
  * @param stage  Stage descriptor.
- * @return Tile plan pointer, or NULL if the stage has no tile plan.
+ * @return Legacy record or NULL. Use tigris_stage_tiles for all schemas.
  */
 static inline const tigris_tile_plan_t *tigris_stage_tile_plan(
     const tigris_plan_t *plan, const tigris_stage_t *stage)
 {
-    if (stage->tile_plan_idx == TIGRIS_NO_TILE_PLAN)
+    if (!plan->tile_plans || stage->tile_plan_idx == TIGRIS_NO_TILE_PLAN)
         return NULL;
     return &plan->tile_plans[stage->tile_plan_idx];
+}
+
+/** Scheduling choices for either wire layout; no allocation or shared cache. */
+static inline tigris_tile_plan_v10_t tigris_stage_tiles(
+    const tigris_plan_t *plan, const tigris_stage_t *stage)
+{
+    tigris_tile_plan_v10_t result = {0};
+    if (!plan || !plan->header || !stage ||
+        stage->tile_plan_idx == TIGRIS_NO_TILE_PLAN ||
+        stage->tile_plan_idx >= plan->header->num_tile_plans)
+        return result;
+    if (plan->header->version >= TIGRIS_SCHEMA_VERSION_STATE) {
+        if (plan->tile_plans_v10)
+            return plan->tile_plans_v10[stage->tile_plan_idx];
+        return result;
+    }
+    const tigris_tile_plan_t *old = tigris_stage_tile_plan(plan, stage);
+    if (!old)
+        return result;
+    result.tileable = old->tileable;
+    result.axis = (uint8_t)(plan->header->version >= TIGRIS_SCHEMA_VERSION_TILE_AXIS
+        ? old->axis : (old->tileable ? TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH : TIGRIS_TILE_AXIS_NONE));
+    result.flags = old->flags;
+    result.tiled_peak_bytes = old->tiled_peak_bytes;
+    result.output_width_extent = old->tile_width;
+    int output_driven = 0;
+    if (result.axis == TIGRIS_TILE_AXIS_HW)
+        output_driven = 1;
+    const uint16_t *ops = tigris_stage_ops(plan, stage);
+    for (uint16_t i = 0; i < stage->ops_count; i++) {
+        uint8_t type = plan->ops[ops[i]].op_type;
+        if (type == TIGRIS_OP_RESIZE || type == TIGRIS_OP_RESIZE_LINEAR)
+            output_driven = 1;
+    }
+    if (output_driven)
+        result.output_band_extent = old->tile_height;
+    else
+        result.input_band_extent = old->tile_height;
+    return result;
 }
 
 /**

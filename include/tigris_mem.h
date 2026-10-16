@@ -75,6 +75,8 @@ typedef struct {
     void    *reduce_acc;
     uint8_t  reduce_first;
     uint8_t  reduce_last;
+    int32_t  reduce_channels;  /* packed channel count, 0 for whole channels */
+    int32_t  reduce_positions; /* packed spatial positions, 0 for row bands */
     /* A layout conversion tiled along its output rows. The kernel is handed a
      * packed [N, in_h, in_w] input gathered from a column range and writes a
      * packed [N, out_h, out_w] output, so it walks the tile extents above

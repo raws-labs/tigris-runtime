@@ -695,11 +695,47 @@ int tigris_reshape_tile_valid(const tigris_tile_plan_t *tile,
            ((int64_t)view->input_rows * view->input_width) % view->output_width == 0;
 }
 
+static int grouped_reduction_valid(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                   const tigris_tile_plan_v10_t *tile)
+{
+    if (!tile->tileable || tile->axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH ||
+        tile->flags != 0u || tile->input_band_extent != 0u || tile->output_band_extent != 0u ||
+        tile->output_width_extent != 0u || tile->output_linear_segment != 0u ||
+        stage->ops_count != 1u || stage->inputs_count != 1u || stage->outputs_count != 1u ||
+        stage->chain_len != 0u || tile->input_channel_group == 0u || tile->input_spatial_interval == 0u)
+        return 0;
+    const tigris_op_t *op = &plan->ops[tigris_stage_ops(plan, stage)[0]];
+    if (op->op_type != TIGRIS_OP_GLOBAL_AVG || op->num_inputs != 1u || op->num_outputs != 1u ||
+        tigris_op_inputs(plan, op)[0] != tigris_stage_inputs(plan, stage)[0] ||
+        tigris_op_outputs(plan, op)[0] != tigris_stage_outputs(plan, stage)[0])
+        return 0;
+    const tigris_tensor_t *input = &plan->tensors[tigris_stage_inputs(plan, stage)[0]];
+    const tigris_tensor_t *output = &plan->tensors[tigris_stage_outputs(plan, stage)[0]];
+    if (input->ndim != 4u || output->ndim != 4u || input->dtype != output->dtype ||
+        (input->dtype != 1u && input->dtype != 3u))
+        return 0;
+    const int32_t *shape = tigris_tensor_shape(plan, input);
+    uint64_t spatial = (uint64_t)(uint32_t)shape[1] * (uint32_t)shape[2];
+    if (tile->input_channel_group > (uint32_t)shape[3] || tile->input_spatial_interval > spatial ||
+        spatial > INT32_MAX || (input->dtype == 3u && spatial > (uint32_t)INT32_MAX / 255u))
+        return 0;
+    uint32_t element = tigris_dtype_size(input->dtype);
+    uint64_t channel = tile->input_channel_group;
+    uint64_t bytes[3] = {channel * 4u, channel * element,
+                        channel * tile->input_spatial_interval * element};
+    uint64_t required = 0u;
+    for (uint8_t i = 0u; i < 3u; i++)
+        required += (bytes[i] + TIGRIS_TENSOR_ALIGN - 1u) / TIGRIS_TENSOR_ALIGN * TIGRIS_TENSOR_ALIGN;
+    return required <= tile->tiled_peak_bytes && tile->tiled_peak_bytes != 0u &&
+           tile->tiled_peak_bytes <= plan->header->budget;
+}
+
 static int tile_v10_valid(const tigris_plan_t *plan, const tigris_stage_t *stage,
                           const tigris_tile_plan_v10_t *tile)
 {
-    if (tile->input_channel_group != 0u || tile->input_spatial_interval != 0u ||
-        tile->output_linear_segment != 0u ||
+    if (tile->input_channel_group != 0u || tile->input_spatial_interval != 0u)
+        return grouped_reduction_valid(plan, stage, tile);
+    if (tile->output_linear_segment != 0u ||
         tile->flags > TIGRIS_TILE_FLAG_BAND_ON_COLUMNS)
         return 0;
     if (!tile->tileable)
@@ -2315,6 +2351,9 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
             const int32_t *out_shape = tigris_tensor_shape(plan, output);
             if (out_shape[0] != in_shape[0] || out_shape[1] != 1 ||
                 out_shape[2] != 1 || out_shape[3] != in_shape[3])
+                return TIGRIS_ERR_BAD_OPERATOR;
+            if (input->dtype == 3u &&
+                (uint64_t)(uint32_t)in_shape[1] * (uint32_t)in_shape[2] > (uint32_t)INT32_MAX / 255u)
                 return TIGRIS_ERR_BAD_OPERATOR;
             break;
         }

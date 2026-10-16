@@ -1792,7 +1792,7 @@ static int stage_is_input_driven_reduction(
 
     const int32_t *in_shape = tigris_tensor_shape(plan, in);
     const int32_t *out_shape = tigris_tensor_shape(plan, out);
-    return in_shape[0] > 0 && in_shape[1] > 1 &&
+    return in_shape[0] > 0 && (int64_t)in_shape[1] * in_shape[2] > 0 &&
            in_shape[2] > 0 && in_shape[3] > 0 &&
            out_shape[0] == in_shape[0] && out_shape[1] == 1 &&
            out_shape[2] == 1 && out_shape[3] == in_shape[3];
@@ -2357,6 +2357,91 @@ static void scatter_row_band(
 #ifndef TIGRIS_TRACE
     (void)tensor;
 #endif
+}
+
+static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_grouped_reduction(
+    const tigris_plan_t *plan, const tigris_stage_t *stage, tigris_mem_t *mem,
+    tigris_kernel_fn kernel, void *user_ctx, tigris_exec_stats_t *stats)
+{
+    uint16_t input = tigris_stage_inputs(plan, stage)[0];
+    uint16_t output = tigris_stage_outputs(plan, stage)[0];
+    uint16_t index = tigris_stage_ops(plan, stage)[0];
+    const tigris_op_t *op = &plan->ops[index];
+    const int32_t *shape = tigris_tensor_shape(plan, &plan->tensors[input]);
+    tigris_tile_plan_v10_t tile = tigris_stage_tiles(plan, stage);
+    int32_t channels = shape[3];
+    int32_t spatial = shape[1] * shape[2];
+    int32_t group = (int32_t)tile.input_channel_group;
+    int32_t interval = (int32_t)tile.input_spatial_interval;
+    uint32_t element = tigris_dtype_size(plan->tensors[input].dtype);
+    void *source = mem->tensor_ptrs[input];
+    if (!source || group <= 0 || interval <= 0)
+        return TIGRIS_EXEC_ERR_TILE;
+    if (tigris_mem_alloc_slow(mem, output, plan->tensors[output].size_bytes) != TIGRIS_MEM_OK)
+        return TIGRIS_EXEC_ERR_MEM;
+    void *destination = mem->tensor_ptrs[output];
+    uint32_t acc_bytes;
+    if (!align_tensor_size((uint32_t)group * 4u, &acc_bytes) ||
+        mem->fast_used > mem->fast_size || acc_bytes > mem->fast_size - mem->fast_used ||
+        acc_bytes > stage_fast_capacity(plan, stage, mem))
+        return TIGRIS_EXEC_ERR_MEM;
+    uint32_t reserved = mem->fast_reserved;
+    void *accumulator = mem->fast_base + mem->fast_used;
+    mem->fast_used += acc_bytes;
+    mem->fast_reserved = mem->fast_used;
+    tigris_mem_note_fast_peak(mem);
+    TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_ALLOC, TIGRIS_TRACE_POOL_FAST,
+        TIGRIS_TRACE_NONE_U16, TIGRIS_TRACE_NONE_U16, mem->fast_used - acc_bytes,
+        0u, acc_bytes, -1, -1, -1, -1);
+    tigris_exec_error_t result = TIGRIS_EXEC_OK;
+    for (int32_t batch = 0; batch < shape[0] && result == TIGRIS_EXEC_OK; batch++) {
+        for (int32_t channel = 0; channel < channels && result == TIGRIS_EXEC_OK; ) {
+            int32_t count = channels - channel < group ? channels - channel : group;
+            for (int32_t start = 0; start < spatial; ) {
+                int32_t positions = spatial - start < interval ? spatial - start : interval;
+                uint32_t bytes = (uint32_t)positions * (uint32_t)count * element;
+                if (stats) stats->total_tiles++;
+                TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_TILE_BEGIN, TIGRIS_TRACE_POOL_NONE,
+                    TIGRIS_TRACE_NONE_U16, (uint16_t)(start / interval), 0u, 0u, 0u,
+                    start, start + positions, channel, channel + count);
+                if (tigris_mem_alloc_fast(mem, input, bytes) != TIGRIS_MEM_OK ||
+                    tigris_mem_alloc_fast(mem, output, (uint32_t)count * element) != TIGRIS_MEM_OK) {
+                    result = TIGRIS_EXEC_ERR_MEM;
+                    break;
+                }
+                const uint8_t *first = (const uint8_t *)source +
+                    ((size_t)batch * (size_t)spatial + (size_t)start) * (size_t)channels * element;
+                gather_row_band((uint8_t *)mem->tensor_ptrs[input], first, positions,
+                                channels, channel, count, element, mem, input);
+                mem->tile.active = 1u;
+                mem->tile.in_h = 1;
+                mem->tile.in_w = 1;
+                mem->tile.out_h = 1;
+                mem->tile.out_w = 1;
+                mem->tile.reduce_channels = count;
+                mem->tile.reduce_positions = positions;
+                mem->tile.reduce_acc = accumulator;
+                mem->tile.reduce_first = start == 0 ? 1u : 0u;
+                mem->tile.reduce_last = spatial - start <= interval ? 1u : 0u;
+                if (TRACED_KERNEL(kernel, plan, op, index, mem, user_ctx) != 0) {
+                    result = TIGRIS_EXEC_ERR_KERNEL;
+                    break;
+                }
+                if (mem->tile.reduce_last)
+                    scatter_row_band((uint8_t *)destination + (size_t)batch * (size_t)channels * element,
+                        (const uint8_t *)mem->tensor_ptrs[output], 1, channels, channel, count, element, mem, output);
+                tigris_mem_reset_fast(mem);
+                start += positions;
+            }
+            channel += count;
+        }
+    }
+    memset(&mem->tile, 0, sizeof(mem->tile));
+    mem->fast_reserved = reserved;
+    tigris_mem_reset_fast(mem);
+    mem->tensor_ptrs[input] = source;
+    mem->tensor_ptrs[output] = destination;
+    return result;
 }
 
 /**
@@ -4414,8 +4499,10 @@ tigris_exec_error_t tigris_run_with_state(
                 result = prepare_stage_weights(plan, s, mem, &stage_plan, &run_plan, stats);
                 if (result != TIGRIS_EXEC_OK)
                     goto restore_fast_arena;
-                tigris_exec_error_t err = exec_stage_tiled_by_input(
-                    run_plan, stage, mem, kernel, user_ctx, stats);
+                tigris_tile_plan_v10_t reduction = tigris_stage_tiles(run_plan, stage);
+                tigris_exec_error_t err = reduction.input_channel_group != 0u
+                    ? exec_stage_grouped_reduction(run_plan, stage, mem, kernel, user_ctx, stats)
+                    : exec_stage_tiled_by_input(run_plan, stage, mem, kernel, user_ctx, stats);
                 if (err != TIGRIS_EXEC_OK) {
                     TIGRIS_PLATFORM_DBG("S%u reduce ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
                         s, (int)err, (unsigned long)total_io,

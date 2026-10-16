@@ -1052,6 +1052,11 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
     int32_t *acc = (int32_t *)mem->tile.reduce_acc;
     int rows = (mem->tile.active && mem->tile.in_h > 0) ? mem->tile.in_h : H;
     int band = rows * W;
+    if (mem->tile.active && mem->tile.reduce_channels > 0) {
+        N = 1;
+        C = mem->tile.reduce_channels;
+        band = mem->tile.reduce_positions;
+    }
 
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {

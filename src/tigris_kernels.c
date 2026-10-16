@@ -1367,6 +1367,13 @@ static int kern_global_avg_pool(
     float *acc = (float *)mem->tile.reduce_acc;
     int rows = (mem->tile.active && mem->tile.in_h > 0) ? mem->tile.in_h : H;
 
+    if (mem->tile.active && mem->tile.reduce_channels > 0) {
+        N = 1;
+        C = mem->tile.reduce_channels;
+        rows = mem->tile.reduce_positions;
+        W = 1;
+    }
+
     /* Output: [N, 1, 1, C] in NHWC */
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {

@@ -61,6 +61,7 @@ typedef struct {
     tigris_op_t op;
     tigris_stage_t stage;
     tigris_tile_plan_t tile_plan;
+    tigris_tile_plan_v10_t grouped;
     tigris_quant_param_t quant_params[2];
     int32_t shapes[8];
     uint16_t indices[7];
@@ -266,11 +267,69 @@ static void test_s8_reduction_is_band_invariant(void)
                 "int8 banded reduction is byte-identical");
 }
 
+static int fail_reduction(const tigris_plan_t *plan, const tigris_op_t *op,
+                          uint16_t index, tigris_mem_t *mem, void *context)
+{
+    (void)plan; (void)op; (void)index; (void)mem; (void)context;
+    return -1;
+}
+
+static void test_channel_and_spatial_groups(void)
+{
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t big[WHOLE_FAST_SIZE];
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t small[128];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t input[2 * TEST_ELEMENTS * sizeof(float)];
+    uint8_t expected[2 * TEST_C * sizeof(float)];
+    uint8_t actual[2 * TEST_C * sizeof(float)];
+    for (uint32_t element = 1u; element <= 4u; element += 3u) {
+        reduce_fixture_t whole, grouped;
+        build_fixture(&whole, element);
+        build_fixture(&grouped, element);
+        whole.shapes[0] = whole.shapes[4] = grouped.shapes[0] = grouped.shapes[4] = 2;
+        for (uint8_t i = 0; i < 2u; i++) {
+            whole.tensors[i].size_bytes *= 2u;
+            grouped.tensors[i].size_bytes *= 2u;
+        }
+        if (element == 1u) {
+            int8_t *values = (int8_t *)input;
+            for (uint32_t i = 0; i < 2u * TEST_ELEMENTS; i++) values[i] = (int8_t)((i * 7u) % 251u - 125u);
+        } else {
+            float *values = (float *)input;
+            for (uint32_t i = 0; i < 2u * TEST_ELEMENTS; i++) values[i] = (float)((int32_t)(i % 37u) - 18) * 0.125f;
+        }
+        grouped.header.version = TIGRIS_SCHEMA_VERSION_V10;
+        grouped.grouped.tileable = 1u;
+        grouped.grouped.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+        grouped.grouped.input_channel_group = 3u;
+        grouped.grouped.input_spatial_interval = 5u;
+        grouped.grouped.tiled_peak_bytes = sizeof(small);
+        grouped.plan.tile_plans = NULL;
+        grouped.plan.tile_plans_v10 = &grouped.grouped;
+        tigris_kernel_fn kernel = element == 1u ? tigris_dispatch_kernel_s8 : tigris_dispatch_kernel;
+        uint16_t tiled = 0u;
+        uint32_t input_bytes = 2u * TEST_ELEMENTS * element;
+        uint32_t output_bytes = 2u * TEST_C * element;
+        TEST_ASSERT_EQ(run_case(&whole, kernel, big, sizeof(big), input, input_bytes,
+                       expected, output_bytes, &tiled), TIGRIS_EXEC_OK, "whole batch reference");
+        TEST_ASSERT_EQ(run_case(&grouped, kernel, small, sizeof(small), input, input_bytes,
+                       actual, output_bytes, &tiled), TIGRIS_EXEC_OK, "partial channel and spatial groups");
+        TEST_ASSERT_EQ(tiled, 1u, "grouped stage executes tiles");
+        TEST_ASSERT(memcmp(actual, expected, output_bytes) == 0, "grouped batches preserve output bits");
+        TEST_ASSERT_EQ(run_case(&grouped, kernel, small, 16u, input, input_bytes,
+                       actual, output_bytes, &tiled), TIGRIS_EXEC_ERR_MEM, "accumulator needs arena space");
+        TEST_ASSERT_EQ(run_case(&grouped, kernel, small, 63u, input, input_bytes,
+                       actual, output_bytes, &tiled), TIGRIS_EXEC_ERR_MEM, "packed buffers need arena space");
+        TEST_ASSERT_EQ(run_case(&grouped, fail_reduction, small, sizeof(small), input, input_bytes,
+                       actual, output_bytes, &tiled), TIGRIS_EXEC_ERR_KERNEL, "group kernel failure propagates");
+    }
+}
+
 int main(void)
 {
     printf("Global reduction tiling tests:\n");
     test_float_reduction_is_band_invariant();
     test_s8_reduction_is_band_invariant();
+    test_channel_and_spatial_groups();
 
 #ifdef TIGRIS_TRACE
     TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_BY_INPUT)) != 0u,

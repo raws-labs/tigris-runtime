@@ -1841,7 +1841,7 @@ static void test_exec_padding_range(void)
             tigris_mem_t mem;
             tile_probe_ctx_t ctx = {0};
 
-            header.version = TIGRIS_SCHEMA_VERSION;
+            header.version = TIGRIS_SCHEMA_VERSION_V9;
             header.num_tensors = chained ? 3 : 2;
             header.num_ops = chained ? 2 : 1;
             header.num_stages = chained ? 2 : 1;
@@ -1951,7 +1951,7 @@ static void run_height_tiling_contract_case(
     memset(&tile_plan, 0, sizeof(tile_plan));
     memset(&plan, 0, sizeof(plan));
 
-    header.version = TIGRIS_SCHEMA_VERSION;
+    header.version = TIGRIS_SCHEMA_VERSION_V9;
     header.num_tensors = 2;
     header.num_ops = 1;
     header.num_stages = 1;
@@ -2075,7 +2075,7 @@ static tigris_exec_error_t run_band_fixture(
 
 static void wire_band_fixture(band_fixture_t *fx, uint16_t n_inputs)
 {
-    fx->header.version = TIGRIS_SCHEMA_VERSION;
+    fx->header.version = TIGRIS_SCHEMA_VERSION_V9;
     fx->header.num_ops = 1;
     fx->header.num_stages = 1;
     fx->header.num_tile_plans = 1;
@@ -2267,7 +2267,7 @@ static void run_convtranspose_tiling_case(
     memset(&tile_plan, 0, sizeof(tile_plan));
     memset(&plan, 0, sizeof(plan));
 
-    header.version = TIGRIS_SCHEMA_VERSION;
+    header.version = TIGRIS_SCHEMA_VERSION_V9;
     header.num_tensors = 2;
     header.num_ops = 1;
     header.num_stages = 1;

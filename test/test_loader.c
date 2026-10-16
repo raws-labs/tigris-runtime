@@ -914,7 +914,7 @@ static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
 
     tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
     memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION;
+    hdr->version = TIGRIS_SCHEMA_VERSION_V9;
     hdr->file_size = TILED_PLAN_SIZE;
     hdr->section_dir_off = sizeof(*hdr);
     hdr->num_tensors = 2;
@@ -1240,6 +1240,51 @@ static void test_op_attribute_payloads(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION,
                    "a reduction axis past the rank is refused");
+}
+
+static void test_compact_tile_record(void)
+{
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE + 8u];
+    tigris_plan_t plan;
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 3u);
+    memmove(buf + TILED_INDEX_OFF + 8u, buf + TILED_INDEX_OFF,
+            TILED_PLAN_SIZE - TILED_INDEX_OFF);
+    tigris_file_header_t *header = (tigris_file_header_t *)buf;
+    header->version = TIGRIS_SCHEMA_VERSION_V10;
+    header->file_size = sizeof(buf);
+    header->budget = 128u;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
+    for (uint16_t i = 0; dir[i].type != 0u; i++)
+        if (dir[i].offset >= TILED_INDEX_OFF)
+            dir[i].offset += 8u;
+    tigris_tile_plan_v10_t *tile = (tigris_tile_plan_v10_t *)(buf + TILED_TILE_PLANS_OFF);
+    memset(tile, 0, sizeof(*tile));
+    tile->tileable = 1u;
+    tile->axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    tile->tiled_peak_bytes = 128u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "compact transpose record loads");
+    TEST_ASSERT(plan.tile_plans == NULL && plan.tile_plans_v10 != NULL,
+                "record layouts have separate pointers");
+    tile->input_channel_group = 1u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "unsupported grouping is refused");
+    tile->input_channel_group = 0u;
+    tile->flags = 2u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "unknown scheduling flags are refused");
+    tile->flags = 0u;
+    tile->input_band_extent = 1u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "transpose cannot carry unrelated input row geometry");
+    tile->input_band_extent = 0u;
+    tile->tiled_peak_bytes = 129u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "working-set ceiling must fit the plan budget");
+    tile->tiled_peak_bytes = 128u;
+    header->file_size = TILED_PLAN_SIZE;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, TILED_PLAN_SIZE, &plan), TIGRIS_ERR_BAD_SECTION,
+                   "truncated extended plan is refused");
 }
 
 static void test_tiled_conversion_contract(void)
@@ -2712,6 +2757,7 @@ static void test_prelu_tiling_contract(void)
         tigris_file_header_t *header = (tigris_file_header_t *)buf;
         header->file_size = sizeof(buf);
         header->num_tile_plans = 1;
+        header->version = TIGRIS_SCHEMA_VERSION_V9;
         tigris_stage_t *stage = (tigris_stage_t *)(buf + SEMANTIC_STAGES_OFF + 24u);
         stage->tile_plan_idx = 0;
         stage->inputs_off = 3; stage->inputs_count = 1;
@@ -4287,7 +4333,7 @@ static void check_state_batch_bands(const tigris_plan_t *original, const state_g
     tigris_stage_t stages[8] = {0};
     tigris_op_t ops[8];
     uint16_t indices[128];
-    tigris_tile_plan_t tile = {0};
+    tigris_tile_plan_v10_t tile = {0};
     if (header.num_ops > 8u) return;
     int found = 0;
     uint16_t at = 0u;
@@ -4316,8 +4362,6 @@ static void check_state_batch_bands(const tigris_plan_t *original, const state_g
             const tigris_tensor_t *input = &plan.tensors[tigris_op_inputs(original, op)[0]];
             int32_t batch = tigris_tensor_shape(original, input)[time_major ? 1u : 0u];
             if (batch <= 1) return;
-            tile.original_height = (uint16_t)batch;
-            tile.num_tiles = (uint16_t)batch;
             stages[j].tile_plan_idx = 0u;
             found = 1;
         }
@@ -4325,14 +4369,16 @@ static void check_state_batch_bands(const tigris_plan_t *original, const state_g
     if (!found) return;
     tile.tileable = 1u;
     tile.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
-    tile.tile_height = tile.receptive_field = 1u;
+    tile.input_band_extent = 1u;
+    tile.tiled_peak_bytes = 256u;
     header.num_stages = header.num_ops;
     header.num_tile_plans = 1u;
     plan.header = &header;
     plan.stages = stages;
     plan.ops = ops;
     plan.index_pool = indices;
-    plan.tile_plans = &tile;
+    plan.tile_plans = NULL;
+    plan.tile_plans_v10 = &tile;
     size_t state_size = tigris_state_required(&plan);
     void *state = malloc(state_size);
     uint8_t output[256];
@@ -4683,6 +4729,7 @@ int main(int argc, char *argv[])
     test_op_attribute_payloads();
     test_resize_scale_guards();
     test_tiled_conversion_contract();
+    test_compact_tile_record();
     test_tiled_reduction_contract();
     test_rank4_row_band_contract();
     test_reshape_band_contract();

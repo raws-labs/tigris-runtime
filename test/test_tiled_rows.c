@@ -73,7 +73,7 @@ static void build_fixture(rows_fixture_t *fx)
 {
     memset(fx, 0, sizeof(*fx));
 
-    fx->header.version = TIGRIS_SCHEMA_VERSION;
+    fx->header.version = TIGRIS_SCHEMA_VERSION_V9;
     fx->header.num_tensors = 3;
     fx->header.num_ops = 2;
     fx->header.num_stages = 1;
@@ -437,7 +437,7 @@ static void build_alias_fixture(alias_fixture_t *fx)
 {
     memset(fx, 0, sizeof(*fx));
 
-    fx->header.version = TIGRIS_SCHEMA_VERSION;
+    fx->header.version = TIGRIS_SCHEMA_VERSION_V9;
     fx->header.num_tensors = 3;
     fx->header.num_ops = 2;
     fx->header.num_stages = 2;

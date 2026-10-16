@@ -603,18 +603,8 @@ static int32_t tensor_row_count(const tigris_plan_t *plan, uint16_t tidx)
 static uint8_t stage_tile_axis(
     const tigris_plan_t *plan, const tigris_stage_t *stage)
 {
-    if (!plan || !plan->header || !stage || !plan->tile_plans ||
-        stage->tile_plan_idx == TIGRIS_NO_TILE_PLAN ||
-        stage->tile_plan_idx >= plan->header->num_tile_plans)
-        return TIGRIS_TILE_AXIS_NONE;
-
-    const tigris_tile_plan_t *tile =
-        &plan->tile_plans[stage->tile_plan_idx];
-    if (!tile->tileable)
-        return TIGRIS_TILE_AXIS_NONE;
-    return plan->header->version >= TIGRIS_SCHEMA_VERSION_TILE_AXIS
-        ? tile->axis
-        : TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    tigris_tile_plan_v10_t tile = tigris_stage_tiles(plan, stage);
+    return tile.tileable ? tile.axis : TIGRIS_TILE_AXIS_NONE;
 }
 
 /* Non-tiled stage execution */
@@ -687,10 +677,9 @@ static uint32_t stage_fast_limit(const tigris_plan_t *plan,
     if (plan->header->version < TIGRIS_SCHEMA_VERSION_V4)
         return available;
     uint32_t peak = stage->peak_bytes;
-    if (stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN && plan->tile_plans &&
-        stage->tile_plan_idx < plan->header->num_tile_plans &&
-        plan->tile_plans[stage->tile_plan_idx].tileable)
-        peak = plan->tile_plans[stage->tile_plan_idx].tiled_peak_bytes;
+    tigris_tile_plan_v10_t tile = tigris_stage_tiles(plan, stage);
+    if (tile.tileable)
+        peak = tile.tiled_peak_bytes;
     /* Hand-built and older plans may omit the working-set estimate. */
     return peak != 0u && peak < available ? peak : available;
 }
@@ -1527,11 +1516,9 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_2d(
     int32_t eff_kh = sp ? ((sp->kernel_h - 1) * dh + 1) : 1;
     int32_t eff_kw = sp ? ((sp->kernel_w - 1) * dw + 1) : 1;
 
-    const tigris_tile_plan_t *tp = tigris_stage_tile_plan(plan, stage);
-    if (!tp)
-        return TIGRIS_EXEC_ERR_TILE;
-    int32_t th = (int32_t)tp->tile_height;
-    int32_t tw = (int32_t)tp->tile_width;
+    tigris_tile_plan_v10_t tp = tigris_stage_tiles(plan, stage);
+    int32_t th = (int32_t)tp.output_band_extent;
+    int32_t tw = (int32_t)tp.output_width_extent;
     if (th <= 0 || tw <= 0 || OH <= 0 || OW <= 0)
         return TIGRIS_EXEC_ERR_TILE;
 
@@ -2099,12 +2086,11 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_transpose(
      * since a slice holds batch * (the other axis) * band elements. Which one
      * that is belongs to whoever sized the band, so a plan that states it is
      * obeyed and only an older one is re-derived here. */
-    const tigris_tile_plan_t *conversion_plan =
-        tigris_stage_tile_plan(plan, stage);
+    tigris_tile_plan_v10_t conversion_plan = tigris_stage_tiles(plan, stage);
     int band_on_cols;
     if (plan->header->version >= TIGRIS_SCHEMA_VERSION_BAND_ORIENTATION &&
-        conversion_plan != NULL)
-        band_on_cols = (conversion_plan->flags &
+        conversion_plan.tileable)
+        band_on_cols = (conversion_plan.flags &
                         TIGRIS_TILE_FLAG_BAND_ON_COLUMNS) != 0u;
     else
         band_on_cols = cols >= rows;
@@ -3057,9 +3043,17 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_reshape(
     tigris_exec_stats_t *stats)
 {
     tigris_reshape_band_t view;
-    const tigris_tile_plan_t *tile = &plan->tile_plans[stage->tile_plan_idx];
-    if (!tigris_reshape_band(plan, stage, &view) || !tigris_reshape_tile_valid(tile, &view))
+    tigris_tile_plan_v10_t tile = tigris_stage_tiles(plan, stage);
+    if (!tigris_reshape_band(plan, stage, &view))
         return TIGRIS_EXEC_ERR_TILE;
+    if (plan->header->version < TIGRIS_SCHEMA_VERSION_STATE) {
+        if (!tigris_reshape_tile_valid(tigris_stage_tile_plan(plan, stage), &view))
+            return TIGRIS_EXEC_ERR_TILE;
+    } else if (tile.input_band_extent == 0u || tile.input_band_extent > (uint32_t)view.input_rows ||
+               ((int64_t)tile.input_band_extent * view.input_width) % view.output_width != 0) {
+        return TIGRIS_EXEC_ERR_TILE;
+    }
+    int32_t band_rows = (int32_t)tile.input_band_extent;
     uint16_t src = tigris_stage_inputs(plan, stage)[0], dst = tigris_stage_outputs(plan, stage)[0];
     void *input = mem->tensor_ptrs[src];
     if (!input) return TIGRIS_EXEC_ERR_MEM;
@@ -3072,14 +3066,14 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_reshape(
     uint32_t input_width = (uint32_t)view.input_width * element;
     uint32_t output_width = (uint32_t)view.output_width * element;
     tigris_exec_error_t result = TIGRIS_EXEC_OK;
-    for (int32_t start = 0; start < view.input_rows; start += tile->tile_height) {
+    for (int32_t start = 0; start < view.input_rows; start += band_rows) {
         int32_t count = view.input_rows - start;
-        if (count > tile->tile_height) count = tile->tile_height;
+        if (count > band_rows) count = band_rows;
         int32_t target_start = (int32_t)((int64_t)start * view.input_width / view.output_width);
         int32_t target_count = (int32_t)((int64_t)count * view.input_width / view.output_width);
         if (stats) stats->total_tiles++;
         TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_TILE_BEGIN, TIGRIS_TRACE_POOL_NONE,
-            TIGRIS_TRACE_NONE_U16, (uint16_t)(start / tile->tile_height), 0u, 0u, 0u,
+            TIGRIS_TRACE_NONE_U16, (uint16_t)(start / band_rows), 0u, 0u, 0u,
             start, start + count, -1, -1);
         uint32_t bytes = (uint32_t)view.blocks * (uint32_t)count * input_width;
         if (tigris_mem_alloc_fast(mem, src, bytes) != TIGRIS_MEM_OK) {
@@ -4252,8 +4246,7 @@ tigris_exec_error_t tigris_run_with_state(
             /* Non-head chain stage - should have been skipped; just in case */
         } else if (stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
                    stage->tile_plan_idx < run_plan->header->num_tile_plans &&
-                   run_plan->tile_plans &&
-                   run_plan->tile_plans[stage->tile_plan_idx].tileable &&
+                   stage_tile_axis(run_plan, stage) != TIGRIS_TILE_AXIS_NONE &&
                    stage_is_reshape_band(run_plan, stage)) {
             /* A Reshape banded along rows that map onto the output's. Decided
              * here, apart from the stripe contract below, which it shares no
@@ -4271,8 +4264,7 @@ tigris_exec_error_t tigris_run_with_state(
             if (stats) stats->stages_tiled++;
         } else if (stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
                    stage->tile_plan_idx < run_plan->header->num_tile_plans &&
-                   run_plan->tile_plans &&
-                   run_plan->tile_plans[stage->tile_plan_idx].tileable &&
+                   stage_tile_axis(run_plan, stage) != TIGRIS_TILE_AXIS_NONE &&
                    tigris_stage_leading_band(run_plan, stage)) {
             TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_ROWS);
             result = prepare_stage_weights(plan, s, mem, &stage_plan, &run_plan, stats);
@@ -4347,8 +4339,7 @@ tigris_exec_error_t tigris_run_with_state(
             if (needs_tiling &&
                 stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
                 (stage->tile_plan_idx >= run_plan->header->num_tile_plans ||
-                 !run_plan->tile_plans ||
-                 !run_plan->tile_plans[stage->tile_plan_idx].tileable ||
+                 stage_tile_axis(run_plan, stage) == TIGRIS_TILE_AXIS_NONE ||
                  (tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH &&
                   tile_axis != TIGRIS_TILE_AXIS_HW) ||
                  ((input_driven || transposed || row_tiled) &&

@@ -1740,6 +1740,16 @@ static int align_tensor_size(uint32_t value, uint32_t *aligned)
     return 1;
 }
 
+/* Adds one tensor as the arena allocates it, aligned; saturates on overflow. */
+static uint32_t add_allocation_bytes(uint32_t total, uint32_t size)
+{
+    uint32_t aligned = 0u;
+    uint32_t sum = UINT32_MAX;
+    if (align_tensor_size(size, &aligned) && aligned <= UINT32_MAX - total)
+        sum = total + aligned;
+    return sum;
+}
+
 /** Find the weight block for a given stage, or NULL if none. */
 static const tigris_weight_block_t *find_weight_block(
     const tigris_plan_t *plan, uint16_t stage_idx)
@@ -4370,13 +4380,15 @@ tigris_exec_error_t tigris_run_with_state(
             uint8_t rank = 0;
             int common_tile_rank = 1;
             for (uint16_t i = 0; i < stage->inputs_count; i++) {
-                total_io += run_plan->tensors[sin[i]].size_bytes;
+                total_io = add_allocation_bytes(
+                    total_io, run_plan->tensors[sin[i]].size_bytes);
                 uint8_t tensor_rank = run_plan->tensors[sin[i]].ndim;
                 if (rank == 0) rank = tensor_rank;
                 if (tensor_rank != rank) common_tile_rank = 0;
             }
             for (uint16_t i = 0; i < stage->outputs_count; i++) {
-                total_io += run_plan->tensors[sout[i]].size_bytes;
+                total_io = add_allocation_bytes(
+                    total_io, run_plan->tensors[sout[i]].size_bytes);
                 uint8_t tensor_rank = run_plan->tensors[sout[i]].ndim;
                 if (rank == 0) rank = tensor_rank;
                 if (tensor_rank != rank) common_tile_rank = 0;

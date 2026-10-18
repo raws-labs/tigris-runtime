@@ -1860,6 +1860,95 @@ static void test_reshape_band_contract(void)
                    "multiple leading output blocks are not a contiguous height band");
 }
 
+static void test_float_section(void)
+{
+    printf("  test_float_section...\n");
+    _Alignas(32) uint8_t buf[332] = {0};
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
+    hdr->version = TIGRIS_SCHEMA_VERSION_BINARY_REQUANT;
+    hdr->file_size = sizeof(buf);
+    hdr->section_dir_off = 48;
+    hdr->num_tensors = 3;
+    hdr->num_ops = 2;
+    hdr->num_stages = 1;
+    hdr->budget = 256;
+    hdr->model_io_off = 6;
+    hdr->num_model_inputs = 1;
+    hdr->num_model_outputs = 1;
+    hdr->num_quant_params = 1;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + 48);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, 112};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, 160};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, 240};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, 268};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, 288};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, 300};
+    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, 304};
+    tigris_tensor_t *t = (tigris_tensor_t *)(buf + 112);
+    for (uint16_t i = 0; i < 3; i++) {
+        t[i].dtype = i == 0 ? 3 : 1;
+        t[i].ndim = 1;
+        t[i].shape_off = i;
+        t[i].size_bytes = i == 0 ? 4 : 16;
+        t[i].quant_param_idx = i == 0 ? 0 : TIGRIS_NO_QUANT_PARAM;
+    }
+    t[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    t[2].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+    const int32_t shape[3] = {4, 4, 4};
+    memcpy(buf + 288, shape, sizeof(shape));
+    const uint16_t indices[10] = {0, 1, 1, 2, 0, 1, 0, 2, 0, 2};
+    memcpy(buf + 268, indices, sizeof(indices));
+    tigris_op_t *ops = (tigris_op_t *)(buf + 160);
+    for (uint8_t i = 0; i < 2; i++) {
+        ops[i].op_type = i == 0 ? TIGRIS_OP_DEQUANTIZE : TIGRIS_OP_RELU;
+        ops[i].num_inputs = 1;
+        ops[i].num_outputs = 1;
+        ops[i].inputs_off = 2u * i;
+        ops[i].outputs_off = 2u * i + 1u;
+        ops[i].weight_idx = TIGRIS_NO_WEIGHT;
+        ops[i].bias_idx = TIGRIS_NO_WEIGHT;
+    }
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + 240);
+    stage->ops_off = 4;
+    stage->ops_count = 2;
+    stage->inputs_off = 8;
+    stage->inputs_count = 1;
+    stage->outputs_off = 9;
+    stage->outputs_count = 1;
+    stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+    uint16_t *quant_header = (uint16_t *)(buf + 304);
+    quant_header[0] = 1;
+    quant_header[1] = 1;
+    tigris_quant_param_t *quant = (tigris_quant_param_t *)(buf + 308);
+    quant->scale = 0.25f;
+    quant->num_channels = 1;
+    quant->shift_off = 1;
+    tigris_plan_t plan;
+    tigris_error_t error = tigris_plan_load(buf, sizeof(buf), &plan);
+    TEST_ASSERT_EQ(error, TIGRIS_OK, "Dequantize and float Relu load in an int8 plan");
+    if (error != TIGRIS_OK) return;
+    _Alignas(32) uint8_t arena[256];
+    void *ptrs[3];
+    tigris_mem_t mem;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, arena, sizeof(arena), arena, 0),
+                   TIGRIS_MEM_OK, "float section memory initializes");
+    int8_t input[4] = {-128, -1, 1, 127};
+    _Alignas(32) float real[4], result[4];
+    ptrs[0] = input; ptrs[1] = real; ptrs[2] = result;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &plan.ops[0], 0, &mem, NULL), 0,
+                   "Dequantize executes through int8 dispatch");
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &plan.ops[1], 1, &mem, NULL), 0,
+                   "float Relu executes through int8 dispatch");
+    const float expected[4] = {0.0f, 0.0f, 0.25f, 31.75f};
+    TEST_ASSERT(memcmp(ptrs[2], expected, sizeof(expected)) == 0,
+                "raw output tensor contains float results");
+    ops[0].op_type = TIGRIS_OP_RELU;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "a float activation without a conversion is refused");
+}
+
 static void test_operator_semantic_guards(void)
 {
     printf("  test_operator_semantic_guards...\n");
@@ -4733,6 +4822,7 @@ int main(int argc, char *argv[])
     test_tiled_reduction_contract();
     test_rank4_row_band_contract();
     test_reshape_band_contract();
+    test_float_section();
     test_operator_semantic_guards();
     test_nonweighted_operator_semantics();
     test_elementwise_semantics();

@@ -1326,7 +1326,7 @@ static int bool_and_sum_valid(const tigris_plan_t *plan, const tigris_op_t *op, 
     const uint8_t rank_limit = arity == 3u ? 5u : 4u;
     uint8_t len = 0u;
     const uint8_t *constant = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_CONSTANT_OPERAND, &len);
-    const uint8_t data_dtype = tigris_plan_data_dtype(plan);
+    const uint8_t data_dtype = x->dtype == 1u || y->dtype == 1u ? 1u : tigris_plan_data_dtype(plan);
     const int comparison = type >= TIGRIS_OP_EQUAL && type <= TIGRIS_OP_GREATER_EQUAL;
     if (op->num_inputs != arity && op->num_inputs != arity - 1u) return 0;
     if (op->num_inputs == arity && (constant != NULL || op->weight_idx != TIGRIS_NO_WEIGHT)) return 0;
@@ -1603,6 +1603,54 @@ static int subgraph_input(const tigris_plan_t *plan, uint16_t t)
     return 0;
 }
 
+static int float_section_contains(const uint8_t *section, uint16_t tensor)
+{
+    const uint8_t mask = (uint8_t)(1u << (tensor % 8u));
+    return (section[tensor / 8u] & mask) != 0u;
+}
+
+static void float_section_add(uint8_t *section, uint16_t tensor)
+{
+    const uint8_t mask = (uint8_t)(1u << (tensor % 8u));
+    section[tensor / 8u] = (uint8_t)(section[tensor / 8u] | mask);
+}
+
+/* A float activation must be reachable from a typed conversion or control flow. */
+static void find_float_sections(const tigris_plan_t *plan, uint8_t *section)
+{
+    memset(section, 0, (TIGRIS_MAX_TENSORS + 7u) / 8u);
+    for (uint16_t n = 0u; n < plan->header->num_ops; n++) {
+        const tigris_op_t *op = &plan->ops[n];
+        if (op->op_type != TIGRIS_OP_DEQUANTIZE && op->op_type != TIGRIS_OP_IF &&
+            op->op_type != TIGRIS_OP_WHILE) continue;
+        const uint16_t *outs = tigris_op_outputs(plan, op);
+        for (uint8_t k = 0u; k < op->num_outputs; k++)
+            if (plan->tensors[outs[k]].dtype == 1u) float_section_add(section, outs[k]);
+    }
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (uint16_t n = 0u; n < plan->header->num_ops; n++) {
+            const tigris_op_t *op = &plan->ops[n];
+            if (!tigris_float_operator(plan, op)) continue;
+            const uint16_t *ins = tigris_op_inputs(plan, op);
+            int valid = 1;
+            for (uint8_t k = 0u; k < op->num_inputs; k++) {
+                const tigris_tensor_t *t = &plan->tensors[ins[k]];
+                if (t->dtype == 3u || (t->dtype == 1u && !float_section_contains(section, ins[k]) &&
+                    (t->flags & TIGRIS_TENSOR_CONSTANT) == 0u)) valid = 0;
+            }
+            if (!valid) continue;
+            const uint16_t *outs = tigris_op_outputs(plan, op);
+            for (uint8_t k = 0u; k < op->num_outputs; k++)
+                if (plan->tensors[outs[k]].dtype == 1u && !float_section_contains(section, outs[k])) {
+                    float_section_add(section, outs[k]);
+                    changed = 1;
+                }
+        }
+    }
+}
+
 static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
     /* Zero is the data dtype, 255 also permits bool; the final input slot repeats. */
@@ -1703,6 +1751,8 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
     const tigris_file_header_t *hdr = plan->header;
     const int legacy = hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES;
     const uint8_t data_dtype = tigris_plan_data_dtype(plan);
+    uint8_t section[(TIGRIS_MAX_TENSORS + 7u) / 8u];
+    find_float_sections(plan, section);
     for (uint16_t t = 0; t < hdr->num_tensors; t++) {
         if (!tigris_dtype_requires_source(plan->tensors[t].dtype)) continue;
         if ((plan->tensors[t].flags & TIGRIS_TENSOR_CONSTANT) != 0u)
@@ -1744,6 +1794,16 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         if (op->op_type >= sizeof(dtype_signatures) / sizeof(dtype_signatures[0]))
             return TIGRIS_ERR_BAD_OPERATOR;
         const dtype_signature_t *signature = &dtype_signatures[op->op_type];
+        const uint8_t op_dtype = data_dtype == 3u && tigris_float_operator(plan, op) ? 1u : data_dtype;
+        if (data_dtype == 3u && op_dtype == 1u) {
+            for (uint8_t i = 0u; i < op->num_inputs; i++)
+                if (plan->tensors[inputs[i]].dtype == 1u && !float_section_contains(section, inputs[i]) &&
+                    (plan->tensors[inputs[i]].flags & TIGRIS_TENSOR_CONSTANT) == 0u)
+                    return TIGRIS_ERR_BAD_OPERATOR;
+            for (uint8_t i = 0u; i < op->num_outputs; i++)
+                if (plan->tensors[outputs[i]].dtype == 1u && !float_section_contains(section, outputs[i]))
+                    return TIGRIS_ERR_BAD_OPERATOR;
+        }
         uint8_t slot_constant_len = 0u;
         const uint8_t *slot_constant = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_CONSTANT_OPERAND, &slot_constant_len);
         for (uint8_t i = 0; i < op->num_inputs; i++) {
@@ -1753,11 +1813,11 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
                      op->weight_idx != TIGRIS_NO_WEIGHT && position >= 1u) position++;
             if (table_attr != NULL) position++;
             uint8_t role = signature->inputs[position < 3u ? position : 2u];
-            if (!dtype_matches_slot(plan->tensors[inputs[i]].dtype, role, data_dtype))
+            if (!dtype_matches_slot(plan->tensors[inputs[i]].dtype, role, op_dtype))
                 return TIGRIS_ERR_BAD_OPERATOR;
         }
         for (uint8_t i = 0; i < op->num_outputs; i++) {
-            if (!dtype_matches_slot(plan->tensors[outputs[i]].dtype, signature->output, data_dtype))
+            if (!dtype_matches_slot(plan->tensors[outputs[i]].dtype, signature->output, op_dtype))
                 return TIGRIS_ERR_BAD_OPERATOR;
         }
         if (dtype == 3 && op->act_min > op->act_max)

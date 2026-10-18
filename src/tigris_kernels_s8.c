@@ -3289,6 +3289,9 @@ int tigris_dispatch_kernel_s8(
 {
     (void)user_ctx;
 
+    if (tigris_float_operator(plan, op))
+        return tigris_dispatch_kernel(plan, op, op_index, mem, user_ctx);
+
 #ifdef TIGRIS_COUNT_KERNEL_ROWS
     extern unsigned long g_tigris_kernel_rows;
     if (mem->tile.active)
@@ -3577,6 +3580,9 @@ tigris_accel_route_t tigris_accel_pre_route(
     const tigris_op_t     *op,
     int                    tile_active)
 {
+    if (plan && op && tigris_float_operator(plan, op))
+        return TIGRIS_ACCEL_ROUTE_S8_REF;
+
     if (op && op->op_type >= TIGRIS_OP_EQUAL && op->op_type <= TIGRIS_OP_REDUCE_ALL)
         return TIGRIS_ACCEL_ROUTE_S8_REF;
 

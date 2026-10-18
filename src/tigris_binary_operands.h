@@ -14,6 +14,21 @@
 
 #include <stdint.h>
 
+/* Conversions and control flow have their own typed dispatch. */
+static inline int tigris_float_operator(const tigris_plan_t *plan, const tigris_op_t *op)
+{
+    const tigris_op_type_t type = (tigris_op_type_t)op->op_type;
+    int floating = 0;
+    if ((type != TIGRIS_OP_QUANTIZE) && (type != TIGRIS_OP_DEQUANTIZE) &&
+        (type != TIGRIS_OP_IF) && (type != TIGRIS_OP_WHILE) &&
+        (type != TIGRIS_OP_DETECTION_POSTPROCESS)) {
+        const uint16_t *inputs = tigris_op_inputs(plan, op);
+        for (uint8_t i = 0u; i < op->num_inputs; i++)
+            if (plan->tensors[inputs[i]].dtype == 1u) floating = 1;
+    }
+    return floating;
+}
+
 typedef struct {
     int32_t blocks;
     int32_t input_rows;

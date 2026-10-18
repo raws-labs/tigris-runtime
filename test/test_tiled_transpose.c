@@ -16,6 +16,7 @@
 #include "tigris_executor.h"
 #include "tigris_kernels.h"
 #include "tigris_mem.h"
+#include "test_harness.h"
 
 #define TEST_N     1
 #define TEST_LONG 64
@@ -24,34 +25,6 @@
 
 #define WHOLE_FAST_SIZE 8192u
 #define SLOW_SIZE       8192u
-
-static int tests_run;
-static int tests_passed;
-static int tests_failed;
-
-#define TEST_ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s\n", \
-                __func__, __LINE__, msg); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-#define TEST_ASSERT_EQ(a, b, msg) do { \
-    long got_ = (long)(a); \
-    long want_ = (long)(b); \
-    tests_run++; \
-    if (got_ != want_) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
-                __func__, __LINE__, msg, got_, want_); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
 
 typedef struct {
     tigris_file_header_t header;
@@ -179,12 +152,52 @@ static tigris_exec_error_t run_case(
     return TIGRIS_EXEC_OK;
 }
 
+/** A rank-4 conversion: [N, H, W, C] -> [N, C, H, W] or the way back. */
+typedef struct {
+    int32_t h;
+    int32_t w;
+    int32_t c;
+    int spatial_first;
+} rank4_layout_t;
+
+/**
+ * Re-shape a rank-3 fixture as the rank-4 conversion that carries the same
+ * matrix. `spatial_first` selects [N, H, W, C] -> [N, C, H, W] (perm 0,3,1,2),
+ * the direction that goes to linear order; otherwise the way back.
+ */
+static void make_rank4(transpose_fixture_t *fx, int32_t h, int32_t w,
+                       int32_t c, int spatial_first)
+{
+    fx->tensors[0].ndim = 4;
+    fx->tensors[1].ndim = 4;
+    fx->tensors[0].shape_off = 0;
+    fx->tensors[1].shape_off = 4;
+    fx->attribute.data_len = 4;
+
+    if (spatial_first) {
+        fx->shapes[0] = TEST_N; fx->shapes[1] = h;
+        fx->shapes[2] = w;      fx->shapes[3] = c;
+        fx->shapes[4] = TEST_N; fx->shapes[5] = c;
+        fx->shapes[6] = h;      fx->shapes[7] = w;
+        fx->perm[0] = 0; fx->perm[1] = 3; fx->perm[2] = 1; fx->perm[3] = 2;
+    } else {
+        fx->shapes[0] = TEST_N; fx->shapes[1] = c;
+        fx->shapes[2] = h;      fx->shapes[3] = w;
+        fx->shapes[4] = TEST_N; fx->shapes[5] = h;
+        fx->shapes[6] = w;      fx->shapes[7] = c;
+        fx->perm[0] = 0; fx->perm[1] = 2; fx->perm[2] = 3; fx->perm[3] = 1;
+    }
+}
+
 /**
  * Run the same conversion whole and in bands and compare. `rows` and `cols`
  * are the input's two permuted extents; swapping them swaps which side of the
- * conversion takes the strided transfer.
+ * conversion takes the strided transfer. A non-NULL `rank4` re-shapes the
+ * fixture as a rank-4 conversion, which leaves the two spatial axes in their
+ * relative order and so carries the same matrix with H*W read as one extent.
  */
-static void check_band_invariance(int32_t rows, int32_t cols, const char *what)
+static void check_band_invariance(int32_t rows, int32_t cols,
+                                  const rank4_layout_t *rank4, const char *what)
 {
     printf("  check_band_invariance %s...\n", what);
 
@@ -192,6 +205,14 @@ static void check_band_invariance(int32_t rows, int32_t cols, const char *what)
     transpose_fixture_t banded;
     build_fixture(&whole, rows, cols);
     build_fixture(&banded, rows, cols);
+    if (rank4) {
+        make_rank4(&whole, rank4->h, rank4->w, rank4->c, rank4->spatial_first);
+        make_rank4(&banded, rank4->h, rank4->w, rank4->c, rank4->spatial_first);
+        /* The spatial pair is the row axis going to linear order and the
+         * column axis coming back. */
+        rows = rank4->spatial_first ? rank4->h * rank4->w : rank4->c;
+        cols = rank4->spatial_first ? rank4->c : rank4->h * rank4->w;
+    }
 
     float input[TEST_ELEMENTS];
     for (int i = 0; i < TEST_ELEMENTS; i++)
@@ -231,93 +252,6 @@ static void check_band_invariance(int32_t rows, int32_t cols, const char *what)
         }
     }
     TEST_ASSERT_EQ(mismatches, 0, "banded conversion matches the permutation");
-}
-
-/**
- * Re-shape a rank-3 fixture as the rank-4 conversion that carries the same
- * matrix. `spatial_first` selects [N, H, W, C] -> [N, C, H, W] (perm 0,3,1,2),
- * the direction that goes to linear order; otherwise the way back.
- */
-static void make_rank4(transpose_fixture_t *fx, int32_t h, int32_t w,
-                       int32_t c, int spatial_first)
-{
-    fx->tensors[0].ndim = 4;
-    fx->tensors[1].ndim = 4;
-    fx->tensors[0].shape_off = 0;
-    fx->tensors[1].shape_off = 4;
-    fx->attribute.data_len = 4;
-
-    if (spatial_first) {
-        fx->shapes[0] = TEST_N; fx->shapes[1] = h;
-        fx->shapes[2] = w;      fx->shapes[3] = c;
-        fx->shapes[4] = TEST_N; fx->shapes[5] = c;
-        fx->shapes[6] = h;      fx->shapes[7] = w;
-        fx->perm[0] = 0; fx->perm[1] = 3; fx->perm[2] = 1; fx->perm[3] = 2;
-    } else {
-        fx->shapes[0] = TEST_N; fx->shapes[1] = c;
-        fx->shapes[2] = h;      fx->shapes[3] = w;
-        fx->shapes[4] = TEST_N; fx->shapes[5] = h;
-        fx->shapes[6] = w;      fx->shapes[7] = c;
-        fx->perm[0] = 0; fx->perm[1] = 2; fx->perm[2] = 3; fx->perm[3] = 1;
-    }
-}
-
-/**
- * A rank-4 conversion leaves the two spatial axes in their relative order, so
- * it carries the same matrix as a rank-3 one with H*W read as a single
- * extent. Both directions must band identically to the single pass.
- */
-static void check_rank4(int32_t h, int32_t w, int32_t c, int spatial_first,
-                        const char *what)
-{
-    printf("  check_rank4 %s...\n", what);
-
-    transpose_fixture_t whole;
-    transpose_fixture_t banded;
-    build_fixture(&whole, TEST_SHORT, TEST_LONG);
-    build_fixture(&banded, TEST_SHORT, TEST_LONG);
-    make_rank4(&whole, h, w, c, spatial_first);
-    make_rank4(&banded, h, w, c, spatial_first);
-
-    float input[TEST_ELEMENTS];
-    for (int i = 0; i < TEST_ELEMENTS; i++)
-        input[i] = (float)i * 0.25f - 48.0f;
-
-    float whole_out[TEST_ELEMENTS];
-    float banded_out[TEST_ELEMENTS];
-    uint16_t whole_tiled = 0;
-    uint16_t banded_tiled = 0;
-
-    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t big[WHOLE_FAST_SIZE];
-    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t small[1024];
-
-    TEST_ASSERT_EQ(
-        run_case(&whole, big, sizeof(big), input, whole_out, &whole_tiled),
-        TIGRIS_EXEC_OK, "rank-4 whole-tensor conversion");
-    TEST_ASSERT_EQ(whole_tiled, 0, "rank-4 whole-tensor run is not tiled");
-
-    TEST_ASSERT_EQ(
-        run_case(&banded, small, sizeof(small), input, banded_out,
-                 &banded_tiled),
-        TIGRIS_EXEC_OK, "rank-4 banded conversion");
-    TEST_ASSERT_EQ(banded_tiled, 1, "rank-4 banded run is tiled");
-
-    TEST_ASSERT(memcmp(whole_out, banded_out, sizeof(whole_out)) == 0,
-                "rank-4 banded conversion is byte-identical");
-
-    /* Against the definition: the collapsed matrix is rows x cols, where the
-     * spatial pair is the row axis going to linear order and the column axis
-     * coming back. */
-    int32_t rows = spatial_first ? h * w : c;
-    int32_t cols = spatial_first ? c : h * w;
-    int mismatches = 0;
-    for (int32_t r = 0; r < rows; r++) {
-        for (int32_t k = 0; k < cols; k++) {
-            if (banded_out[k * rows + r] != input[r * cols + k])
-                mismatches++;
-        }
-    }
-    TEST_ASSERT_EQ(mismatches, 0, "rank-4 conversion matches the permutation");
 }
 
 
@@ -402,11 +336,16 @@ static void check_fixed_axis_permutation(void)
 int main(void)
 {
     printf("Layout conversion tiling tests:\n");
-    check_band_invariance(TEST_SHORT, TEST_LONG, "gathering input columns");
-    check_band_invariance(TEST_LONG, TEST_SHORT, "scattering output columns");
+    static const rank4_layout_t to_linear = {4, 4, 24, 1};
+    static const rank4_layout_t to_spatial = {4, 4, 24, 0};
+
+    check_band_invariance(TEST_SHORT, TEST_LONG, NULL, "gathering input columns");
+    check_band_invariance(TEST_LONG, TEST_SHORT, NULL, "scattering output columns");
     check_band_orientation(TEST_SHORT, TEST_LONG);
-    check_rank4(4, 4, 24, 1, "rank 4 to linear order");
-    check_rank4(4, 4, 24, 0, "rank 4 back to spatial order");
+    check_band_invariance(TEST_SHORT, TEST_LONG, &to_linear,
+                          "rank 4 to linear order");
+    check_band_invariance(TEST_SHORT, TEST_LONG, &to_spatial,
+                          "rank 4 back to spatial order");
     check_fixed_axis_permutation();
 
 #ifdef TIGRIS_TRACE
@@ -414,7 +353,5 @@ int main(void)
                    1, "transpose path checked against trace");
 #endif
 
-    printf("\nResults: %d passed, %d failed, %d total\n",
-           tests_passed, tests_failed, tests_run);
-    return tests_failed == 0 ? 0 : 1;
+    return test_report();
 }

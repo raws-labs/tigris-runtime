@@ -10,6 +10,7 @@
 #include "tigris.h"
 #include "tigris_executor.h"
 #include "tigris_mem.h"
+#include "test_harness.h"
 
 #define TEST_ALIGN_UP(x) \
     (((uint32_t)(x) + (TIGRIS_TENSOR_ALIGN - 1u)) & \
@@ -20,32 +21,6 @@
 #define STANDALONE_BLOCK_SIZE 17u
 #define TEST_FAST_STORAGE_SIZE 1024u
 #define TEST_SLOW_SIZE 1024u
-
-static int tests_run;
-static int tests_passed;
-static int tests_failed;
-
-#define TEST_ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s\n", \
-                __func__, __LINE__, msg); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-#define TEST_ASSERT_EQ(a, b, msg) do { \
-    tests_run++; \
-    if ((a) != (b)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
-                __func__, __LINE__, msg, (long)(a), (long)(b)); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
 
 typedef struct {
     tigris_file_header_t header;
@@ -473,7 +448,5 @@ int main(void)
                    1, "normal path checked against trace");
 #endif
 
-    printf("\nResults: %d passed, %d failed, %d total\n",
-           tests_passed, tests_failed, tests_run);
-    return tests_failed ? 1 : 0;
+    return test_report();
 }

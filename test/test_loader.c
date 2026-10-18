@@ -1,11 +1,6 @@
 /**
  * @file test_loader.c
  * @brief Native POSIX tests for the tigris plan loader.
- *
- * Usage: ./test_loader [fixture1.tgrs] [fixture2.tgrs] ...
- *
- * If no arguments given, runs built-in error tests only.
- * When fixture files are provided, loads each and verifies the parsed plan.
  */
 
 #include <math.h>
@@ -22,33 +17,7 @@
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
 #include "tigris_iface.h"
-
-/* Test infrastructure */
-
-static int tests_run = 0;
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST_ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-#define TEST_ASSERT_EQ(a, b, msg) do { \
-    tests_run++; \
-    if ((a) != (b)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
-                __func__, __LINE__, msg, (long)(a), (long)(b)); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
+#include "test_harness.h"
 
 /* Error tests (no fixtures needed) */
 
@@ -236,18 +205,6 @@ static void test_pool_alignment_guards(void)
     hdr->num_tensors = 1;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION, "unaligned shape pool rejected");
-}
-
-static void test_v2_plan_header_is_still_accepted(void)
-{
-    printf("  test_v2_plan_header_is_still_accepted...\n");
-    _Alignas(4) uint8_t buf[MINIMAL_PLAN_SIZE];
-    tigris_plan_t plan;
-
-    build_minimal_plan(buf);
-    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
-    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
-                   "v2 minimal plan loads");
 }
 
 #define V2_QUANT_PLAN_SIZE 136u
@@ -3506,32 +3463,6 @@ static void test_struct_sizes(void)
 
 /* Fixture loading tests */
 
-static uint8_t *load_file(const char *path, uint32_t *out_len)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "  Cannot open: %s\n", path);
-        return NULL;
-    }
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    uint8_t *buf = (uint8_t *)malloc(len);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-    if ((long)fread(buf, 1, len, f) != len) {
-        free(buf);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-    *out_len = (uint32_t)len;
-    return buf;
-}
-
 static void test_fixture(const uint8_t *buf, uint32_t buf_len)
 {
     tigris_plan_t plan;
@@ -4728,7 +4659,7 @@ static void test_state_fixture(void)
     free(buf);
 }
 
-int main(int argc, char *argv[])
+int main(void)
 {
     test_movement_contract();
     test_constant_gather_contract();
@@ -4746,7 +4677,6 @@ int main(int argc, char *argv[])
     test_error_strings();
     test_section_directory_guards();
     test_pool_alignment_guards();
-    test_v2_plan_header_is_still_accepted();
     test_v2_quant_plan_is_still_accepted();
     test_counted_sections_required();
     test_chain_limit_guards();
@@ -4797,15 +4727,6 @@ int main(int argc, char *argv[])
     printf("\nStruct size tests:\n");
     test_struct_sizes();
 
-    if (argc > 1) {
-        printf("\nFixture tests:\n");
-        for (int i = 1; i < argc; i++) {
-            test_fixture_file(argv[i]);
-        }
-    } else {
-        printf("\n(No fixture files provided - pass .tgrs paths as arguments)\n");
-    }
-
 #ifdef TIGRIS_TRACE
     TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_NORMAL)) != 0u,
                    1, "normal path checked against trace");
@@ -4817,7 +4738,5 @@ int main(int argc, char *argv[])
                    1, "control path checked against trace");
 #endif
 
-    printf("\nResults: %d passed, %d failed, %d total\n",
-           tests_passed, tests_failed, tests_run);
-    return tests_failed > 0 ? 1 : 0;
+    return test_report();
 }

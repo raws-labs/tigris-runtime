@@ -11,32 +11,7 @@
 #include "tigris_accel_policy.h"
 #include "tigris_kernels_s8.h"
 #include "tigris_mem.h"
-
-static int tests_run;
-static int tests_passed;
-static int tests_failed;
-
-#define TEST_ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s\n", \
-                __func__, __LINE__, msg); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-#define TEST_ASSERT_EQ(a, b, msg) do { \
-    tests_run++; \
-    if ((a) != (b)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
-                __func__, __LINE__, msg, (long)(a), (long)(b)); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
+#include "test_harness.h"
 
 typedef struct {
     tigris_file_header_t header;
@@ -230,53 +205,39 @@ static void assert_array_eq(const int8_t *actual, const int8_t *expected,
     }
 }
 
-static void test_esp_dilated_conv_routes_reference(void)
+static void test_esp_dilated_ops_route_reference(void)
 {
-    printf("  test_esp_dilated_conv_routes_reference...\n");
-    route_fixture_t fx;
-    int8_t direct[5] = {0};
-    int8_t routed[5] = {0};
-    int handled = 0;
-    build_fixture(&fx, TIGRIS_OP_CONV, 0);
+    static const struct {
+        const char *name;
+        tigris_op_type_t op_type;
+        int horizontal;
+    } cases[] = {
+        { "Conv", TIGRIS_OP_CONV, 0 },
+        { "Depthwise", TIGRIS_OP_DEPTHWISE, 1 },
+    };
 
-    TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
-                   TIGRIS_ACCEL_ROUTE_S8_REF,
-                   "ESP-NN dilated Conv pre-routes to s8_ref");
-    TEST_ASSERT_EQ(run_reference(&fx, direct, 0), 0,
-                   "direct Conv reference succeeds");
-    TEST_ASSERT_EQ(run_pre_route(&fx, TIGRIS_ACCEL_ESP_NN,
-                                 routed, 0, &handled), 0,
-                   "ESP-NN Conv fallback succeeds");
-    TEST_ASSERT_EQ(handled, 1, "ESP-NN Conv adapter is bypassed");
-    assert_array_eq(routed, direct, "ESP-NN Conv fallback matches s8_ref");
-    assert_array_eq(routed, expected_dilated,
-                    "ESP-NN Conv fallback matches dilated result");
-}
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        printf("  test_esp_dilated_ops_route_reference %s...\n", cases[c].name);
+        route_fixture_t fx;
+        int8_t direct[5] = {0};
+        int8_t routed[5] = {0};
+        int handled = 0;
+        build_fixture(&fx, cases[c].op_type, cases[c].horizontal);
 
-static void test_esp_dilated_depthwise_routes_reference(void)
-{
-    printf("  test_esp_dilated_depthwise_routes_reference...\n");
-    route_fixture_t fx;
-    int8_t direct[5] = {0};
-    int8_t routed[5] = {0};
-    int handled = 0;
-    build_fixture(&fx, TIGRIS_OP_DEPTHWISE, 1);
-
-    TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
-                   TIGRIS_ACCEL_ROUTE_S8_REF,
-                   "ESP-NN dilated Depthwise pre-routes to s8_ref");
-    TEST_ASSERT_EQ(run_reference(&fx, direct, 0), 0,
-                   "direct Depthwise reference succeeds");
-    TEST_ASSERT_EQ(run_pre_route(&fx, TIGRIS_ACCEL_ESP_NN,
-                                 routed, 0, &handled), 0,
-                   "ESP-NN Depthwise fallback succeeds");
-    TEST_ASSERT_EQ(handled, 1, "ESP-NN Depthwise adapter is bypassed");
-    assert_array_eq(routed, direct,
-                    "ESP-NN Depthwise fallback matches s8_ref");
-    assert_array_eq(routed, expected_dilated,
-                    "ESP-NN Depthwise fallback matches dilated result");
+        TEST_ASSERT_EQ(tigris_accel_pre_route(
+                           TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_ROUTE_S8_REF,
+                       "ESP-NN dilated op pre-routes to s8_ref");
+        TEST_ASSERT_EQ(run_reference(&fx, direct, 0), 0,
+                       "direct reference succeeds");
+        TEST_ASSERT_EQ(run_pre_route(&fx, TIGRIS_ACCEL_ESP_NN,
+                                     routed, 0, &handled), 0,
+                       "ESP-NN fallback succeeds");
+        TEST_ASSERT_EQ(handled, 1, "ESP-NN adapter is bypassed");
+        assert_array_eq(routed, direct, "ESP-NN fallback matches s8_ref");
+        assert_array_eq(routed, expected_dilated,
+                        "ESP-NN fallback matches dilated result");
+    }
 }
 
 static void test_cmsis_dilation_and_tile_routes(void)
@@ -832,8 +793,7 @@ static void test_float_section_routes_reference(void)
 int main(void)
 {
     printf("TiGrIS Accelerator Routing Tests\n\n");
-    test_esp_dilated_conv_routes_reference();
-    test_esp_dilated_depthwise_routes_reference();
+    test_esp_dilated_ops_route_reference();
     test_cmsis_dilation_and_tile_routes();
     test_cmsis_plain_height_tile_routes_adapter();
     test_unit_dilation_keeps_esp_adapter();
@@ -846,7 +806,5 @@ int main(void)
     test_esp_asymmetric_pad_workspace_policy();
     test_row_band_matches_unsplit_op();
 
-    printf("\nResults: %d passed, %d failed, %d total\n",
-           tests_passed, tests_failed, tests_run);
-    return tests_failed ? 1 : 0;
+    return test_report();
 }

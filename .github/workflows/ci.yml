@@ -2,6 +2,9 @@ name: Runtime CI
 
 on:
   push:
+    branches: [develop]
+    # A release tag runs only the capability contract, which checks the tag version.
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -54,9 +57,19 @@ jobs:
         # Every contract case compiled by the matching compiler, executed by
         # this runtime and compared with ONNX Runtime.
         run: python tigris-compiler/scripts/crossrepo_contract.py --runtime .
+      - name: Stage this runtime's host library in the compiler
+        run: python tigris-compiler/scripts/runtime_bundle.py --source .
+      - name: Run the TFLite and host contract suites on this runtime
+        working-directory: tigris-compiler
+        env:
+          TIGRIS_REQUIRE_HOST: "1"
+        run: >-
+          python -m pytest -q
+          tests/test_frontend_tflite.py tests/test_host_contract_cases.py
 
   native:
     name: Native ${{ matrix.compiler }}
+    if: github.ref_type != 'tag'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -93,6 +106,7 @@ jobs:
 
   sanitizers:
     name: ASan and UBSan
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -111,14 +125,23 @@ jobs:
 
   static-analysis:
     name: Static analysis and MISRA regression
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-24.04
+    env:
+      CPPCHECK_COMMIT: 904cfdcf774c44b17db789c8a212e2f1c69fc833
     steps:
       - uses: actions/checkout@v4
       - name: Mutation-test the static-analysis checker
         run: python3 scripts/check_static_analysis.py --self-test
+      - id: image
+        run: echo "name=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      - id: cppcheck
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cppcheck-build/bin
+          key: cppcheck-${{ env.CPPCHECK_COMMIT }}-${{ runner.arch }}-${{ steps.image.outputs.name }}
       - name: Fetch the exact reviewed Cppcheck source
-        env:
-          CPPCHECK_COMMIT: 904cfdcf774c44b17db789c8a212e2f1c69fc833
+        if: steps.cppcheck.outputs.cache-hit != 'true'
         run: |
           git init /tmp/cppcheck
           git -C /tmp/cppcheck remote add origin https://github.com/cppcheck-opensource/cppcheck.git
@@ -126,12 +149,14 @@ jobs:
           git -C /tmp/cppcheck checkout --detach FETCH_HEAD
           test "$(git -C /tmp/cppcheck rev-parse HEAD)" = "$CPPCHECK_COMMIT"
       - name: Build pinned Cppcheck 2.21.1
+        if: steps.cppcheck.outputs.cache-hit != 'true'
         run: >-
           cmake -S /tmp/cppcheck -B /tmp/cppcheck-build
           -DCMAKE_BUILD_TYPE=Release
           -DBUILD_GUI=OFF
           -DBUILD_TESTING=OFF
-      - run: >-
+      - if: steps.cppcheck.outputs.cache-hit != 'true'
+        run: >-
           cmake --build /tmp/cppcheck-build
           --target cppcheck --parallel 2
       - name: Enforce correctness and reviewed MISRA findings
@@ -141,6 +166,7 @@ jobs:
 
   coverage:
     name: Deterministic runtime coverage
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -162,6 +188,7 @@ jobs:
 
   loader-fuzz-smoke:
     name: Loader fuzz smoke
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -187,6 +214,7 @@ jobs:
 
   cortex-m:
     name: Cortex-M cross-build
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -205,6 +233,7 @@ jobs:
 
   stack-usage:
     name: Stack usage budget
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

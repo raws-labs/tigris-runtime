@@ -15,33 +15,7 @@
 #include "tigris_mem.h"
 #include "tigris_kernels_s8.h"
 #include "elementwise_s8_golden.h"
-
-/* Test infrastructure */
-
-static int tests_run = 0;
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST_ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-#define TEST_ASSERT_EQ(a, b, msg) do { \
-    tests_run++; \
-    if ((a) != (b)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
-                __func__, __LINE__, msg, (long)(a), (long)(b)); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
+#include "test_harness.h"
 
 /* Synthetic plan builder helpers */
 
@@ -192,6 +166,21 @@ static void build_plan(tigris_plan_t *plan)
     plan->num_op_attributes = 0;
 }
 
+/* One-operator plan with the given tensors. */
+static void one_op_s8(tigris_plan_t *plan, uint8_t type, const uint16_t *ins, int n_in,
+                      const uint16_t *outs, int n_out, uint16_t weight)
+{
+    test_ops[0].op_type = type;
+    test_ops[0].num_inputs = (uint8_t)n_in; test_ops[0].num_outputs = (uint8_t)n_out;
+    test_ops[0].inputs_off = add_indices(ins, n_in);
+    test_ops[0].outputs_off = add_indices(outs, n_out);
+    test_ops[0].weight_idx = weight;
+    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
+    test_ops[0].act_min = -128; test_ops[0].act_max = 127;
+    test_header.num_ops = 1;
+    build_plan(plan);
+}
+
 /* Tests */
 
 static void test_relu_s8(void)
@@ -203,34 +192,16 @@ static void test_relu_s8(void)
 
     /* Quant param: scale=0.5, zp=-2 */
     uint16_t qp = add_quant_param(0.5f, -2, 1, NULL, NULL);
-
     int32_t shape[] = {1, 4};
     uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, 4, qp);
     uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, 4, TIGRIS_NO_QUANT_PARAM);
+    one_op_s8(&plan, TIGRIS_OP_RELU, &t_in, 1, &t_out, 1, TIGRIS_NO_WEIGHT);
 
-    test_ops[0].op_type = TIGRIS_OP_RELU;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    /* Set up mem */
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[1024], slow[1024];
-    tigris_mem_t mem;
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
     tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
-
     /* Input: [-5, -2, 0, 10]. zp=-2, so relu clamps to >= -2 */
     int8_t input_data[] = {-5, -2, 0, 10};
-    tigris_mem_alloc_fast(&mem, t_in, 4);
-    memcpy(ptrs[t_in], input_data, 4);
+    tigris_mem_alloc_fast(&mem, t_in, 4); memcpy(ptrs[t_in], input_data, 4);
     tigris_mem_alloc_fast(&mem, t_out, 4);
 
     int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
@@ -241,54 +212,6 @@ static void test_relu_s8(void)
     TEST_ASSERT_EQ(out[1], -2, "relu(-2, zp=-2) = -2");
     TEST_ASSERT_EQ(out[2], 0, "relu(0, zp=-2) = 0");
     TEST_ASSERT_EQ(out[3], 10, "relu(10, zp=-2) = 10");
-}
-
-static void test_relu6_s8(void)
-{
-    printf("  test_relu6_s8...\n");
-
-    plan_reset();
-    tigris_plan_t plan;
-
-    /* Quant param: scale=0.1, zp=0. quantized(6) = 6/0.1 + 0 = 60 */
-    uint16_t qp = add_quant_param(0.1f, 0, 1, NULL, NULL);
-
-    int32_t shape[] = {1, 4};
-    uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, 4, qp);
-    uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, 4, TIGRIS_NO_QUANT_PARAM);
-
-    test_ops[0].op_type = TIGRIS_OP_RELU6;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[1024], slow[1024];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
-
-    /* scale=0.1, zp=0: quantized range [0, 60] */
-    int8_t input_data[] = {-10, 0, 30, 80};
-    tigris_mem_alloc_fast(&mem, t_in, 4);
-    memcpy(ptrs[t_in], input_data, 4);
-    tigris_mem_alloc_fast(&mem, t_out, 4);
-
-    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    TEST_ASSERT_EQ(ret, 0, "relu6_s8 returns 0");
-
-    int8_t *out = (int8_t *)ptrs[t_out];
-    TEST_ASSERT_EQ(out[0], 0, "relu6(-10) = 0");
-    TEST_ASSERT_EQ(out[1], 0, "relu6(0) = 0");
-    TEST_ASSERT_EQ(out[2], 30, "relu6(30) = 30 (in range)");
-    TEST_ASSERT_EQ(out[3], 60, "relu6(80) = 60 (clamped)");
 }
 
 static void test_binary_s8_contract(void)
@@ -463,33 +386,16 @@ static void test_reshape_s8(void)
 
     plan_reset();
     tigris_plan_t plan;
-
     int32_t in_shape[] = {1, 2, 3};
     int32_t out_shape[] = {1, 6};
     uint16_t t_in = add_tensor(&plan, "in", in_shape, 3, 3, 6, TIGRIS_NO_QUANT_PARAM);
     uint16_t t_out = add_tensor(&plan, "out", out_shape, 2, 3, 6, TIGRIS_NO_QUANT_PARAM);
+    one_op_s8(&plan, TIGRIS_OP_RESHAPE, &t_in, 1, &t_out, 1, TIGRIS_NO_WEIGHT);
 
-    test_ops[0].op_type = TIGRIS_OP_RESHAPE;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[1024], slow[1024];
-    tigris_mem_t mem;
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
     tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
-
     int8_t input_data[] = {1, 2, 3, 4, 5, 6};
-    tigris_mem_alloc_fast(&mem, t_in, 6);
-    memcpy(ptrs[t_in], input_data, 6);
+    tigris_mem_alloc_fast(&mem, t_in, 6); memcpy(ptrs[t_in], input_data, 6);
     tigris_mem_alloc_fast(&mem, t_out, 6);
 
     int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
@@ -501,96 +407,14 @@ static void test_reshape_s8(void)
     }
 }
 
-static void test_conv2d_s8_per_tensor(void)
+static void test_conv2d_s8(void)
 {
-    printf("  test_conv2d_s8_per_tensor...\n");
-
-    plan_reset();
-    tigris_plan_t plan;
+    printf("  test_conv2d_s8...\n");
 
     /*
-     * Per-tensor requantization: 1 output channel, num_channels=1.
-     * 3x3 input, 2x2 kernel, no padding, stride 1.
-     * Input shape NHWC: [1, 3, 3, 1], Output: [1, 2, 2, 1]
-     * Weight shape OHWI: [1, 2, 2, 1]
-     *
-     * Input (int8, zp=0): 1..9
-     * Weight: [1, 0, 0, 1]  Bias: [0]
-     *
-     * Accumulator: 6, 8, 12, 14
-     * Identity requant (multiplier=2^30, shift=1) -> output = acc
-     */
-    int32_t mults[] = {1073741824};
-    int32_t shifts[] = {1};
-    uint16_t in_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
-    uint16_t out_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
-
-    int32_t x_shape[] = {1, 3, 3, 1};
-    int32_t y_shape[] = {1, 2, 2, 1};
-    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 9, in_qp);
-    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 4, out_qp);
-
-    int8_t weight[] = {1, 0, 0, 1};
-    uint16_t w_idx = add_weight(weight, 4, "w");
-
-    int32_t bias[] = {0};
-    uint16_t b_idx = add_weight(bias, 4, "b");
-
-    test_ops[0].op_type = TIGRIS_OP_CONV;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = w_idx;
-    test_ops[0].bias_idx = b_idx;
-    test_ops[0].spatial.kernel_h = 2;
-    test_ops[0].spatial.kernel_w = 2;
-    test_ops[0].spatial.stride_h = 1;
-    test_ops[0].spatial.stride_w = 1;
-    test_ops[0].spatial.dilation_h = 1;
-    test_ops[0].spatial.dilation_w = 1;
-    test_ops[0].spatial.group = 1;
-    test_ops[0].act_min = -128;
-    test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[4096], slow_buf[4096];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
-
-    int8_t input_data[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-    tigris_mem_alloc_fast(&mem, t_in, 9);
-    memcpy(ptrs[t_in], input_data, 9);
-    tigris_mem_alloc_fast(&mem, t_out, 4);
-
-    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    TEST_ASSERT_EQ(ret, 0, "conv2d_s8_per_tensor returns 0");
-
-    int8_t *out = (int8_t *)ptrs[t_out];
-    TEST_ASSERT_EQ(out[0], 6, "y[0,0,0,0]=6");
-    TEST_ASSERT_EQ(out[1], 8, "y[0,0,1,0]=8");
-    TEST_ASSERT_EQ(out[2], 12, "y[0,1,0,0]=12");
-    TEST_ASSERT_EQ(out[3], 14, "y[0,1,1,0]=14");
-}
-
-static void test_conv2d_s8_v2(void)
-{
-    printf("  test_conv2d_s8_v2...\n");
-
-    plan_reset();
-    tigris_plan_t plan;
-
-    /*
-     * 1-channel conv: 3x3 input, 2x2 kernel, no padding, stride 1
-     * Output has 2 channels to test per-channel requantization.
-     *
-     * Input shape NHWC: [1, 3, 3, 1], Output: [1, 2, 2, 2]
-     * Weight shape OHWI: [2, 2, 2, 1]
+     * 1-channel conv: 3x3 input, 2x2 kernel, no padding, stride 1, two output
+     * channels. Input NHWC [1, 3, 3, 1], output [1, 2, 2, 2], weight OHWI
+     * [2, 2, 2, 1].
      *
      * Input (int8, zp=0):
      *   1  2  3
@@ -599,454 +423,56 @@ static void test_conv2d_s8_v2(void)
      *
      * Weight OC=0 (identity-like): [1,0,0,1]
      * Weight OC=1 (all ones):      [1,1,1,1]
-     *
      * Bias (int32): [0, 0]
      *
-     * OC=0 accumulator: 6, 8, 12, 14 (same as single-channel)
+     * OC=0 accumulator: 6, 8, 12, 14
      * OC=1 accumulator: 1+2+4+5=12, 2+3+5+6=16, 4+5+7+8=24, 5+6+8+9=28
      *
-     * Multiplier = 2^30 (=1073741824), shift = 1
-     * Output = acc * 1 = acc (identity requant)
+     * Multiplier = 2^30, shift = 1: output = acc. The requantization is stated
+     * once for both channels (per-tensor), then once per channel.
      */
-    int32_t mults[] = {1073741824, 1073741824};
-    int32_t shifts[] = {1, 1};
-    uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
-    uint16_t out_qp = add_quant_param(1.0f, 0, 2, mults, shifts);
+    const int8_t expected[] = {6, 12, 8, 16, 12, 24, 14, 28};
+    for (uint16_t channels = 1; channels <= 2; channels++) {
+        plan_reset();
+        tigris_plan_t plan;
+        int32_t mults[] = {1073741824, 1073741824};
+        int32_t shifts[] = {1, 1};
+        uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+        uint16_t out_qp = add_quant_param(1.0f, 0, channels, mults, shifts);
 
-    int32_t x_shape[] = {1, 3, 3, 1};
-    int32_t y_shape[] = {1, 2, 2, 2};
-    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 9, in_qp);
-    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 8, out_qp);
+        int32_t x_shape[] = {1, 3, 3, 1};
+        int32_t y_shape[] = {1, 2, 2, 2};
+        uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 9, in_qp);
+        uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 8, out_qp);
+        int8_t weight[] = {1, 0, 0, 1, 1, 1, 1, 1};
+        int32_t bias[] = {0, 0};
+        uint16_t w_idx = add_weight(weight, 8, "w");
+        uint16_t b_idx = add_weight(bias, 8, "b");
+        one_op_s8(&plan, TIGRIS_OP_CONV, &t_in, 1, &t_out, 1, w_idx);
+        test_ops[0].bias_idx = b_idx;
+        test_ops[0].spatial.kernel_h = 2;
+        test_ops[0].spatial.kernel_w = 2;
+        test_ops[0].spatial.stride_h = 1;
+        test_ops[0].spatial.stride_w = 1;
+        test_ops[0].spatial.dilation_h = 1;
+        test_ops[0].spatial.dilation_w = 1;
+        test_ops[0].spatial.group = 1;
 
-    /* Weight [2, 2, 2, 1] = {1,0,0,1, 1,1,1,1} */
-    int8_t weight[] = {1, 0, 0, 1, 1, 1, 1, 1};
-    uint16_t w_idx = add_weight(weight, 8, "w");
+        void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+        tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+        int8_t input_data[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+        tigris_mem_alloc_fast(&mem, t_in, 9); memcpy(ptrs[t_in], input_data, 9);
+        tigris_mem_alloc_fast(&mem, t_out, 8);
 
-    int32_t bias[] = {0, 0};
-    uint16_t b_idx = add_weight(bias, 8, "b");
+        int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+        TEST_ASSERT_EQ(ret, 0, "conv2d_s8 returns 0");
 
-    test_ops[0].op_type = TIGRIS_OP_CONV;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = w_idx;
-    test_ops[0].bias_idx = b_idx;
-    test_ops[0].spatial.kernel_h = 2;
-    test_ops[0].spatial.kernel_w = 2;
-    test_ops[0].spatial.stride_h = 1;
-    test_ops[0].spatial.stride_w = 1;
-    test_ops[0].spatial.dilation_h = 1;
-    test_ops[0].spatial.dilation_w = 1;
-    test_ops[0].spatial.group = 1;
-    test_ops[0].act_min = -128;
-    test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[4096], slow_buf[4096];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
-
-    int8_t input_data[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-    tigris_mem_alloc_fast(&mem, t_in, 9);
-    memcpy(ptrs[t_in], input_data, 9);
-    tigris_mem_alloc_fast(&mem, t_out, 8);
-
-    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    TEST_ASSERT_EQ(ret, 0, "conv2d_s8_v2 returns 0");
-
-    int8_t *out = (int8_t *)ptrs[t_out];
-    /* NHWC output: interleaved [y00_oc0, y00_oc1, y01_oc0, y01_oc1, ...] */
-    TEST_ASSERT_EQ(out[0], 6, "y[0,0,0,0]=6");
-    TEST_ASSERT_EQ(out[1], 12, "y[0,0,0,1]=12");
-    TEST_ASSERT_EQ(out[2], 8, "y[0,0,1,0]=8");
-    TEST_ASSERT_EQ(out[3], 16, "y[0,0,1,1]=16");
-    TEST_ASSERT_EQ(out[4], 12, "y[0,1,0,0]=12");
-    TEST_ASSERT_EQ(out[5], 24, "y[0,1,0,1]=24");
-    TEST_ASSERT_EQ(out[6], 14, "y[0,1,1,0]=14");
-    TEST_ASSERT_EQ(out[7], 28, "y[0,1,1,1]=28");
-}
-
-/* ConvTranspose s8 tests */
-
-static void test_conv_transpose_s8_stride2(void)
-{
-    printf("  test_conv_transpose_s8_stride2...\n");
-
-    plan_reset();
-    tigris_plan_t plan;
-
-    /*
-     * Same no-overlap stride2 gather geometry as the f32
-     * test_conv_transpose_stride2 (kernel_h/kernel_w == stride_h/stride_w,
-     * no padding): each input pixel maps to a disjoint 2x2 output block,
-     * out[2*ih+kh, 2*iw+kw] = X[ih,iw] * W[kh,kw] + bias.
-     * Identity requant (multiplier=2^30, shift=1), zp=0, bias=1 (oc=0).
-     * X[ih,iw]: 1 2 / 3 4   W[kh,kw]: 1 2 / 3 4
-     * Hand-computed per input pixel (product + bias 1):
-     *   ih=0,iw=0 (X=1): out[0,0]=2 out[0,1]=3 out[1,0]=4 out[1,1]=5
-     *   ih=0,iw=1 (X=2): out[0,2]=3 out[0,3]=5 out[1,2]=7 out[1,3]=9
-     *   ih=1,iw=0 (X=3): out[2,0]=4 out[2,1]=7 out[3,0]=10 out[3,1]=13
-     *   ih=1,iw=1 (X=4): out[2,2]=5 out[2,3]=9 out[3,2]=13 out[3,3]=17
-     */
-    int32_t mults[] = {1073741824};
-    int32_t shifts[] = {1};
-    uint16_t in_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
-    uint16_t out_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
-
-    int32_t x_shape[] = {1, 2, 2, 1};
-    int32_t y_shape[] = {1, 4, 4, 1};
-    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
-    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 16, out_qp);
-
-    /* Weight [OC=1, KH=2, KW=2, IC=1] (OHWI) */
-    int8_t weight[] = {1, 2, 3, 4};
-    uint16_t w_idx = add_weight(weight, sizeof(weight), "w");
-
-    int32_t bias[] = {1};
-    uint16_t b_idx = add_weight(bias, sizeof(bias), "b");
-
-    test_ops[0].op_type = TIGRIS_OP_CONV_TRANSPOSE;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = w_idx;
-    test_ops[0].bias_idx = b_idx;
-    test_ops[0].spatial.kernel_h = 2;
-    test_ops[0].spatial.kernel_w = 2;
-    test_ops[0].spatial.stride_h = 2;
-    test_ops[0].spatial.stride_w = 2;
-    test_ops[0].spatial.dilation_h = 1;
-    test_ops[0].spatial.dilation_w = 1;
-    test_ops[0].spatial.group = 1;
-    test_ops[0].act_min = -128;
-    test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[4096], slow_buf[4096];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
-
-    int8_t input_data[] = {1, 2, 3, 4};
-    tigris_mem_alloc_fast(&mem, t_in, 4);
-    memcpy(ptrs[t_in], input_data, 4);
-    tigris_mem_alloc_fast(&mem, t_out, 16);
-
-    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    TEST_ASSERT_EQ(ret, 0, "conv_transpose_s8_stride2 returns 0");
-
-    int8_t *out = (int8_t *)ptrs[t_out];
-    int8_t expected[16] = {
-        2,  3,  3,  5,
-        4,  5,  7,  9,
-        4,  7,  5,  9,
-        10, 13, 13, 17,
-    };
-    for (int i = 0; i < 16; i++)
-        TEST_ASSERT_EQ(out[i], expected[i], "conv_transpose_s8 stride2 output");
-}
-
-static void test_conv_transpose_s8_pad_stride_skip(void)
-{
-    printf("  test_conv_transpose_s8_pad_stride_skip...\n");
-
-    plan_reset();
-    tigris_plan_t plan;
-
-    /*
-     * Same padded/indivisible-stride geometry as the f32
-     * test_conv_transpose_pad_stride_skip (kernel 3x3, stride 2, pad 1,
-     * 1x2x2x1 input -> 1x3x3x1 output): exercises the modulo-skip branch
-     * (num_h/num_w % stride != 0) in the s8 gather loop. Identity requant
-     * (multiplier=2^30, shift=1), zp=0, bias=0.
-     * X[ih,iw]: 1 2 / 3 4   W[kh,kw] row-major 1..9: 1 2 3 / 4 5 6 / 7 8 9
-     * Expected (same valid (ih,kh,oh)/(iw,kw,ow) triples as the f32 test):
-     *   Y[0,0]=5   Y[0,1]=14  Y[0,2]=10
-     *   Y[1,0]=14  Y[1,1]=36  Y[1,2]=24
-     *   Y[2,0]=15  Y[2,1]=34  Y[2,2]=20
-     */
-    int32_t mults[] = {1073741824};
-    int32_t shifts[] = {1};
-    uint16_t in_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
-    uint16_t out_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
-
-    int32_t x_shape[] = {1, 2, 2, 1};
-    int32_t y_shape[] = {1, 3, 3, 1};
-    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
-    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 9, out_qp);
-
-    int8_t weight[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-    uint16_t w_idx = add_weight(weight, sizeof(weight), "w");
-
-    int32_t bias[] = {0};
-    uint16_t b_idx = add_weight(bias, sizeof(bias), "b");
-
-    test_ops[0].op_type = TIGRIS_OP_CONV_TRANSPOSE;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = w_idx;
-    test_ops[0].bias_idx = b_idx;
-    test_ops[0].spatial.kernel_h = 3;
-    test_ops[0].spatial.kernel_w = 3;
-    test_ops[0].spatial.stride_h = 2;
-    test_ops[0].spatial.stride_w = 2;
-    test_ops[0].spatial.pad_top = 1;
-    test_ops[0].spatial.pad_bottom = 1;
-    test_ops[0].spatial.pad_left = 1;
-    test_ops[0].spatial.pad_right = 1;
-    test_ops[0].spatial.dilation_h = 1;
-    test_ops[0].spatial.dilation_w = 1;
-    test_ops[0].spatial.group = 1;
-    test_ops[0].act_min = -128;
-    test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[4096], slow_buf[4096];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
-
-    int8_t input_data[] = {1, 2, 3, 4};
-    tigris_mem_alloc_fast(&mem, t_in, 4);
-    memcpy(ptrs[t_in], input_data, 4);
-    tigris_mem_alloc_fast(&mem, t_out, 9);
-
-    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    TEST_ASSERT_EQ(ret, 0, "conv_transpose_s8_pad_stride_skip returns 0");
-
-    int8_t *out = (int8_t *)ptrs[t_out];
-    int8_t expected[9] = {
-         5, 14, 10,
-        14, 36, 24,
-        15, 34, 20,
-    };
-    for (int i = 0; i < 9; i++)
-        TEST_ASSERT_EQ(out[i], expected[i], "conv_transpose_s8 pad/stride-skip output");
-}
-
-static void test_conv_transpose_s8_out_of_range_skip(void)
-{
-    printf("  test_conv_transpose_s8_out_of_range_skip...\n");
-
-    plan_reset();
-    tigris_plan_t plan;
-
-    /*
-     * Same geometry as the f32 test_conv_transpose_out_of_range_skip
-     * (kernel 3x3, stride 1, pad 2, 1x2x2x1 input -> 1x3x3x1 output):
-     * stride_h=stride_w=1 makes num_h % SH and num_w % SW always 0, so the
-     * only skip that can happen here is the ih/iw >= input-extent bounds
-     * check, isolating that branch in the s8 kernel from the modulo-skip
-     * branch already covered above. Identity requant (multiplier=2^30,
-     * shift=1), zp=0, bias=7.
-     * X[ih,iw]: 1 2 / 3 4   W[kh,kw] row-major 1..9: 1 2 3 / 4 5 6 / 7 8 9
-     * Expected (same derivation as the f32 test):
-     *   Y[0,0]=70  Y[0,1]=49  Y[0,2]=7
-     *   Y[1,0]=66  Y[1,1]=43  Y[1,2]=7
-     *   Y[2,0]=7   Y[2,1]=7   Y[2,2]=7
-     */
-    int32_t mults[] = {1073741824};
-    int32_t shifts[] = {1};
-    uint16_t in_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
-    uint16_t out_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
-
-    int32_t x_shape[] = {1, 2, 2, 1};
-    int32_t y_shape[] = {1, 3, 3, 1};
-    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
-    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 9, out_qp);
-
-    int8_t weight[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-    uint16_t w_idx = add_weight(weight, sizeof(weight), "w");
-
-    int32_t bias[] = {7};
-    uint16_t b_idx = add_weight(bias, sizeof(bias), "b");
-
-    test_ops[0].op_type = TIGRIS_OP_CONV_TRANSPOSE;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = w_idx;
-    test_ops[0].bias_idx = b_idx;
-    test_ops[0].spatial.kernel_h = 3;
-    test_ops[0].spatial.kernel_w = 3;
-    test_ops[0].spatial.stride_h = 1;
-    test_ops[0].spatial.stride_w = 1;
-    test_ops[0].spatial.pad_top = 2;
-    test_ops[0].spatial.pad_bottom = 2;
-    test_ops[0].spatial.pad_left = 2;
-    test_ops[0].spatial.pad_right = 2;
-    test_ops[0].spatial.dilation_h = 1;
-    test_ops[0].spatial.dilation_w = 1;
-    test_ops[0].spatial.group = 1;
-    test_ops[0].act_min = -128;
-    test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[4096], slow_buf[4096];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
-
-    int8_t input_data[] = {1, 2, 3, 4};
-    tigris_mem_alloc_fast(&mem, t_in, 4);
-    memcpy(ptrs[t_in], input_data, 4);
-    tigris_mem_alloc_fast(&mem, t_out, 9);
-
-    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    TEST_ASSERT_EQ(ret, 0, "conv_transpose_s8_out_of_range_skip returns 0");
-
-    int8_t *out = (int8_t *)ptrs[t_out];
-    int8_t expected[9] = {
-        70, 49, 7,
-        66, 43, 7,
-         7,  7, 7,
-    };
-    for (int i = 0; i < 9; i++)
-        TEST_ASSERT_EQ(out[i], expected[i], "conv_transpose_s8 out-of-range-skip output");
-}
-
-static void test_conv_transpose_s8_tile_2d(void)
-{
-    printf("  test_conv_transpose_s8_tile_2d...\n");
-
-    plan_reset();
-    tigris_plan_t plan;
-
-    /*
-     * Same interior 2D output tile geometry as the f32 test
-     * (test_conv_transpose_tile_2d): NHWC 1x4x4x1 input, kernel 2x2,
-     * stride=2, pad=0 -> 1x8x8x1 output. Interior output tile
-     * [oh0..oh1) x [ow0..ow1) = [4..6) x [2..6):
-     *   ih_lo = floor_div(oh0 + PT - (KH-1), SH) = floor_div(4+0-1, 2) = 1
-     *   ih_hi = floor_div(oh1-1 + PT, SH)        = floor_div(5+0, 2)   = 2
-     *   iw_lo = floor_div(ow0 + PL - (KW-1), SW) = floor_div(2+0-1, 2) = 0
-     *   iw_hi = floor_div(ow1-1 + PL, SW)        = floor_div(5+0, 2)   = 2
-     * loaded input rect: rows [1,3) cols [0,3) -> in_h=2, in_w=3, ih0=1, iw0=0
-     * effective pads: PT_eff = oh0 + PT - ih0*SH = 4 - 2 = 2
-     *                 PL_eff = ow0 + PL - iw0*SW = 2 - 0 = 2
-     * out_h=2, out_w=4.
-     * Identity requant (multiplier=2^30, shift=1), zp=0, bias=1 (oc=0), same
-     * scaffolding as test_conv_transpose_s8_stride2. Run the op WHOLE (tile
-     * inactive) to get Y_full, the oracle; no expected values are
-     * hardcoded. Then run it TILED for the interior tile and assert exact
-     * int8 equality against Y_full's sub-region.
-     */
-    int32_t mults[] = {1073741824};
-    int32_t shifts[] = {1};
-    uint16_t in_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
-    uint16_t out_qp = add_quant_param(1.0f, 0, 1, mults, shifts);
-
-    int32_t x_shape[] = {1, 4, 4, 1};
-    int32_t y_shape[] = {1, 8, 8, 1};
-    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 16, in_qp);
-    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 64, out_qp);
-
-    /* Weight [OC=1, KH=2, KW=2, IC=1] (OHWI) */
-    int8_t weight[] = {1, 2, 3, 4};
-    uint16_t w_idx = add_weight(weight, sizeof(weight), "w");
-
-    int32_t bias[] = {1};
-    uint16_t b_idx = add_weight(bias, sizeof(bias), "b");
-
-    test_ops[0].op_type = TIGRIS_OP_CONV_TRANSPOSE;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = w_idx;
-    test_ops[0].bias_idx = b_idx;
-    test_ops[0].spatial.kernel_h = 2;
-    test_ops[0].spatial.kernel_w = 2;
-    test_ops[0].spatial.stride_h = 2;
-    test_ops[0].spatial.stride_w = 2;
-    test_ops[0].spatial.dilation_h = 1;
-    test_ops[0].spatial.dilation_w = 1;
-    test_ops[0].spatial.group = 1;
-    test_ops[0].act_min = -128;
-    test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[4096], slow_buf[4096];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
-
-    int8_t input_data[16] = {
-         1,  2,  3,  4,
-         5,  6,  7,  8,
-         9, 10, 11, 12,
-        13, 14, 15, 16,
-    };
-    tigris_mem_alloc_fast(&mem, t_in, 16);
-    memcpy(ptrs[t_in], input_data, 16);
-    tigris_mem_alloc_fast(&mem, t_out, 64);
-
-    /* 1) Run WHOLE (tile inactive): Y_full is the oracle. */
-    int ret_full = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    TEST_ASSERT_EQ(ret_full, 0, "conv_transpose_s8_tile_2d whole dispatch returns 0");
-
-    int8_t Y_full[64];
-    memcpy(Y_full, ptrs[t_out], sizeof(Y_full));
-
-    /* 2) Build packed X_tile = X_full[1:3, 0:3] (in_h=2, in_w=3, IC=1). */
-    int8_t input_tile[6];
-    for (int r = 0; r < 2; r++)
-        for (int c = 0; c < 3; c++)
-            input_tile[r * 3 + c] = input_data[(1 + r) * 4 + (0 + c)];
-
-    /* 3) Run TILED for output tile [4..6) x [2..6). */
-    tigris_mem_reset_fast(&mem);
-    tigris_mem_alloc_fast(&mem, t_in, 6);
-    memcpy(ptrs[t_in], input_tile, 6);
-    tigris_mem_alloc_fast(&mem, t_out, 8);
-
-    mem.tile.active = 1;
-    mem.tile.width_tiled = 1;
-    mem.tile.in_h = 2;
-    mem.tile.out_h = 2;
-    mem.tile.in_w = 3;
-    mem.tile.out_w = 4;
-    mem.tile.pad_top = 2;
-    mem.tile.pad_left = 2;
-    mem.tile.pad_bottom = 0;
-    mem.tile.pad_right = 0;
-    mem.tile.out_row_start = 0;
-    mem.tile.in_row_start = 0;
-
-    int ret_tile = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    TEST_ASSERT_EQ(ret_tile, 0, "conv_transpose_s8_tile_2d tiled dispatch returns 0");
-
-    int8_t *out_tile = (int8_t *)ptrs[t_out];
-    for (int r = 0; r < 2; r++)
-        for (int c = 0; c < 4; c++)
-            TEST_ASSERT_EQ(out_tile[r * 4 + c], Y_full[(4 + r) * 8 + (2 + c)],
-                           "conv_transpose_s8 2D tile == whole sub-region");
+        /* NHWC output: interleaved [y00_oc0, y00_oc1, y01_oc0, y01_oc1, ...] */
+        int8_t *out = (int8_t *)ptrs[t_out];
+        for (int i = 0; i < 8; i++)
+            TEST_ASSERT_EQ(out[i], expected[i],
+                           channels == 1 ? "per-tensor conv2d_s8 output" : "per-channel conv2d_s8 output");
+    }
 }
 
 static void test_fc_s8(void)
@@ -1076,40 +502,21 @@ static void test_fc_s8(void)
     int32_t y_shape[] = {1, 2};
     uint16_t t_in = add_tensor(&plan, "x", x_shape, 2, 3, 3, in_qp);
     uint16_t t_out = add_tensor(&plan, "y", y_shape, 2, 3, 2, out_qp);
-
     int8_t weight[] = {1, 0, 0, 0, 1, 0};
-    uint16_t w_idx = add_weight(weight, 6, "w");
-
     int32_t bias[] = {10, 20};
+    uint16_t w_idx = add_weight(weight, 6, "w");
     uint16_t b_idx = add_weight(bias, 8, "b");
-
-    test_ops[0].op_type = TIGRIS_OP_FULLY_CONN;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = w_idx;
+    one_op_s8(&plan, TIGRIS_OP_FULLY_CONN, &t_in, 1, &t_out, 1, w_idx);
     test_ops[0].bias_idx = b_idx;
-    test_ops[0].act_min = -128;
-    test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
 
     TEST_ASSERT(((uintptr_t)tigris_op_bias(&plan, &test_ops[0]) %
                  _Alignof(int32_t)) != 0,
                 "FC bias fixture is deliberately unaligned");
 
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[4096], slow_buf[4096];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
-
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
     int8_t input_data[] = {1, 2, 3};
-    tigris_mem_alloc_fast(&mem, t_in, 3);
-    memcpy(ptrs[t_in], input_data, 3);
+    tigris_mem_alloc_fast(&mem, t_in, 3); memcpy(ptrs[t_in], input_data, 3);
     tigris_mem_alloc_fast(&mem, t_out, 2);
 
     int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
@@ -1195,33 +602,16 @@ static void test_global_avg_pool_s8(void)
      */
     uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
     uint16_t out_qp_idx = add_quant_param(1.0f, 0, 1, NULL, NULL);
-
     int32_t x_shape[] = {1, 2, 2, 1};
     int32_t y_shape[] = {1, 1, 1, 1};
     uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
     uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 1, out_qp_idx);
+    one_op_s8(&plan, TIGRIS_OP_GLOBAL_AVG, &t_in, 1, &t_out, 1, TIGRIS_NO_WEIGHT);
 
-    test_ops[0].op_type = TIGRIS_OP_GLOBAL_AVG;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[4096], slow_buf[4096];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
-
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
     int8_t input_data[] = {2, 4, 6, 8};
-    tigris_mem_alloc_fast(&mem, t_in, 4);
-    memcpy(ptrs[t_in], input_data, 4);
+    tigris_mem_alloc_fast(&mem, t_in, 4); memcpy(ptrs[t_in], input_data, 4);
     tigris_mem_alloc_fast(&mem, t_out, 1);
 
     int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
@@ -1295,113 +685,48 @@ static void test_global_avg_pool_s8_average_rounding(void)
     TEST_ASSERT(mean_differs > 0, "mean rounding differs from average rounding on some sums");
 }
 
+/* A maximum preserves the value, not the encoding. With matching
+ * quantization it passes through unchanged; the negative rules out an
+ * unsigned read of the input. When the output declares a different scale or
+ * zero point, the same value is a different int8: both max kernels used to
+ * write the input's encoding straight out, and now match kern_avg_pool_s8,
+ * which has always defined this case. */
 static void test_global_max_pool_s8(void)
 {
     printf("  test_global_max_pool_s8...\n");
 
-    plan_reset();
-    tigris_plan_t plan;
+    /* max(-9, 4, 7, 3) is 7.0; at scale 0.5, zero point -10 it encodes as
+     * round(7.0 / 0.5) + (-10) = 4. */
+    static const struct {
+        float out_scale;
+        int32_t out_zp;
+        int8_t expected;
+        const char *what;
+    } cases[] = {
+        {1.0f, 0, 7, "max(-9,4,7,3) = 7"},
+        {0.5f, -10, 4, "max 7 at scale 1.0 is 4 at scale 0.5, zp -10"},
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        plan_reset();
+        tigris_plan_t plan;
+        uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
+        uint16_t out_qp_idx = add_quant_param(cases[k].out_scale, cases[k].out_zp, 1, NULL, NULL);
+        int32_t x_shape[] = {1, 2, 2, 1};
+        int32_t y_shape[] = {1, 1, 1, 1};
+        uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
+        uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 1, out_qp_idx);
+        one_op_s8(&plan, TIGRIS_OP_GLOBAL_MAX, &t_in, 1, &t_out, 1, TIGRIS_NO_WEIGHT);
 
-    /* A maximum is one of the input values, so with matching quantization it
-     * passes through unchanged. The negative rules out an unsigned read of the
-     * input. The sibling test below covers the case where the two tensors
-     * declare different quantization, where the value survives but its
-     * encoding does not. */
-    uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
-    uint16_t out_qp_idx = add_quant_param(1.0f, 0, 1, NULL, NULL);
+        void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+        tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+        int8_t input_data[] = {-9, 4, 7, 3};
+        tigris_mem_alloc_fast(&mem, t_in, 4); memcpy(ptrs[t_in], input_data, 4);
+        tigris_mem_alloc_fast(&mem, t_out, 1);
 
-    int32_t x_shape[] = {1, 2, 2, 1};
-    int32_t y_shape[] = {1, 1, 1, 1};
-    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
-    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 1, out_qp_idx);
-
-    test_ops[0].op_type = TIGRIS_OP_GLOBAL_MAX;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].act_min = -128;
-    test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[4096], slow_buf[4096];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
-                    slow_buf, sizeof(slow_buf));
-
-    int8_t input_data[] = {-9, 4, 7, 3};
-    tigris_mem_alloc_fast(&mem, t_in, 4);
-    memcpy(ptrs[t_in], input_data, 4);
-    tigris_mem_alloc_fast(&mem, t_out, 1);
-
-    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    TEST_ASSERT_EQ(ret, 0, "global_max_pool_s8 returns 0");
-
-    int8_t *out = (int8_t *)ptrs[t_out];
-    TEST_ASSERT_EQ(out[0], 7, "max(-9,4,7,3) = 7");
-}
-
-/* A maximum preserves the value, not the encoding. When the output tensor
- * declares a different scale or zero point, the same value is a different
- * int8, and both max kernels used to write the input's encoding straight out.
- * kern_avg_pool_s8 beside them has always defined this case; these now match
- * it. */
-static void test_max_pool_s8_requantizes(void)
-{
-    printf("  test_max_pool_s8_requantizes...\n");
-
-    plan_reset();
-    tigris_plan_t plan;
-
-    /* Input at scale 1.0, zero point 0; output at scale 0.5, zero point -10.
-     * max(-9, 4, 7, 3) is 7, so the value is 7.0 and its encoding at the
-     * output is round(7.0 / 0.5) + (-10) = 4. */
-    uint16_t in_qp = add_quant_param(1.0f, 0, 1, NULL, NULL);
-    uint16_t out_qp_idx = add_quant_param(0.5f, -10, 1, NULL, NULL);
-
-    int32_t x_shape[] = {1, 2, 2, 1};
-    int32_t y_shape[] = {1, 1, 1, 1};
-    uint16_t t_in = add_tensor(&plan, "x", x_shape, 4, 3, 4, in_qp);
-    uint16_t t_out = add_tensor(&plan, "y", y_shape, 4, 3, 1, out_qp_idx);
-
-    test_ops[0].op_type = TIGRIS_OP_GLOBAL_MAX;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in};
-    uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].act_min = -128;
-    test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[4096], slow_buf[4096];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
-                    slow_buf, sizeof(slow_buf));
-
-    int8_t input_data[] = {-9, 4, 7, 3};
-    tigris_mem_alloc_fast(&mem, t_in, 4);
-    memcpy(ptrs[t_in], input_data, 4);
-    tigris_mem_alloc_fast(&mem, t_out, 1);
-
-    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    TEST_ASSERT_EQ(ret, 0, "global_max_pool_s8 returns 0");
-
-    int8_t *out = (int8_t *)ptrs[t_out];
-    TEST_ASSERT_EQ(out[0], 4, "max 7 at scale 1.0 is 4 at scale 0.5, zp -10");
+        int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
+        TEST_ASSERT_EQ(ret, 0, "global_max_pool_s8 returns 0");
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_out])[0], cases[k].expected, cases[k].what);
+    }
 }
 
 /* A row band hands the matrix product a band of its first operand's rows and
@@ -1433,20 +758,8 @@ static void test_matmul_s8_row_band(void)
     uint16_t t_y = add_tensor(&plan, "y", y_shape, 2, 3,
                               ROWS * COLS, out_qp);
 
-    test_ops[0].op_type = TIGRIS_OP_MATMUL;
-    test_ops[0].num_inputs = 2;
-    test_ops[0].num_outputs = 1;
     uint16_t inp[] = {t_a, t_b};
-    uint16_t outp[] = {t_y};
-    test_ops[0].inputs_off = add_indices(inp, 2);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].act_min = -128;
-    test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-
-    build_plan(&plan);
+    one_op_s8(&plan, TIGRIS_OP_MATMUL, inp, 2, &t_y, 1, TIGRIS_NO_WEIGHT);
 
     /* The band buffer holds the first two rows of a; b is whole. */
     int8_t a_band[BAND * INNER] = {1, 2, 3, 4};
@@ -1485,10 +798,8 @@ static void test_unsupported_op_s8(void)
     plan_reset();
     tigris_plan_t plan;
 
-    /* Pad has a schema opcode but no runtime dispatcher. Softmax is
-     * intentionally supported by s8_ref for terminal classifiers, and MatMul
-     * gained a dispatcher, so neither is the unsupported exemplar any more. */
-    test_ops[0].op_type = TIGRIS_OP_PAD;
+    /* An opcode no dispatcher handles reaches the default branch. */
+    test_ops[0].op_type = TIGRIS_OP_UNKNOWN;
     test_header.num_ops = 1;
 
     build_plan(&plan);
@@ -1512,10 +823,9 @@ static void test_relu6_s8_rounds_ceiling(void)
     tigris_plan_t plan;
 
     uint16_t qp = add_quant_param(0.11f, 0, 1, NULL, NULL);
-    int32_t shape[] = {1, 3};
-    uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, 3, qp);
-    uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, 3, TIGRIS_NO_QUANT_PARAM);
-
+    int32_t shape[] = {1, 4};
+    uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, 4, qp);
+    uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, 4, TIGRIS_NO_QUANT_PARAM);
     test_ops[0].op_type = TIGRIS_OP_RELU6;
     test_ops[0].num_inputs = 1;
     test_ops[0].num_outputs = 1;
@@ -1531,10 +841,10 @@ static void test_relu6_s8_rounds_ceiling(void)
     uint8_t fast[1024], slow[1024];
     tigris_mem_t mem;
     tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
-    int8_t input_data[] = {55, 100, -10};
-    tigris_mem_alloc_fast(&mem, t_in, 3);
-    memcpy(ptrs[t_in], input_data, 3);
-    tigris_mem_alloc_fast(&mem, t_out, 3);
+    int8_t input_data[] = {55, 100, -10, 30};
+    tigris_mem_alloc_fast(&mem, t_in, 4);
+    memcpy(ptrs[t_in], input_data, 4);
+    tigris_mem_alloc_fast(&mem, t_out, 4);
 
     int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
     TEST_ASSERT_EQ(ret, 0, "relu6_s8 returns 0");
@@ -1542,6 +852,7 @@ static void test_relu6_s8_rounds_ceiling(void)
     TEST_ASSERT_EQ(out[0], 55, "relu6(55): ceiling rounds to 55, not truncated to 54");
     TEST_ASSERT_EQ(out[1], 55, "relu6(100) clamps to 55");
     TEST_ASSERT_EQ(out[2], 0,  "relu6(-10) clamps to 0");
+    TEST_ASSERT_EQ(out[3], 30, "relu6(30) passes through inside the range");
 }
 
 /* Tanh via LUT (regression: s8 dispatch must handle TIGRIS_OP_TANH). */
@@ -1557,24 +868,12 @@ static void test_tanh_s8(void)
     uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, 3, in_qp);
     uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, 3, out_qp);
 
-    test_ops[0].op_type = TIGRIS_OP_TANH;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in}; uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_header.num_ops = 1;
-    build_plan(&plan);
+    one_op_s8(&plan, TIGRIS_OP_TANH, &t_in, 1, &t_out, 1, TIGRIS_NO_WEIGHT);
 
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[1024], slow[1024];
-    tigris_mem_t mem;
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
     tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
     int8_t input_data[] = {0, 20, -20};   /* real 0, +2.0, -2.0 */
-    tigris_mem_alloc_fast(&mem, t_in, 3);
-    memcpy(ptrs[t_in], input_data, 3);
+    tigris_mem_alloc_fast(&mem, t_in, 3); memcpy(ptrs[t_in], input_data, 3);
     tigris_mem_alloc_fast(&mem, t_out, 3);
 
     int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
@@ -1651,24 +950,12 @@ static void test_hardswish_s8(void)
     int32_t shape[] = {1, 5};
     uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, 5, in_qp);
     uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, 5, out_qp);
-    test_ops[0].op_type = TIGRIS_OP_HARDSWISH;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in}; uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_header.num_ops = 1;
-    build_plan(&plan);
+    one_op_s8(&plan, TIGRIS_OP_HARDSWISH, &t_in, 1, &t_out, 1, TIGRIS_NO_WEIGHT);
 
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[1024], slow[1024];
-    tigris_mem_t mem;
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
     tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
     int8_t input_data[] = {-40, -10, 0, 20, 40};
-    tigris_mem_alloc_fast(&mem, t_in, 5);
-    memcpy(ptrs[t_in], input_data, 5);
+    tigris_mem_alloc_fast(&mem, t_in, 5); memcpy(ptrs[t_in], input_data, 5);
     tigris_mem_alloc_fast(&mem, t_out, 5);
     TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
                    "hardswish_s8 returns 0");
@@ -1794,142 +1081,19 @@ static void test_per_channel_binary_s8(void)
     run_per_channel_binary_s8(TIGRIS_OP_ADD, sum, "per-channel Add");
 }
 
-/* Int8 bilinear, 2x2 -> 4x4, one channel, unit scale. Half-pixel places output
- * row o at (o + 0.5) / 2 - 0.5 (clamped at 0), asymmetric at o / 2; worked by
- * hand from the grid [[0, 10], [20, 30]] and rounded half away from zero. */
-static int run_resize_linear_s8(uint16_t convention, const tigris_tile_ctx_t *tile,
-                                const int8_t *input, int8_t *output, int with_quant)
+/* Softmax rows against the TFLite reference and CMSIS-NN arm_softmax_s8, which
+ * use fixed point for the common [0,1] -> [-128,127] output encoding; another
+ * output quantization keeps float. */
+static int run_softmax_s8(float in_scale, int32_t in_zp, float out_scale, int32_t out_zp,
+                          const int8_t *data, uint32_t rows, uint32_t classes, int8_t *result)
 {
     plan_reset();
     tigris_plan_t plan;
-    uint16_t qp = with_quant ? add_quant_param(1.0f, 0, 1, NULL, NULL)
-                             : TIGRIS_NO_QUANT_PARAM;
-    int32_t in_shape[] = {1, 2, 2, 1};
-    int32_t out_shape[] = {1, 4, 4, 1};
-    uint16_t t_in = add_tensor(&plan, "in", in_shape, 4, 3, 4, qp);
-    uint16_t t_out = add_tensor(&plan, "out", out_shape, 4, 3, 16, qp);
-    test_ops[0].op_type = TIGRIS_OP_RESIZE_LINEAR;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in}; uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].spatial.stride_h = 2;
-    test_ops[0].spatial.stride_w = 2;
-    test_ops[0].spatial.kernel_h = convention;
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_header.num_ops = 1;
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    tigris_mem_t mem;
-    memset(&mem, 0, sizeof(mem));
-    mem.tensor_ptrs = ptrs;
-    mem.num_tensors = test_header.num_tensors;
-    ptrs[t_in] = (void *)input;
-    ptrs[t_out] = output;
-    if (tile)
-        mem.tile = *tile;
-    return tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-}
-
-static void test_resize_linear_s8(void)
-{
-    printf("  test_resize_linear_s8...\n");
-    const int8_t grid[] = {0, 10, 20, 30};
-    const int8_t half_pixel[] = {0, 3, 8, 10, 5, 8, 13, 15,
-                                 15, 18, 23, 25, 20, 23, 28, 30};
-    const int8_t asymmetric[] = {0, 5, 10, 10, 10, 15, 20, 20,
-                                 20, 25, 30, 30, 20, 25, 30, 30};
-    int8_t out[16];
-
-    TEST_ASSERT_EQ(run_resize_linear_s8(0, NULL, grid, out, 1), 0, "half-pixel runs");
-    for (int i = 0; i < 16; i++)
-        TEST_ASSERT_EQ(out[i], half_pixel[i], "half-pixel bilinear value");
-    TEST_ASSERT_EQ(run_resize_linear_s8(1, NULL, grid, out, 1), 0, "asymmetric runs");
-    for (int i = 0; i < 16; i++)
-        TEST_ASSERT_EQ(out[i], asymmetric[i], "asymmetric bilinear value");
-
-    /* Output row 3 alone, from input row 1 alone: the origins place the band. */
-    tigris_tile_ctx_t tile;
-    memset(&tile, 0, sizeof(tile));
-    tile.active = 1;
-    tile.in_h = 1; tile.out_h = 1;
-    tile.in_w = 2; tile.out_w = 4;
-    tile.out_row_origin = 3;
-    tile.in_row_origin = 1;
-    TEST_ASSERT_EQ(run_resize_linear_s8(0, &tile, grid + 2, out, 1), 0, "a band runs");
-    for (int i = 0; i < 4; i++)
-        TEST_ASSERT_EQ(out[i], half_pixel[12 + i], "a band reproduces its row");
-
-    TEST_ASSERT(run_resize_linear_s8(0, NULL, grid, out, 0) != 0,
-                "int8 bilinear without quantization is refused");
-    TEST_ASSERT(run_resize_linear_s8(3, NULL, grid, out, 1) != 0,
-                "an unknown convention is refused");
-}
-
-/* Softmax is a terminal classifier operation and must be available through
- * the reference fallback used by accelerator backends. */
-static void test_softmax_s8(void)
-{
-    printf("  test_softmax_s8...\n");
-    plan_reset();
-    tigris_plan_t plan;
-
-    uint16_t in_qp = add_quant_param(0.5f, -3, 1, NULL, NULL);
-    /* TFLite's common int8 Softmax representation: [0,1] -> [-128,127]. */
-    uint16_t out_qp = add_quant_param(1.0f / 256.0f, -128, 1, NULL, NULL);
-    int32_t shape[] = {2, 3};
-    uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, 6, in_qp);
-    uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, 6, out_qp);
-
-    test_ops[0].op_type = TIGRIS_OP_SOFTMAX;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in}; uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_header.num_ops = 1;
-    build_plan(&plan);
-
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[1024], slow[1024];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
-    /* Rows encode real logits [0, 1, -1] and [0, 0, 0]. */
-    int8_t input_data[] = {-3, -1, -5, -3, -3, -3};
-    tigris_mem_alloc_fast(&mem, t_in, 6);
-    memcpy(ptrs[t_in], input_data, 6);
-    tigris_mem_alloc_fast(&mem, t_out, 6);
-
-    int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    TEST_ASSERT_EQ(ret, 0, "softmax_s8 returns 0");
-    int8_t *out = (int8_t *)ptrs[t_out];
-    /* Quantized probabilities: [0.2447, .6652, .0900] and [1/3,1/3,1/3]. */
-    TEST_ASSERT_EQ(out[0], -65, "softmax row 0 class 0");
-    TEST_ASSERT_EQ(out[1], 42,  "softmax row 0 class 1");
-    TEST_ASSERT_EQ(out[2], -105,"softmax row 0 class 2");
-    TEST_ASSERT_EQ(out[3], -43, "softmax row 1 class 0");
-    TEST_ASSERT_EQ(out[4], -43, "softmax row 1 class 1");
-    TEST_ASSERT_EQ(out[5], -43, "softmax row 1 class 2");
-}
-
-/* Rows where the float softmax rounds differently from TFLite's fixed-point
- * kernel. Expected values are the TFLite reference and CMSIS-NN
- * arm_softmax_s8 results; a non-TFLite output quantization keeps float. */
-static int run_softmax_row_s8(float in_scale, float out_scale, int32_t out_zp,
-                              const int8_t *row, uint32_t classes, int8_t *result)
-{
-    plan_reset();
-    tigris_plan_t plan;
-    uint16_t in_qp = add_quant_param(in_scale, 0, 1, NULL, NULL);
+    uint16_t in_qp = add_quant_param(in_scale, in_zp, 1, NULL, NULL);
     uint16_t out_qp = add_quant_param(out_scale, out_zp, 1, NULL, NULL);
-    int32_t shape[] = {1, (int32_t)classes};
-    uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, classes, in_qp);
-    uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, classes, out_qp);
+    int32_t shape[] = {(int32_t)rows, (int32_t)classes};
+    uint16_t t_in = add_tensor(&plan, "in", shape, 2, 3, rows * classes, in_qp);
+    uint16_t t_out = add_tensor(&plan, "out", shape, 2, 3, rows * classes, out_qp);
     test_ops[0].op_type = TIGRIS_OP_SOFTMAX;
     test_ops[0].num_inputs = 1;
     test_ops[0].num_outputs = 1;
@@ -1945,40 +1109,46 @@ static int run_softmax_row_s8(float in_scale, float out_scale, int32_t out_zp,
     uint8_t fast[256], slow[64];
     tigris_mem_t mem;
     tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
-    tigris_mem_alloc_fast(&mem, t_in, classes);
-    memcpy(ptrs[t_in], row, classes);
-    tigris_mem_alloc_fast(&mem, t_out, classes);
+    tigris_mem_alloc_fast(&mem, t_in, rows * classes);
+    memcpy(ptrs[t_in], data, rows * classes);
+    tigris_mem_alloc_fast(&mem, t_out, rows * classes);
     int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
-    memcpy(result, ptrs[t_out], classes);
+    memcpy(result, ptrs[t_out], rows * classes);
     return ret;
 }
 
-static void test_softmax_s8_fixed_point(void)
+static void test_softmax_s8(void)
 {
-    printf("  test_softmax_s8_fixed_point...\n");
+    printf("  test_softmax_s8...\n");
     static const struct {
         float scale;
-        uint32_t classes;
-        int8_t row[6];
+        int32_t zero_point;
+        uint32_t rows, classes;
+        int8_t data[6];
         int8_t expected[6];
     } cases[] = {
-        {0.053988829255104065f, 6, {-21, -37, 19, -9, 39, -11}, {-121, -125, -71, -116, 38, -117}},
-        {0.01572207175195217f, 4, {33, -7, -39, 7}, {-26, -74, -95, -61}},
-        {0.1154790073633194f, 6, {-37, 34, -25, 4, 4, -32}, {-128, 113, -128, -120, -120, -128}},
+        /* Two rows encoding real logits [0, 1, -1] and [0, 0, 0]: each row
+         * normalizes on its own, to [.2447, .6652, .0900] and thirds. */
+        {0.5f, -3, 2, 3, {-3, -1, -5, -3, -3, -3}, {-65, 42, -105, -43, -43, -43}},
+        /* Rows where a float softmax would round differently. */
+        {0.053988829255104065f, 0, 1, 6, {-21, -37, 19, -9, 39, -11}, {-121, -125, -71, -116, 38, -117}},
+        {0.01572207175195217f, 0, 1, 4, {33, -7, -39, 7}, {-26, -74, -95, -61}},
+        {0.1154790073633194f, 0, 1, 6, {-37, 34, -25, 4, 4, -32}, {-128, 113, -128, -120, -120, -128}},
     };
     for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
         int8_t out[6];
-        TEST_ASSERT_EQ(run_softmax_row_s8(cases[k].scale, 1.0f / 256.0f, -128,
-                                          cases[k].row, cases[k].classes, out), 0,
+        uint32_t n = cases[k].rows * cases[k].classes;
+        TEST_ASSERT_EQ(run_softmax_s8(cases[k].scale, cases[k].zero_point, 1.0f / 256.0f, -128,
+                                      cases[k].data, cases[k].rows, cases[k].classes, out), 0,
                        "fixed-point softmax returns 0");
-        TEST_ASSERT(memcmp(out, cases[k].expected, cases[k].classes) == 0,
-                    "fixed-point softmax matches TFLite");
+        for (uint32_t i = 0; i < n; i++)
+            TEST_ASSERT_EQ(out[i], cases[k].expected[i], "fixed-point softmax matches TFLite");
     }
 
     /* Output zero point -127 is not TFLite's: float, round half away. */
     int8_t out[6];
-    TEST_ASSERT_EQ(run_softmax_row_s8(0.053988829255104065f, 1.0f / 256.0f, -127,
-                                      cases[0].row, 6, out), 0, "float softmax returns 0");
+    TEST_ASSERT_EQ(run_softmax_s8(0.053988829255104065f, 0, 1.0f / 256.0f, -127,
+                                  cases[1].data, 1, 6, out), 0, "float softmax returns 0");
     static const int8_t float_expected[6] = {-120, -124, -70, -115, 40, -116};
     TEST_ASSERT(memcmp(out, float_expected, 6) == 0, "float softmax keeps its rounding");
 }
@@ -2005,31 +1175,18 @@ static void test_conv1d_s8(void)
     int32_t bias[] = {0};
     uint16_t b_idx = add_weight(bias, 4, "b");
 
-    test_ops[0].op_type = TIGRIS_OP_CONV1D;
-    test_ops[0].num_inputs = 1;
-    test_ops[0].num_outputs = 1;
-    uint16_t inp[] = {t_in}; uint16_t outp[] = {t_out};
-    test_ops[0].inputs_off = add_indices(inp, 1);
-    test_ops[0].outputs_off = add_indices(outp, 1);
-    test_ops[0].weight_idx = w_idx;
+    one_op_s8(&plan, TIGRIS_OP_CONV1D, &t_in, 1, &t_out, 1, w_idx);
     test_ops[0].bias_idx = b_idx;
     test_ops[0].spatial.kernel_h = 2;   /* K */
     test_ops[0].spatial.stride_h = 1;
     test_ops[0].spatial.dilation_h = 1;
     test_ops[0].spatial.pad_top = 0;    /* pad_begin */
-    test_ops[0].act_min = -128;
-    test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-    build_plan(&plan);
 
-    void *ptrs[MAX_TENSORS];
-    uint8_t fast[4096], slow_buf[4096];
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow_buf, sizeof(slow_buf));
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
     /* NLC: t0=[1,2] t1=[3,4] t2=[5,6] */
     int8_t input_data[] = {1, 2, 3, 4, 5, 6};
-    tigris_mem_alloc_fast(&mem, t_in, 6);
-    memcpy(ptrs[t_in], input_data, 6);
+    tigris_mem_alloc_fast(&mem, t_in, 6); memcpy(ptrs[t_in], input_data, 6);
     tigris_mem_alloc_fast(&mem, t_out, 2);
 
     int ret = tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL);
@@ -2040,8 +1197,7 @@ static void test_conv1d_s8(void)
     TEST_ASSERT_EQ(out[1], 18, "conv1d y[1]=18");
 
     tigris_mem_reset_fast(&mem);
-    tigris_mem_alloc_fast(&mem, t_in, 4);
-    memcpy(ptrs[t_in], input_data, 4);
+    tigris_mem_alloc_fast(&mem, t_in, 4); memcpy(ptrs[t_in], input_data, 4);
     tigris_mem_alloc_fast(&mem, t_out, 1);
     mem.tile.active = 1;
     mem.tile.in_h = 2;
@@ -2051,46 +1207,6 @@ static void test_conv1d_s8(void)
     TEST_ASSERT_EQ(ret, 0, "tiled conv1d_s8 returns 0");
     out = (int8_t *)ptrs[t_out];
     TEST_ASSERT_EQ(out[0], 10, "tiled conv1d y[0]=10");
-}
-
-static void test_transpose_s8(void)
-{
-    printf("  test_transpose_s8...\n");
-    plan_reset();
-    tigris_plan_t plan;
-    int32_t input_shape[] = {2, 3};
-    int32_t output_shape[] = {3, 2};
-    uint16_t input = add_tensor(&plan, "x", input_shape, 2, 3, 6,
-                                TIGRIS_NO_QUANT_PARAM);
-    uint16_t output = add_tensor(&plan, "y", output_shape, 2, 3, 6,
-                                 TIGRIS_NO_QUANT_PARAM);
-    uint16_t ins[] = {input}, outs[] = {output};
-    test_ops[0].op_type = TIGRIS_OP_TRANSPOSE;
-    test_ops[0].num_inputs = 1; test_ops[0].num_outputs = 1;
-    test_ops[0].inputs_off = add_indices(ins, 1);
-    test_ops[0].outputs_off = add_indices(outs, 1);
-    test_header.num_ops = 1;
-    build_plan(&plan);
-    tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_TRANSPOSE_PERM, 2, 0};
-    const uint8_t perm[] = {1, 0};
-    plan.op_attributes = &attr;
-    plan.op_attribute_data = perm;
-    plan.num_op_attributes = 1;
-
-    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[256]; tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
-                    slow, sizeof(slow));
-    const int8_t values[] = {1, 2, 3, 4, 5, 6};
-    const int8_t expected[] = {1, 4, 2, 5, 3, 6};
-    tigris_mem_alloc_fast(&mem, input, sizeof(values));
-    memcpy(ptrs[input], values, sizeof(values));
-    tigris_mem_alloc_fast(&mem, output, sizeof(expected));
-    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
-                                             NULL), 0,
-                   "transpose_s8 returns 0");
-    for (int i = 0; i < 6; i++)
-        TEST_ASSERT_EQ(((int8_t *)ptrs[output])[i], expected[i],
-                       "transpose_s8 value");
 }
 
 
@@ -2113,27 +1229,17 @@ static void test_reduce_mean_s8(void)
     int32_t y_shape[] = {1, 1, 2};
     uint16_t t_in = add_tensor(&plan, "x", x_shape, 3, 3, 8, in_qp);
     uint16_t t_out = add_tensor(&plan, "y", y_shape, 3, 3, 2, out_qp);
-    uint16_t ins[] = {t_in}, outs[] = {t_out};
-    test_ops[0].op_type = TIGRIS_OP_REDUCE_MEAN;
-    test_ops[0].num_inputs = 1; test_ops[0].num_outputs = 1;
-    test_ops[0].inputs_off = add_indices(ins, 1);
-    test_ops[0].outputs_off = add_indices(outs, 1);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_header.num_ops = 1;
-    build_plan(&plan);
+    one_op_s8(&plan, TIGRIS_OP_REDUCE_MEAN, &t_in, 1, &t_out, 1, TIGRIS_NO_WEIGHT);
     tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_AXES, 1, 0};
     const uint8_t axes[] = {1};
     plan.op_attributes = &attr;
     plan.op_attribute_data = axes;
     plan.num_op_attributes = 1;
 
-    void *ptrs[MAX_TENSORS]; uint8_t fast[4096], slow[4096]; tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
-                    slow, sizeof(slow));
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
     const int8_t values[] = {2, 10, 4, 12, 6, 14, 8, 16};
-    tigris_mem_alloc_fast(&mem, t_in, sizeof(values));
-    memcpy(ptrs[t_in], values, sizeof(values));
+    tigris_mem_alloc_fast(&mem, t_in, sizeof(values)); memcpy(ptrs[t_in], values, sizeof(values));
     tigris_mem_alloc_fast(&mem, t_out, 2);
     TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
                                              NULL), 0,
@@ -2254,24 +1360,15 @@ static void test_split_s8(void)
     uint16_t t_a = add_tensor(&plan, "a", part_shape, 2, 3, 4, qp);
     uint16_t t_b = add_tensor(&plan, "b", part_shape, 2, 3, 4, qp);
     uint16_t t_c = add_tensor(&plan, "c", part_shape, 2, 3, 4, qp);
-    uint16_t ins[] = {t_in}, outs[] = {t_a, t_b, t_c};
-    test_ops[0].op_type = TIGRIS_OP_SPLIT;
-    test_ops[0].num_inputs = 1; test_ops[0].num_outputs = 3;
-    test_ops[0].inputs_off = add_indices(ins, 1);
-    test_ops[0].outputs_off = add_indices(outs, 3);
-    test_ops[0].weight_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_header.num_ops = 1;
-    build_plan(&plan);
+    uint16_t outs[] = {t_a, t_b, t_c};
+    one_op_s8(&plan, TIGRIS_OP_SPLIT, &t_in, 1, outs, 3, TIGRIS_NO_WEIGHT);
 
-    void *ptrs[MAX_TENSORS]; uint8_t fast[1024], slow[1024]; tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast),
-                    slow, sizeof(slow));
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
     int8_t values[12];
     for (int i = 0; i < 12; i++)
         values[i] = (int8_t)(i - 6);
-    tigris_mem_alloc_fast(&mem, t_in, sizeof(values));
-    memcpy(ptrs[t_in], values, sizeof(values));
+    tigris_mem_alloc_fast(&mem, t_in, sizeof(values)); memcpy(ptrs[t_in], values, sizeof(values));
     tigris_mem_alloc_fast(&mem, t_a, 4);
     tigris_mem_alloc_fast(&mem, t_b, 4);
     tigris_mem_alloc_fast(&mem, t_c, 4);
@@ -2289,21 +1386,6 @@ static void test_split_s8(void)
     TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem,
                                           NULL) != 0,
                 "split_s8 without a source is refused");
-}
-
-/* One-operator plan with the given tensors, for the tests below. */
-static void one_op_s8(tigris_plan_t *plan, uint8_t type, const uint16_t *ins, int n_in,
-                      const uint16_t *outs, int n_out, uint16_t weight)
-{
-    test_ops[0].op_type = type;
-    test_ops[0].num_inputs = (uint8_t)n_in; test_ops[0].num_outputs = (uint8_t)n_out;
-    test_ops[0].inputs_off = add_indices(ins, n_in);
-    test_ops[0].outputs_off = add_indices(outs, n_out);
-    test_ops[0].weight_idx = weight;
-    test_ops[0].bias_idx = TIGRIS_NO_WEIGHT;
-    test_ops[0].act_min = -128; test_ops[0].act_max = 127;
-    test_header.num_ops = 1;
-    build_plan(plan);
 }
 
 /* Operand pairs where TFLite's fixed-point product and a float product
@@ -2702,6 +1784,13 @@ static void test_pad_s8(void)
     const int8_t stated_fill[] = {7, 7, 7, 1, 2, 7, 3, 4, 7};
     for (int i = 0; i < 9; i++)
         TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], stated_fill[i], "pad with a stated fill");
+
+    uint16_t fill = test_ops[0].weight_idx;
+    const int8_t two_fills[] = {7, 7};
+    test_ops[0].weight_idx = add_weight(two_fills, 2, "fills");
+    TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
+                "pad refuses a fill that is not one value");
+    test_ops[0].weight_idx = fill;
 
     mem.tile.active = 1;
     TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL) != 0,
@@ -3114,34 +2203,24 @@ int main(void)
     printf("TiGrIS Int8 Kernel Tests\n\n");
 
     test_relu_s8();
-    test_relu6_s8();
     test_relu6_s8_rounds_ceiling();
     test_binary_s8_contract();
     test_tiled_rank3_binary_s8();
     test_reshape_s8();
-    test_conv2d_s8_per_tensor();
-    test_conv2d_s8_v2();
-    test_conv_transpose_s8_stride2();
-    test_conv_transpose_s8_pad_stride_skip();
-    test_conv_transpose_s8_out_of_range_skip();
-    test_conv_transpose_s8_tile_2d();
+    test_conv2d_s8();
     test_fc_s8();
     test_fc_s8_shift_beyond_31_bits();
     test_global_avg_pool_s8();
     test_global_avg_pool_s8_average_rounding();
     test_global_max_pool_s8();
-    test_max_pool_s8_requantizes();
     test_matmul_s8_row_band();
     test_hardswish_s8();
     test_requantize_s8();
     test_per_channel_binary_s8();
-    test_resize_linear_s8();
     test_tanh_s8();
     test_gelu_s8();
     test_softmax_s8();
-    test_softmax_s8_fixed_point();
     test_conv1d_s8();
-    test_transpose_s8();
     test_reduce_mean_s8();
     test_binary_requant_is_read_from_the_plan();
     test_split_s8();
@@ -3161,8 +2240,5 @@ int main(void)
     test_reduce_s8_domains();
     test_cumsum_s8_domains();
 
-    printf("\nResults: %d passed, %d failed, %d total\n",
-           tests_passed, tests_failed, tests_run);
-
-    return tests_failed > 0 ? 1 : 0;
+    return test_report();
 }

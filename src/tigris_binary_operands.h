@@ -29,6 +29,29 @@ static inline int tigris_float_operator(const tigris_plan_t *plan, const tigris_
     return floating;
 }
 
+/* Whether op computes on int32 operands: ADD, SUB, MUL, a comparison or a CAST. */
+static inline int tigris_int32_operator(const tigris_plan_t *plan, const tigris_op_t *op)
+{
+    int int32 = 0;
+    switch ((tigris_op_type_t)op->op_type) {
+    case TIGRIS_OP_ADD:
+    case TIGRIS_OP_SUB:
+    case TIGRIS_OP_MUL:
+    case TIGRIS_OP_EQUAL:
+    case TIGRIS_OP_LESS:
+    case TIGRIS_OP_LESS_EQUAL:
+    case TIGRIS_OP_GREATER:
+    case TIGRIS_OP_GREATER_EQUAL:
+    case TIGRIS_OP_CAST:
+        if ((op->num_inputs > 0u) && (plan->tensors[tigris_op_inputs(plan, op)[0]].dtype == 6u))
+            int32 = 1;
+        break;
+    default:
+        break;
+    }
+    return int32;
+}
+
 typedef struct {
     int32_t blocks;
     int32_t input_rows;
@@ -101,8 +124,6 @@ int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
 int tigris_reduce_all_execute(const tigris_plan_t *plan, const tigris_op_t *op,
                               uint16_t op_index, tigris_mem_t *mem);
 
-/* Whether op computes on int32 operands: ADD, SUB, MUL, a comparison or a CAST. */
-int tigris_int32_operator(const tigris_plan_t *plan, const tigris_op_t *op);
 int tigris_int32_execute(const tigris_plan_t *plan, const tigris_op_t *op,
                          uint16_t op_index, tigris_mem_t *mem);
 int tigris_bool_execute(const tigris_plan_t *plan, const tigris_op_t *op,

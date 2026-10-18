@@ -11,6 +11,7 @@
 
 #include "tigris_kernel_window.h"
 #include "tigris_binary_operands.h"
+#include "tigris_op_config.h"
 
 #include <float.h>
 #include <math.h>
@@ -1136,6 +1137,7 @@ static int32_t load_i32(const uint8_t *data, uint32_t i)
 int tigris_int32_execute(const tigris_plan_t *plan, const tigris_op_t *op,
                          uint16_t op_index, tigris_mem_t *mem)
 {
+#if TIGRIS_KERNEL_I32
     const uint16_t result = tigris_op_outputs(plan, op)[0];
     uint8_t *y = (uint8_t *)tigris_mem_tensor_ptr(mem, result);
     const uint32_t count = tensor_numel(plan, result);
@@ -1174,6 +1176,13 @@ int tigris_int32_execute(const tigris_plan_t *plan, const tigris_op_t *op,
             y[i] = value ? 1u : 0u;
     }
     return 0;
+#else
+    (void)plan;
+    (void)op;
+    (void)op_index;
+    (void)mem;
+    return -1;
+#endif
 }
 
 int tigris_bool_execute(const tigris_plan_t *plan, const tigris_op_t *op,
@@ -3220,93 +3229,269 @@ int tigris_dispatch_kernel(
     if (tigris_int32_operator(plan, op))
         return tigris_int32_execute(plan, op, op_index, mem);
     switch ((tigris_op_type_t)op->op_type) {
-    case TIGRIS_OP_CONV:        return kern_conv2d(plan, op, mem);
+#if TIGRIS_KERNEL_F32_CONV
+    case TIGRIS_OP_CONV: return kern_conv2d(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_CONV_TRANSPOSE
     case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose(plan, op, mem);
-    case TIGRIS_OP_DEPTHWISE:   return kern_depthwise_conv2d(plan, op, mem);
-    case TIGRIS_OP_RELU:        return kern_relu(plan, op, mem);
-    case TIGRIS_OP_RELU6:       return kern_relu6(plan, op, mem);
-    case TIGRIS_OP_SIGMOID:     return kern_sigmoid(plan, op, mem);
-    case TIGRIS_OP_TANH:        return kern_tanh(plan, op, mem);
-    case TIGRIS_OP_SOFTMAX:     return kern_softmax(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_DEPTHWISE
+    case TIGRIS_OP_DEPTHWISE: return kern_depthwise_conv2d(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_RELU
+    case TIGRIS_OP_RELU: return kern_relu(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_RELU6
+    case TIGRIS_OP_RELU6: return kern_relu6(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_SIGMOID
+    case TIGRIS_OP_SIGMOID: return kern_sigmoid(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_TANH
+    case TIGRIS_OP_TANH: return kern_tanh(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_SOFTMAX
+    case TIGRIS_OP_SOFTMAX: return kern_softmax(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LEAKY_RELU
     case TIGRIS_OP_LEAKY_RELU: return kern_activation_f32(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_ELU
     case TIGRIS_OP_ELU: return kern_activation_f32(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_PRELU
     case TIGRIS_OP_PRELU: return kern_binary_f32(plan, op, op_index, mem, BINARY_PRELU);
+#endif
+#if TIGRIS_KERNEL_F32_LOG_SOFTMAX
     case TIGRIS_OP_LOG_SOFTMAX: return kern_normalization_f32(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_L2_NORMALIZATION
     case TIGRIS_OP_L2_NORMALIZATION: return kern_normalization_f32(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_L2_POOL
     case TIGRIS_OP_L2_POOL: return kern_avg_pool(plan, op, mem);
-    case TIGRIS_OP_ADD:         return kern_add(plan, op, op_index, mem);
-    case TIGRIS_OP_MUL:         return kern_mul(plan, op, op_index, mem);
-    case TIGRIS_OP_CONV1D:      return kern_conv1d(plan, op, mem);
-    case TIGRIS_OP_GLOBAL_AVG:  return kern_global_avg_pool(plan, op, mem);
-    case TIGRIS_OP_FULLY_CONN:  return kern_fully_connected(plan, op, mem);
-    case TIGRIS_OP_RESHAPE:     return kern_reshape(plan, op, mem);
-    case TIGRIS_OP_FLATTEN:     return kern_reshape(plan, op, mem);
-    case TIGRIS_OP_MAX_POOL:    return kern_max_pool(plan, op, mem);
-    case TIGRIS_OP_AVG_POOL:    return kern_avg_pool(plan, op, mem);
-    case TIGRIS_OP_CONCAT:      return kern_concat(plan, op, mem);
-    case TIGRIS_OP_RESIZE:      return kern_resize_nearest(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_ADD
+    case TIGRIS_OP_ADD: return kern_add(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_MUL
+    case TIGRIS_OP_MUL: return kern_mul(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_CONV1D
+    case TIGRIS_OP_CONV1D: return kern_conv1d(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_GLOBAL_AVG
+    case TIGRIS_OP_GLOBAL_AVG: return kern_global_avg_pool(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_FULLY_CONN
+    case TIGRIS_OP_FULLY_CONN: return kern_fully_connected(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_RESHAPE
+    case TIGRIS_OP_RESHAPE: return kern_reshape(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_FLATTEN
+    case TIGRIS_OP_FLATTEN: return kern_reshape(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_MAX_POOL
+    case TIGRIS_OP_MAX_POOL: return kern_max_pool(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_AVG_POOL
+    case TIGRIS_OP_AVG_POOL: return kern_avg_pool(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_CONCAT
+    case TIGRIS_OP_CONCAT: return kern_concat(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_RESIZE
+    case TIGRIS_OP_RESIZE: return kern_resize_nearest(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_RESIZE_LINEAR
     case TIGRIS_OP_RESIZE_LINEAR:
                                 return kern_resize_linear(plan, op, mem);
-    case TIGRIS_OP_SUB:         return kern_sub(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_SUB
+    case TIGRIS_OP_SUB: return kern_sub(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_GLOBAL_MAX
     case TIGRIS_OP_GLOBAL_MAX: return kern_global_max_pool(plan, op, mem);
-    case TIGRIS_OP_MATMUL:      return kern_matmul(plan, op, mem);
-    case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
-    case TIGRIS_OP_GELU:        return kern_gelu(plan, op, op_index, mem);
-    case TIGRIS_OP_ERF:         return kern_erf(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_MATMUL
+    case TIGRIS_OP_MATMUL: return kern_matmul(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_TRANSPOSE
+    case TIGRIS_OP_TRANSPOSE: return tigris_transpose_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_GELU
+    case TIGRIS_OP_GELU: return kern_gelu(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_ERF
+    case TIGRIS_OP_ERF: return kern_erf(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_ABS
     case TIGRIS_OP_ABS: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_RSQRT
     case TIGRIS_OP_RSQRT: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_NEG
     case TIGRIS_OP_NEG: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_EXP
     case TIGRIS_OP_EXP: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LOG
     case TIGRIS_OP_LOG: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_SQRT
     case TIGRIS_OP_SQRT: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_SQUARE
     case TIGRIS_OP_SQUARE: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_FLOOR
     case TIGRIS_OP_FLOOR: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_CEIL
     case TIGRIS_OP_CEIL: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_ROUND
     case TIGRIS_OP_ROUND: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_SIN
     case TIGRIS_OP_SIN: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_COS
     case TIGRIS_OP_COS: return kern_elementwise_unary_f32(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_DIV
     case TIGRIS_OP_DIV: return kern_binary_f32(plan, op, op_index, mem, BINARY_DIV);
+#endif
+#if TIGRIS_KERNEL_F32_SQUARED_DIFFERENCE
     case TIGRIS_OP_SQUARED_DIFFERENCE: return kern_binary_f32(plan, op, op_index, mem, BINARY_SQUARED_DIFFERENCE);
+#endif
+#if TIGRIS_KERNEL_F32_MAXIMUM
     case TIGRIS_OP_MAXIMUM: return kern_binary_f32(plan, op, op_index, mem, BINARY_MAXIMUM);
+#endif
+#if TIGRIS_KERNEL_F32_MINIMUM
     case TIGRIS_OP_MINIMUM: return kern_binary_f32(plan, op, op_index, mem, BINARY_MINIMUM);
+#endif
+#if TIGRIS_KERNEL_F32_FLOOR_DIV
     case TIGRIS_OP_FLOOR_DIV: return kern_binary_f32(plan, op, op_index, mem, BINARY_FLOOR_DIV);
+#endif
+#if TIGRIS_KERNEL_F32_FLOOR_MOD
     case TIGRIS_OP_FLOOR_MOD: return kern_binary_f32(plan, op, op_index, mem, BINARY_FLOOR_MOD);
-    case TIGRIS_OP_HARDSWISH:   return kern_hardswish(plan, op, mem);
-    case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_HARDSWISH
+    case TIGRIS_OP_HARDSWISH: return kern_hardswish(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LAYER_NORM
+    case TIGRIS_OP_LAYER_NORM: return kern_layer_norm(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_REDUCE_MEAN
     case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean(plan, op, op_index, mem);
-    case TIGRIS_OP_REDUCE_MAX:
-    case TIGRIS_OP_REDUCE_MIN:
+#endif
+#if TIGRIS_KERNEL_F32_REDUCE_MAX
+    case TIGRIS_OP_REDUCE_MAX: return kern_reduce_f32(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_REDUCE_MIN
+    case TIGRIS_OP_REDUCE_MIN: return kern_reduce_f32(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_REDUCE_SUM
     case TIGRIS_OP_REDUCE_SUM: return kern_reduce_f32(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_REDUCE_ALL
     case TIGRIS_OP_REDUCE_ALL: return tigris_reduce_all_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_GATHER
     case TIGRIS_OP_GATHER:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_GATHER_ND
     case TIGRIS_OP_GATHER_ND:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_STRIDED_SLICE
     case TIGRIS_OP_STRIDED_SLICE:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_MIRROR_PAD
     case TIGRIS_OP_MIRROR_PAD:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_REVERSE_V2
     case TIGRIS_OP_REVERSE_V2:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_EMBEDDING_LOOKUP
     case TIGRIS_OP_EMBEDDING_LOOKUP:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_DYNAMIC_UPDATE_SLICE
     case TIGRIS_OP_DYNAMIC_UPDATE_SLICE:
         return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_EQUAL
     case TIGRIS_OP_EQUAL: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LESS
     case TIGRIS_OP_LESS: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LESS_EQUAL
     case TIGRIS_OP_LESS_EQUAL: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_GREATER
     case TIGRIS_OP_GREATER: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_GREATER_EQUAL
     case TIGRIS_OP_GREATER_EQUAL: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LOGICAL_AND
     case TIGRIS_OP_LOGICAL_AND: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LOGICAL_OR
     case TIGRIS_OP_LOGICAL_OR: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LOGICAL_NOT
     case TIGRIS_OP_LOGICAL_NOT: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_SELECT_V2
     case TIGRIS_OP_SELECT_V2: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_CAST
     case TIGRIS_OP_CAST: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_ADD_N
     case TIGRIS_OP_ADD_N: return kern_add_n_f32(plan, op, mem);
-    case TIGRIS_OP_ARG_MAX:
+#endif
+#if TIGRIS_KERNEL_F32_ARG_MAX
+    case TIGRIS_OP_ARG_MAX: return tigris_arg_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_ARG_MIN
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_CUMSUM
     case TIGRIS_OP_CUMSUM: return kern_cumsum_f32(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_SVDF
     case TIGRIS_OP_SVDF: return kern_svdf_f32(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LSTM
     case TIGRIS_OP_LSTM: return kern_lstm_f32(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_DETECTION_POSTPROCESS
     case TIGRIS_OP_DETECTION_POSTPROCESS: return tigris_detection_execute(plan, op, op_index, mem);
-    case TIGRIS_OP_QUANTIZE:
+#endif
+#if TIGRIS_KERNEL_F32_QUANTIZE
+    case TIGRIS_OP_QUANTIZE: return tigris_quantize_execute(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_DEQUANTIZE
     case TIGRIS_OP_DEQUANTIZE: return tigris_quantize_execute(plan, op, mem);
-    case TIGRIS_OP_SPLIT:       return kern_split(plan, op, mem);
-    case TIGRIS_OP_PAD:         return kern_pad(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_SPLIT
+    case TIGRIS_OP_SPLIT: return kern_split(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_PAD
+    case TIGRIS_OP_PAD: return kern_pad(plan, op, op_index, mem);
+#endif
     default:
         return -1;  /* unsupported op type */
     }

@@ -339,6 +339,7 @@ typedef enum {
     TIGRIS_ERR_BAD_TENSOR   = -10,  /* Tensor metadata is not executable */
     TIGRIS_ERR_BAD_OPERATOR = -11,  /* Operator contract is not executable */
     TIGRIS_ERR_BAD_INTERFACE = -12, /* Declared model interface is not convertible */
+    TIGRIS_ERR_KERNEL_DISABLED = -13, /* Build leaves out a kernel the plan uses */
 } tigris_error_t;
 
 /* Sentinel: tile_plan_idx == 0xFFFF means no tile plan for this stage */

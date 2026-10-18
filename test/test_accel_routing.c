@@ -803,6 +803,32 @@ static void test_binary_routes(void)
     }
 }
 
+static void test_float_section_routes_reference(void)
+{
+    route_fixture_t fx;
+    build_fixture(&fx, TIGRIS_OP_RELU, 1);
+    fx.op.weight_idx = TIGRIS_NO_WEIGHT;
+    for (uint8_t i = 0; i < 2; i++) {
+        fx.tensors[i].dtype = 1;
+        fx.tensors[i].size_bytes = 5u * sizeof(float);
+        fx.tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+    float input[5] = {-2.0f, -1.0f, 0.0f, 1.0f, 2.0f}, output[5];
+    const float expected[5] = {0.0f, 0.0f, 0.0f, 1.0f, 2.0f};
+    void *ptrs[2] = {input, output};
+    tigris_mem_t mem = { .tensor_ptrs = ptrs, .num_tensors = 2 };
+    for (int backend = TIGRIS_ACCEL_ESP_NN; backend <= TIGRIS_ACCEL_CMSIS_NN; backend++) {
+        int handled = 0;
+        TEST_ASSERT_EQ(tigris_accel_pre_route((tigris_accel_backend_t)backend,
+                       &fx.plan, &fx.op, 0), TIGRIS_ACCEL_ROUTE_S8_REF,
+                       "float section avoids the int8 adapter");
+        TEST_ASSERT_EQ(tigris_accel_try_s8_ref((tigris_accel_backend_t)backend,
+                       &fx.plan, &fx.op, 0, &mem, NULL, &handled), 0, "float section executes");
+        TEST_ASSERT_EQ(handled, 1, "float section handled by reference");
+        TEST_ASSERT(memcmp(output, expected, sizeof(expected)) == 0, "float section result");
+    }
+}
+
 int main(void)
 {
     printf("TiGrIS Accelerator Routing Tests\n\n");
@@ -812,6 +838,7 @@ int main(void)
     test_cmsis_plain_height_tile_routes_adapter();
     test_unit_dilation_keeps_esp_adapter();
     test_depthwise_multiplier_routes_adapter();
+    test_float_section_routes_reference();
     test_binary_routes();
     test_rolled_tile_routing();
     test_width_tiled_routing();

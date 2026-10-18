@@ -217,7 +217,7 @@ void app_main(void) {
             return;
         }
     }
-    printf("Running inference (the s8_ref decoder takes ~20 s)...\n\n");
+    printf("Running inference (the s8_ref decoder takes about 12 s)...\n\n");
     tigris_exec_stats_t stats = {0};
     int64_t t0 = esp_timer_get_time();
     tigris_exec_error_t err = tigris_run_with_workspace_buffer(

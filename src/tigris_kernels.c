@@ -1109,24 +1109,6 @@ static inline uint32_t binary_index(const tigris_binary_operands_t *operands, ui
     return (operands->period[k] != 0u) ? (i % operands->period[k]) : i;
 }
 
-int tigris_int32_operator(const tigris_plan_t *plan, const tigris_op_t *op)
-{
-    switch ((tigris_op_type_t)op->op_type) {
-    case TIGRIS_OP_ADD:
-    case TIGRIS_OP_SUB:
-    case TIGRIS_OP_MUL:
-    case TIGRIS_OP_EQUAL:
-    case TIGRIS_OP_LESS:
-    case TIGRIS_OP_LESS_EQUAL:
-    case TIGRIS_OP_GREATER:
-    case TIGRIS_OP_GREATER_EQUAL:
-    case TIGRIS_OP_CAST:
-        return op->num_inputs > 0u && plan->tensors[tigris_op_inputs(plan, op)[0]].dtype == 6u;
-    default:
-        return 0;
-    }
-}
-
 static int32_t load_i32(const uint8_t *data, uint32_t i)
 {
     int32_t value;

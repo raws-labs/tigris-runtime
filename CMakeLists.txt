@@ -5,8 +5,11 @@ if(TIGRIS_TRACE)
     add_compile_definitions(TIGRIS_TRACE=1)
 endif()
 # A header, such as one codegen writes for a plan, that selects which operator
-# kernels the runtime links. Empty links every kernel.
-set(TIGRIS_OP_CONFIG "" CACHE FILEPATH "Header selecting the operator kernels to link")
+# kernels the runtime links. Empty links every kernel. A parent project's own
+# variable wins; creating the cache entry would hide it on the first configure.
+if(NOT DEFINED TIGRIS_OP_CONFIG)
+    set(TIGRIS_OP_CONFIG "" CACHE FILEPATH "Header selecting the operator kernels to link")
+endif()
 
 set(TIGRIS_RUNTIME_SRCS
     src/tigris_loader.c

@@ -135,18 +135,34 @@ static void test_error_strings(void)
 
 #define MINIMAL_PLAN_SIZE 100u
 
+typedef struct {
+    tigris_file_header_t *header;
+    tigris_section_entry_t *sections;
+} plan_builder_t;
+
+static plan_builder_t plan_builder_begin(uint8_t *buf, uint32_t size, uint16_t version)
+{
+    memset(buf, 0, size);
+    plan_builder_t builder;
+    builder.header = (tigris_file_header_t *)buf;
+    memcpy(builder.header->magic, TIGRIS_MAGIC_BYTES, 4);
+    builder.header->version = version;
+    builder.header->file_size = size;
+    builder.header->section_dir_off = sizeof(*builder.header);
+    builder.sections = (tigris_section_entry_t *)(buf + builder.header->section_dir_off);
+    return builder;
+}
+
+static void plan_builder_section(plan_builder_t *builder, uint32_t index,
+                                 uint32_t type, uint32_t offset)
+{
+    builder->sections[index].type = type;
+    builder->sections[index].offset = offset;
+}
+
 static void build_minimal_plan(uint8_t *buf)
 {
-    memset(buf, 0, MINIMAL_PLAN_SIZE);
-
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION;
-    hdr->file_size = MINIMAL_PLAN_SIZE;
-    hdr->section_dir_off = sizeof(*hdr);
-
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    plan_builder_t builder = plan_builder_begin(buf, MINIMAL_PLAN_SIZE, TIGRIS_SCHEMA_VERSION);
     const uint32_t required[] = {
         TIGRIS_SEC_TENSORS,
         TIGRIS_SEC_OPS,
@@ -155,11 +171,10 @@ static void build_minimal_plan(uint8_t *buf)
         TIGRIS_SEC_STRINGS,
     };
     for (uint32_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
-        dir[i].type = required[i];
-        dir[i].offset = MINIMAL_PLAN_SIZE - 1u;
+        plan_builder_section(&builder, i, required[i], MINIMAL_PLAN_SIZE - 1u);
     }
     buf[MINIMAL_PLAN_SIZE - 1u] = '\0';
-    /* dir[5] remains the zero-valued sentinel. */
+    /* Section 5 remains the zero-valued sentinel. */
 }
 
 static void test_section_directory_guards(void)
@@ -239,17 +254,11 @@ static void test_v2_plan_header_is_still_accepted(void)
 
 static void build_v2_quant_plan(uint8_t *buf)
 {
-    memset(buf, 0, V2_QUANT_PLAN_SIZE);
-
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION_V2;
-    hdr->file_size = V2_QUANT_PLAN_SIZE;
-    hdr->section_dir_off = sizeof(*hdr);
+    plan_builder_t builder = plan_builder_begin(buf, V2_QUANT_PLAN_SIZE,
+                                                TIGRIS_SCHEMA_VERSION_V2);
+    tigris_file_header_t *hdr = builder.header;
     hdr->num_quant_params = 1;
 
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
     const uint32_t required[] = {
         TIGRIS_SEC_TENSORS,
         TIGRIS_SEC_OPS,
@@ -258,11 +267,9 @@ static void build_v2_quant_plan(uint8_t *buf)
         TIGRIS_SEC_STRINGS,
     };
     for (uint32_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
-        dir[i].type = required[i];
-        dir[i].offset = 104u;
+        plan_builder_section(&builder, i, required[i], 104u);
     }
-    dir[5].type = TIGRIS_SEC_QUANT_PARAMS;
-    dir[5].offset = 108u;
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_QUANT_PARAMS, 108u);
 
     uint16_t *quant_header = (uint16_t *)(buf + 108u);
     quant_header[0] = 1;  /* num params */
@@ -339,27 +346,20 @@ static void test_counted_sections_required(void)
 
 static void build_staged_plan(uint8_t *buf)
 {
-    memset(buf, 0, STAGED_PLAN_SIZE);
-
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION;
-    hdr->file_size = STAGED_PLAN_SIZE;
-    hdr->section_dir_off = sizeof(*hdr);
+    plan_builder_t builder = plan_builder_begin(buf, STAGED_PLAN_SIZE, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
     hdr->num_tensors = 1;
     hdr->num_ops = 9;
     hdr->num_stages = 2;
     hdr->num_weights = 1;
 
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, STAGED_TENSORS_OFF};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, STAGED_OPS_OFF};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, STAGED_STAGES_OFF};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, STAGED_INDEX_OFF};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, STAGED_SHAPES_OFF};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, STAGED_STRINGS_OFF};
-    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHTS, STAGED_WEIGHTS_OFF};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, STAGED_TENSORS_OFF);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, STAGED_OPS_OFF);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, STAGED_STAGES_OFF);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, STAGED_INDEX_OFF);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, STAGED_SHAPES_OFF);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, STAGED_STRINGS_OFF);
+    plan_builder_section(&builder, 6u, TIGRIS_SEC_WEIGHTS, STAGED_WEIGHTS_OFF);
 
     tigris_tensor_t *tensor =
         (tigris_tensor_t *)(buf + STAGED_TENSORS_OFF);
@@ -558,23 +558,18 @@ static uint8_t *build_many_stage_plan(uint16_t stage_count, uint32_t *out_size)
     if (!buf)
         return NULL;
 
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION;
-    hdr->file_size = plan_size;
-    hdr->section_dir_off = sizeof(*hdr);
+    plan_builder_t builder = plan_builder_begin(buf, plan_size, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
     hdr->num_tensors = 1;
     hdr->num_ops = stage_count;
     hdr->num_stages = stage_count;
 
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, tensors_off};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, ops_off};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, stages_off};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, index_off};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, shapes_off};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, strings_off};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, tensors_off);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, ops_off);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, stages_off);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, index_off);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, shapes_off);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, strings_off);
 
     tigris_tensor_t *tensor = (tigris_tensor_t *)(buf + tensors_off);
     tensor->size_bytes = sizeof(float);
@@ -652,26 +647,19 @@ static void test_schema_v5_many_stage_schedule(void)
 
 static void build_compressed_weight_plan(uint8_t *buf)
 {
-    memset(buf, 0, WEIGHT_BLOCK_PLAN_SIZE);
-
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION;
-    hdr->file_size = WEIGHT_BLOCK_PLAN_SIZE;
-    hdr->section_dir_off = sizeof(*hdr);
+    plan_builder_t builder = plan_builder_begin(buf, WEIGHT_BLOCK_PLAN_SIZE, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
     hdr->num_stages = 1;
     hdr->num_weights = 1;
 
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, WB_STAGES_OFF};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, WB_STAGES_OFF};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, WB_STAGES_OFF};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, WB_INDEX_OFF};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, WB_STRINGS_OFF};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, WB_STRINGS_OFF};
-    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHTS, WB_WEIGHTS_OFF};
-    dir[7] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHT_BLOCKS, WB_BLOCKS_OFF};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, WB_STAGES_OFF);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, WB_STAGES_OFF);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, WB_STAGES_OFF);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, WB_INDEX_OFF);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, WB_STRINGS_OFF);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, WB_STRINGS_OFF);
+    plan_builder_section(&builder, 6u, TIGRIS_SEC_WEIGHTS, WB_WEIGHTS_OFF);
+    plan_builder_section(&builder, 7u, TIGRIS_SEC_WEIGHT_BLOCKS, WB_BLOCKS_OFF);
 
     tigris_stage_t *stage = (tigris_stage_t *)(buf + WB_STAGES_OFF);
     stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
@@ -730,22 +718,17 @@ static void test_compressed_block_guards(void)
 
 static void build_referenced_plan(uint8_t *buf)
 {
-    memset(buf, 0, REFERENCED_PLAN_SIZE);
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION;
-    hdr->file_size = REFERENCED_PLAN_SIZE;
-    hdr->section_dir_off = sizeof(*hdr);
+    plan_builder_t builder = plan_builder_begin(buf, REFERENCED_PLAN_SIZE,
+                                                TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
     hdr->num_tensors = 1;
     hdr->num_model_inputs = 1;
 
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, REF_TENSORS_OFF};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, REF_INDEX_OFF};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, REF_INDEX_OFF};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, REF_SHAPES_OFF};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, REF_STRINGS_OFF};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, REF_TENSORS_OFF);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, REF_INDEX_OFF);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_INDEX_POOL, REF_INDEX_OFF);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_SHAPE_POOL, REF_SHAPES_OFF);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_STRINGS, REF_STRINGS_OFF);
 
     tigris_tensor_t *tensor = (tigris_tensor_t *)(buf + REF_TENSORS_OFF);
     tensor->size_bytes = sizeof(float);
@@ -809,13 +792,8 @@ static void test_cross_reference_guards(void)
 
 static void build_transpose_plan(uint8_t *buf)
 {
-    memset(buf, 0, TRANSPOSE_PLAN_SIZE);
-
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION;
-    hdr->file_size = TRANSPOSE_PLAN_SIZE;
-    hdr->section_dir_off = sizeof(*hdr);
+    plan_builder_t builder = plan_builder_begin(buf, TRANSPOSE_PLAN_SIZE, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
     hdr->num_tensors = 2;
     hdr->num_ops = 1;
     hdr->num_stages = 1;
@@ -823,15 +801,13 @@ static void build_transpose_plan(uint8_t *buf)
     hdr->num_model_inputs = 1;
     hdr->num_model_outputs = 1;
 
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, TRANSPOSE_TENSORS_OFF};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, TRANSPOSE_OPS_OFF};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, TRANSPOSE_STAGES_OFF};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, TRANSPOSE_INDEX_OFF};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, TRANSPOSE_SHAPES_OFF};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, TRANSPOSE_STRINGS_OFF};
-    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, TRANSPOSE_ATTRS_OFF};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, TRANSPOSE_TENSORS_OFF);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, TRANSPOSE_OPS_OFF);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, TRANSPOSE_STAGES_OFF);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, TRANSPOSE_INDEX_OFF);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, TRANSPOSE_SHAPES_OFF);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, TRANSPOSE_STRINGS_OFF);
+    plan_builder_section(&builder, 6u, TIGRIS_SEC_OP_ATTRIBUTES, TRANSPOSE_ATTRS_OFF);
 
     tigris_tensor_t *tensors =
         (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
@@ -910,13 +886,8 @@ static void build_transpose_plan(uint8_t *buf)
  */
 static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
 {
-    memset(buf, 0, TILED_PLAN_SIZE);
-
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION_V9;
-    hdr->file_size = TILED_PLAN_SIZE;
-    hdr->section_dir_off = sizeof(*hdr);
+    plan_builder_t builder = plan_builder_begin(buf, TILED_PLAN_SIZE, TIGRIS_SCHEMA_VERSION_V9);
+    tigris_file_header_t *hdr = builder.header;
     hdr->num_tensors = 2;
     hdr->num_ops = 1;
     hdr->num_stages = 1;
@@ -927,14 +898,14 @@ static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
 
     tigris_section_entry_t *dir =
         (tigris_section_entry_t *)(buf + hdr->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, TILED_TENSORS_OFF};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, TILED_OPS_OFF};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, TILED_STAGES_OFF};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, TILED_TENSORS_OFF);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, TILED_OPS_OFF);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, TILED_STAGES_OFF);
     dir[3] = (tigris_section_entry_t){TIGRIS_SEC_TILE_PLANS,
                                       TILED_TILE_PLANS_OFF};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, TILED_INDEX_OFF};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, TILED_SHAPES_OFF};
-    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, TILED_STRINGS_OFF};
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_INDEX_POOL, TILED_INDEX_OFF);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_SHAPE_POOL, TILED_SHAPES_OFF);
+    plan_builder_section(&builder, 6u, TIGRIS_SEC_STRINGS, TILED_STRINGS_OFF);
     /* The section exists only when it has a record: an empty one is not a
      * shape the emitter produces. A Transpose carries its permutation and a
      * reduction the axis it collapses. */
@@ -1506,13 +1477,8 @@ static void test_declared_interface_dtype_contract(void)
 
 static void build_split_plan(uint8_t *buf)
 {
-    memset(buf, 0, SPLIT_PLAN_SIZE);
-
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION;
-    hdr->file_size = SPLIT_PLAN_SIZE;
-    hdr->section_dir_off = sizeof(*hdr);
+    plan_builder_t builder = plan_builder_begin(buf, SPLIT_PLAN_SIZE, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
     hdr->num_tensors = 3;
     hdr->num_ops = 1;
     hdr->num_stages = 1;
@@ -1520,14 +1486,12 @@ static void build_split_plan(uint8_t *buf)
     hdr->num_model_inputs = 1;
     hdr->num_model_outputs = 1;
 
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, SPLIT_TENSORS_OFF};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, SPLIT_OPS_OFF};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, SPLIT_STAGES_OFF};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, SPLIT_INDEX_OFF};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, SPLIT_SHAPES_OFF};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, SPLIT_STRINGS_OFF};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, SPLIT_TENSORS_OFF);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, SPLIT_OPS_OFF);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, SPLIT_STAGES_OFF);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, SPLIT_INDEX_OFF);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, SPLIT_SHAPES_OFF);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, SPLIT_STRINGS_OFF);
 
     int32_t *shapes = (int32_t *)(buf + SPLIT_SHAPES_OFF);
     shapes[0] = 4; shapes[1] = 2; shapes[2] = 8;   /* input  */
@@ -2037,13 +2001,8 @@ static void semantic_set_shape(
 static void build_semantic_plan(
     uint8_t *buf, tigris_op_type_t op_type, uint8_t num_inputs)
 {
-    memset(buf, 0, SEMANTIC_PLAN_SIZE);
-
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION;
-    hdr->file_size = SEMANTIC_PLAN_SIZE;
-    hdr->section_dir_off = sizeof(*hdr);
+    plan_builder_t builder = plan_builder_begin(buf, SEMANTIC_PLAN_SIZE, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
     hdr->num_tensors = 3;
     hdr->num_ops = 1;
     hdr->num_stages = 1;
@@ -2051,14 +2010,12 @@ static void build_semantic_plan(
     hdr->num_model_inputs = 1;
     hdr->num_model_outputs = 1;
 
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, SEMANTIC_TENSORS_OFF};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, SEMANTIC_OPS_OFF};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, SEMANTIC_STAGES_OFF};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, SEMANTIC_INDEX_OFF};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, SEMANTIC_SHAPES_OFF};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, SEMANTIC_STRINGS_OFF};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, SEMANTIC_TENSORS_OFF);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, SEMANTIC_OPS_OFF);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, SEMANTIC_STAGES_OFF);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, SEMANTIC_INDEX_OFF);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, SEMANTIC_SHAPES_OFF);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, SEMANTIC_STRINGS_OFF);
 
     tigris_tensor_t *tensors =
         (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF);
@@ -3257,13 +3214,8 @@ static void test_convolution_semantic_guards(void)
 
 static void build_conv_transpose_plan(uint8_t *buf)
 {
-    memset(buf, 0, CONVT_PLAN_SIZE);
-
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION;
-    hdr->file_size = CONVT_PLAN_SIZE;
-    hdr->section_dir_off = sizeof(*hdr);
+    plan_builder_t builder = plan_builder_begin(buf, CONVT_PLAN_SIZE, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
     hdr->num_tensors = 2;
     hdr->num_ops = 1;
     hdr->num_stages = 1;
@@ -3272,15 +3224,13 @@ static void build_conv_transpose_plan(uint8_t *buf)
     hdr->num_model_inputs = 1;
     hdr->num_model_outputs = 1;
 
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, CONVT_TENSORS_OFF};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, CONVT_OPS_OFF};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, CONVT_STAGES_OFF};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, CONVT_INDEX_OFF};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, CONVT_SHAPES_OFF};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, CONVT_STRINGS_OFF};
-    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHTS, CONVT_WEIGHTS_OFF};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, CONVT_TENSORS_OFF);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, CONVT_OPS_OFF);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, CONVT_STAGES_OFF);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, CONVT_INDEX_OFF);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, CONVT_SHAPES_OFF);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, CONVT_STRINGS_OFF);
+    plan_builder_section(&builder, 6u, TIGRIS_SEC_WEIGHTS, CONVT_WEIGHTS_OFF);
 
     tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + CONVT_TENSORS_OFF);
     int32_t *shapes = (int32_t *)(buf + CONVT_SHAPES_OFF);
@@ -3412,13 +3362,8 @@ static void test_conv_transpose_semantic_guards(void)
 
 static void build_conv_transpose_quant_plan(uint8_t *buf, uint16_t num_channels)
 {
-    memset(buf, 0, CONVTQ_PLAN_SIZE);
-
-    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
-    memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION;
-    hdr->file_size = CONVTQ_PLAN_SIZE;
-    hdr->section_dir_off = sizeof(*hdr);
+    plan_builder_t builder = plan_builder_begin(buf, CONVTQ_PLAN_SIZE, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
     hdr->num_tensors = 2;
     hdr->num_ops = 1;
     hdr->num_stages = 1;
@@ -3428,16 +3373,14 @@ static void build_conv_transpose_quant_plan(uint8_t *buf, uint16_t num_channels)
     hdr->num_model_inputs = 1;
     hdr->num_model_outputs = 1;
 
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + hdr->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, CONVTQ_TENSORS_OFF};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, CONVTQ_OPS_OFF};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, CONVTQ_STAGES_OFF};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, CONVTQ_INDEX_OFF};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, CONVTQ_SHAPES_OFF};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, CONVTQ_STRINGS_OFF};
-    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHTS, CONVTQ_WEIGHTS_OFF};
-    dir[7] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, CONVTQ_QUANT_OFF};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, CONVTQ_TENSORS_OFF);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, CONVTQ_OPS_OFF);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, CONVTQ_STAGES_OFF);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, CONVTQ_INDEX_OFF);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, CONVTQ_SHAPES_OFF);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, CONVTQ_STRINGS_OFF);
+    plan_builder_section(&builder, 6u, TIGRIS_SEC_WEIGHTS, CONVTQ_WEIGHTS_OFF);
+    plan_builder_section(&builder, 7u, TIGRIS_SEC_QUANT_PARAMS, CONVTQ_QUANT_OFF);
 
     tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + CONVTQ_TENSORS_OFF);
     int32_t *shapes = (int32_t *)(buf + CONVTQ_SHAPES_OFF);
@@ -3974,12 +3917,9 @@ static void test_schema_compatibility_fixtures(void)
 
 static void build_movement_plan(uint8_t *buf, const movement_golden_t *gold)
 {
-    memset(buf, 0, MOVEMENT_PLAN_SIZE);
-    tigris_file_header_t *h = (tigris_file_header_t *)buf;
-    memcpy(h->magic, TIGRIS_MAGIC_BYTES, 4);
-    h->version = TIGRIS_SCHEMA_VERSION;
-    h->file_size = MOVEMENT_PLAN_SIZE;
-    h->section_dir_off = sizeof(*h);
+    plan_builder_t builder = plan_builder_begin(buf, MOVEMENT_PLAN_SIZE,
+                                                TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *h = builder.header;
     h->num_tensors = 3;
     h->num_ops = h->num_stages = 1;
     h->num_weights = gold->index_count != 0u ? 1 : 0;
@@ -3987,17 +3927,18 @@ static void build_movement_plan(uint8_t *buf, const movement_golden_t *gold)
     h->num_model_inputs = gold->update_count != 0u ? 2 : 1;
     h->num_model_outputs = 1;
     h->model_io_off = 4;
-    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + h->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, 144};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, 192};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, 232};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, 260};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, 288};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, 360};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, 144u);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, 192u);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, 232u);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, 260u);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, 288u);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, 360u);
     uint8_t section = 6;
-    if (h->num_weights != 0u) dir[section++] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHTS, 368};
-    if (h->num_quant_params != 0u) dir[section++] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, 1024};
-    dir[section] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, 1152};
+    if (h->num_weights != 0u)
+        plan_builder_section(&builder, section++, TIGRIS_SEC_WEIGHTS, 368u);
+    if (h->num_quant_params != 0u)
+        plan_builder_section(&builder, section++, TIGRIS_SEC_QUANT_PARAMS, 1024u);
+    plan_builder_section(&builder, section, TIGRIS_SEC_OP_ATTRIBUTES, 1152u);
     tigris_tensor_t *t = (tigris_tensor_t *)(buf + 144);
     uint32_t counts[] = {gold->input_count, gold->update_count ? gold->update_count : 1u, gold->output_count};
     uint8_t ranks[] = {gold->rank, gold->update_rank ? gold->update_rank : 1u, gold->output_rank};
@@ -4131,6 +4072,13 @@ static void test_constant_gather_contract(void)
         tigris_error_t error = tigris_plan_load(buf, sizeof(buf), &plan);
         TEST_ASSERT_EQ(error, TIGRIS_OK, "constant Gather table loads");
         if (error != TIGRIS_OK) continue;
+        uint32_t original_offset = attr[1].data_offset;
+        attr[1].data_offset = MOVEMENT_PLAN_SIZE;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                       "future attribute offset is checked before another payload reads it");
+        attr[1].data_offset = original_offset;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                       "restored table plan loads");
         uint8_t output[1024] = {0};
         tigris_mem_t mem;
         memset(&mem, 0, sizeof(mem));
@@ -4188,28 +4136,25 @@ static void test_movement_contract(void)
 
 static void build_bool_plan(uint8_t *buf, const bool_golden_t *gold)
 {
-    memset(buf, 0, BOOL_PLAN_SIZE);
-    tigris_file_header_t *h = (tigris_file_header_t *)buf;
-    memcpy(h->magic, TIGRIS_MAGIC_BYTES, 4);
-    h->version = TIGRIS_SCHEMA_VERSION;
-    h->file_size = BOOL_PLAN_SIZE;
-    h->section_dir_off = sizeof(*h);
+    plan_builder_t builder = plan_builder_begin(buf, BOOL_PLAN_SIZE,
+                                                TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *h = builder.header;
     h->num_tensors = gold->inputs + 1u;
     h->num_ops = h->num_stages = 1;
     h->num_model_inputs = gold->inputs;
     h->num_model_outputs = 1;
     h->model_io_off = 40;
     h->num_quant_params = 4;
-    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + h->section_dir_off);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, 160};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, 240};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, 280};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, 320};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, 448};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, 528};
-    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, 544};
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, 160u);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, 240u);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, 280u);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, 320u);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, 448u);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, 528u);
+    plan_builder_section(&builder, 6u, TIGRIS_SEC_QUANT_PARAMS, 544u);
     const int compare_s8 = gold->op >= TIGRIS_OP_EQUAL && gold->op <= TIGRIS_OP_GREATER_EQUAL && gold->dtypes[0] == 3;
-    if (compare_s8) dir[7] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, 672};
+    if (compare_s8)
+        plan_builder_section(&builder, 7u, TIGRIS_SEC_OP_ATTRIBUTES, 672u);
     tigris_tensor_t *t = (tigris_tensor_t *)(buf + 160);
     int32_t *shapes = (int32_t *)(buf + 448);
     uint16_t *indices = (uint16_t *)(buf + 320);

@@ -3,7 +3,7 @@
  * TIGRIS_KERNEL_DEFAULT to 0 and enables the kernels a plan uses, so the
  * linker can drop the rest. Without it every kernel is linked. A plan that
  * needs a kernel this build leaves out fails to load with
- * TIGRIS_ERR_KERNEL_DISABLED. */
+ * TIGRIS_ERR_KERNEL_DISABLED. Generated from the compiler's operator table. */
 #ifndef TIGRIS_OP_CONFIG_H
 #define TIGRIS_OP_CONFIG_H
 

@@ -4,6 +4,9 @@ option(TIGRIS_TRACE "Enable execution trace callbacks" OFF)
 if(TIGRIS_TRACE)
     add_compile_definitions(TIGRIS_TRACE=1)
 endif()
+# A header, such as one codegen writes for a plan, that selects which operator
+# kernels the runtime links. Empty links every kernel.
+set(TIGRIS_OP_CONFIG "" CACHE FILEPATH "Header selecting the operator kernels to link")
 
 set(TIGRIS_RUNTIME_SRCS
     src/tigris_loader.c
@@ -25,6 +28,9 @@ if(COMMAND idf_component_register)
         REQUIRES esp-nn
     )
     target_compile_definitions(${COMPONENT_LIB} PUBLIC TIGRIS_HAS_ESP_NN)
+    if(TIGRIS_OP_CONFIG)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE "TIGRIS_OP_CONFIG=\"${TIGRIS_OP_CONFIG}\"")
+    endif()
     if(TIGRIS_TRACE)
         target_compile_definitions(${COMPONENT_LIB} PUBLIC TIGRIS_TRACE=1)
     endif()
@@ -54,6 +60,9 @@ if(TIGRIS_TRACE)
     target_compile_definitions(tigris_runtime PUBLIC TIGRIS_TRACE=1)
 endif()
 set_target_properties(tigris_runtime PROPERTIES EXPORT_NAME runtime)
+if(TIGRIS_OP_CONFIG)
+    target_compile_definitions(tigris_runtime PRIVATE "TIGRIS_OP_CONFIG=\"${TIGRIS_OP_CONFIG}\"")
+endif()
 target_include_directories(tigris_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
@@ -157,6 +166,17 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_include_directories(test_executor_rows PRIVATE include)
     target_compile_definitions(test_executor_rows PRIVATE TIGRIS_COUNT_KERNEL_ROWS)
     target_link_libraries(test_executor_rows m)
+
+    # The same kernel selection test against the full library and against a
+    # runtime built with a selection header.
+    add_executable(test_kernel_selection test/test_kernel_selection.c)
+    target_link_libraries(test_kernel_selection tigris_runtime)
+    add_executable(test_kernel_selection_selected
+        test/test_kernel_selection.c ${TIGRIS_RUNTIME_SRCS})
+    target_include_directories(test_kernel_selection_selected PRIVATE include)
+    target_compile_definitions(test_kernel_selection_selected PRIVATE
+        "TIGRIS_OP_CONFIG=\"${CMAKE_CURRENT_SOURCE_DIR}/test/kernel_selection_config.h\"")
+    target_link_libraries(test_kernel_selection_selected m)
 
     # This executable references only the explicit executor API. The legacy
     # wrapper lives in a separate archive member and must not add its second
@@ -283,6 +303,8 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_test(NAME loader COMMAND test_loader)
     add_test(NAME executor COMMAND test_executor)
     add_test(NAME executor_rows COMMAND test_executor_rows)
+    add_test(NAME kernel_selection COMMAND test_kernel_selection)
+    add_test(NAME kernel_selection_selected COMMAND test_kernel_selection_selected)
     add_test(NAME explicit_workspace_link COMMAND explicit_workspace_link_smoke)
     add_test(NAME kernels_f32 COMMAND test_kernels)
     add_test(NAME kernels_s8 COMMAND test_kernels_s8)

@@ -15,6 +15,7 @@
 #include "tigris_accel_policy.h"
 #include "tigris_kernel_window.h"
 #include "tigris_binary_operands.h"
+#include "tigris_op_config.h"
 
 #include <math.h>
 #include <string.h>
@@ -3301,82 +3302,232 @@ int tigris_dispatch_kernel_s8(
     if (tigris_int32_operator(plan, op))
         return tigris_int32_execute(plan, op, op_index, mem);
     switch ((tigris_op_type_t)op->op_type) {
-    case TIGRIS_OP_CONV:        return kern_conv2d_s8(plan, op, mem);
-    case TIGRIS_OP_DEPTHWISE:   return kern_depthwise_conv2d_s8(plan, op, mem);
-    case TIGRIS_OP_FULLY_CONN:  return kern_fully_connected_s8(plan, op, mem);
-    case TIGRIS_OP_RELU:        return kern_relu_s8(plan, op, mem);
-    case TIGRIS_OP_RELU6:       return kern_relu6_s8(plan, op, mem);
-    case TIGRIS_OP_ADD:         return kern_add_s8(plan, op, op_index, mem);
-    case TIGRIS_OP_GLOBAL_AVG:  return kern_global_avg_pool_s8(plan, op, op_index, mem);
-    case TIGRIS_OP_AVG_POOL:     return kern_avg_pool_s8(plan, op, mem);
-    case TIGRIS_OP_RESHAPE:     return kern_reshape_s8(plan, op, mem);
-    case TIGRIS_OP_FLATTEN:     return kern_reshape_s8(plan, op, mem);
-    case TIGRIS_OP_MAX_POOL:    return kern_max_pool_s8(plan, op, mem);
-    case TIGRIS_OP_CONCAT:      return kern_concat_s8(plan, op, mem);
-    case TIGRIS_OP_RESIZE:      return kern_resize_nearest_s8(plan, op, mem);
-    case TIGRIS_OP_SIGMOID:     return kern_sigmoid_s8(plan, op, mem);
-    case TIGRIS_OP_GELU:        return kern_gelu_s8(plan, op, op_index, mem);
-    case TIGRIS_OP_TANH:        return kern_tanh_s8(plan, op, mem);
-    case TIGRIS_OP_SOFTMAX:     return kern_softmax_s8(plan, op, mem);
+#if TIGRIS_KERNEL_S8_CONV
+    case TIGRIS_OP_CONV: return kern_conv2d_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_DEPTHWISE
+    case TIGRIS_OP_DEPTHWISE: return kern_depthwise_conv2d_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_FULLY_CONN
+    case TIGRIS_OP_FULLY_CONN: return kern_fully_connected_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_RELU
+    case TIGRIS_OP_RELU: return kern_relu_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_RELU6
+    case TIGRIS_OP_RELU6: return kern_relu6_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_ADD
+    case TIGRIS_OP_ADD: return kern_add_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_GLOBAL_AVG
+    case TIGRIS_OP_GLOBAL_AVG: return kern_global_avg_pool_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_AVG_POOL
+    case TIGRIS_OP_AVG_POOL: return kern_avg_pool_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_RESHAPE
+    case TIGRIS_OP_RESHAPE: return kern_reshape_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_FLATTEN
+    case TIGRIS_OP_FLATTEN: return kern_reshape_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_MAX_POOL
+    case TIGRIS_OP_MAX_POOL: return kern_max_pool_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_CONCAT
+    case TIGRIS_OP_CONCAT: return kern_concat_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_RESIZE
+    case TIGRIS_OP_RESIZE: return kern_resize_nearest_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_SIGMOID
+    case TIGRIS_OP_SIGMOID: return kern_sigmoid_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_GELU
+    case TIGRIS_OP_GELU: return kern_gelu_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_TANH
+    case TIGRIS_OP_TANH: return kern_tanh_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_SOFTMAX
+    case TIGRIS_OP_SOFTMAX: return kern_softmax_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_LEAKY_RELU
     case TIGRIS_OP_LEAKY_RELU: return kern_leaky_relu_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_PRELU
     case TIGRIS_OP_PRELU: return kern_prelu_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_ELU
     case TIGRIS_OP_ELU: return kern_elu_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_LOG_SOFTMAX
     case TIGRIS_OP_LOG_SOFTMAX: return kern_log_softmax_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_L2_NORMALIZATION
     case TIGRIS_OP_L2_NORMALIZATION: return kern_l2_normalization_s8(plan, op, mem);
-    case TIGRIS_OP_MUL:         return kern_mul_s8(plan, op, op_index, mem);
-    case TIGRIS_OP_CONV1D:      return kern_conv1d_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_MUL
+    case TIGRIS_OP_MUL: return kern_mul_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_CONV1D
+    case TIGRIS_OP_CONV1D: return kern_conv1d_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_CONV_TRANSPOSE
     case TIGRIS_OP_CONV_TRANSPOSE: return kern_conv_transpose_s8(plan, op, mem);
-    case TIGRIS_OP_SUB:         return kern_sub_s8(plan, op, op_index, mem);
-    case TIGRIS_OP_GLOBAL_MAX:  return kern_global_max_pool_s8(plan, op, mem);
-    case TIGRIS_OP_MATMUL:      return kern_matmul_s8(plan, op, mem);
-    case TIGRIS_OP_TRANSPOSE:   return tigris_transpose_execute(plan, op, op_index, mem);
-    case TIGRIS_OP_ERF:         return kern_erf_s8(plan, op, mem);
-    case TIGRIS_OP_HARDSWISH:   return kern_hardswish_s8(plan, op, mem);
-    case TIGRIS_OP_ABS:        return kern_elementwise_unary_s8(plan, op, mem);
-    case TIGRIS_OP_RSQRT:      return kern_elementwise_unary_s8(plan, op, mem);
-    case TIGRIS_OP_DIV:        return kern_elementwise_binary_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_SUB
+    case TIGRIS_OP_SUB: return kern_sub_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_GLOBAL_MAX
+    case TIGRIS_OP_GLOBAL_MAX: return kern_global_max_pool_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_MATMUL
+    case TIGRIS_OP_MATMUL: return kern_matmul_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_TRANSPOSE
+    case TIGRIS_OP_TRANSPOSE: return tigris_transpose_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_ERF
+    case TIGRIS_OP_ERF: return kern_erf_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_HARDSWISH
+    case TIGRIS_OP_HARDSWISH: return kern_hardswish_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_ABS
+    case TIGRIS_OP_ABS: return kern_elementwise_unary_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_RSQRT
+    case TIGRIS_OP_RSQRT: return kern_elementwise_unary_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_DIV
+    case TIGRIS_OP_DIV: return kern_elementwise_binary_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_SQUARED_DIFFERENCE
     case TIGRIS_OP_SQUARED_DIFFERENCE: return kern_elementwise_binary_s8(plan, op, op_index, mem);
-    case TIGRIS_OP_MAXIMUM:    return kern_elementwise_binary_s8(plan, op, op_index, mem);
-    case TIGRIS_OP_MINIMUM:    return kern_elementwise_binary_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_MAXIMUM
+    case TIGRIS_OP_MAXIMUM: return kern_elementwise_binary_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_MINIMUM
+    case TIGRIS_OP_MINIMUM: return kern_elementwise_binary_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_RESIZE_LINEAR
     case TIGRIS_OP_RESIZE_LINEAR: return kern_resize_linear_s8(plan, op, mem);
-    case TIGRIS_OP_LAYER_NORM:  return kern_layer_norm_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_LAYER_NORM
+    case TIGRIS_OP_LAYER_NORM: return kern_layer_norm_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_REDUCE_MEAN
     case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean_s8(plan, op, op_index, mem);
-    case TIGRIS_OP_REDUCE_MAX:
-    case TIGRIS_OP_REDUCE_MIN:
+#endif
+#if TIGRIS_KERNEL_S8_REDUCE_MAX
+    case TIGRIS_OP_REDUCE_MAX: return kern_reduce_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_REDUCE_MIN
+    case TIGRIS_OP_REDUCE_MIN: return kern_reduce_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_REDUCE_SUM
     case TIGRIS_OP_REDUCE_SUM: return kern_reduce_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_GATHER
     case TIGRIS_OP_GATHER:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_GATHER_ND
     case TIGRIS_OP_GATHER_ND:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_STRIDED_SLICE
     case TIGRIS_OP_STRIDED_SLICE:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_MIRROR_PAD
     case TIGRIS_OP_MIRROR_PAD:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_REVERSE_V2
     case TIGRIS_OP_REVERSE_V2:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_EMBEDDING_LOOKUP
     case TIGRIS_OP_EMBEDDING_LOOKUP:
+        return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_DYNAMIC_UPDATE_SLICE
     case TIGRIS_OP_DYNAMIC_UPDATE_SLICE:
         return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_EQUAL
     case TIGRIS_OP_EQUAL: return kern_comparison_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_LESS
     case TIGRIS_OP_LESS: return kern_comparison_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_LESS_EQUAL
     case TIGRIS_OP_LESS_EQUAL: return kern_comparison_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_GREATER
     case TIGRIS_OP_GREATER: return kern_comparison_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_GREATER_EQUAL
     case TIGRIS_OP_GREATER_EQUAL: return kern_comparison_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_LOGICAL_AND
     case TIGRIS_OP_LOGICAL_AND: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_LOGICAL_OR
     case TIGRIS_OP_LOGICAL_OR: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_LOGICAL_NOT
     case TIGRIS_OP_LOGICAL_NOT: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_SELECT_V2
     case TIGRIS_OP_SELECT_V2: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_CAST
     case TIGRIS_OP_CAST: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_ADD_N
     case TIGRIS_OP_ADD_N: return kern_add_n_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_REDUCE_ALL
     case TIGRIS_OP_REDUCE_ALL: return tigris_reduce_all_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_SVDF
     case TIGRIS_OP_SVDF: return kern_svdf_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_LSTM
     case TIGRIS_OP_LSTM: return kern_lstm_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_DETECTION_POSTPROCESS
     case TIGRIS_OP_DETECTION_POSTPROCESS: return tigris_detection_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_QUANTIZE
     case TIGRIS_OP_QUANTIZE:
         if (plan->tensors[tigris_op_inputs(plan, op)[0]].dtype == 3u)
             return kern_requantize_s8(plan, op, mem);
         return tigris_quantize_execute(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_DEQUANTIZE
     case TIGRIS_OP_DEQUANTIZE: return tigris_quantize_execute(plan, op, mem);
-    case TIGRIS_OP_ARG_MAX:
+#endif
+#if TIGRIS_KERNEL_S8_ARG_MAX
+    case TIGRIS_OP_ARG_MAX: return tigris_arg_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_ARG_MIN
     case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_CUMSUM
     case TIGRIS_OP_CUMSUM: return kern_cumsum_s8(plan, op, op_index, mem);
-    case TIGRIS_OP_SPLIT:       return kern_split_s8(plan, op, mem);
-    case TIGRIS_OP_PAD:         return kern_pad_s8(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_S8_SPLIT
+    case TIGRIS_OP_SPLIT: return kern_split_s8(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_PAD
+    case TIGRIS_OP_PAD: return kern_pad_s8(plan, op, op_index, mem);
+#endif
     default:
         return -1;  /* unsupported op type */
     }

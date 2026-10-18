@@ -17,6 +17,7 @@
 #include "tigris_kernels_cmsis_nn.h"
 #include "tigris_accel_policy.h"
 #include "tigris_kernels_s8.h"
+#include "tigris_op_config.h"
 
 #include "arm_nnfunctions.h"
 #include <limits.h>
@@ -696,14 +697,30 @@ int tigris_dispatch_kernel_cmsis_nn(
 #endif
 
     switch ((tigris_op_type_t)op->op_type) {
-    case TIGRIS_OP_CONV:        return adapt_conv2d(plan, op, mem);
-    case TIGRIS_OP_DEPTHWISE:   return adapt_depthwise_conv2d(plan, op, mem);
-    case TIGRIS_OP_FULLY_CONN:  return adapt_fully_connected(plan, op, mem);
-    case TIGRIS_OP_AVG_POOL:    return adapt_avg_pool(plan, op, op_index, mem, user_ctx);
-    case TIGRIS_OP_GLOBAL_AVG:  return adapt_avg_pool(plan, op, op_index, mem, user_ctx);
-    case TIGRIS_OP_MUL:         return adapt_binary(plan, op, mem);
-    case TIGRIS_OP_MAXIMUM:     return adapt_binary(plan, op, mem);
-    case TIGRIS_OP_MINIMUM:     return adapt_binary(plan, op, mem);
+#if TIGRIS_KERNEL_S8_CONV
+    case TIGRIS_OP_CONV: return adapt_conv2d(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_DEPTHWISE
+    case TIGRIS_OP_DEPTHWISE: return adapt_depthwise_conv2d(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_FULLY_CONN
+    case TIGRIS_OP_FULLY_CONN: return adapt_fully_connected(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_AVG_POOL
+    case TIGRIS_OP_AVG_POOL: return adapt_avg_pool(plan, op, op_index, mem, user_ctx);
+#endif
+#if TIGRIS_KERNEL_S8_GLOBAL_AVG
+    case TIGRIS_OP_GLOBAL_AVG: return adapt_avg_pool(plan, op, op_index, mem, user_ctx);
+#endif
+#if TIGRIS_KERNEL_S8_MUL
+    case TIGRIS_OP_MUL: return adapt_binary(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_MAXIMUM
+    case TIGRIS_OP_MAXIMUM: return adapt_binary(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_S8_MINIMUM
+    case TIGRIS_OP_MINIMUM: return adapt_binary(plan, op, mem);
+#endif
 
     /* Ops without CMSIS-NN equivalent: fall back to reference s8 kernels */
     default:

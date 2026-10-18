@@ -27,6 +27,7 @@
 #include "tigris_kernels_esp_nn.h"
 #include "tigris_accel_policy.h"
 #include "tigris_kernels_s8.h"
+#include "tigris_op_config.h"
 
 #include "sdkconfig.h"   /* CONFIG_NN_OPTIMIZED, CONFIG_IDF_TARGET_ESP32S3 */
 #include <esp_nn.h>
@@ -921,11 +922,21 @@ int tigris_dispatch_kernel_esp_nn(
 
     int rc;
     switch ((tigris_op_type_t)op->op_type) {
-    case TIGRIS_OP_CONV:        rc = adapt_conv2d(plan, op, mem); break;
-    case TIGRIS_OP_DEPTHWISE:   rc = adapt_depthwise_conv2d(plan, op, mem); break;
-    case TIGRIS_OP_FULLY_CONN:  rc = adapt_fully_connected(plan, op, mem); break;
-    case TIGRIS_OP_AVG_POOL:    rc = adapt_avg_pool(plan, op, mem); break;
-    case TIGRIS_OP_MUL:         rc = adapt_mul(plan, op, mem); break;
+#if TIGRIS_KERNEL_S8_CONV
+    case TIGRIS_OP_CONV: rc = adapt_conv2d(plan, op, mem); break;
+#endif
+#if TIGRIS_KERNEL_S8_DEPTHWISE
+    case TIGRIS_OP_DEPTHWISE: rc = adapt_depthwise_conv2d(plan, op, mem); break;
+#endif
+#if TIGRIS_KERNEL_S8_FULLY_CONN
+    case TIGRIS_OP_FULLY_CONN: rc = adapt_fully_connected(plan, op, mem); break;
+#endif
+#if TIGRIS_KERNEL_S8_AVG_POOL
+    case TIGRIS_OP_AVG_POOL: rc = adapt_avg_pool(plan, op, mem); break;
+#endif
+#if TIGRIS_KERNEL_S8_MUL
+    case TIGRIS_OP_MUL: rc = adapt_mul(plan, op, mem); break;
+#endif
     /* Global avg pool: s8_ref uses float rescale (in_scale/out_scale)
      * that esp_nn_avg_pool_s8 doesn't support - fall back. */
     case TIGRIS_OP_GLOBAL_AVG:  rc = -99; break;

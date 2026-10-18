@@ -2,8 +2,6 @@ build/
 build-*/
 *.o
 *.a
-test/fixtures/*.tgrs
-test/fixtures/*.reference.bin
 compile_commands.json
 __pycache__/
 

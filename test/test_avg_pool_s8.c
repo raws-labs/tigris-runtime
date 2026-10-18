@@ -12,6 +12,7 @@
 #include "tigris_executor.h"
 #include "tigris_kernels_s8.h"
 #include "tigris_mem.h"
+#include "test_harness.h"
 
 #define TEST_H             16
 #define TEST_W              4
@@ -20,32 +21,6 @@
 #define NORMAL_FAST_SIZE 2048u
 #define TILED_FAST_SIZE   512u
 #define TEST_SLOW_SIZE   2048u
-
-static int tests_run;
-static int tests_passed;
-static int tests_failed;
-
-#define TEST_ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s\n", \
-                __func__, __LINE__, msg); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-#define TEST_ASSERT_EQ(a, b, msg) do { \
-    tests_run++; \
-    if ((a) != (b)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
-                __func__, __LINE__, msg, (long)(a), (long)(b)); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
 
 typedef struct {
     tigris_file_header_t header;
@@ -423,7 +398,5 @@ int main(void)
     test_asymmetric_quant_normal_and_tiled();
     test_accelerator_pool_routes();
 
-    printf("\nResults: %d passed, %d failed, %d total\n",
-           tests_passed, tests_failed, tests_run);
-    return tests_failed ? 1 : 0;
+    return test_report();
 }

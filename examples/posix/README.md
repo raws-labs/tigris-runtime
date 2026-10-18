@@ -16,7 +16,9 @@ cmake -S . -B build && cmake --build build
 ```
 
 Generate a plan with the compiler (`tigris compile model.onnx -m 256K -o
-model.tgrs`), or use one of the fixtures under `test/fixtures/`.
+model.tgrs`), or use the frozen int8 plan
+`test/schema_compat/schema-v9-binary-requant.tgrs`, which CTest runs as
+`posix_example`.
 
 The plan must execute on int8; the example reports and exits otherwise. Its
 boundary is a separate question: `tigris_output_read()` returns the output in

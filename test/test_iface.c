@@ -16,53 +16,7 @@
 #include "tigris_iface.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
-
-static int tests_run = 0;
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST_ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-#define TEST_ASSERT_EQ(a, b, msg) do { \
-    tests_run++; \
-    if ((a) != (b)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
-                __func__, __LINE__, msg, (long)(a), (long)(b)); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-static uint8_t *load_file(const char *path, uint32_t *out_len)
-{
-    FILE *f = fopen(path, "rb");
-    long size;
-    uint8_t *buf;
-    if (!f)
-        return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    size = ftell(f);
-    if (size <= 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
-    buf = (uint8_t *)malloc((size_t)size);
-    if (!buf) { fclose(f); return NULL; }
-    if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
-        free(buf);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-    *out_len = (uint32_t)size;
-    return buf;
-}
+#include "test_harness.h"
 
 /* The schema-6 fixture: a QDQ Conv whose boundary declares float32. */
 static uint8_t *fixture_buf = NULL;
@@ -500,7 +454,5 @@ int main(void)
     test_unconvertible_interfaces_are_refused();
 
     free(fixture_buf);
-    printf("\nResults: %d passed, %d failed, %d total\n",
-           tests_passed, tests_failed, tests_run);
-    return tests_failed == 0 ? 0 : 1;
+    return test_report();
 }

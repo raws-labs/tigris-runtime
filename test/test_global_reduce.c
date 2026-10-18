@@ -17,6 +17,7 @@
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
 #include "tigris_mem.h"
+#include "test_harness.h"
 
 #define TEST_N   1
 #define TEST_H  16
@@ -26,34 +27,6 @@
 
 #define WHOLE_FAST_SIZE 16384u
 #define SLOW_SIZE        8192u
-
-static int tests_run;
-static int tests_passed;
-static int tests_failed;
-
-#define TEST_ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s\n", \
-                __func__, __LINE__, msg); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-#define TEST_ASSERT_EQ(a, b, msg) do { \
-    long got_ = (long)(a); \
-    long want_ = (long)(b); \
-    tests_run++; \
-    if (got_ != want_) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
-                __func__, __LINE__, msg, got_, want_); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
 
 typedef struct {
     tigris_file_header_t header;
@@ -187,84 +160,71 @@ static tigris_exec_error_t run_case(
     return TIGRIS_EXEC_OK;
 }
 
-static void test_float_reduction_is_band_invariant(void)
+typedef struct {
+    const char *name;
+    uint32_t elem_size;
+    tigris_kernel_fn kernel;
+    uint32_t small_fast_size;
+} reduce_case_t;
+
+/* The small arenas force 7+7+2 float bands and 6+6+4 int8 bands. */
+static const reduce_case_t k_reduce_cases[] = {
+    { "float", sizeof(float), tigris_dispatch_kernel, 1024u },
+    { "int8", 1u, tigris_dispatch_kernel_s8, 256u },
+};
+
+static void test_reduction_is_band_invariant(void)
 {
-    printf("  test_float_reduction_is_band_invariant...\n");
-
-    reduce_fixture_t whole;
-    reduce_fixture_t banded;
-    build_fixture(&whole, sizeof(float));
-    build_fixture(&banded, sizeof(float));
-
-    float input[TEST_ELEMENTS];
-    for (int i = 0; i < TEST_ELEMENTS; i++)
-        input[i] = (float)((i % 37) - 18) * 0.125f;
-
-    float whole_out[TEST_N * TEST_C];
-    float banded_out[TEST_N * TEST_C];
-    uint16_t whole_tiled = 0;
-    uint16_t banded_tiled = 0;
+    printf("  test_reduction_is_band_invariant...\n");
 
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t big[WHOLE_FAST_SIZE];
-    /* 1024 leaves room for a 7-row band, so the 16 rows arrive as 7+7+2. */
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t small[1024];
 
-    TEST_ASSERT_EQ(
-        run_case(&whole, tigris_dispatch_kernel, big, sizeof(big),
-                 input, sizeof(input), whole_out, sizeof(whole_out),
-                 &whole_tiled),
-        TIGRIS_EXEC_OK, "float whole-tensor run");
-    TEST_ASSERT_EQ(whole_tiled, 0, "float whole-tensor run is not tiled");
+    for (size_t c = 0; c < sizeof(k_reduce_cases) / sizeof(k_reduce_cases[0]); c++) {
+        const reduce_case_t *rc = &k_reduce_cases[c];
+        reduce_fixture_t whole;
+        reduce_fixture_t banded;
+        build_fixture(&whole, rc->elem_size);
+        build_fixture(&banded, rc->elem_size);
+        memset(big, 0, sizeof(big));
+        memset(small, 0, sizeof(small));
 
-    TEST_ASSERT_EQ(
-        run_case(&banded, tigris_dispatch_kernel, small, sizeof(small),
-                 input, sizeof(input), banded_out, sizeof(banded_out),
-                 &banded_tiled),
-        TIGRIS_EXEC_OK, "float banded run");
-    TEST_ASSERT_EQ(banded_tiled, 1, "float banded run is tiled");
+        float input_f32[TEST_ELEMENTS];
+        int8_t input_s8[TEST_ELEMENTS];
+        for (int i = 0; i < TEST_ELEMENTS; i++) {
+            input_f32[i] = (float)((i % 37) - 18) * 0.125f;
+            input_s8[i] = (int8_t)((i * 7) % 251 - 125);
+        }
+        const void *input = rc->elem_size == 1u ? (const void *)input_s8
+                                                : (const void *)input_f32;
+        const uint32_t input_bytes = TEST_ELEMENTS * rc->elem_size;
+        const uint32_t output_bytes = TEST_N * TEST_C * rc->elem_size;
 
-    TEST_ASSERT(memcmp(whole_out, banded_out, sizeof(whole_out)) == 0,
-                "float banded reduction is byte-identical");
-}
+        float whole_out[TEST_N * TEST_C];
+        float banded_out[TEST_N * TEST_C];
+        uint16_t whole_tiled = 0;
+        uint16_t banded_tiled = 0;
+        char msg[96];
 
-static void test_s8_reduction_is_band_invariant(void)
-{
-    printf("  test_s8_reduction_is_band_invariant...\n");
+        snprintf(msg, sizeof(msg), "%s whole-tensor run", rc->name);
+        TEST_ASSERT_EQ(
+            run_case(&whole, rc->kernel, big, sizeof(big), input, input_bytes,
+                     whole_out, output_bytes, &whole_tiled),
+            TIGRIS_EXEC_OK, msg);
+        snprintf(msg, sizeof(msg), "%s whole-tensor run is not tiled", rc->name);
+        TEST_ASSERT_EQ(whole_tiled, 0, msg);
 
-    reduce_fixture_t whole;
-    reduce_fixture_t banded;
-    build_fixture(&whole, 1u);
-    build_fixture(&banded, 1u);
+        snprintf(msg, sizeof(msg), "%s banded run", rc->name);
+        TEST_ASSERT_EQ(
+            run_case(&banded, rc->kernel, small, rc->small_fast_size, input,
+                     input_bytes, banded_out, output_bytes, &banded_tiled),
+            TIGRIS_EXEC_OK, msg);
+        snprintf(msg, sizeof(msg), "%s banded run is tiled", rc->name);
+        TEST_ASSERT_EQ(banded_tiled, 1, msg);
 
-    int8_t input[TEST_ELEMENTS];
-    for (int i = 0; i < TEST_ELEMENTS; i++)
-        input[i] = (int8_t)((i * 7) % 251 - 125);
-
-    int8_t whole_out[TEST_N * TEST_C];
-    int8_t banded_out[TEST_N * TEST_C];
-    uint16_t whole_tiled = 0;
-    uint16_t banded_tiled = 0;
-
-    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t big[WHOLE_FAST_SIZE];
-    /* 256 leaves room for a 6-row band, so the 16 rows arrive as 6+6+4. */
-    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t small[256];
-
-    TEST_ASSERT_EQ(
-        run_case(&whole, tigris_dispatch_kernel_s8, big, sizeof(big),
-                 input, sizeof(input), whole_out, sizeof(whole_out),
-                 &whole_tiled),
-        TIGRIS_EXEC_OK, "int8 whole-tensor run");
-    TEST_ASSERT_EQ(whole_tiled, 0, "int8 whole-tensor run is not tiled");
-
-    TEST_ASSERT_EQ(
-        run_case(&banded, tigris_dispatch_kernel_s8, small, sizeof(small),
-                 input, sizeof(input), banded_out, sizeof(banded_out),
-                 &banded_tiled),
-        TIGRIS_EXEC_OK, "int8 banded run");
-    TEST_ASSERT_EQ(banded_tiled, 1, "int8 banded run is tiled");
-
-    TEST_ASSERT(memcmp(whole_out, banded_out, sizeof(whole_out)) == 0,
-                "int8 banded reduction is byte-identical");
+        snprintf(msg, sizeof(msg), "%s banded reduction is byte-identical", rc->name);
+        TEST_ASSERT(memcmp(whole_out, banded_out, output_bytes) == 0, msg);
+    }
 }
 
 static int fail_reduction(const tigris_plan_t *plan, const tigris_op_t *op,
@@ -327,8 +287,7 @@ static void test_channel_and_spatial_groups(void)
 int main(void)
 {
     printf("Global reduction tiling tests:\n");
-    test_float_reduction_is_band_invariant();
-    test_s8_reduction_is_band_invariant();
+    test_reduction_is_band_invariant();
     test_channel_and_spatial_groups();
 
 #ifdef TIGRIS_TRACE
@@ -336,7 +295,5 @@ int main(void)
                    1, "by_input path checked against trace");
 #endif
 
-    printf("\nResults: %d passed, %d failed, %d total\n",
-           tests_passed, tests_failed, tests_run);
-    return tests_failed == 0 ? 0 : 1;
+    return test_report();
 }

@@ -15,6 +15,7 @@
 #include "tigris_executor.h"
 #include "tigris_kernels.h"
 #include "tigris_mem.h"
+#include "test_harness.h"
 
 #define TEST_ROWS  64
 #define TEST_IN    8
@@ -24,34 +25,6 @@
 
 #define WHOLE_FAST_SIZE 16384u
 #define SLOW_SIZE        8192u
-
-static int tests_run;
-static int tests_passed;
-static int tests_failed;
-
-#define TEST_ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s\n", \
-                __func__, __LINE__, msg); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-#define TEST_ASSERT_EQ(a, b, msg) do { \
-    long got_ = (long)(a); \
-    long want_ = (long)(b); \
-    tests_run++; \
-    if (got_ != want_) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
-                __func__, __LINE__, msg, got_, want_); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
 
 typedef struct {
     tigris_file_header_t header;
@@ -650,7 +623,5 @@ int main(void)
                    1, "rows path checked against trace");
 #endif
 
-    printf("\nResults: %d passed, %d failed, %d total\n",
-           tests_passed, tests_failed, tests_run);
-    return tests_failed == 0 ? 0 : 1;
+    return test_report();
 }

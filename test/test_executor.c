@@ -1,13 +1,9 @@
 /**
  * @file test_executor.c
  * @brief Native POSIX tests for the memory manager and stage executor.
- *
- * Usage: ./test_executor [fixture1.tgrs] [fixture2.tgrs] ...
- *
- * If no arguments given, runs built-in memory manager tests only.
- * When fixture files are provided, loads each and runs executor tests.
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,67 +14,13 @@
 #include "tigris_executor.h"
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
+#include "test_harness.h"
 
 /* Alignment helper */
 
 #define ALIGN_UP(x) (((x) + (TIGRIS_TENSOR_ALIGN - 1u)) & ~(TIGRIS_TENSOR_ALIGN - 1u))
 
-/* Test infrastructure */
-
-static int tests_run = 0;
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST_ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-#define TEST_ASSERT_EQ(a, b, msg) do { \
-    tests_run++; \
-    if ((a) != (b)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
-                __func__, __LINE__, msg, (long)(a), (long)(b)); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
-
-/* File loader helper */
-
 #include "trace_assert.h"
-
-static uint8_t *load_file(const char *path, uint32_t *out_len)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "  Cannot open: %s\n", path);
-        return NULL;
-    }
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    uint8_t *buf = (uint8_t *)malloc(len);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-    if ((long)fread(buf, 1, len, f) != len) {
-        free(buf);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-    *out_len = (uint32_t)len;
-    return buf;
-}
 
 /* Memory manager tests (no fixtures needed) */
 
@@ -381,14 +323,9 @@ static void test_mem_error_strings(void)
     TEST_ASSERT(strlen(tigris_mem_error_str((tigris_mem_error_t)999)) > 0, "unknown string");
 }
 
-/* Executor tests (require fixtures) */
+/* Executor tests */
 
-/* Stub kernel: memsets each output tensor to 0x01, increments counter */
-typedef struct {
-    int call_count;
-    int fail_on_call;  /* -1 = never fail */
-} stub_ctx_t;
-
+/* Kernel for calls that are rejected before any dispatch. */
 static int stub_kernel(
     const tigris_plan_t *plan,
     const tigris_op_t   *op,
@@ -396,21 +333,11 @@ static int stub_kernel(
     tigris_mem_t        *mem,
     void                *user_ctx)
 {
+    (void)plan;
+    (void)op;
     (void)op_index;
-    stub_ctx_t *ctx = (stub_ctx_t *)user_ctx;
-    ctx->call_count++;
-
-    if (ctx->fail_on_call >= 0 && ctx->call_count == ctx->fail_on_call)
-        return -1;
-
-    const uint16_t *outs = tigris_op_outputs(plan, op);
-    for (uint8_t i = 0; i < op->num_outputs; i++) {
-        uint16_t tidx = outs[i];
-        void *ptr = tigris_mem_tensor_ptr(mem, tidx);
-        if (ptr) {
-            memset(ptr, 0x01, plan->tensors[tidx].size_bytes);
-        }
-    }
+    (void)mem;
+    (void)user_ctx;
     return 0;
 }
 
@@ -505,69 +432,12 @@ static void test_exec_workspace_chain_sizing(void)
         tigris_executor_workspace_required(&plan),
         TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(5, 2, 3, 2, 2),
         "query includes pool in actual chain spatial capacity");
-}
-
-/**
- * The compiler sets TIGRIS_STAGE_FLAG_LINE_BUFFERED on a recomputing chain's
- * head stage. The runtime reads it in exec_chain_tiled but does not act on
- * it yet (the roll is a later change). Confirm that setting the bit on the
- * head stage's _reserved1 does not perturb workspace sizing, i.e. it is
- * safely ignored by everything that currently looks at chain stages.
- */
-static void test_exec_line_buffered_flag_is_noop_for_sizing(void)
-{
-    printf("  test_exec_line_buffered_flag_is_noop_for_sizing...\n");
-    tigris_file_header_t header;
-    tigris_op_t ops[3];
-    tigris_stage_t stages[2];
-    tigris_plan_t plan;
-    const uint16_t indices[] = {
-        0, 1,       /* stage 0 ops */
-        0, 1,       /* stage 0 inputs */
-        2,          /* stage 0 output */
-        2,          /* stage 1 op */
-        2,          /* stage 1 input */
-        2, 3, 4,    /* stage 1 outputs */
-    };
-
-    memset(&header, 0, sizeof(header));
-    memset(ops, 0, sizeof(ops));
-    memset(stages, 0, sizeof(stages));
-    memset(&plan, 0, sizeof(plan));
-    header.num_tensors = 5;
-    header.num_ops = 3;
-    header.num_stages = 2;
-    ops[0].op_type = TIGRIS_OP_CONV;
-    ops[1].op_type = TIGRIS_OP_AVG_POOL;
-    ops[2].op_type = TIGRIS_OP_CONV;
-    stages[0].ops_off = 0;
-    stages[0].ops_count = 2;
-    stages[0].inputs_off = 2;
-    stages[0].inputs_count = 2;
-    stages[0].outputs_off = 4;
-    stages[0].outputs_count = 1;
-    stages[0].chain_id = 0;
-    stages[0].chain_len = 2;
-    stages[1].ops_off = 5;
-    stages[1].ops_count = 1;
-    stages[1].inputs_off = 6;
-    stages[1].inputs_count = 1;
-    stages[1].outputs_off = 7;
-    stages[1].outputs_count = 3;
-    stages[1].chain_id = 0;
-    stages[1].chain_len = 2;
-    plan.header = &header;
-    plan.ops = ops;
-    plan.stages = stages;
-    plan.index_pool = indices;
-
-    uint32_t required_unset = tigris_executor_workspace_required(&plan);
 
     stages[0]._reserved1 = TIGRIS_STAGE_FLAG_LINE_BUFFERED;
-    uint32_t required_set = tigris_executor_workspace_required(&plan);
-
-    TEST_ASSERT_EQ(required_set, required_unset,
-                   "line-buffered flag on head stage does not change workspace sizing");
+    TEST_ASSERT_EQ(
+        tigris_executor_workspace_required(&plan),
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(5, 2, 3, 2, 2),
+        "line-buffered flag on head stage does not change workspace sizing");
 }
 
 /** Helper: compute sum of all non-constant tensor sizes for slow buffer sizing. */
@@ -717,81 +587,6 @@ static uint8_t *run_plan_capture_output(const tigris_plan_t *plan, uint32_t *out
     free(fast_buf);
     free(slow_buf);
     return out;
-}
-
-/**
- * Regression guard for the actual read site: run the SAME streaming chain
- * plan bytes through exec_chain_tiled (via tigris_run_with_workspace) twice,
- * once with the compiler-emitted line-buffered flag on the head stage and
- * once with that single bit cleared, and assert the model output is
- * byte-for-byte identical. This is what a future change that starts
- * branching on `line_buffered` inside exec_chain_tiled without also
- * updating this test would break - unlike
- * test_exec_line_buffered_flag_is_noop_for_sizing() (workspace sizing
- * only), this exercises the real tiled execution path the flag was read
- * for.
- */
-static void test_exec_chain_tiled_line_buffered_flag_is_noop(void)
-{
-    printf("  test_exec_chain_tiled_line_buffered_flag_is_noop...\n");
-
-    const size_t plan_len = sizeof(k_line_buffered_chain_plan);
-    uint8_t *buf_flagged = (uint8_t *)malloc(plan_len);
-    uint8_t *buf_cleared = (uint8_t *)malloc(plan_len);
-    memcpy(buf_flagged, k_line_buffered_chain_plan, plan_len);
-    memcpy(buf_cleared, k_line_buffered_chain_plan, plan_len);
-
-    tigris_plan_t plan_flagged;
-    tigris_error_t lerr = tigris_plan_load(buf_flagged, (uint32_t)plan_len, &plan_flagged);
-    TEST_ASSERT_EQ(lerr, TIGRIS_OK, "load flagged plan");
-    if (lerr != TIGRIS_OK) { free(buf_flagged); free(buf_cleared); return; }
-
-    TEST_ASSERT(plan_flagged.header->num_stages >= 2, "chain fixture has >=2 stages");
-    TEST_ASSERT_EQ(plan_flagged.stages[0].chain_len, 2, "chain length is 2");
-    TEST_ASSERT_EQ(plan_flagged.stages[0].chain_id, 0, "stage 0 is the chain head");
-    TEST_ASSERT((plan_flagged.stages[0]._reserved1 & TIGRIS_STAGE_FLAG_LINE_BUFFERED) != 0,
-                "fixture head stage carries the line-buffered flag as compiled");
-
-    /* Loader is zero-copy: plan.stages points directly into the loaded
-     * buffer, so this offset locates the exact byte to flip in the second
-     * copy. */
-    size_t reserved1_off =
-        (size_t)((const uint8_t *)&plan_flagged.stages[0]._reserved1 - buf_flagged);
-    TEST_ASSERT(reserved1_off + sizeof(uint16_t) <= plan_len, "reserved1 offset in bounds");
-    buf_cleared[reserved1_off] = (uint8_t)(buf_cleared[reserved1_off] &
-        ~(uint8_t)(TIGRIS_STAGE_FLAG_LINE_BUFFERED & 0xFFu));
-
-    tigris_plan_t plan_cleared;
-    lerr = tigris_plan_load(buf_cleared, (uint32_t)plan_len, &plan_cleared);
-    TEST_ASSERT_EQ(lerr, TIGRIS_OK, "load cleared plan");
-    if (lerr != TIGRIS_OK) { free(buf_flagged); free(buf_cleared); return; }
-    TEST_ASSERT_EQ(plan_cleared.stages[0]._reserved1 & TIGRIS_STAGE_FLAG_LINE_BUFFERED, 0,
-                   "flag bit cleared in second copy");
-
-    int diffs = 0;
-    for (size_t i = 0; i < plan_len; i++)
-        if (buf_flagged[i] != buf_cleared[i]) diffs++;
-    TEST_ASSERT_EQ(diffs, 1, "the two plan buffers differ in exactly one byte (the flag)");
-
-    uint32_t out_len_flagged = 0, out_len_cleared = 0;
-    uint8_t *out_flagged = run_plan_capture_output(&plan_flagged, &out_len_flagged,
-                                                   tigris_dispatch_kernel);
-    uint8_t *out_cleared = run_plan_capture_output(&plan_cleared, &out_len_cleared,
-                                                   tigris_dispatch_kernel);
-
-    TEST_ASSERT(out_flagged != NULL && out_cleared != NULL,
-                "both flagged and cleared runs produced output");
-    if (out_flagged && out_cleared) {
-        TEST_ASSERT_EQ(out_len_flagged, out_len_cleared, "output length matches");
-        TEST_ASSERT(out_len_flagged == out_len_cleared &&
-                    memcmp(out_flagged, out_cleared, out_len_flagged) == 0,
-                    "output bytes are identical with the flag set vs cleared");
-    }
-
-    free(out_flagged);
-    free(out_cleared);
-    free(buf_flagged);
-    free(buf_cleared);
 }
 
 #ifdef TIGRIS_COUNT_KERNEL_ROWS
@@ -1127,6 +922,60 @@ static uint8_t *run_chain_plan_with_flag(
 }
 
 /**
+ * Runs the compiler-emitted AvgPool -> MaxPool stride-2 chain with the head
+ * stage's line-buffered flag as compiled (set) and cleared, and asserts
+ * byte-identical model output.
+ */
+static void test_exec_chain_tiled_line_buffered_rolls_pool(void)
+{
+    printf("  test_exec_chain_tiled_line_buffered_rolls_pool...\n");
+
+    const uint8_t *plan_bytes = k_line_buffered_chain_plan;
+    const size_t plan_len = sizeof(k_line_buffered_chain_plan);
+
+    uint8_t *buf = (uint8_t *)malloc(plan_len);
+    memcpy(buf, plan_bytes, plan_len);
+    tigris_plan_t plan;
+    tigris_error_t lerr = tigris_plan_load(buf, (uint32_t)plan_len, &plan);
+    TEST_ASSERT_EQ(lerr, TIGRIS_OK, "load compiled plan");
+    if (lerr != TIGRIS_OK) { free(buf); return; }
+
+    TEST_ASSERT(plan.header->num_stages >= 2, "chain fixture has >=2 stages");
+    TEST_ASSERT_EQ(plan.stages[0].chain_len, 2, "chain length is 2");
+    TEST_ASSERT_EQ(plan.stages[0].chain_id, 0, "stage 0 is the chain head");
+    TEST_ASSERT((plan.stages[0]._reserved1 & TIGRIS_STAGE_FLAG_LINE_BUFFERED) != 0,
+                "fixture head stage carries the line-buffered flag as compiled");
+
+    size_t reserved1_off =
+        (size_t)((const uint8_t *)&plan.stages[0]._reserved1 - buf);
+    buf[reserved1_off] = (uint8_t)(buf[reserved1_off] &
+        ~(uint8_t)(TIGRIS_STAGE_FLAG_LINE_BUFFERED & 0xFFu));
+    int diffs = 0;
+    for (size_t i = 0; i < plan_len; i++)
+        if (buf[i] != plan_bytes[i]) diffs++;
+    TEST_ASSERT_EQ(diffs, 1, "clearing the flag changes exactly one plan byte");
+    free(buf);
+
+    uint32_t len_on = 0, len_off = 0;
+    unsigned long rows_on = 0, rows_off = 0;
+    uint8_t *out_on = run_chain_plan_with_flag(
+        plan_bytes, plan_len, 1, &len_on, &rows_on, tigris_dispatch_kernel);
+    uint8_t *out_off = run_chain_plan_with_flag(
+        plan_bytes, plan_len, 0, &len_off, &rows_off, tigris_dispatch_kernel);
+
+    TEST_ASSERT(out_on != NULL && out_off != NULL,
+                "both flagged and cleared runs produced output");
+    if (out_on && out_off) {
+        TEST_ASSERT_EQ(len_on, len_off, "output length matches");
+        TEST_ASSERT(len_on == len_off &&
+                    memcmp(out_on, out_off, len_on) == 0,
+                    "output bytes are identical with the flag set vs cleared");
+    }
+    free(out_on);
+    free(out_off);
+}
+
+/**
  * The line-buffered roll must be BIT-EXACT with the recompute path and must
  * compute materially fewer kernel output rows. Runs a real 3-stage Conv chain
  * twice (flag set vs cleared), asserts byte-identical model output, and (when
@@ -1435,53 +1284,6 @@ static const uint8_t k_linebuf_conv_sig_chain_plan[] = {
     0x9b, 0x6e, 0x52, 0x3d, 0x9c, 0x6d, 0xd3, 0x3d, 0xb5, 0xa9, 0x96, 0x3d,
 };
 
-/* INT8 Conv,Sigmoid,Conv rollable chain (see generator note). */
-
-
-/*
- * Load-bearing regression for the rolled height-preserving op input offset.
- * Runs the float Conv,Sigmoid,Conv chain twice (line-buffered flag set vs
- * cleared) and asserts byte-identical model output. The rolled Sigmoid stage
- * must read the NEW input rows, not the carried overlap rows; before the
- * in_row_start fix this assertion FAILS (flag-on diverges), after it PASSES.
- * The row counter confirms a stage genuinely rolled, so the byte-identity is
- * meaningful rather than a trivial single-tile equality.
- */
-static void test_exec_chain_tiled_line_buffered_rolls_pointwise(void)
-{
-    printf("  test_exec_chain_tiled_line_buffered_rolls_pointwise...\n");
-
-    const uint8_t *plan_bytes = k_linebuf_conv_sig_chain_plan;
-    const size_t plan_len = sizeof(k_linebuf_conv_sig_chain_plan);
-
-    uint32_t len_on = 0, len_off = 0;
-    unsigned long rows_on = 0, rows_off = 0;
-    uint8_t *out_on = run_chain_plan_with_flag(
-        plan_bytes, plan_len, 1, &len_on, &rows_on, tigris_dispatch_kernel);
-    uint8_t *out_off = run_chain_plan_with_flag(
-        plan_bytes, plan_len, 0, &len_off, &rows_off, tigris_dispatch_kernel);
-
-    TEST_ASSERT(out_on != NULL && out_off != NULL,
-                "both flagged and cleared runs produced output");
-    if (out_on && out_off) {
-        TEST_ASSERT_EQ(len_on, len_off, "output length matches");
-        TEST_ASSERT(len_on == len_off &&
-                    memcmp(out_on, out_off, len_on) == 0,
-                    "line-buffered pointwise chain is byte-identical to recompute");
-    }
-#ifdef TIGRIS_COUNT_KERNEL_ROWS
-    printf("    tile_h=%d tiles=%d rows: line_buffered=%lu recompute=%lu\n",
-           g_tigris_chain_tile_h, g_tigris_chain_num_tiles, rows_on, rows_off);
-    TEST_ASSERT(g_tigris_chain_num_tiles >= 3,
-                "run has tile 0, interior tile(s), and a last tile (rolling active)");
-    TEST_ASSERT(rows_off > 0 && rows_on > 0, "row counter recorded work");
-    TEST_ASSERT(rows_on < rows_off,
-                "line-buffered computes fewer rows, so a stage actually rolled");
-#endif
-    free(out_on);
-    free(out_off);
-}
-
 /*
  * The int8 analogue of the pointwise-roll chain: QDQ Conv -> Sigmoid -> Conv,
  * input [1,3,64,64] -> [1,8,64,64], padded 3x3 stride 1 (composed halo 2).
@@ -1629,163 +1431,59 @@ static void test_exec_chain_fully_carried_band(void)
     free(off);
 }
 
-/* The int8 pointwise roll must match recomputation byte for byte. */
-static void test_exec_chain_tiled_line_buffered_rolls_pointwise_s8(void)
-{
-    printf("  test_exec_chain_tiled_line_buffered_rolls_pointwise_s8...\n");
-
-    const uint8_t *plan_bytes = k_linebuf_s8_conv_sig_chain_plan;
-    const size_t plan_len = sizeof(k_linebuf_s8_conv_sig_chain_plan);
-
-    uint32_t len_on = 0, len_off = 0;
-    unsigned long rows_on = 0, rows_off = 0;
-    uint8_t *out_on = run_chain_plan_with_flag(
-        plan_bytes, plan_len, 1, &len_on, &rows_on, tigris_dispatch_kernel_s8);
-    uint8_t *out_off = run_chain_plan_with_flag(
-        plan_bytes, plan_len, 0, &len_off, &rows_off, tigris_dispatch_kernel_s8);
-
-    TEST_ASSERT(out_on != NULL && out_off != NULL,
-                "both flagged and cleared runs produced output");
-    if (out_on && out_off) {
-        TEST_ASSERT_EQ(len_on, len_off, "output length matches");
-        TEST_ASSERT(len_on == len_off &&
-                    memcmp(out_on, out_off, len_on) == 0,
-                    "s8 line-buffered pointwise chain is byte-identical to recompute");
-    }
-#ifdef TIGRIS_COUNT_KERNEL_ROWS
-    printf("    tile_h=%d tiles=%d rows: line_buffered=%lu recompute=%lu\n",
-           g_tigris_chain_tile_h, g_tigris_chain_num_tiles, rows_on, rows_off);
-    TEST_ASSERT(g_tigris_chain_num_tiles >= 3,
-                "s8 run has tile 0, interior tile(s), and a last tile (rolling active)");
-    TEST_ASSERT(rows_off > 0 && rows_on > 0, "row counter recorded work");
-    TEST_ASSERT(rows_on < rows_off,
-                "s8 line-buffered computes fewer rows, so a stage actually rolled");
-#endif
-    free(out_on);
-    free(out_off);
-}
-
-/**
- * Run executor on a fixture: allocate model inputs in slow, fill with 0xAA,
- * run with stub kernel (fills outputs with 0x01), verify output is in slow.
+/*
+ * Runs the float and int8 Conv,Sigmoid,Conv chains with the line-buffered flag
+ * set and cleared and asserts byte-identical model output. The rolled Sigmoid
+ * must read the new input rows, not the carried overlap rows. The row counter
+ * confirms a stage rolled, so the identity is not a single-tile equality.
  */
-static void test_exec_fixture(const char *path, int expected_kernel_calls)
+static void test_exec_chain_tiled_line_buffered_rolls_pointwise(void)
 {
-    printf("  test_exec_fixture(%s, expect %d kernel calls)...\n",
-           path, expected_kernel_calls);
+    static const struct {
+        const char *label;
+        const uint8_t *plan_bytes;
+        size_t plan_len;
+        tigris_kernel_fn kernel;
+    } cases[] = {
+        { "f32", k_linebuf_conv_sig_chain_plan,
+          sizeof(k_linebuf_conv_sig_chain_plan), tigris_dispatch_kernel },
+        { "s8", k_linebuf_s8_conv_sig_chain_plan,
+          sizeof(k_linebuf_s8_conv_sig_chain_plan), tigris_dispatch_kernel_s8 },
+    };
 
-    uint32_t buf_len = 0;
-    uint8_t *buf = load_file(path, &buf_len);
-    if (!buf) {
-        tests_run++;
-        tests_failed++;
-        fprintf(stderr, "  FAIL: could not load fixture\n");
-        return;
-    }
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        printf("  test_exec_chain_tiled_line_buffered_rolls_pointwise[%s]...\n",
+               cases[c].label);
 
-    tigris_plan_t plan;
-    tigris_error_t lerr = tigris_plan_load(buf, buf_len, &plan);
-    TEST_ASSERT_EQ(lerr, TIGRIS_OK, "load plan");
-    if (lerr != TIGRIS_OK) { free(buf); return; }
+        uint32_t len_on = 0, len_off = 0;
+        unsigned long rows_on = 0, rows_off = 0;
+        uint8_t *out_on = run_chain_plan_with_flag(
+            cases[c].plan_bytes, cases[c].plan_len, 1, &len_on, &rows_on,
+            cases[c].kernel);
+        uint8_t *out_off = run_chain_plan_with_flag(
+            cases[c].plan_bytes, cases[c].plan_len, 0, &len_off, &rows_off,
+            cases[c].kernel);
 
-    /* Allocate buffers */
-    uint16_t nt = plan.header->num_tensors;
-    void **ptrs = (void **)calloc(nt, sizeof(void *));
-    uint32_t fast_size = total_tensor_bytes(&plan);
-    uint8_t *fast_buf = (uint8_t *)malloc(fast_size);
-    /* Slow: enough for all activation tensors (2x for load+spill headroom) */
-    uint32_t slow_size = total_tensor_bytes(&plan) * 2;
-    uint8_t *slow_buf = (uint8_t *)malloc(slow_size);
-
-    tigris_mem_t mem;
-    tigris_mem_error_t merr = tigris_mem_init(&mem, ptrs, nt,
-                                              fast_buf, fast_size,
-                                              slow_buf, slow_size);
-    TEST_ASSERT_EQ(merr, TIGRIS_MEM_OK, "mem init");
-
-    /* Allocate model inputs in slow and fill with test data */
-    for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {
-        uint16_t tidx = plan.model_inputs[i];
-        merr = tigris_mem_alloc_slow(&mem, tidx, plan.tensors[tidx].size_bytes);
-        TEST_ASSERT_EQ(merr, TIGRIS_MEM_OK, "alloc model input");
-        memset(ptrs[tidx], 0xAA, plan.tensors[tidx].size_bytes);
-    }
-
-    /* Run executor */
-    stub_ctx_t ctx = { .call_count = 0, .fail_on_call = -1 };
-    tigris_executor_workspace_t workspace;
-    tigris_exec_error_t eerr = tigris_run_with_workspace(
-        &plan, &mem, stub_kernel, &ctx, NULL, &workspace);
-    TEST_ASSERT_EQ(eerr, TIGRIS_EXEC_OK, "exec ok");
-    TEST_ASSERT_EQ(ctx.call_count, expected_kernel_calls, "kernel call count");
-
-    /* Model outputs should be in slow buffer and filled with 0x01 */
-    for (uint8_t i = 0; i < plan.header->num_model_outputs; i++) {
-        uint16_t tidx = plan.model_outputs[i];
-        void *ptr = ptrs[tidx];
-        TEST_ASSERT(ptr != NULL, "output ptr not null");
-        TEST_ASSERT(ptr >= (void *)slow_buf && ptr < (void *)(slow_buf + slow_size),
-                    "output in slow buffer");
-        if (ptr) {
-            uint8_t *data = (uint8_t *)ptr;
-            int match = 1;
-            for (uint32_t b = 0; b < plan.tensors[tidx].size_bytes; b++) {
-                if (data[b] != 0x01) { match = 0; break; }
-            }
-            TEST_ASSERT(match, "output data is 0x01");
+        TEST_ASSERT(out_on != NULL && out_off != NULL,
+                    "both flagged and cleared runs produced output");
+        if (out_on && out_off) {
+            TEST_ASSERT_EQ(len_on, len_off, "output length matches");
+            TEST_ASSERT(len_on == len_off &&
+                        memcmp(out_on, out_off, len_on) == 0,
+                        "line-buffered pointwise chain is byte-identical to recompute");
         }
+#ifdef TIGRIS_COUNT_KERNEL_ROWS
+        printf("    tile_h=%d tiles=%d rows: line_buffered=%lu recompute=%lu\n",
+               g_tigris_chain_tile_h, g_tigris_chain_num_tiles, rows_on, rows_off);
+        TEST_ASSERT(g_tigris_chain_num_tiles >= 3,
+                    "run has tile 0, interior tile(s), and a last tile (rolling active)");
+        TEST_ASSERT(rows_off > 0 && rows_on > 0, "row counter recorded work");
+        TEST_ASSERT(rows_on < rows_off,
+                    "line-buffered computes fewer rows, so a stage actually rolled");
+#endif
+        free(out_on);
+        free(out_off);
     }
-
-    free(ptrs);
-    free(fast_buf);
-    free(slow_buf);
-    free(buf);
-}
-
-static void test_exec_kernel_error(const char *path)
-{
-    printf("  test_exec_kernel_error(%s)...\n", path);
-
-    uint32_t buf_len = 0;
-    uint8_t *buf = load_file(path, &buf_len);
-    if (!buf) {
-        tests_run++;
-        tests_failed++;
-        fprintf(stderr, "  FAIL: could not load fixture\n");
-        return;
-    }
-
-    tigris_plan_t plan;
-    tigris_error_t lerr = tigris_plan_load(buf, buf_len, &plan);
-    TEST_ASSERT_EQ(lerr, TIGRIS_OK, "load plan");
-    if (lerr != TIGRIS_OK) { free(buf); return; }
-
-    uint16_t nt = plan.header->num_tensors;
-    void **ptrs = (void **)calloc(nt, sizeof(void *));
-    uint32_t fast_size = total_tensor_bytes(&plan);
-    uint8_t *fast_buf = (uint8_t *)malloc(fast_size);
-    uint32_t slow_size = total_tensor_bytes(&plan) * 2;
-    uint8_t *slow_buf = (uint8_t *)malloc(slow_size);
-
-    tigris_mem_t mem;
-    tigris_mem_init(&mem, ptrs, nt, fast_buf, fast_size, slow_buf, slow_size);
-
-    for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {
-        uint16_t tidx = plan.model_inputs[i];
-        tigris_mem_alloc_slow(&mem, tidx, plan.tensors[tidx].size_bytes);
-        memset(ptrs[tidx], 0xAA, plan.tensors[tidx].size_bytes);
-    }
-
-    /* Kernel fails on 2nd call */
-    stub_ctx_t ctx = { .call_count = 0, .fail_on_call = 2 };
-    tigris_exec_error_t eerr = tigris_run(&plan, &mem, stub_kernel, &ctx, NULL);
-    TEST_ASSERT_EQ(eerr, TIGRIS_EXEC_ERR_KERNEL, "kernel error propagated");
-    TEST_ASSERT_EQ(ctx.call_count, 2, "stopped on 2nd call");
-
-    free(ptrs);
-    free(fast_buf);
-    free(slow_buf);
-    free(buf);
 }
 
 static void test_exec_error_strings(void)
@@ -1910,6 +1608,309 @@ static void test_exec_padding_range(void)
                         "oversized padding rejected before kernel dispatch");
         }
     }
+}
+
+/* A 300-row pad and dilation 100 run in normal, tiled and chain mode against a
+ * scalar reference. */
+#define INPUT_H             512
+#define OUTPUT_H            712
+#define HIGH_PADDING        300u
+#define DILATION_H          100u
+#define KERNEL_H            5
+#define NORMAL_FAST_SIZE    8192u
+#define TILED_FAST_SIZE     4096u
+#define SLOW_SIZE           8192u
+
+typedef struct {
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[3];
+    tigris_op_t ops[2];
+    tigris_stage_t stages[2];
+    int32_t shapes[12];
+    uint16_t indices[12];
+    tigris_weight_entry_t weight_entries[2];
+    _Alignas(float) uint8_t weight_blob[6 * sizeof(float)];
+    char strings[1];
+    tigris_plan_t plan;
+} padding_fixture_t;
+
+typedef enum {
+    RUN_NORMAL,
+    RUN_TILED,
+    RUN_CHAIN
+} padding_mode_t;
+
+typedef struct {
+    uint32_t max_pad_top;
+    uint32_t max_pad_bottom;
+    uint32_t dilated_calls;
+    uint32_t tiled_dilated_calls;
+} padding_observe_ctx_t;
+
+static const float first_weights[KERNEL_H] = {
+    0.5f, -1.0f, 1.5f, 2.0f, -0.75f
+};
+static const float second_weight = 1.25f;
+
+static void build_padding_plan(padding_fixture_t *fx)
+{
+    memset(fx, 0, sizeof(*fx));
+
+    fx->header.num_tensors = 3;
+    fx->header.num_ops = 2;
+    fx->header.num_stages = 2;
+    fx->header.num_weights = 2;
+    fx->header.num_model_inputs = 1;
+    fx->header.num_model_outputs = 1;
+    fx->header.model_io_off = 10;
+
+    const int32_t heights[3] = {INPUT_H, OUTPUT_H, OUTPUT_H};
+    for (uint16_t i = 0; i < 3; i++) {
+        fx->tensors[i].size_bytes = (uint32_t)heights[i] * sizeof(float);
+        fx->tensors[i].shape_off = (uint16_t)(i * 4);
+        fx->tensors[i].ndim = 4;
+        fx->tensors[i].dtype = 1; /* ONNX FLOAT */
+        fx->tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        fx->shapes[i * 4] = 1;
+        fx->shapes[i * 4 + 1] = heights[i];
+        fx->shapes[i * 4 + 2] = 1;
+        fx->shapes[i * 4 + 3] = 1;
+    }
+    fx->tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    fx->tensors[2].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+
+    fx->indices[0] = 0;  /* op 0 input */
+    fx->indices[1] = 1;  /* op 0 output */
+    fx->indices[2] = 1;  /* op 1 input */
+    fx->indices[3] = 2;  /* op 1 output */
+    fx->indices[4] = 0;  /* stage 0 op */
+    fx->indices[5] = 0;  /* stage 0 input */
+    fx->indices[6] = 1;  /* stage 0 output */
+    fx->indices[7] = 1;  /* stage 1 op */
+    fx->indices[8] = 1;  /* stage 1 input */
+    fx->indices[9] = 2;  /* stage 1 output */
+    fx->indices[10] = 0; /* model input */
+    fx->indices[11] = 2; /* model output */
+
+    for (uint16_t i = 0; i < 2; i++) {
+        fx->ops[i].op_type = TIGRIS_OP_CONV;
+        fx->ops[i].num_inputs = 1;
+        fx->ops[i].num_outputs = 1;
+        fx->ops[i].stage = (uint8_t)i;
+        fx->ops[i].inputs_off = (uint16_t)(i * 2);
+        fx->ops[i].outputs_off = (uint16_t)(i * 2 + 1);
+        fx->ops[i].weight_idx = i;
+        fx->ops[i].bias_idx = TIGRIS_NO_WEIGHT;
+        fx->ops[i].spatial.kernel_w = 1;
+        fx->ops[i].spatial.stride_h = 1;
+        fx->ops[i].spatial.stride_w = 1;
+        fx->ops[i].spatial.dilation_h = 1;
+        fx->ops[i].spatial.dilation_w = 1;
+        fx->ops[i].spatial.group = 1;
+    }
+    fx->ops[0].spatial.kernel_h = KERNEL_H;
+    fx->ops[0].spatial.pad_top = HIGH_PADDING;
+    fx->ops[0].spatial.pad_bottom = HIGH_PADDING;
+    fx->ops[0].spatial.dilation_h = DILATION_H;
+    fx->ops[1].spatial.kernel_h = 1;
+
+    fx->weight_entries[0].offset = 0;
+    fx->weight_entries[0].size_bytes = sizeof(first_weights);
+    fx->weight_entries[1].offset = sizeof(first_weights);
+    fx->weight_entries[1].size_bytes = sizeof(second_weight);
+    memcpy(fx->weight_blob, first_weights, sizeof(first_weights));
+    memcpy(fx->weight_blob + sizeof(first_weights),
+           &second_weight, sizeof(second_weight));
+
+    fx->stages[0].ops_off = 4;
+    fx->stages[0].ops_count = 1;
+    fx->stages[0].inputs_off = 5;
+    fx->stages[0].inputs_count = 1;
+    fx->stages[0].outputs_off = 6;
+    fx->stages[0].outputs_count = 1;
+    fx->stages[1].ops_off = 7;
+    fx->stages[1].ops_count = 1;
+    fx->stages[1].inputs_off = 8;
+    fx->stages[1].inputs_count = 1;
+    fx->stages[1].outputs_off = 9;
+    fx->stages[1].outputs_count = 1;
+    for (uint16_t i = 0; i < 2; i++) {
+        fx->stages[i].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+        fx->stages[i].chain_id = TIGRIS_NO_CHAIN;
+    }
+
+    fx->plan.header = &fx->header;
+    fx->plan.tensors = fx->tensors;
+    fx->plan.ops = fx->ops;
+    fx->plan.stages = fx->stages;
+    fx->plan.index_pool = fx->indices;
+    fx->plan.shape_pool = fx->shapes;
+    fx->plan.strings = fx->strings;
+    fx->plan.weight_entries = fx->weight_entries;
+    fx->plan.weight_blob = fx->weight_blob;
+    fx->plan.model_inputs = &fx->indices[10];
+    fx->plan.model_outputs = &fx->indices[11];
+}
+
+static void configure_padding_mode(padding_fixture_t *fx, padding_mode_t mode)
+{
+    for (uint16_t i = 0; i < 2; i++) {
+        fx->stages[i].chain_id = TIGRIS_NO_CHAIN;
+        fx->stages[i].chain_len = 0;
+        fx->stages[i].chain_tile_h = 0;
+    }
+    if (mode == RUN_CHAIN) {
+        for (uint16_t i = 0; i < 2; i++) {
+            fx->stages[i].chain_id = 0;
+            fx->stages[i].chain_len = 2;
+        }
+        fx->stages[0].chain_tile_h = 64;
+    }
+}
+
+static int padding_observing_kernel(
+    const tigris_plan_t *plan, const tigris_op_t *op,
+    uint16_t op_index, tigris_mem_t *mem, void *user_ctx)
+{
+    padding_observe_ctx_t *ctx = (padding_observe_ctx_t *)user_ctx;
+    if (op_index == 0) {
+        ctx->dilated_calls++;
+        if (mem->tile.active) {
+            uint32_t pad_top = mem->tile.pad_top;
+            uint32_t pad_bottom = mem->tile.pad_bottom;
+            ctx->tiled_dilated_calls++;
+            if (pad_top > ctx->max_pad_top)
+                ctx->max_pad_top = pad_top;
+            if (pad_bottom > ctx->max_pad_bottom)
+                ctx->max_pad_bottom = pad_bottom;
+        }
+    }
+    return tigris_dispatch_kernel(plan, op, op_index, mem, NULL);
+}
+
+static tigris_exec_error_t run_padding_plan(
+    padding_fixture_t *fx, padding_mode_t mode, const float *input,
+    float *output, padding_observe_ctx_t *observe, tigris_exec_stats_t *stats)
+{
+    void *ptrs[3];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[NORMAL_FAST_SIZE];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[SLOW_SIZE];
+    tigris_mem_t mem;
+    uint32_t fast_size = mode == RUN_NORMAL
+        ? NORMAL_FAST_SIZE : TILED_FAST_SIZE;
+
+    configure_padding_mode(fx, mode);
+    memset(observe, 0, sizeof(*observe));
+    memset(stats, 0, sizeof(*stats));
+
+    tigris_mem_error_t merr = tigris_mem_init(
+        &mem, ptrs, 3, fast, fast_size, slow, sizeof(slow));
+    if (merr != TIGRIS_MEM_OK)
+        return TIGRIS_EXEC_ERR_MEM;
+    merr = tigris_mem_alloc_slow(&mem, 0, INPUT_H * sizeof(float));
+    if (merr != TIGRIS_MEM_OK)
+        return TIGRIS_EXEC_ERR_MEM;
+    memcpy(ptrs[0], input, INPUT_H * sizeof(float));
+
+    tigris_exec_error_t err = tigris_run(
+        &fx->plan, &mem, padding_observing_kernel, observe, stats);
+    if (err == TIGRIS_EXEC_OK && ptrs[2])
+        memcpy(output, ptrs[2], OUTPUT_H * sizeof(float));
+    return err;
+}
+
+static void compute_padding_expected(const float *input, float *expected)
+{
+    for (int oh = 0; oh < OUTPUT_H; oh++) {
+        float acc = 0.0f;
+        for (int kh = 0; kh < KERNEL_H; kh++) {
+            int ih = oh - (int)HIGH_PADDING + kh * (int)DILATION_H;
+            if (ih >= 0 && ih < INPUT_H)
+                acc += input[ih] * first_weights[kh];
+        }
+        expected[oh] = acc * second_weight;
+    }
+}
+
+static int padding_rows_close(const float *actual, const float *expected)
+{
+    for (int i = 0; i < OUTPUT_H; i++) {
+        if (fabsf(actual[i] - expected[i]) > 1.0e-6f) {
+            fprintf(stderr,
+                    "  mismatch at row %d: got %.9g, expected %.9g\n",
+                    i, (double)actual[i], (double)expected[i]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void test_exec_large_padding_and_dilation_modes(void)
+{
+    printf("  test_exec_large_padding_and_dilation_modes...\n");
+
+    padding_fixture_t fx;
+    float input[INPUT_H];
+    float expected[OUTPUT_H];
+    float normal[OUTPUT_H];
+    float tiled[OUTPUT_H];
+    float chain[OUTPUT_H];
+    padding_observe_ctx_t normal_observe, tiled_observe, chain_observe;
+    tigris_exec_stats_t normal_stats, tiled_stats, chain_stats;
+
+    build_padding_plan(&fx);
+    for (int i = 0; i < INPUT_H; i++)
+        input[i] = (float)((i % 23) - 11) * 0.125f;
+    compute_padding_expected(input, expected);
+
+    TEST_ASSERT_EQ(sizeof(((tigris_tile_ctx_t *)0)->pad_top), sizeof(uint16_t),
+                   "tile top padding stores schema-v2 width");
+    TEST_ASSERT_EQ(sizeof(((tigris_tile_ctx_t *)0)->pad_bottom), sizeof(uint16_t),
+                   "tile bottom padding stores schema-v2 width");
+
+    TEST_ASSERT_EQ(run_padding_plan(&fx, RUN_NORMAL, input, normal,
+                            &normal_observe, &normal_stats),
+                   TIGRIS_EXEC_OK, "normal dilated plan succeeds");
+    TEST_ASSERT_EQ(normal_stats.stages_normal, 2,
+                   "normal mode executes both stages normally");
+    TEST_ASSERT_EQ(normal_observe.dilated_calls, 1,
+                   "normal mode executes dilated reference kernel");
+    TEST_ASSERT_EQ(normal_observe.tiled_dilated_calls, 0,
+                   "normal reference kernel has no tile override");
+    TEST_ASSERT(padding_rows_close(normal, expected),
+                "normal output matches scalar reference");
+
+    TEST_ASSERT_EQ(run_padding_plan(&fx, RUN_TILED, input, tiled,
+                            &tiled_observe, &tiled_stats),
+                   TIGRIS_EXEC_OK, "standalone tiled dilated plan succeeds");
+    TEST_ASSERT_EQ(tiled_stats.stages_tiled, 2,
+                   "standalone mode tiles both stages");
+    TEST_ASSERT(tiled_observe.tiled_dilated_calls > 1,
+                "standalone dilated convolution spans tiles");
+    TEST_ASSERT_EQ(tiled_observe.max_pad_top, HIGH_PADDING,
+                   "standalone tile retains 300-row top padding");
+    TEST_ASSERT_EQ(tiled_observe.max_pad_bottom, HIGH_PADDING,
+                   "standalone tile retains 300-row bottom padding");
+    TEST_ASSERT(padding_rows_close(tiled, expected),
+                "standalone tiled output matches scalar reference");
+
+    TEST_ASSERT_EQ(run_padding_plan(&fx, RUN_CHAIN, input, chain,
+                            &chain_observe, &chain_stats),
+                   TIGRIS_EXEC_OK, "chained dilated plan succeeds");
+    TEST_ASSERT_EQ(chain_stats.stages_chain, 2,
+                   "chain mode streams both stages");
+    TEST_ASSERT(chain_observe.tiled_dilated_calls > 1,
+                "chained dilated convolution spans tiles");
+    TEST_ASSERT_EQ(chain_observe.max_pad_top, HIGH_PADDING,
+                   "chain tile retains 300-row top padding");
+    TEST_ASSERT_EQ(chain_observe.max_pad_bottom, HIGH_PADDING,
+                   "chain tile retains 300-row bottom padding");
+    TEST_ASSERT(padding_rows_close(chain, expected),
+                "chained output matches scalar reference");
+    TEST_ASSERT(padding_rows_close(tiled, normal),
+                "standalone tiled and normal outputs agree");
+    TEST_ASSERT(padding_rows_close(chain, normal),
+                "chained and normal outputs agree");
 }
 
 static void run_height_tiling_contract_case(
@@ -3262,7 +3263,7 @@ static void test_exec_dispatch_counts_aligned_tensors(void)
 
 /* Main */
 
-int main(int argc, char *argv[])
+int main(void)
 {
     printf("TiGrIS Memory + Executor Tests\n\n");
 
@@ -3288,14 +3289,13 @@ int main(int argc, char *argv[])
     test_exec_null_args();
     test_exec_workspace_contract();
     test_exec_workspace_chain_sizing();
-    test_exec_line_buffered_flag_is_noop_for_sizing();
-    test_exec_chain_tiled_line_buffered_flag_is_noop();
+    test_exec_chain_tiled_line_buffered_rolls_pool();
     test_exec_chain_tiled_line_buffered_rolls();
     test_exec_chain_buffer_bound();
     test_exec_chain_tiled_line_buffered_rolls_pointwise();
-    test_exec_chain_tiled_line_buffered_rolls_pointwise_s8();
     test_exec_chain_fully_carried_band();
     test_exec_padding_range();
+    test_exec_large_padding_and_dilation_modes();
     test_exec_height_tiling_contract();
     test_exec_half_pixel_bilinear_bands_match_one_band();
     test_exec_per_channel_gate_bands_over_the_map();
@@ -3308,23 +3308,6 @@ int main(int argc, char *argv[])
     test_exec_dispatch_counts_aligned_tensors();
     test_exec_error_strings();
 
-    if (argc > 1) {
-        printf("\nExecutor fixture tests:\n");
-
-        /* linear_3op: 1 stage, 3 ops -> 3 kernel calls */
-        test_exec_fixture(argv[1], 3);
-
-        if (argc > 2) {
-            /* conv_relu_chain: 1 stage, 2 ops -> 2 kernel calls (Relu fused into Conv) */
-            test_exec_fixture(argv[2], 2);
-
-            /* Kernel error test: needs >=2 ops, conv_relu_chain has 2 */
-            test_exec_kernel_error(argv[2]);
-        }
-    } else {
-        printf("\n(No fixture files provided - pass .tgrs paths as arguments)\n");
-    }
-
 #ifdef TIGRIS_TRACE
     TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_NORMAL)) != 0u,
                    1, "normal path checked against trace");
@@ -3336,7 +3319,5 @@ int main(int argc, char *argv[])
                    1, "chain path checked against trace");
 #endif
 
-    printf("\nResults: %d passed, %d failed, %d total\n",
-           tests_passed, tests_failed, tests_run);
-    return tests_failed > 0 ? 1 : 0;
+    return test_report();
 }

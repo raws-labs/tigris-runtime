@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Create deterministic loader-fuzz seeds for every cheap rejection path."""
+"""Create the loader-fuzz corpus.
+
+Deterministic seeds cover every cheap rejection path; the committed
+compiler-emitted plans cover the accepted schema versions and sections.
+"""
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import struct
 from pathlib import Path
 
@@ -13,6 +18,7 @@ SECTION_DIR_OFFSET = 48
 SCHEMA_VERSION = 2
 CURRENT_SCHEMA_VERSION = 4
 REQUIRED_SECTIONS = (1, 2, 5, 6, 7)
+FIXTURE_DIRS = ("schema_compat", "tile2d_fixtures")
 
 UNARY_PLAN_SIZE = 238
 UNARY_TENSORS_OFFSET = 112
@@ -173,7 +179,18 @@ def main() -> None:
     invalid_fusion[UNARY_OPS_OFFSET + 34] = 1
     write(args.output / "semantic-invalid-fusion.tgrs", invalid_fusion)
 
-    print(f"wrote {len(list(args.output.glob('*.tgrs')))} deterministic seeds")
+    fixtures = sorted(
+        path
+        for name in FIXTURE_DIRS
+        for path in (Path(__file__).resolve().parent / name).glob("*.tgrs")
+    )
+    if not fixtures:
+        raise SystemExit("no committed .tgrs fixtures found")
+    for fixture in fixtures:
+        shutil.copyfile(fixture, args.output / fixture.name)
+
+    print(f"wrote {len(list(args.output.glob('*.tgrs')))} seeds, "
+          f"{len(fixtures)} of them committed plans")
 
 
 if __name__ == "__main__":

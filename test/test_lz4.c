@@ -8,22 +8,7 @@
 #include <stdint.h>
 
 #include "tigris_lz4.h"
-
-/* Test infrastructure */
-
-static int tests_run = 0;
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST_ASSERT(cond, msg) do { \
-    tests_run++; \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
-        tests_failed++; \
-    } else { \
-        tests_passed++; \
-    } \
-} while (0)
+#include "test_harness.h"
 
 /* Test vectors (generated from Python lz4.block) */
 
@@ -170,8 +155,5 @@ int main(void)
     test_decompress_dst_too_small();
     test_decompress_corrupted();
 
-    printf("\nResults: %d passed, %d failed, %d total\n",
-           tests_passed, tests_failed, tests_run);
-
-    return tests_failed > 0 ? 1 : 0;
+    return test_report();
 }

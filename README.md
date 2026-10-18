@@ -188,18 +188,18 @@ standard system location.
 
 ## ESP32 (ESP-IDF)
 
-The ESP-IDF example lives in `examples/esp32`:
+The ESP-IDF example lives in `examples/esp32/getting-started`:
 
 ```bash
-cd examples/esp32
+cd examples/esp32/getting-started
 idf.py set-target esp32s3
 idf.py build
-idf.py flash
+idf.py flash monitor
 ```
 
-The example's portable int8 path is the default. With the `espressif/esp-nn`
-managed component available, pass `-DTIGRIS_ENABLE_ESP_NN=ON` to build the
-ESP-NN adapter.
+The component depends on `espressif/esp-nn`, so the ESP-NN adapter builds
+without extra options. The same project can be created from the registry with
+`idf.py create-project-from-example "raws-labs/tigris-runtime:getting-started"`.
 
 The plan should live in a memory-mapped flash partition. Allocate the fast
 arena from internal SRAM and the slow arena from PSRAM when available. When

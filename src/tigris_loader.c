@@ -459,10 +459,13 @@ int tigris_stage_band_mode(const tigris_plan_t *plan, const tigris_stage_t *stag
 {
     uint16_t index = tigris_stage_ops(plan, stage)[0];
     const tigris_op_t *op = &plan->ops[index];
-    if (op->op_type == TIGRIS_OP_SPLIT || op->op_type == TIGRIS_OP_CONCAT ||
-        op->op_type == TIGRIS_OP_PAD || op->op_type == TIGRIS_OP_TRANSPOSE || is_binary_op(op->op_type) ||
-        (op->num_inputs > 1u && tigris_band_whole_input(op, 1u)) ||
-        (op->num_inputs > 2u && tigris_band_whole_input(op, 2u))) {
+    /* The loader asks before it checks operand counts, and a legacy custom
+     * operator may have none. */
+    if (op->num_inputs != 0u && op->num_outputs != 0u &&
+        (op->op_type == TIGRIS_OP_SPLIT || op->op_type == TIGRIS_OP_CONCAT ||
+         op->op_type == TIGRIS_OP_PAD || op->op_type == TIGRIS_OP_TRANSPOSE || is_binary_op(op->op_type) ||
+         (op->num_inputs > 1u && tigris_band_whole_input(op, 1u)) ||
+         (op->num_inputs > 2u && tigris_band_whole_input(op, 2u)))) {
         const tigris_tensor_t *input = &plan->tensors[is_binary_op(op->op_type) ?
             tigris_op_outputs(plan, op)[0] : tigris_op_inputs(plan, op)[0]];
         const int32_t *shape = tigris_tensor_shape(plan, input);

@@ -459,10 +459,13 @@ int tigris_stage_band_mode(const tigris_plan_t *plan, const tigris_stage_t *stag
 {
     uint16_t index = tigris_stage_ops(plan, stage)[0];
     const tigris_op_t *op = &plan->ops[index];
-    if (op->op_type == TIGRIS_OP_SPLIT || op->op_type == TIGRIS_OP_CONCAT ||
-        op->op_type == TIGRIS_OP_PAD || op->op_type == TIGRIS_OP_TRANSPOSE || is_binary_op(op->op_type) ||
-        (op->num_inputs > 1u && tigris_band_whole_input(op, 1u)) ||
-        (op->num_inputs > 2u && tigris_band_whole_input(op, 2u))) {
+    /* The loader asks before it checks operand counts, and a legacy custom
+     * operator may have none. */
+    if (op->num_inputs != 0u && op->num_outputs != 0u &&
+        (op->op_type == TIGRIS_OP_SPLIT || op->op_type == TIGRIS_OP_CONCAT ||
+         op->op_type == TIGRIS_OP_PAD || op->op_type == TIGRIS_OP_TRANSPOSE || is_binary_op(op->op_type) ||
+         (op->num_inputs > 1u && tigris_band_whole_input(op, 1u)) ||
+         (op->num_inputs > 2u && tigris_band_whole_input(op, 2u)))) {
         const tigris_tensor_t *input = &plan->tensors[is_binary_op(op->op_type) ?
             tigris_op_outputs(plan, op)[0] : tigris_op_inputs(plan, op)[0]];
         const int32_t *shape = tigris_tensor_shape(plan, input);
@@ -2719,10 +2722,11 @@ static tigris_error_t load_header_and_directory(tigris_load_state_t *ctx)
     if (ctx->hdr->num_quant_params && !ctx->section_offsets[TIGRIS_SEC_QUANT_PARAMS])
         return TIGRIS_ERR_MISSING_SEC;
 
-    /* The on-disk tables are otherwise byte-addressable, but these pools are
-     * dereferenced through uint16_t/int32_t pointers below.  Reject malformed
-     * offsets before exposing an unaligned pointer to a target that faults on
-     * it (or to UBSan during loader fuzzing). */
+    /* The on-disk tables are otherwise byte-addressable, but these pools and
+     * the unpacked state and subgraph tables are dereferenced through
+     * uint16_t/int32_t pointers below.  Reject malformed offsets before
+     * exposing an unaligned pointer to a target that faults on it (or to UBSan
+     * during loader fuzzing). */
     if ((ctx->section_offsets[TIGRIS_SEC_INDEX_POOL] % sizeof(uint16_t)) != 0 &&
         (ctx->hdr->num_ops || ctx->hdr->num_stages || ctx->hdr->num_model_inputs ||
          ctx->hdr->num_model_outputs))
@@ -2732,6 +2736,9 @@ static tigris_error_t load_header_and_directory(tigris_load_state_t *ctx)
         return TIGRIS_ERR_BAD_SECTION;
     if ((ctx->section_offsets[TIGRIS_SEC_QUANT_PARAMS] % sizeof(int32_t)) != 0 &&
         ctx->hdr->num_quant_params)
+        return TIGRIS_ERR_BAD_SECTION;
+    if ((ctx->section_offsets[TIGRIS_SEC_STATE] % sizeof(uint32_t)) != 0 ||
+        (ctx->section_offsets[TIGRIS_SEC_SUBGRAPHS] % sizeof(uint16_t)) != 0)
         return TIGRIS_ERR_BAD_SECTION;
 
     /* Set pointers */

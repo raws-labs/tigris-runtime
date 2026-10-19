@@ -2,7 +2,8 @@
 """Create the loader-fuzz corpus.
 
 Deterministic seeds cover every cheap rejection path; the committed
-compiler-emitted plans cover the accepted schema versions and sections.
+compiler-emitted plans cover the accepted schema versions and sections, and
+`fuzz_regressions/` keeps inputs that once crashed the loader.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ SECTION_DIR_OFFSET = 48
 SCHEMA_VERSION = 2
 CURRENT_SCHEMA_VERSION = 4
 REQUIRED_SECTIONS = (1, 2, 5, 6, 7)
-FIXTURE_DIRS = ("schema_compat", "tile2d_fixtures")
+FIXTURE_DIRS = ("schema_compat", "tile2d_fixtures", "fuzz_regressions")
 
 UNARY_PLAN_SIZE = 238
 UNARY_TENSORS_OFFSET = 112

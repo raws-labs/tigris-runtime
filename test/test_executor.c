@@ -3141,6 +3141,211 @@ static void test_exec_reshape_alias(void)
                 "a reshape that changes size does not share its input");
 }
 
+#define GROUP_OPS 5u
+#define GROUP_TENSORS 6u
+#define GROUP_BYTES 64u
+#define GROUP_NO_INPUT 0xFFFFu
+#define GROUP_MAX_OUTPUTS 2u
+
+typedef struct {
+    uint8_t  op_type;
+    uint16_t in0;
+    uint16_t in1;
+} group_op_t;
+
+/* Op k writes t(k + 1); each tensor holds its tag, shared within a reshape group. */
+typedef struct {
+    const char *name;
+    group_op_t ops[GROUP_OPS];
+    uint8_t tag[GROUP_TENSORS];
+    uint16_t outputs[GROUP_MAX_OUTPUTS];
+    uint16_t outputs_count;
+    uint16_t root;
+    int root_is_output;
+} group_case_t;
+
+typedef struct {
+    const uint8_t *tag;
+    uint16_t root;
+    int missing;
+    int changed;
+    int root_held[GROUP_OPS];
+} group_ctx_t;
+
+/* Fails on a missing or changed input, then fills the output with its tensor's tag. */
+static int group_kernel(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    tigris_mem_t *mem, void *user_ctx)
+{
+    group_ctx_t *ctx = (group_ctx_t *)user_ctx;
+    const uint16_t *inputs = tigris_op_inputs(plan, op);
+    const uint16_t *outputs = tigris_op_outputs(plan, op);
+    ctx->root_held[op_index] = mem->tensor_ptrs[ctx->root] != NULL;
+    for (uint8_t k = 0; k < op->num_inputs; k++) {
+        const uint8_t *in = (const uint8_t *)mem->tensor_ptrs[inputs[k]];
+        if (!in) {
+            ctx->missing++;
+            return -1;
+        }
+        for (uint32_t b = 0; b < GROUP_BYTES; b++) {
+            if (in[b] != ctx->tag[inputs[k]]) {
+                ctx->changed++;
+                return -1;
+            }
+        }
+    }
+    memset(mem->tensor_ptrs[outputs[0]], ctx->tag[outputs[0]], GROUP_BYTES);
+    return 0;
+}
+
+/* One stage; every tensor states its own order, so each reshape shares its input's buffer. */
+static tigris_exec_error_t run_reshape_group(
+    const group_case_t *gc, group_ctx_t *ctx)
+{
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[GROUP_TENSORS];
+    tigris_op_t ops[GROUP_OPS];
+    tigris_stage_t stage;
+    int32_t shape_pool[2] = {4, 4};
+    uint16_t indices[3u * GROUP_OPS + GROUP_OPS + 1u + GROUP_MAX_OUTPUTS];
+    uint16_t at = 0;
+    tigris_plan_t plan;
+    void *ptrs[GROUP_TENSORS];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[512];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[512];
+    tigris_mem_t mem;
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(
+        GROUP_TENSORS, 1, GROUP_MAX_OUTPUTS, 0, 0)];
+    tigris_exec_stats_t stats;
+
+    memset(&header, 0, sizeof(header));
+    memset(tensors, 0, sizeof(tensors));
+    memset(ops, 0, sizeof(ops));
+    memset(&stage, 0, sizeof(stage));
+    memset(&plan, 0, sizeof(plan));
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->tag = gc->tag;
+    ctx->root = gc->root;
+
+    header.num_tensors = GROUP_TENSORS;
+    header.num_ops = GROUP_OPS;
+    header.num_stages = 1;
+    header.num_model_inputs = 1;
+    header.num_model_outputs = gc->outputs_count;
+    for (uint16_t t = 0; t < GROUP_TENSORS; t++) {
+        tensors[t].size_bytes = GROUP_BYTES;
+        tensors[t].flags = TIGRIS_TENSOR_LINEAR;
+        tensors[t].ndim = 2;
+        tensors[t].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+    for (uint16_t k = 0; k < GROUP_OPS; k++) {
+        ops[k].op_type = gc->ops[k].op_type;
+        ops[k].inputs_off = at;
+        ops[k].num_inputs = 1;
+        indices[at++] = gc->ops[k].in0;
+        if (gc->ops[k].in1 != GROUP_NO_INPUT) {
+            indices[at++] = gc->ops[k].in1;
+            ops[k].num_inputs = 2;
+        }
+        ops[k].outputs_off = at;
+        ops[k].num_outputs = 1;
+        indices[at++] = (uint16_t)(k + 1u);
+    }
+    stage.ops_off = at;
+    stage.ops_count = GROUP_OPS;
+    for (uint16_t k = 0; k < GROUP_OPS; k++)
+        indices[at++] = k;
+    stage.inputs_off = at;
+    stage.inputs_count = 1;
+    indices[at++] = 0;
+    stage.outputs_off = at;
+    stage.outputs_count = gc->outputs_count;
+    for (uint16_t k = 0; k < gc->outputs_count; k++)
+        indices[at++] = gc->outputs[k];
+    stage.tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage.chain_id = TIGRIS_NO_CHAIN;
+
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = ops;
+    plan.stages = &stage;
+    plan.index_pool = indices;
+    plan.shape_pool = shape_pool;
+    plan.model_inputs = &indices[stage.inputs_off];
+    plan.model_outputs = &indices[stage.outputs_off];
+
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, GROUP_TENSORS, fast,
+                                   sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "reshape-group memory init");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, GROUP_BYTES),
+                   TIGRIS_MEM_OK, "reshape-group input allocation");
+    memset(mem.tensor_ptrs[0], gc->tag[0], GROUP_BYTES);
+
+    tigris_exec_error_t err = tigris_run_with_workspace_buffer(
+        &plan, &mem, group_kernel, ctx, &stats, workspace, sizeof(workspace));
+    for (uint16_t k = 0; err == TIGRIS_EXEC_OK && k < gc->outputs_count; k++) {
+        const uint8_t *out = (const uint8_t *)ptrs[gc->outputs[k]];
+        int same = out != NULL;
+        for (uint32_t b = 0; same && b < GROUP_BYTES; b++)
+            same = out[b] == gc->tag[gc->outputs[k]];
+        TEST_ASSERT(same, "a reshape-group stage output holds its bytes");
+    }
+    return err;
+}
+
+static void test_exec_reshape_group_lifetime(void)
+{
+    printf("  test_exec_reshape_group_lifetime...\n");
+    static const group_case_t cases[] = {
+        /* t1 and t2 both reshape t0; t2 is read last at op 2, t1 at op 3. */
+        {"siblings",
+         {{TIGRIS_OP_RESHAPE, 0, GROUP_NO_INPUT},
+          {TIGRIS_OP_RESHAPE, 0, GROUP_NO_INPUT},
+          {TIGRIS_OP_RELU, 2, GROUP_NO_INPUT},
+          {TIGRIS_OP_ADD, 1, 3},
+          {TIGRIS_OP_RELU, 4, GROUP_NO_INPUT}},
+         {0x11, 0x11, 0x11, 0x23, 0x24, 0x25}, {5, 0}, 1, 0, 0},
+        /* t2 reshapes t1, which reshapes t0; t0 is read again after t2. */
+        {"chain",
+         {{TIGRIS_OP_RESHAPE, 0, GROUP_NO_INPUT},
+          {TIGRIS_OP_RESHAPE, 1, GROUP_NO_INPUT},
+          {TIGRIS_OP_RELU, 2, GROUP_NO_INPUT},
+          {TIGRIS_OP_ADD, 0, 3},
+          {TIGRIS_OP_RELU, 4, GROUP_NO_INPUT}},
+         {0x11, 0x11, 0x11, 0x23, 0x24, 0x25}, {5, 0}, 1, 0, 0},
+        /* t2 reshapes t0 and nothing reads it; t1 is read at op 2. */
+        {"unread sibling",
+         {{TIGRIS_OP_RESHAPE, 0, GROUP_NO_INPUT},
+          {TIGRIS_OP_RESHAPE, 0, GROUP_NO_INPUT},
+          {TIGRIS_OP_RELU, 1, GROUP_NO_INPUT},
+          {TIGRIS_OP_RELU, 3, GROUP_NO_INPUT},
+          {TIGRIS_OP_RELU, 4, GROUP_NO_INPUT}},
+         {0x11, 0x11, 0x11, 0x23, 0x24, 0x25}, {5, 0}, 1, 0, 0},
+        /* t2 and t3 both reshape t1; t2 is a stage output, t3 is read at op 3. */
+        {"sibling kept as stage output",
+         {{TIGRIS_OP_RELU, 0, GROUP_NO_INPUT},
+          {TIGRIS_OP_RESHAPE, 1, GROUP_NO_INPUT},
+          {TIGRIS_OP_RESHAPE, 1, GROUP_NO_INPUT},
+          {TIGRIS_OP_RELU, 3, GROUP_NO_INPUT},
+          {TIGRIS_OP_RELU, 4, GROUP_NO_INPUT}},
+         {0x10, 0x21, 0x21, 0x21, 0x24, 0x25}, {2, 5}, 2, 1, 1},
+    };
+    group_ctx_t ctx;
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        printf("    %s\n", cases[c].name);
+        TEST_ASSERT_EQ(run_reshape_group(&cases[c], &ctx), TIGRIS_EXEC_OK,
+                       "a reshape group runs to the end");
+        TEST_ASSERT_EQ(ctx.missing, 0,
+                       "every member of a reshape group outlives its last read");
+        TEST_ASSERT_EQ(ctx.changed, 0,
+                       "no op writes over a live reshape group");
+        if (!cases[c].root_is_output)
+            TEST_ASSERT(!ctx.root_held[GROUP_OPS - 1u],
+                        "the group's buffer goes after the group's last read");
+    }
+}
+
 /* A one-operator int8 Add of [1,5,5,4] and [1,1,1,4], compiled for a 256-byte
  * fast budget, with its TFLite Micro reference output. Its unpadded stage
  * tensors (100 + 4 + 100 bytes) fit the stage's tiled working set, but their
@@ -3305,6 +3510,7 @@ int main(void)
     test_exec_chained_convtranspose_fails_closed();
     test_exec_compaction_preserves_data();
     test_exec_reshape_alias();
+    test_exec_reshape_group_lifetime();
     test_exec_dispatch_counts_aligned_tensors();
     test_exec_error_strings();
 

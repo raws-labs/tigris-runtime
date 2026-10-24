@@ -773,13 +773,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
             last_use_op[tidx] = UINT16_MAX;
     }
 
-    /* A reshape that moves no byte hands its buffer to its output, so the two
-     * tensors are one allocation and it dies when the later of them is read
-     * for the last time. Give both that step. Walking backwards carries it
-     * through a chain of reshapes, which is what a lowered matrix product
-     * leaves on either side of itself. Without this the buffer was pinned for
-     * the rest of the stage, and a stage holding many of them ran the fast
-     * pool dry and pushed every later operator's output into slow memory. */
+    /* A reshape group shares one buffer, so every member gets the group's last read. */
     for (uint16_t j = stage->ops_count; j-- > 0; ) {
         const tigris_op_t *op = &plan->ops[sops[j]];
         uint16_t produced;
@@ -800,6 +794,17 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
         }
         last_use_op[produced] = group;
         last_use_op[source] = group;
+    }
+    for (uint16_t j = 0; j < stage->ops_count; j++) {
+        const tigris_op_t *op = &plan->ops[sops[j]];
+        uint16_t produced;
+        uint16_t source;
+        if (!is_pure_reinterpretation(plan, op))
+            continue;
+        produced = tigris_op_outputs(plan, op)[0];
+        source = tigris_op_inputs(plan, op)[0];
+        if (produced < num_t && source < num_t)
+            last_use_op[produced] = last_use_op[source];
     }
 
     /* Load stage inputs */

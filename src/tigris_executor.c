@@ -4268,10 +4268,18 @@ tigris_exec_error_t tigris_run_with_state(
                 last_consumer[sin[i]] = s;
         }
     }
-    /* Model outputs are never freed */
+    /* Model outputs are never freed. Subgraph outputs are freed by copy_out_of_graph. */
     for (uint8_t i = 0; i < plan->header->num_model_outputs; i++) {
         if (plan->model_outputs[i] < num_t)
             last_consumer[plan->model_outputs[i]] = UINT16_MAX;
+    }
+    for (uint16_t g = 1; g < plan->num_subgraphs; g++) {
+        const tigris_subgraph_t *graph = &plan->subgraphs[g];
+        for (uint16_t i = 0; i < graph->outputs_count; i++) {
+            const uint16_t t = plan->index_pool[graph->outputs_off + i];
+            if (t < num_t)
+                last_consumer[t] = UINT16_MAX;
+        }
     }
 
     /* Each variable enters as its value from the last run, placed in slow

@@ -23,19 +23,25 @@
 extern "C" {
 #endif
 
+/* Runtime release; scripts/check_version_sources.py holds it to the CMake project version. */
+#define TIGRIS_RUNTIME_VERSION_MAJOR 0
+#define TIGRIS_RUNTIME_VERSION_MINOR 12
+#define TIGRIS_RUNTIME_VERSION_PATCH 1
+
 /* Keep in sync with tigris/src/tigris/emitters/binary/defs.py */
 
 /* Format constants */
 
 #define TIGRIS_MAGIC           0x53524754  /* "TGRS" in little-endian */
 #define TIGRIS_MAGIC_BYTES     "TGRS"
+#define TIGRIS_SCHEMA_VERSION_V11 11
 #define TIGRIS_SCHEMA_VERSION_V10 10
 #define TIGRIS_SCHEMA_VERSION_V9 9
 #define TIGRIS_SCHEMA_VERSION_V8 8
 #define TIGRIS_SCHEMA_VERSION_V7 7
 #define TIGRIS_SCHEMA_VERSION_V6 6
 #define TIGRIS_SCHEMA_VERSION_V5 5
-#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V10
+#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V11
 #define TIGRIS_SCHEMA_VERSION_V4 4
 #define TIGRIS_SCHEMA_VERSION_V3 3
 #define TIGRIS_SCHEMA_VERSION_V2 2
@@ -64,6 +70,12 @@ extern "C" {
 /* A plan may keep variables across invocations in a caller-supplied state
  * buffer. Only a plan that does is written at this version. */
 #define TIGRIS_SCHEMA_VERSION_STATE TIGRIS_SCHEMA_VERSION_V10
+
+/* A plan states the fast-arena bytes its activations need, so a run refuses a smaller arena up front. */
+#define TIGRIS_SCHEMA_VERSION_SCHEDULED_PEAK TIGRIS_SCHEMA_VERSION_V11
+
+/* A tile record states its tiling, which the loader derives from the plan and checks. */
+#define TIGRIS_SCHEMA_VERSION_TILE_FACTS TIGRIS_SCHEMA_VERSION_V11
 #define TIGRIS_QUANT_PAGE_ELEMS 65536u
 
 /* Section type IDs */
@@ -80,7 +92,8 @@ extern "C" {
 #define TIGRIS_SEC_OP_ATTRIBUTES  11
 #define TIGRIS_SEC_STATE          12
 #define TIGRIS_SEC_SUBGRAPHS      13
-#define TIGRIS_SEC_MAX            14  /* one past the last valid section */
+#define TIGRIS_SEC_MEMORY         14  /* tigris_memory_t, schema 11+ */
+#define TIGRIS_SEC_MAX            15  /* one past the last valid section */
 
 /* Auxiliary tensor placement is constrained by operator dtype slots. */
 static inline int tigris_dtype_requires_source(uint8_t dtype)
@@ -324,7 +337,7 @@ typedef enum {
 
 /* Error codes */
 
-/** Loader error codes returned by tigris_plan_load(). */
+/** Error codes returned by tigris_plan_load() and the model interface calls. */
 typedef enum {
     TIGRIS_OK               = 0,    /* Success */
     TIGRIS_ERR_NULL         = -1,   /* Null pointer argument */
@@ -340,6 +353,9 @@ typedef enum {
     TIGRIS_ERR_BAD_OPERATOR = -11,  /* Operator contract is not executable */
     TIGRIS_ERR_BAD_INTERFACE = -12, /* Declared model interface is not convertible */
     TIGRIS_ERR_KERNEL_DISABLED = -13, /* Build leaves out a kernel the plan uses */
+    TIGRIS_ERR_MEM          = -14,  /* Arena cannot hold the tensor */
+    TIGRIS_ERR_TENSOR_SLOTS = -15,  /* Memory manager has fewer tensor slots than the plan */
+    TIGRIS_ERR_TILE_FACTS   = -16,  /* A tile record's stated tiling disagrees with the plan */
 } tigris_error_t;
 
 /* Sentinel: tile_plan_idx == 0xFFFF means no tile plan for this stage */
@@ -501,6 +517,25 @@ typedef struct {
     uint32_t tiled_peak_bytes;        /* 28: fast working-set ceiling */
 } tigris_tile_plan_v10_t;
 
+/**
+ * What a schema 11 tile record states about its tiling, 16 bytes. The loader
+ * derives each field from the plan and refuses a record that disagrees.
+ */
+typedef struct {
+    uint32_t tile_extent;             /*  0: band length the count uses */
+    uint32_t num_tiles;               /*  4: bands of tile_extent (times columns for HW) */
+    uint32_t original_extent;         /*  8: extent the bands divide */
+    uint16_t halo;                    /* 12: rows a band reads beyond its own */
+    uint8_t band_axis;                /* 14: serialized axis the bands run along */
+    uint8_t _reserved;                /* 15: 0 */
+} tigris_tile_facts_t;
+
+/** Schema-11 tile record, 48 bytes: the schema-10 choices and their facts. */
+typedef struct {
+    tigris_tile_plan_v10_t choices;   /*  0 */
+    tigris_tile_facts_t facts;        /* 32 */
+} tigris_tile_plan_v11_t;
+
 /* Which of the two axes a layout conversion's band runs along. Both sides
  * used to pick the longer one and agree only by coincidence when the two are
  * equal, which is what a square attention block is. */
@@ -579,6 +614,10 @@ TIGRIS_LAYOUT_ASSERT(tigris_layout_stage_size,
                      sizeof(tigris_stage_t) == 28);
 TIGRIS_LAYOUT_ASSERT(tigris_layout_tile_plan_v10_size,
                      sizeof(tigris_tile_plan_v10_t) == 32);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_tile_facts_size,
+                     sizeof(tigris_tile_facts_t) == 16);
+TIGRIS_LAYOUT_ASSERT(tigris_layout_tile_plan_v11_size,
+                     sizeof(tigris_tile_plan_v11_t) == 48);
 TIGRIS_LAYOUT_ASSERT(tigris_layout_tile_plan_size,
                      sizeof(tigris_tile_plan_t) == 24);
 TIGRIS_LAYOUT_ASSERT(tigris_layout_weight_entry_size,
@@ -639,6 +678,16 @@ typedef struct {
 
 TIGRIS_LAYOUT_ASSERT(tigris_layout_subgraph_size, sizeof(tigris_subgraph_t) == 12);
 
+/**
+ * Memory record, 4 bytes: the whole of TIGRIS_SEC_MEMORY, which every plan of
+ * schema 11 or later carries and earlier plans do not.
+ */
+typedef struct {
+    uint32_t    scheduled_peak;     /* 0: fast bytes the largest stage or chain holds, as checked; no decompressed weights */
+} tigris_memory_t;
+
+TIGRIS_LAYOUT_ASSERT(tigris_layout_memory_size, sizeof(tigris_memory_t) == 4);
+
 #undef TIGRIS_LAYOUT_ASSERT
 
 /* Parsed plan handle */
@@ -683,11 +732,14 @@ typedef struct {
     const tigris_subgraph_t     *subgraphs;      /* [num_subgraphs] or NULL */
     uint16_t                     num_subgraphs;  /* 0 without control flow */
 
-    const tigris_tile_plan_v10_t *tile_plans_v10; /* schema 10+, otherwise NULL */
+    const tigris_tile_plan_v10_t *tile_plans_v10; /* schema 10 only, otherwise NULL */
 
     /* Convenience: model I/O resolved from header */
     const uint16_t              *model_inputs;  /* [num_model_inputs] */
     const uint16_t              *model_outputs; /* [num_model_outputs] */
+
+    uint32_t                     scheduled_peak; /* schema 11+, see tigris_memory_t; 0 before */
+    const tigris_tile_plan_v11_t *tile_plans_v11; /* schema 11+, otherwise NULL */
 } tigris_plan_t;
 
 /* Inline helper functions */
@@ -831,7 +883,7 @@ static inline const tigris_tile_plan_t *tigris_stage_tile_plan(
     return &plan->tile_plans[stage->tile_plan_idx];
 }
 
-/** Scheduling choices for either wire layout; no allocation or shared cache. */
+/** Scheduling choices for any wire layout; no allocation or shared cache. */
 static inline tigris_tile_plan_v10_t tigris_stage_tiles(
     const tigris_plan_t *plan, const tigris_stage_t *stage)
 {
@@ -840,6 +892,11 @@ static inline tigris_tile_plan_v10_t tigris_stage_tiles(
         stage->tile_plan_idx == TIGRIS_NO_TILE_PLAN ||
         stage->tile_plan_idx >= plan->header->num_tile_plans)
         return result;
+    if (plan->header->version >= TIGRIS_SCHEMA_VERSION_TILE_FACTS) {
+        if (plan->tile_plans_v11)
+            return plan->tile_plans_v11[stage->tile_plan_idx].choices;
+        return result;
+    }
     if (plan->header->version >= TIGRIS_SCHEMA_VERSION_STATE) {
         if (plan->tile_plans_v10)
             return plan->tile_plans_v10[stage->tile_plan_idx];
@@ -992,10 +1049,13 @@ uint32_t tigris_weight_decompression_overhead(const tigris_plan_t *plan);
 /**
  * Compute the core fast-arena capacity required by a loaded plan.
  *
- * This is the plan's activation budget plus the simultaneous compressed-weight
- * reservation returned by tigris_weight_decompression_overhead(). The result
- * assumes the arena base satisfies TIGRIS_TENSOR_ALIGN. Leading padding for an
- * unaligned base and backend-specific scratch/workspace are not included.
+ * This is the activation figure plus the simultaneous compressed-weight
+ * reservation returned by tigris_weight_decompression_overhead(). The
+ * activation figure is the plan's scheduled peak from schema 11 on, and its
+ * budget before. A run of a schema 11 plan refuses a fast arena below this
+ * with TIGRIS_EXEC_ERR_MEM before it starts. The result assumes the arena base
+ * satisfies TIGRIS_TENSOR_ALIGN. Leading padding for an unaligned base and
+ * backend-specific scratch/workspace are not included.
  *
  * @param plan  Loaded plan.
  * @return Required core arena capacity in bytes, or UINT32_MAX if plan/header

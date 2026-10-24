@@ -26,6 +26,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCES = (
     ("CMakeLists.txt", r"project\(tigris_runtime VERSION ([0-9]+\.[0-9]+\.[0-9]+)"),
     ("idf_component.yml", r'^version:\s*"([0-9]+\.[0-9]+\.[0-9]+)"'),
+    # Code built against the headers checks the version it needs with these.
+    ("include/tigris.h", r"^#define TIGRIS_RUNTIME_VERSION_MAJOR ([0-9]+)\n"
+                         r"#define TIGRIS_RUNTIME_VERSION_MINOR ([0-9]+)\n"
+                         r"#define TIGRIS_RUNTIME_VERSION_PATCH ([0-9]+)$"),
 )
 # The packaged-consumer test asks for a major.minor floor, which must be this
 # release's own, or a consumer requesting the current version is refused.
@@ -45,7 +49,7 @@ README = ("README.md", r"find_package\(tigris_runtime ([0-9]+\.[0-9]+) REQUIRED"
 def _read(relative: str, pattern: str) -> tuple[str, str | None]:
     text = (ROOT / relative).read_text()
     found = re.search(pattern, text, re.MULTILINE)
-    return relative, found.group(1) if found else None
+    return relative, ".".join(found.groups()) if found else None
 
 
 def _set(relative: str, pattern: str, value: str) -> None:
@@ -54,7 +58,10 @@ def _set(relative: str, pattern: str, value: str) -> None:
     found = re.search(pattern, text, re.MULTILINE)
     if found is None:
         raise ValueError(f"{relative}: no version found")
-    path.write_text(text[:found.start(1)] + value + text[found.end(1):])
+    parts = value.split(".") if found.re.groups > 1 else [value]
+    for group in range(found.re.groups, 0, -1):
+        text = text[:found.start(group)] + parts[group - 1] + text[found.end(group):]
+    path.write_text(text)
 
 
 def set_version(version: str) -> None:

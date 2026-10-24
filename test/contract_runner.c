@@ -3,6 +3,8 @@
  *
  * Usage:
  *   tigris_contract_runner plan.tgrs inputs.bin outputs.bin [activation-limit]
+ *       [--no-linebuffer] [--workspace-limits=T,I,O,C,S] [--slow-arena=BYTES]
+ *       [--inputs-in-slow]
  *
  * inputs.bin and outputs.bin concatenate model tensors in model-I/O order.
  * The companion compiler gate owns ONNX Runtime comparison and malformed-plan
@@ -130,8 +132,9 @@ static int slow_requirement(
     return 0;
 }
 
+/* Reads the model inputs from path and reports on stderr why it could not. */
 static int load_inputs(
-    const char *path, const tigris_plan_t *plan, tigris_mem_t *mem)
+    const char *path, const tigris_plan_t *plan, tigris_mem_t *mem, int in_slow)
 {
     FILE *file;
     int trailing;
@@ -139,41 +142,60 @@ static int load_inputs(
     if (!path || !plan || !plan->header || !mem)
         return -1;
     file = fopen(path, "rb");
-    if (!file)
+    if (!file) {
+        fprintf(stderr, "could not read inputs: %s\n", path);
         return -1;
+    }
 
     for (uint8_t i = 0; i < plan->header->num_model_inputs; ++i) {
         uint16_t index = plan->model_inputs[i];
-        uint32_t size;
         uint32_t iface_size;
         void *staging;
+        tigris_error_t written;
         if (index >= plan->header->num_tensors)
-            goto fail;
-        size = plan->tensors[index].size_bytes;
+            goto layout;
         /* The file holds the dtype the model declares, which is not always the
-         * dtype the plan executes on. */
+         * dtype the plan executes on. The write places the tensor where the
+         * run reads it. */
         iface_size = tigris_iface_bytes(plan, index);
-        if (iface_size == 0u ||
-            tigris_mem_alloc_slow(mem, index, size) != TIGRIS_MEM_OK)
-            goto fail;
+        if (iface_size == 0u)
+            goto layout;
+        if (in_slow) {
+            tigris_mem_error_t allocated =
+                tigris_mem_alloc_slow(mem, index, plan->tensors[index].size_bytes);
+            if (allocated != TIGRIS_MEM_OK) {
+                fprintf(stderr, "input allocation failed: %s\n",
+                        tigris_mem_error_str(allocated));
+                goto fail;
+            }
+        }
         staging = malloc(iface_size);
-        if (!staging)
-            goto fail;
-        if (fread(staging, 1, iface_size, file) != iface_size ||
-            tigris_input_write(plan, mem, index, staging, iface_size) !=
-                TIGRIS_OK) {
-            free(staging);
+        if (!staging) {
+            fprintf(stderr, "could not allocate input buffer\n");
             goto fail;
         }
+        if (fread(staging, 1, iface_size, file) != iface_size) {
+            free(staging);
+            goto layout;
+        }
+        written = tigris_input_write(plan, mem, index, staging, iface_size);
         free(staging);
+        if (written != TIGRIS_OK) {
+            fprintf(stderr, "input write failed: %s\n", tigris_error_str(written));
+            goto fail;
+        }
     }
     trailing = fgetc(file);
     if (trailing != EOF)
-        goto fail;
-    if (fclose(file) != 0)
+        goto layout;
+    if (fclose(file) != 0) {
+        fprintf(stderr, "could not read inputs: %s\n", path);
         return -1;
+    }
     return 0;
 
+layout:
+    fprintf(stderr, "input layout does not match plan model inputs\n");
 fail:
     fclose(file);
     return -1;
@@ -241,6 +263,11 @@ int main(int argc, char **argv)
      * with the executor's own global workspace. */
     unsigned long limits[5] = {0, 0, 0, 0, 0};
     int have_limits = 0;
+    /* Exact slow arena size, 0 for none. */
+    unsigned long slow_arena = 0;
+    int have_slow_arena = 0;
+    /* Allocate inputs in slow first, so the run copies them into fast. */
+    int inputs_in_slow = 0;
     void *workspace = NULL;
     void *state = NULL;
     char *pos_argv[5];
@@ -262,6 +289,16 @@ int main(int argc, char **argv)
                 return 2;
             }
             have_limits = 1;
+        } else if (strncmp(argv[arg_index], "--slow-arena=", 13) == 0) {
+            char *end = NULL;
+            slow_arena = strtoul(argv[arg_index] + 13, &end, 10);
+            if (!argv[arg_index][13] || !end || *end != '\0' || slow_arena > UINT32_MAX) {
+                fprintf(stderr, "invalid slow arena: %s\n", argv[arg_index]);
+                return 2;
+            }
+            have_slow_arena = 1;
+        } else if (strcmp(argv[arg_index], "--inputs-in-slow") == 0) {
+            inputs_in_slow = 1;
         } else if (pos_argc < (int)(sizeof(pos_argv) / sizeof(pos_argv[0]))) {
             pos_argv[pos_argc++] = argv[arg_index];
         } else {
@@ -273,7 +310,8 @@ int main(int argc, char **argv)
     if (pos_argc != 4 && pos_argc != 5) {
         fprintf(stderr,
                 "usage: %s plan.tgrs inputs.bin outputs.bin [activation-limit] "
-                "[--no-linebuffer] [--workspace-limits=T,I,O,C,S]\n",
+                "[--no-linebuffer] [--workspace-limits=T,I,O,C,S] [--slow-arena=BYTES] "
+                "[--inputs-in-slow]\n",
                 pos_argv[0]);
         return 2;
     }
@@ -316,10 +354,13 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     fast_size = activation_limit + overhead;
+    if (have_slow_arena)
+        slow_size = (uint32_t)slow_arena;
     tensor_ptrs = calloc(plan.header->num_tensors, sizeof(*tensor_ptrs));
     if (!tensor_ptrs ||
         allocate_aligned(TIGRIS_TENSOR_ALIGN, fast_size, &fast_buf) != 0 ||
-        allocate_aligned(TIGRIS_TENSOR_ALIGN, slow_size, &slow_buf) != 0) {
+        (slow_size > 0u &&
+         allocate_aligned(TIGRIS_TENSOR_ALIGN, slow_size, &slow_buf) != 0)) {
         fprintf(stderr, "could not allocate contract arenas\n");
         goto cleanup;
     }
@@ -329,10 +370,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "memory initialization failed\n");
         goto cleanup;
     }
-    if (load_inputs(pos_argv[2], &plan, &mem) != 0) {
-        fprintf(stderr, "input layout does not match plan model inputs\n");
+    if (load_inputs(pos_argv[2], &plan, &mem, inputs_in_slow) != 0)
         goto cleanup;
-    }
     if (no_linebuffer) {
         /* Force the recompute path: clear the line-buffered flag on every
          * loaded stage. The loader is zero-copy, so plan.stages aliases the

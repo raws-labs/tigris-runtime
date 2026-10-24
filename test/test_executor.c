@@ -12,6 +12,7 @@
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "tigris_executor.h"
+#include "tigris_iface.h"
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
 #include "test_harness.h"
@@ -58,6 +59,10 @@ static void test_mem_init_null(void)
                    TIGRIS_MEM_ERR_NULL, "null fast");
     TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 2, buf, 64, NULL, 64),
                    TIGRIS_MEM_ERR_NULL, "null slow");
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 2, buf, 64, NULL, 0),
+                   TIGRIS_MEM_OK, "no slow buffer of no size");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, 1), TIGRIS_MEM_ERR_OOM,
+                   "no slow buffer holds nothing");
 }
 
 static void test_mem_init_unalignable_buffer(void)
@@ -355,9 +360,21 @@ static void test_exec_null_args(void)
                    TIGRIS_EXEC_ERR_NULL, "null mem");
     TEST_ASSERT_EQ(tigris_run(&plan, &mem, NULL, NULL, NULL),
                    TIGRIS_EXEC_ERR_NULL, "null kernel");
+    tigris_exec_stats_t stats;
+    memset(&stats, 0xff, sizeof(stats));
+    TEST_ASSERT_EQ(tigris_run(NULL, &mem, stub_kernel, NULL, &stats),
+                   TIGRIS_EXEC_ERR_NULL, "null plan with stats");
+    TEST_ASSERT(stats.stages_normal == 0u && stats.loads_bytes == 0u && stats.copy_bytes == 0u,
+                "stats zeroed for a run refused on its arguments");
     TEST_ASSERT_EQ(tigris_run_with_workspace(
                        &plan, &mem, stub_kernel, NULL, NULL, NULL),
                    TIGRIS_EXEC_ERR_WORKSPACE, "null explicit workspace");
+    memset(&stats, 0xff, sizeof(stats));
+    TEST_ASSERT_EQ(tigris_run_with_workspace(
+                       &plan, &mem, stub_kernel, NULL, &stats, NULL),
+                   TIGRIS_EXEC_ERR_WORKSPACE, "null explicit workspace with stats");
+    TEST_ASSERT(stats.stages_normal == 0u && stats.loads_bytes == 0u && stats.copy_bytes == 0u,
+                "stats zeroed for a run without a workspace");
 }
 
 static void test_exec_workspace_contract(void)
@@ -2358,16 +2375,11 @@ static void test_exec_convtranspose_2d_routing(void)
         TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH, TIGRIS_EXEC_ERR_TILE);
 }
 
-/* Regression guard: a single stage that CONTAINS a
- * ConvTranspose is HW-tileable only when ConvTranspose is its SOLE spatial op.
- * A mixed [Conv, ConvTranspose] stage must fall back to exec_stage_normal, not
- * be routed to the 1D tiler. The compiler never attaches a tile plan to such a
- * stage, so it carries TIGRIS_NO_TILE_PLAN. total_io (256 + 1024) exceeds the
- * fast budget (needs_tiling=1), which is exactly the condition that used to
- * misroute it: find_spatial_op returned the LEADING Conv, the 1D tiler sized
- * from Conv geometry, and the expanding ConvTranspose output OOMed. Post-fix
- * the stage is not axis1_tileable (spatial_count==2) so it runs on the normal
- * path (both ops execute, nothing tiled). */
+/* A stage that contains a ConvTranspose is HW-tileable only when the
+ * ConvTranspose is its only spatial op. A mixed [Conv, ConvTranspose] stage
+ * carries TIGRIS_NO_TILE_PLAN, and its total_io (256 + 1024) exceeds the fast
+ * budget (needs_tiling=1), but it is not axis1_tileable (spatial_count==2), so
+ * it runs on exec_stage_normal: both ops execute and nothing is tiled. */
 static void test_exec_mixed_conv_convtranspose_not_tiled(void)
 {
     printf("  test_exec_mixed_conv_convtranspose_not_tiled...\n");
@@ -2409,6 +2421,7 @@ static void test_exec_mixed_conv_convtranspose_not_tiled(void)
     memset(&stage, 0, sizeof(stage));
     memset(&plan, 0, sizeof(plan));
 
+    /* A scheduled peak of 0 understates the stage, so the run reaches its in-run checks. */
     header.version = TIGRIS_SCHEMA_VERSION;
     header.num_tensors = 3;
     header.num_ops = 2;
@@ -2654,7 +2667,7 @@ static void test_exec_chain_residual_rows(void)
 /* Fail-closed guard (final whole-branch review): is_height_tiling_op admits
  * ConvTranspose (the standalone 2D route needs it), so a forged/malformed plan
  * could place a ConvTranspose inside a tiled chain. exec_chain_tiled's composer
- * only models shrinking spatial ops (is_height_spatial_op), so it would run the
+ * only models shrinking spatial ops (tigris_height_spatial_op), so it would run the
  * ConvTranspose with shape-preserving pointwise geometry - wrong output or an
  * OOB write, not an error. The guard in the chain's pre-execution op
  * enumeration must reject it with TIGRIS_EXEC_ERR_TILE. Here the ConvTranspose
@@ -2705,6 +2718,7 @@ static void test_exec_chained_convtranspose_fails_closed(void)
     memset(stages, 0, sizeof(stages));
     memset(&plan, 0, sizeof(plan));
 
+    /* A scheduled peak of 0 understates the stage, so the run reaches its in-run checks. */
     header.version = TIGRIS_SCHEMA_VERSION;
     header.num_tensors = 3;
     header.num_ops = 2;
@@ -3468,6 +3482,451 @@ static void test_exec_dispatch_counts_aligned_tensors(void)
 
 /* Main */
 
+/* t0 (128 B) -> t1 (64 B) -> t2 (128 B): the 192 B peak fits only if the input is freed after op 0. */
+typedef struct {
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[3];
+    tigris_op_t ops[2];
+    tigris_stage_t stages[2];
+    uint16_t indices[12];
+    tigris_plan_t plan;
+} io_plan_t;
+
+#define IO_PEAK 192u
+
+static void build_io_plan(io_plan_t *fx)
+{
+    static const uint16_t indices[12] = {0, 1, 1, 2, 0, 1, 0, 2, 0, 2, 2, 1};
+    static const uint32_t sizes[3] = {128u, 64u, 128u};
+    memset(fx, 0, sizeof(*fx));
+    memcpy(fx->indices, indices, sizeof(indices));
+    fx->header.version = TIGRIS_SCHEMA_VERSION;
+    fx->plan.scheduled_peak = IO_PEAK;
+    fx->header.num_tensors = 3;
+    fx->header.num_ops = 2;
+    fx->header.num_stages = 1;
+    fx->header.num_model_inputs = 1;
+    fx->header.num_model_outputs = 1;
+    for (uint16_t i = 0; i < 3; i++) {
+        fx->tensors[i].dtype = 3;
+        fx->tensors[i].ndim = 1;
+        fx->tensors[i].size_bytes = sizes[i];
+        fx->tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+    fx->tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    fx->tensors[2].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+    for (uint16_t i = 0; i < 2; i++) {
+        fx->ops[i].num_inputs = 1;
+        fx->ops[i].num_outputs = 1;
+        fx->ops[i].inputs_off = (uint16_t)(2 * i);
+        fx->ops[i].outputs_off = (uint16_t)(2 * i + 1);
+        fx->ops[i].weight_idx = TIGRIS_NO_WEIGHT;
+        fx->ops[i].bias_idx = TIGRIS_NO_WEIGHT;
+    }
+    fx->stages[0].ops_off = 4;
+    fx->stages[0].ops_count = 2;
+    fx->stages[0].inputs_off = 6;
+    fx->stages[0].inputs_count = 1;
+    fx->stages[0].outputs_off = 7;
+    fx->stages[0].outputs_count = 1;
+    fx->stages[0].peak_bytes = IO_PEAK;
+    fx->stages[0].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    fx->stages[0].chain_id = TIGRIS_NO_CHAIN;
+    fx->plan.header = &fx->header;
+    fx->plan.tensors = fx->tensors;
+    fx->plan.ops = fx->ops;
+    fx->plan.stages = fx->stages;
+    fx->plan.index_pool = fx->indices;
+    fx->plan.model_inputs = &fx->indices[8];
+    fx->plan.model_outputs = &fx->indices[9];
+}
+
+/* t2 reads t1 behind where it writes, so an output placed over t1 reads clobbered bytes. */
+static int io_kernel(const tigris_plan_t *plan, const tigris_op_t *op,
+                     uint16_t op_index, tigris_mem_t *mem, void *user_ctx)
+{
+    const uint8_t *in = (const uint8_t *)mem->tensor_ptrs[tigris_op_inputs(plan, op)[0]];
+    uint8_t *out = (uint8_t *)mem->tensor_ptrs[tigris_op_outputs(plan, op)[0]];
+    (void)user_ctx;
+    if (!in || !out)
+        return -1;
+    for (uint32_t i = 0; i < plan->tensors[tigris_op_outputs(plan, op)[0]].size_bytes; i++)
+        out[i] = op_index == 0u ? (uint8_t)(in[i] + in[i + 64u])
+                                : (uint8_t)(3u * in[(i + 63u) % 64u] + i);
+    return 0;
+}
+
+/* io_kernel, but op *user_ctx fails and an op without inputs writes t[i] = 7 * i. */
+static int io_kernel_or_fail(const tigris_plan_t *plan, const tigris_op_t *op,
+                             uint16_t op_index, tigris_mem_t *mem, void *user_ctx)
+{
+    uint8_t *out = (uint8_t *)mem->tensor_ptrs[tigris_op_outputs(plan, op)[0]];
+    if (user_ctx && *(const uint16_t *)user_ctx == op_index)
+        return -1;
+    if (op->num_inputs == 0u) {
+        for (uint32_t i = 0; out && i < plan->tensors[tigris_op_outputs(plan, op)[0]].size_bytes; i++)
+            out[i] = (uint8_t)(7u * i);
+        return out ? 0 : -1;
+    }
+    return io_kernel(plan, op, op_index, mem, NULL);
+}
+
+static int in_pool(const void *p, const uint8_t *base, uint32_t size)
+{
+    return p != NULL && (const uint8_t *)p >= base && (const uint8_t *)p < base + size;
+}
+
+/* Where tigris_input_write places an input: fast exactly when the plan reads its inputs in place. */
+static int input_lands_in_fast(io_plan_t *fx)
+{
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[512];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[512];
+    uint8_t data[128];
+    void *ptrs[3];
+    tigris_mem_t mem;
+    memset(data, 7, sizeof(data));
+    if (tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), slow, sizeof(slow)) != TIGRIS_MEM_OK ||
+        tigris_input_write(&fx->plan, &mem, 0, data, sizeof(data)) != TIGRIS_OK ||
+        memcmp(ptrs[0], data, sizeof(data)) != 0)
+        return -1;
+    return in_pool(ptrs[0], fast, sizeof(fast));
+}
+
+static void test_exec_io_in_fast_rule(void)
+{
+    printf("  test_exec_io_in_fast_rule...\n");
+    io_plan_t fx;
+
+    build_io_plan(&fx);
+    TEST_ASSERT_EQ(input_lands_in_fast(&fx), 1, "reads its inputs in place: input in fast");
+
+    build_io_plan(&fx);
+    fx.header.num_stages = 2;
+    TEST_ASSERT_EQ(input_lands_in_fast(&fx), 0, "two stages: input in slow");
+
+    build_io_plan(&fx);
+    fx.stages[0].tile_plan_idx = 0;
+    TEST_ASSERT_EQ(input_lands_in_fast(&fx), 0, "a tile plan: input in slow");
+
+    build_io_plan(&fx);
+    fx.stages[0].chain_id = 0;
+    fx.stages[0].chain_len = 2;
+    TEST_ASSERT_EQ(input_lands_in_fast(&fx), 0, "a chain: input in slow");
+
+    build_io_plan(&fx);
+    fx.plan.num_subgraphs = 1;
+    TEST_ASSERT_EQ(input_lands_in_fast(&fx), 0, "control flow: input in slow");
+
+    build_io_plan(&fx);
+    fx.plan.num_state = 1;
+    TEST_ASSERT_EQ(input_lands_in_fast(&fx), 0, "state: input in slow");
+
+    build_io_plan(&fx);
+    fx.header.version = TIGRIS_SCHEMA_VERSION_V4;
+    TEST_ASSERT_EQ(input_lands_in_fast(&fx), 0, "schema 4: input in slow");
+
+    build_io_plan(&fx);
+    fx.header.num_model_inputs = 2;
+    fx.plan.model_inputs = &fx.indices[0];
+    TEST_ASSERT_EQ(input_lands_in_fast(&fx), 0, "an input the stage never reads: input in slow");
+
+    build_io_plan(&fx);
+    fx.plan.model_outputs = &fx.indices[1];
+    TEST_ASSERT_EQ(input_lands_in_fast(&fx), 0, "an output the stage keeps internal: input in slow");
+}
+
+static void test_exec_input_write_out_of_memory(void)
+{
+    printf("  test_exec_input_write_out_of_memory...\n");
+    io_plan_t fx;
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t small[64];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t roomy[512];
+    uint8_t data[128];
+    void *ptrs[3];
+    tigris_mem_t mem;
+
+    memset(data, 7, sizeof(data));
+    build_io_plan(&fx);
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, small, sizeof(small), roomy, sizeof(roomy)),
+                   TIGRIS_MEM_OK, "init with a small fast arena");
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_ERR_MEM,
+                   "reads its inputs in place: fast arena too small");
+    TEST_ASSERT(ptrs[0] == NULL, "no buffer after a failed placement");
+    TEST_ASSERT_EQ(mem.fast_used, 0u, "fast arena untouched");
+
+    fx.header.num_stages = 2;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, roomy, sizeof(roomy), small, sizeof(small)),
+                   TIGRIS_MEM_OK, "init with a small slow arena");
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_ERR_MEM,
+                   "two stages: slow arena too small");
+    TEST_ASSERT(ptrs[0] == NULL, "no buffer after a failed slow placement");
+
+    for (uint16_t stages = 1u; stages <= 2u; stages++) {
+        fx.header.num_stages = stages;
+        TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 0, roomy, sizeof(roomy), small, sizeof(small)),
+                       TIGRIS_MEM_OK, "init with no tensor slot");
+        TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)),
+                       TIGRIS_ERR_TENSOR_SLOTS, "a manager without the input's slot");
+        TEST_ASSERT_EQ(mem.fast_used, 0u, "no fast bytes without a slot");
+        TEST_ASSERT_EQ(mem.slow_used, 0u, "no slow bytes without a slot");
+        mem.tensor_ptrs = NULL;
+        TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)),
+                       TIGRIS_ERR_NULL, "a manager without a pointer table");
+        TEST_ASSERT_EQ(mem.fast_used, 0u, "no fast bytes without a pointer table");
+        TEST_ASSERT_EQ(mem.slow_used, 0u, "no slow bytes without a pointer table");
+    }
+}
+
+static void test_exec_input_alloc(void)
+{
+    printf("  test_exec_input_alloc...\n");
+    io_plan_t fx;
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[512];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[512];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t small[64];
+    void *ptrs[3];
+    tigris_mem_t mem;
+
+    build_io_plan(&fx);
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "memory for input placement");
+    TEST_ASSERT_EQ(tigris_input_alloc(NULL, &mem, 0), TIGRIS_ERR_NULL, "no plan");
+    TEST_ASSERT_EQ(tigris_input_alloc(&fx.plan, NULL, 0), TIGRIS_ERR_NULL, "no memory manager");
+    TEST_ASSERT_EQ(tigris_input_alloc(&fx.plan, &mem, 2), TIGRIS_ERR_BAD_TENSOR,
+                   "a model output is not placed as an input");
+    TEST_ASSERT_EQ(tigris_input_alloc(&fx.plan, &mem, 0), TIGRIS_OK, "input placed");
+    TEST_ASSERT(in_pool(ptrs[0], fast, sizeof(fast)), "reads its inputs in place: input in fast");
+    void *placed = ptrs[0];
+    uint32_t used = mem.fast_used;
+    TEST_ASSERT_EQ(tigris_input_alloc(&fx.plan, &mem, 0), TIGRIS_OK, "placed input again");
+    TEST_ASSERT(ptrs[0] == placed && mem.fast_used == used, "a placed input keeps its buffer");
+
+    fx.header.num_stages = 2;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "memory for a staged plan");
+    TEST_ASSERT_EQ(tigris_input_alloc(&fx.plan, &mem, 0), TIGRIS_OK, "staged input placed");
+    TEST_ASSERT(in_pool(ptrs[0], slow, sizeof(slow)), "two stages: input in slow");
+    ptrs[0] = NULL;
+    mem.slow_base = NULL;
+    TEST_ASSERT_EQ(tigris_input_alloc(&fx.plan, &mem, 0), TIGRIS_ERR_NULL,
+                   "a slow arena with a size but no buffer");
+
+    fx.header.num_stages = 1;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, small, sizeof(small), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "memory with a small fast arena");
+    TEST_ASSERT_EQ(tigris_input_alloc(&fx.plan, &mem, 0), TIGRIS_ERR_MEM,
+                   "fast arena too small for the input");
+    TEST_ASSERT(ptrs[0] == NULL && mem.fast_used == 0u, "a failed placement changes nothing");
+}
+
+static void test_exec_fast_requirement_checked_up_front(void)
+{
+    printf("  test_exec_fast_requirement_checked_up_front...\n");
+    io_plan_t fx;
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[IO_PEAK];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[512];
+    uint8_t data[128];
+    void *ptrs[3];
+    tigris_mem_t mem;
+    tigris_exec_stats_t stats;
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+    uint32_t short_arena = IO_PEAK - TIGRIS_TENSOR_ALIGN;
+
+    memset(data, 3, sizeof(data));
+    build_io_plan(&fx);
+    TEST_ASSERT_EQ(tigris_fast_arena_required(&fx.plan), IO_PEAK, "requirement of the plan");
+
+    /* Read in place, one alignment unit short: refused with the input still placed. */
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, short_arena, NULL, 0),
+                   TIGRIS_MEM_OK, "short in-place memory");
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_OK,
+                   "input written into the short arena");
+    void *placed = ptrs[0];
+    memset(&stats, 0xff, sizeof(stats));
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel, NULL, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_ERR_MEM, "in place below the requirement: refused");
+    TEST_ASSERT_EQ(stats.stages_normal + stats.stages_tiled + stats.stages_chain, 0u,
+                   "the refused run reports no stage");
+    TEST_ASSERT(ptrs[0] == placed && mem.fast_used == 128u,
+                "the refused run leaves the input where it was");
+
+    /* Inputs in slow, a fast arena one unit short: refused as well. */
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, short_arena, slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "short copy-path memory");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, 128), TIGRIS_MEM_OK, "input in slow");
+    placed = ptrs[0];
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel, NULL, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_ERR_MEM, "copy path below the requirement: refused");
+    TEST_ASSERT(ptrs[0] == placed && mem.slow_used == 128u, "the refused run leaves slow as it was");
+
+    /* At the requirement the same plan runs. */
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), NULL, 0),
+                   TIGRIS_MEM_OK, "in-place memory at the requirement");
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_OK,
+                   "input written at the requirement");
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel, NULL, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "a run at the requirement");
+
+    /* A schema 10 plan states no requirement: the short arena fails inside the run. */
+    build_io_plan(&fx);
+    fx.header.version = TIGRIS_SCHEMA_VERSION_V10;
+    fx.plan.scheduled_peak = 0u;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, short_arena, NULL, 0),
+                   TIGRIS_MEM_OK, "short memory for a schema 10 plan");
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_OK,
+                   "schema 10 input written");
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel, NULL, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_ERR_MEM, "schema 10 below its need fails in the run");
+    TEST_ASSERT(ptrs[0] == NULL, "the failed schema 10 run released its input");
+}
+
+static void test_exec_io_in_fast_run(void)
+{
+    printf("  test_exec_io_in_fast_run...\n");
+    io_plan_t fx;
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[IO_PEAK];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t roomy[512];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[512];
+    uint8_t data[128];
+    uint8_t copied[128];
+    uint8_t in_place[128];
+    void *ptrs[3];
+    tigris_mem_t mem;
+    tigris_exec_stats_t stats;
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+
+    for (uint32_t i = 0; i < sizeof(data); i++)
+        data[i] = (uint8_t)(5u * i + 1u);
+    build_io_plan(&fx);
+
+    /* Inputs placed in slow: loaded, and outputs spilled. */
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "copy-path memory");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, 128), TIGRIS_MEM_OK, "input in slow");
+    memcpy(ptrs[0], data, sizeof(data));
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel, NULL, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "copy path runs");
+    TEST_ASSERT_EQ(stats.loads_bytes, 128u, "copy path loads the input");
+    TEST_ASSERT_EQ(stats.spills_bytes, 128u, "copy path spills the output");
+    TEST_ASSERT(in_pool(ptrs[2], slow, sizeof(slow)), "copy path output in slow");
+    TEST_ASSERT(mem.fast_peak <= IO_PEAK, "copy path within the stage peak");
+    memcpy(copied, ptrs[2], sizeof(copied));
+
+    /* Inputs written with no buffer: placed in fast, read in place, outputs left there. */
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), NULL, 0),
+                   TIGRIS_MEM_OK, "in-place memory without a slow buffer");
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_OK,
+                   "input written into fast");
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel, NULL, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "in-place run fits the stage peak with no slow arena");
+    TEST_ASSERT_EQ(stats.loads_bytes, 0u, "input read in place");
+    TEST_ASSERT_EQ(stats.spills_bytes, 0u, "output left in fast");
+    TEST_ASSERT_EQ(stats.slow_peak, 0u, "no slow bytes");
+    TEST_ASSERT_EQ(stats.compactions, 1u, "the dead input's bytes are reclaimed");
+    TEST_ASSERT(mem.fast_peak <= IO_PEAK, "in-place run within the stage peak");
+    TEST_ASSERT(in_pool(ptrs[2], fast, sizeof(fast)), "output in fast");
+    TEST_ASSERT(ptrs[0] == NULL, "input consumed");
+    TEST_ASSERT_EQ(mem.fast_used, 0u, "arena back to the caller's offset below the input");
+    TEST_ASSERT_EQ(tigris_output_read(&fx.plan, &mem, 2, in_place, sizeof(in_place)), TIGRIS_OK,
+                   "output read from fast");
+    TEST_ASSERT(memcmp(in_place, copied, sizeof(copied)) == 0,
+                "in-place output bit-identical to the copy path");
+
+    /* The same manager runs again from fresh inputs. */
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_OK,
+                   "second input written into fast");
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel, NULL, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "second in-place run");
+    TEST_ASSERT_EQ(tigris_output_read(&fx.plan, &mem, 2, in_place, sizeof(in_place)), TIGRIS_OK,
+                   "second output read");
+    TEST_ASSERT(memcmp(in_place, copied, sizeof(copied)) == 0, "second run identical");
+
+    /* A failed run leaves no stale pointer, so the next run is in place again. */
+    {
+        uint16_t failing_op = 1u;
+        TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_OK,
+                       "input written before a failing run");
+        TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel_or_fail,
+                                                        &failing_op, &stats,
+                                                        workspace, sizeof(workspace)),
+                       TIGRIS_EXEC_ERR_KERNEL, "the second op fails");
+        TEST_ASSERT(ptrs[0] == NULL && ptrs[1] == NULL && ptrs[2] == NULL,
+                    "a failed run drops every pointer into the released arena");
+        TEST_ASSERT_EQ(mem.fast_used, 0u, "a failed run releases the input");
+    }
+    memset(in_place, 0, sizeof(in_place));
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_OK,
+                   "input written after a failed run");
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel, NULL, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "run after a failed run");
+    TEST_ASSERT_EQ(stats.loads_bytes, 0u, "input read in place after a failed run");
+    TEST_ASSERT_EQ(tigris_output_read(&fx.plan, &mem, 2, in_place, sizeof(in_place)), TIGRIS_OK,
+                   "output read after a failed run");
+    TEST_ASSERT(memcmp(in_place, copied, sizeof(copied)) == 0, "run after a failed run identical");
+
+    /* A stage output that is not a model output does not outlive the run. */
+    build_io_plan(&fx);
+    fx.stages[0].outputs_off = 10;
+    fx.stages[0].outputs_count = 2;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), NULL, 0),
+                   TIGRIS_MEM_OK, "memory for a plan with an extra stage output");
+    for (int run = 0; run < 2; run++) {
+        uint8_t wide[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 2, 0, 0)];
+        memset(in_place, 0, sizeof(in_place));
+        TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_OK,
+                       "input written for a plan with an extra stage output");
+        TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel, NULL, &stats,
+                                                        wide, sizeof(wide)),
+                       TIGRIS_EXEC_OK, "a plan with an extra stage output runs in place");
+        TEST_ASSERT(ptrs[1] == NULL, "only model outputs keep their pointers");
+        TEST_ASSERT_EQ(tigris_output_read(&fx.plan, &mem, 2, in_place, sizeof(in_place)),
+                       TIGRIS_OK, "output read with an extra stage output");
+        TEST_ASSERT(memcmp(in_place, copied, sizeof(copied)) == 0,
+                    "output identical with an extra stage output");
+    }
+
+    /* A plan with no model input keeps its outputs in fast as well. */
+    build_io_plan(&fx);
+    fx.header.num_model_inputs = 0;
+    fx.tensors[0].flags = 0;
+    fx.ops[0].num_inputs = 0;
+    fx.stages[0].inputs_count = 0;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), NULL, 0),
+                   TIGRIS_MEM_OK, "memory for a plan with no model input");
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel_or_fail, NULL,
+                                                    &stats, workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "a plan with no model input runs with no slow arena");
+    TEST_ASSERT_EQ(stats.spills_bytes, 0u, "no output spilled without a model input");
+    TEST_ASSERT(in_pool(ptrs[2], fast, sizeof(fast)), "output in fast without a model input");
+    TEST_ASSERT_EQ(((const uint8_t *)ptrs[2])[0], (uint8_t)(3u * 7u * 63u),
+                   "output computed without a model input");
+    build_io_plan(&fx);
+
+    /* Caller bytes above the input: both stay untouched and the input is copied. */
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, roomy, sizeof(roomy), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "copy-path memory");
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_OK,
+                   "copy-path input in fast");
+    memset(roomy + mem.fast_used, 0xa5, TIGRIS_TENSOR_ALIGN);
+    mem.fast_used += TIGRIS_TENSOR_ALIGN;
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, io_kernel, NULL, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "copy-path run");
+    TEST_ASSERT_EQ(stats.loads_bytes, 128u, "an input below caller bytes is loaded");
+    TEST_ASSERT(in_pool(ptrs[2], slow, sizeof(slow)), "copy-path output in slow");
+    TEST_ASSERT(memcmp(ptrs[2], copied, sizeof(copied)) == 0, "copy-path output identical");
+    TEST_ASSERT_EQ(mem.fast_used, 128u + TIGRIS_TENSOR_ALIGN, "caller bytes kept");
+    TEST_ASSERT_EQ(roomy[128], 0xa5, "caller bytes untouched");
+}
+
 int main(void)
 {
     printf("TiGrIS Memory + Executor Tests\n\n");
@@ -3512,6 +3971,11 @@ int main(void)
     test_exec_reshape_alias();
     test_exec_reshape_group_lifetime();
     test_exec_dispatch_counts_aligned_tensors();
+    test_exec_io_in_fast_rule();
+    test_exec_input_write_out_of_memory();
+    test_exec_io_in_fast_run();
+    test_exec_input_alloc();
+    test_exec_fast_requirement_checked_up_front();
     test_exec_error_strings();
 
 #ifdef TIGRIS_TRACE

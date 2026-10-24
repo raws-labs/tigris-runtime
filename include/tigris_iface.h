@@ -40,15 +40,45 @@ uint32_t tigris_iface_bytes(const tigris_plan_t *plan, uint16_t tensor_idx);
 int8_t tigris_quantize_value(float value, const tigris_quant_param_t *quant);
 
 /**
+ * Place a model input where the run reads it.
+ *
+ * A plan reads its inputs in place when it has schema 5 or later and a single
+ * stage, without a tile plan, chain, control flow or state, that reads every
+ * model input and writes every model output. Such a plan's input goes in the
+ * fast arena, and the first of its inputs leaves
+ * tigris_weight_decompression_overhead() bytes free directly below it, where
+ * the run decompresses the stage's weights. Place every input of such a plan
+ * this way, one after another, so they sit together at the top of the fast
+ * arena; the run then reads them there, consumes them, and leaves the model
+ * outputs in the fast arena. Any other plan's input goes in the slow buffer.
+ * An input that already has a buffer keeps it.
+ *
+ * @param plan        Loaded plan.
+ * @param mem         Memory manager.
+ * @param tensor_idx  Index of a model input tensor.
+ * @return TIGRIS_OK, TIGRIS_ERR_NULL when plan or mem is NULL or mem has no
+ *         pointer table, TIGRIS_ERR_BAD_TENSOR when tensor_idx is not a model
+ *         input, TIGRIS_ERR_TENSOR_SLOTS when mem has no slot for it, or
+ *         TIGRIS_ERR_MEM when the arena cannot hold it. A failed call leaves
+ *         mem unchanged.
+ */
+tigris_error_t tigris_input_alloc(
+    const tigris_plan_t *plan, tigris_mem_t *mem, uint16_t tensor_idx);
+
+/**
  * Convert the caller's data into a model input tensor.
  * Int64 index inputs must fit int32; narrowing overflow returns BAD_INTERFACE.
  *
+ * An input with no buffer yet is placed with tigris_input_alloc() first. A
+ * buffer the caller allocated beforehand is used as it is.
+ *
  * @param plan        Loaded plan.
- * @param mem         Memory manager with the input tensor allocated.
+ * @param mem         Memory manager.
  * @param tensor_idx  Index of a model input tensor.
  * @param src         Caller data in the declared dtype.
  * @param src_bytes   Size of src, which must equal tigris_iface_bytes().
- * @return TIGRIS_OK, or a negative error code.
+ * @return TIGRIS_OK, an error of tigris_input_alloc(), or another negative
+ *         error code.
  */
 tigris_error_t tigris_input_write(
     const tigris_plan_t *plan, tigris_mem_t *mem, uint16_t tensor_idx,

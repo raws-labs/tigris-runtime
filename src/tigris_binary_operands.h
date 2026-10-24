@@ -58,6 +58,7 @@ typedef struct {
     int32_t input_width;
     int32_t output_rows;
     int32_t output_width;
+    uint8_t input_axis;     /* the input axis whose rows the band takes */
 } tigris_reshape_band_t;
 
 int tigris_reshape_band(const tigris_plan_t *plan, const tigris_stage_t *stage,
@@ -118,6 +119,23 @@ int tigris_band_whole_input(const tigris_op_t *op, uint8_t position);
 /* Whether a reduction or movement preserves the existing row-band geometry. */
 int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
                                 uint16_t op_index, int row_tiled);
+
+/* The rules the executor bands a stage by, which the loader's tile facts also derive from. */
+int tigris_height_spatial_op(uint8_t type);
+int tigris_height_upsample_op(uint8_t type);
+int tigris_stage_spatial_op(const tigris_plan_t *plan, const tigris_stage_t *stage);
+int tigris_tensor_row_view(const tigris_plan_t *plan, const tigris_tensor_t *t,
+                           int32_t *batch, int32_t *rows, int32_t *cols);
+int tigris_row_tiling_op(uint8_t type);
+int tigris_whole_operand_op(uint8_t type);
+int tigris_stage_row_tiled(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                           int32_t *out_batch, int32_t *out_rows);
+int tigris_whole_band_operand(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                              uint16_t tidx);
+int tigris_stage_input_driven_reduction(const tigris_plan_t *plan, const tigris_stage_t *stage);
+int tigris_transpose_extents(const tigris_plan_t *plan, uint16_t op_idx, uint16_t in_idx,
+                             int32_t *outer, int32_t *rows, int32_t *cols);
+int tigris_stage_tiled_transpose(const tigris_plan_t *plan, const tigris_stage_t *stage);
 
 /* Bool operations and byte-preserving selection share both dispatchers. */
 /** All of one axis of a rank-3 bool tensor, kept at one or dropped. */

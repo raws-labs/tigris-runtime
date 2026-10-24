@@ -19,6 +19,7 @@
 #include "tigris_mem.h"
 
 #define EXAMPLE_SLOW_BYTES (512u * 1024u)
+#define ONNX_DTYPE_FLOAT 1u
 #define ONNX_DTYPE_INT8 3u
 
 static int plan_has_int8_io(const tigris_plan_t *plan)
@@ -138,16 +139,32 @@ int main(int argc, char **argv)
             goto cleanup;
         }
 
+        /* tigris_input_write converts each input and places it. */
         for (i = 0; i < plan.header->num_model_inputs; ++i) {
             uint16_t idx = plan.model_inputs[i];
-            mem_err = tigris_mem_alloc_slow(
-                &mem, idx, plan.tensors[idx].size_bytes);
-            if (mem_err != TIGRIS_MEM_OK) {
-                fprintf(stderr, "input allocation failed: %s\n",
-                        tigris_mem_error_str(mem_err));
+            const tigris_tensor_t *t = &plan.tensors[idx];
+            uint32_t in_bytes = tigris_iface_bytes(&plan, idx);
+            uint8_t *input = in_bytes ? (uint8_t *)malloc(in_bytes) : NULL;
+            tigris_error_t write_err;
+            uint32_t j;
+
+            if (input == NULL) {
+                fprintf(stderr, "could not allocate input buffer\n");
                 goto cleanup;
             }
-            memset(mem.tensor_ptrs[idx], 1, plan.tensors[idx].size_bytes);
+            if ((t->iface_dtype ? t->iface_dtype : t->dtype) == ONNX_DTYPE_FLOAT) {
+                for (j = 0; j < in_bytes / (uint32_t)sizeof(float); ++j)
+                    ((float *)(void *)input)[j] = 0.1f;
+            } else {
+                memset(input, 1, in_bytes);
+            }
+            write_err = tigris_input_write(&plan, &mem, idx, input, in_bytes);
+            free(input);
+            if (write_err != TIGRIS_OK) {
+                fprintf(stderr, "input write failed: %s\n",
+                        tigris_error_str(write_err));
+                goto cleanup;
+            }
         }
 
         {

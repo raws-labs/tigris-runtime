@@ -98,11 +98,21 @@ static void test_error_strings(void)
     TEST_ASSERT(strlen(tigris_error_str(TIGRIS_ERR_BAD_OPERATOR)) > 0,
                 "operator contract string");
     TEST_ASSERT(strlen(tigris_error_str((tigris_error_t)999)) > 0, "unknown string");
+    TEST_ASSERT_EQ(TIGRIS_ERR_KERNEL_DISABLED, -13, "existing codes keep their values");
+    TEST_ASSERT_EQ(TIGRIS_ERR_MEM, -14, "memory code follows the last one");
+    TEST_ASSERT(strcmp(tigris_error_str(TIGRIS_ERR_MEM),
+                       tigris_error_str((tigris_error_t)999)) != 0, "memory string");
+    TEST_ASSERT_EQ(TIGRIS_ERR_TENSOR_SLOTS, -15, "tensor-slot code follows the memory code");
+    TEST_ASSERT(strcmp(tigris_error_str(TIGRIS_ERR_TENSOR_SLOTS),
+                       tigris_error_str((tigris_error_t)999)) != 0, "tensor-slot string");
+    TEST_ASSERT_EQ(TIGRIS_ERR_TILE_FACTS, -16, "tile-facts code follows the tensor-slot code");
+    TEST_ASSERT(strcmp(tigris_error_str(TIGRIS_ERR_TILE_FACTS),
+                       tigris_error_str((tigris_error_t)999)) != 0, "tile-facts string");
 }
 
 /* Minimal self-contained plans for malformed-input tests. */
 
-#define MINIMAL_PLAN_SIZE 100u
+#define MINIMAL_PLAN_SIZE 112u
 
 typedef struct {
     tigris_file_header_t *header;
@@ -129,6 +139,43 @@ static void plan_builder_section(plan_builder_t *builder, uint32_t index,
     builder->sections[index].offset = offset;
 }
 
+/* Ends a current-schema plan: a memory record of peak 0 in its last 4 bytes, entered last. */
+static void plan_finish(uint8_t *buf)
+{
+    tigris_file_header_t *header = (tigris_file_header_t *)buf;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
+    uint32_t i = 0;
+    while (dir[i].type != 0u && dir[i].type != TIGRIS_SEC_MEMORY)
+        i++;
+    dir[i].type = TIGRIS_SEC_MEMORY;
+    dir[i].offset = header->file_size - (uint32_t)sizeof(tigris_memory_t);
+    memset(buf + dir[i].offset, 0, sizeof(tigris_memory_t));
+}
+
+/* Removes a directory entry; the later ones, the memory entry among them, move up. */
+static void plan_drop_section(uint8_t *buf, uint32_t index)
+{
+    tigris_file_header_t *header = (tigris_file_header_t *)buf;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
+    for (uint32_t i = index; dir[i].type != 0u; i++)
+        dir[i] = dir[i + 1u];
+}
+
+/* Rewrites a plan's schema; below 11 the memory entry, the last one, becomes the sentinel. */
+static void plan_set_version(uint8_t *buf, uint32_t version)
+{
+    tigris_file_header_t *header = (tigris_file_header_t *)buf;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
+    header->version = version;
+    if (version >= TIGRIS_SCHEMA_VERSION_V11)
+        return;
+    for (uint32_t i = 0; dir[i].type != 0u; i++)
+        if (dir[i].type == TIGRIS_SEC_MEMORY)
+            memset(&dir[i], 0, sizeof(dir[i]));
+}
+
+#define MINIMAL_POOLS_OFF 105u
+
 static void build_minimal_plan(uint8_t *buf)
 {
     plan_builder_t builder = plan_builder_begin(buf, MINIMAL_PLAN_SIZE, TIGRIS_SCHEMA_VERSION);
@@ -140,10 +187,11 @@ static void build_minimal_plan(uint8_t *buf)
         TIGRIS_SEC_STRINGS,
     };
     for (uint32_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
-        plan_builder_section(&builder, i, required[i], MINIMAL_PLAN_SIZE - 1u);
+        plan_builder_section(&builder, i, required[i], MINIMAL_POOLS_OFF);
     }
-    buf[MINIMAL_PLAN_SIZE - 1u] = '\0';
-    /* Section 5 remains the zero-valued sentinel. */
+    buf[MINIMAL_POOLS_OFF] = '\0';
+    plan_finish(buf);
+    /* Section 6 remains the zero-valued sentinel. */
 }
 
 static void test_section_directory_guards(void)
@@ -159,8 +207,9 @@ static void test_section_directory_guards(void)
     build_minimal_plan(buf);
     tigris_section_entry_t *dir =
         (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+    dir[6] = dir[5];
     dir[5].type = TIGRIS_SEC_WEIGHTS;
-    dir[5].offset = MINIMAL_PLAN_SIZE;
+    dir[5].offset = MINIMAL_POOLS_OFF;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION, "missing directory sentinel");
 
@@ -184,6 +233,49 @@ static void test_section_directory_guards(void)
                    TIGRIS_ERR_BAD_SECTION, "section overlaps directory");
 }
 
+static void test_memory_section(void)
+{
+    printf("  test_memory_section...\n");
+    _Alignas(4) uint8_t buf[MINIMAL_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_section_entry_t *dir =
+        (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
+    const uint32_t peak = 192u;
+
+    build_minimal_plan(buf);
+    ((tigris_file_header_t *)buf)->budget = 256u;
+    memcpy(buf + dir[5].offset, &peak, sizeof(peak));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "schema 11 plan with its memory record loads");
+    TEST_ASSERT_EQ(plan.scheduled_peak, 192u, "scheduled peak read from the plan");
+    TEST_ASSERT_EQ(tigris_fast_arena_required(&plan), 192u,
+                   "requirement is the scheduled peak, not the budget");
+
+    build_minimal_plan(buf);
+    memset(&dir[5], 0, sizeof(dir[5]));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_MISSING_SEC,
+                   "schema 11 requires the memory section");
+
+    build_minimal_plan(buf);
+    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V10;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                   "an older plan carries no memory section");
+
+    build_minimal_plan(buf);
+    dir[5].offset = MINIMAL_PLAN_SIZE - 2u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                   "a truncated memory record is refused");
+
+    build_minimal_plan(buf);
+    ((tigris_file_header_t *)buf)->budget = 256u;
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V10);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "an older plan loads without the section");
+    TEST_ASSERT_EQ(plan.scheduled_peak, 0u, "an older plan states no scheduled peak");
+    TEST_ASSERT_EQ(tigris_fast_arena_required(&plan), 256u,
+                   "an older plan's requirement stays its budget");
+}
+
 static void test_pool_alignment_guards(void)
 {
     printf("  test_pool_alignment_guards...\n");
@@ -191,7 +283,7 @@ static void test_pool_alignment_guards(void)
     tigris_plan_t plan;
     tigris_file_header_t *hdr;
 
-    /* The minimal plan deliberately puts all empty pools at byte 99.  They
+    /* The minimal plan deliberately puts all empty pools at byte 105.  They
      * are valid while unused, but a count must not make an unaligned typed
      * pool dereference reachable. */
     build_minimal_plan(buf);
@@ -292,14 +384,14 @@ static void test_counted_sections_required(void)
                    TIGRIS_ERR_MISSING_SEC, "counted quant params require section");
 }
 
-#define STAGED_PLAN_SIZE 704u
-#define STAGED_TENSORS_OFF 112u
-#define STAGED_OPS_OFF   128u
-#define STAGED_STAGES_OFF 480u
-#define STAGED_INDEX_OFF 544u
-#define STAGED_SHAPES_OFF 640u
-#define STAGED_STRINGS_OFF 656u
-#define STAGED_WEIGHTS_OFF 660u
+#define STAGED_PLAN_SIZE 724u
+#define STAGED_TENSORS_OFF 128u
+#define STAGED_OPS_OFF   144u
+#define STAGED_STAGES_OFF 496u
+#define STAGED_INDEX_OFF 560u
+#define STAGED_SHAPES_OFF 656u
+#define STAGED_STRINGS_OFF 672u
+#define STAGED_WEIGHTS_OFF 676u
 
 static void build_staged_plan(uint8_t *buf)
 {
@@ -317,6 +409,7 @@ static void build_staged_plan(uint8_t *buf)
     plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, STAGED_SHAPES_OFF);
     plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, STAGED_STRINGS_OFF);
     plan_builder_section(&builder, 6u, TIGRIS_SEC_WEIGHTS, STAGED_WEIGHTS_OFF);
+    plan_finish(buf);
 
     tigris_tensor_t *tensor =
         (tigris_tensor_t *)(buf + STAGED_TENSORS_OFF);
@@ -500,7 +593,7 @@ static uint32_t align4(uint32_t value)
 
 static uint8_t *build_many_stage_plan(uint16_t stage_count, uint32_t *out_size)
 {
-    const uint32_t tensors_off = 104u;
+    const uint32_t tensors_off = 112u;
     const uint32_t ops_off = tensors_off + sizeof(tigris_tensor_t);
     const uint32_t stages_off = align4(
         ops_off + (uint32_t)stage_count * sizeof(tigris_op_t));
@@ -510,7 +603,7 @@ static uint8_t *build_many_stage_plan(uint16_t stage_count, uint32_t *out_size)
     const uint32_t shapes_off = align4(
         index_off + index_count * sizeof(uint16_t));
     const uint32_t strings_off = shapes_off + sizeof(int32_t);
-    const uint32_t plan_size = strings_off + 1u;
+    const uint32_t plan_size = align4(strings_off + 1u) + (uint32_t)sizeof(tigris_memory_t);
     uint8_t *buf = calloc(1, plan_size);
     if (!buf)
         return NULL;
@@ -527,6 +620,7 @@ static uint8_t *build_many_stage_plan(uint16_t stage_count, uint32_t *out_size)
     plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, index_off);
     plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, shapes_off);
     plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, strings_off);
+    plan_finish(buf);
 
     tigris_tensor_t *tensor = (tigris_tensor_t *)(buf + tensors_off);
     tensor->size_bytes = sizeof(float);
@@ -586,7 +680,7 @@ static void test_schema_v5_many_stage_schedule(void)
     TEST_ASSERT(buf != NULL, "legacy many-stage plan allocation");
     if (!buf)
         return;
-    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V4;
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V4);
     TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan),
                    TIGRIS_ERR_BAD_OPERATOR,
                    "schema-v4 retains its authoritative uint8 stage limit");
@@ -595,12 +689,12 @@ static void test_schema_v5_many_stage_schedule(void)
 
 /* A compact valid compressed-weight plan.  It lets the loader tests exercise
  * block metadata without depending on generated model fixtures. */
-#define WEIGHT_BLOCK_PLAN_SIZE 191u
-#define WB_STAGES_OFF          120u
-#define WB_INDEX_OFF           148u
-#define WB_STRINGS_OFF         150u
-#define WB_WEIGHTS_OFF         151u
-#define WB_BLOCKS_OFF          163u
+#define WEIGHT_BLOCK_PLAN_SIZE 212u
+#define WB_STAGES_OFF          136u
+#define WB_INDEX_OFF           164u
+#define WB_STRINGS_OFF         166u
+#define WB_WEIGHTS_OFF         167u
+#define WB_BLOCKS_OFF          179u
 
 static void build_compressed_weight_plan(uint8_t *buf)
 {
@@ -617,6 +711,7 @@ static void build_compressed_weight_plan(uint8_t *buf)
     plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, WB_STRINGS_OFF);
     plan_builder_section(&builder, 6u, TIGRIS_SEC_WEIGHTS, WB_WEIGHTS_OFF);
     plan_builder_section(&builder, 7u, TIGRIS_SEC_WEIGHT_BLOCKS, WB_BLOCKS_OFF);
+    plan_finish(buf);
 
     tigris_stage_t *stage = (tigris_stage_t *)(buf + WB_STAGES_OFF);
     stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
@@ -667,11 +762,11 @@ static void test_compressed_block_guards(void)
 
 /* A tiny valid plan with one tensor and a model-input reference. */
 
-#define REFERENCED_PLAN_SIZE 133u
-#define REF_TENSORS_OFF 96u
-#define REF_INDEX_OFF   112u
-#define REF_SHAPES_OFF  116u
-#define REF_STRINGS_OFF 132u
+#define REFERENCED_PLAN_SIZE 153u
+#define REF_TENSORS_OFF 112u
+#define REF_INDEX_OFF   128u
+#define REF_SHAPES_OFF  132u
+#define REF_STRINGS_OFF 148u
 
 static void build_referenced_plan(uint8_t *buf)
 {
@@ -686,6 +781,7 @@ static void build_referenced_plan(uint8_t *buf)
     plan_builder_section(&builder, 2u, TIGRIS_SEC_INDEX_POOL, REF_INDEX_OFF);
     plan_builder_section(&builder, 3u, TIGRIS_SEC_SHAPE_POOL, REF_SHAPES_OFF);
     plan_builder_section(&builder, 4u, TIGRIS_SEC_STRINGS, REF_STRINGS_OFF);
+    plan_finish(buf);
 
     tigris_tensor_t *tensor = (tigris_tensor_t *)(buf + REF_TENSORS_OFF);
     tensor->size_bytes = sizeof(float);
@@ -737,15 +833,15 @@ static void test_cross_reference_guards(void)
 /* A compact schema-v4 plan that carries the required Transpose permutation
  * attribute.  This exercises both the optional metadata section and the
  * loader's semantic validation before an executor can consume it. */
-#define TRANSPOSE_PLAN_SIZE      259u
-#define TRANSPOSE_TENSORS_OFF    112u
-#define TRANSPOSE_OPS_OFF        144u
-#define TRANSPOSE_STAGES_OFF     182u
-#define TRANSPOSE_INDEX_OFF      210u
-#define TRANSPOSE_SHAPES_OFF     220u
-#define TRANSPOSE_STRINGS_OFF    236u
-#define TRANSPOSE_ATTRS_OFF      237u
-#define TRANSPOSE_ATTR_DATA_OFF  249u
+#define TRANSPOSE_PLAN_SIZE      280u
+#define TRANSPOSE_TENSORS_OFF    128u
+#define TRANSPOSE_OPS_OFF        160u
+#define TRANSPOSE_STAGES_OFF     198u
+#define TRANSPOSE_INDEX_OFF      226u
+#define TRANSPOSE_SHAPES_OFF     236u
+#define TRANSPOSE_STRINGS_OFF    252u
+#define TRANSPOSE_ATTRS_OFF      253u
+#define TRANSPOSE_ATTR_DATA_OFF  265u
 
 static void build_transpose_plan(uint8_t *buf)
 {
@@ -765,6 +861,7 @@ static void build_transpose_plan(uint8_t *buf)
     plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, TRANSPOSE_SHAPES_OFF);
     plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, TRANSPOSE_STRINGS_OFF);
     plan_builder_section(&builder, 6u, TIGRIS_SEC_OP_ATTRIBUTES, TRANSPOSE_ATTRS_OFF);
+    plan_finish(buf);
 
     tigris_tensor_t *tensors =
         (tigris_tensor_t *)(buf + TRANSPOSE_TENSORS_OFF);
@@ -821,20 +918,39 @@ static void build_transpose_plan(uint8_t *buf)
     buf[TRANSPOSE_ATTR_DATA_OFF + 1u] = 0;
 }
 
-/* A schema-v7 plan whose single stage carries a height tile plan. The tiled
- * contract admits two stage shapes the stripe rules cannot express: a global
+/* A plan whose single stage carries a height tile plan. The tiled contract
+ * admits two stage shapes the stripe rules cannot express: a global
  * reduction, which collapses the height, and a layout conversion, which
  * permutes it. Both are validated here, where the executor is not reached. */
-#define TILED_PLAN_SIZE       308u
-#define TILED_TENSORS_OFF     120u
-#define TILED_OPS_OFF         152u
-#define TILED_STAGES_OFF      190u
-#define TILED_TILE_PLANS_OFF  218u
-#define TILED_INDEX_OFF       242u
-#define TILED_SHAPES_OFF      256u
-#define TILED_STRINGS_OFF     288u
-#define TILED_ATTRS_OFF       292u
-#define TILED_ATTR_DATA_OFF   304u
+/* The tile section holds one schema 11 record; a schema 9 record fits in it too. */
+#define TILED_PLAN_SIZE       352u
+#define TILED_TENSORS_OFF     136u
+#define TILED_OPS_OFF         168u
+#define TILED_STAGES_OFF      206u
+#define TILED_TILE_PLANS_OFF  234u
+#define TILED_INDEX_OFF       282u
+#define TILED_SHAPES_OFF      296u
+#define TILED_STRINGS_OFF     328u
+#define TILED_ATTRS_OFF       332u
+#define TILED_ATTR_DATA_OFF   344u
+
+static tigris_tile_plan_v11_t *tiled_record(uint8_t *buf)
+{
+    return (tigris_tile_plan_v11_t *)(buf + TILED_TILE_PLANS_OFF);
+}
+
+/* What the record states about its tiling. */
+static void tiled_state_facts(uint8_t *buf, uint32_t tile_extent, uint32_t num_tiles,
+                              uint32_t original_extent, uint16_t halo, uint8_t band_axis)
+{
+    tigris_tile_facts_t *facts = &tiled_record(buf)->facts;
+    facts->tile_extent = tile_extent;
+    facts->num_tiles = num_tiles;
+    facts->original_extent = original_extent;
+    facts->halo = halo;
+    facts->band_axis = band_axis;
+    facts->_reserved = 0u;
+}
 
 /**
  * Build the plan above. `op_type` selects the stage's single operator;
@@ -843,7 +959,7 @@ static void build_transpose_plan(uint8_t *buf)
  */
 static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
 {
-    plan_builder_t builder = plan_builder_begin(buf, TILED_PLAN_SIZE, TIGRIS_SCHEMA_VERSION_V9);
+    plan_builder_t builder = plan_builder_begin(buf, TILED_PLAN_SIZE, TIGRIS_SCHEMA_VERSION);
     tigris_file_header_t *hdr = builder.header;
     hdr->num_tensors = 2;
     hdr->num_ops = 1;
@@ -869,6 +985,7 @@ static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
     if (op_type == TIGRIS_OP_TRANSPOSE || op_type == TIGRIS_OP_REDUCE_MEAN)
         dir[7] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES,
                                           TILED_ATTRS_OFF};
+    plan_finish(buf);
 
     int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
     uint32_t elems;
@@ -912,13 +1029,12 @@ static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
     stage->tile_plan_idx = 0;
     stage->chain_id = TIGRIS_NO_CHAIN;
 
-    tigris_tile_plan_t *tile =
-        (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
-    tile->tileable = 1;
-    tile->axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
-    tile->tile_height = 1;
-    tile->num_tiles = 4;
-    tile->original_height = 4;
+    /* A conversion's run sizes its band, so the record states one: one row of the swapped group. */
+    tigris_tile_plan_v11_t *tile = tiled_record(buf);
+    tile->choices.tileable = 1;
+    tile->choices.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    tile->choices.tiled_peak_bytes = 128u;
+    tiled_state_facts(buf, 1u, ndim == 3u ? 4u : 8u, ndim == 3u ? 4u : 8u, 0u, 1u);
 
     uint16_t *indices = (uint16_t *)(buf + TILED_INDEX_OFF);
     indices[0] = 0;  /* op input */
@@ -955,6 +1071,19 @@ static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
     } else {
         perm[0] = 0; perm[1] = 3; perm[2] = 1; perm[3] = 2;
     }
+}
+
+/* The same plan at schema 9, whose record states a band of one height row of four. */
+static void tiled_plan_to_v9(uint8_t *buf)
+{
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V9);
+    tigris_tile_plan_t *tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
+    memset(buf + TILED_TILE_PLANS_OFF, 0, sizeof(tigris_tile_plan_v11_t));
+    tile->tileable = 1;
+    tile->axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    tile->tile_height = 1;
+    tile->num_tiles = 4;
+    tile->original_height = 4;
 }
 
 /* A reduction states the one axis it collapses, and the result either keeps
@@ -1017,9 +1146,7 @@ static void test_reduce_mean_contract(void)
     build_tiled_stage_plan(buf, TIGRIS_OP_REDUCE_MEAN, 3u);
     stage = (tigris_stage_t *)(buf + TILED_STAGES_OFF);
     stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
-    tigris_section_entry_t *dir =
-        (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
-    memset(&dir[7], 0, sizeof(dir[7]));
+    plan_drop_section(buf, 7u);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION,
                    "attribute-free reduction rejected");
@@ -1065,7 +1192,7 @@ static void test_op_attribute_kinds(void)
     /* A schema-7 plan carries no kind but the permutation, whatever the
      * operator, because the loader that reads it knows no other. */
     build_transpose_plan(buf);
-    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V7;
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V7);
     attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
     attr->type = TIGRIS_OP_ATTR_EPSILON;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
@@ -1170,30 +1297,24 @@ static void test_op_attribute_payloads(void)
                    "a reduction axis past the rank is refused");
 }
 
+/* Schema 10's record states the scheduling choices alone, in 32 bytes. */
 static void test_compact_tile_record(void)
 {
-    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE + 8u];
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
     tigris_plan_t plan;
     build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 3u);
-    memmove(buf + TILED_INDEX_OFF + 8u, buf + TILED_INDEX_OFF,
-            TILED_PLAN_SIZE - TILED_INDEX_OFF);
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V10);
     tigris_file_header_t *header = (tigris_file_header_t *)buf;
-    header->version = TIGRIS_SCHEMA_VERSION_V10;
-    header->file_size = sizeof(buf);
     header->budget = 128u;
-    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
-    for (uint16_t i = 0; dir[i].type != 0u; i++)
-        if (dir[i].offset >= TILED_INDEX_OFF)
-            dir[i].offset += 8u;
     tigris_tile_plan_v10_t *tile = (tigris_tile_plan_v10_t *)(buf + TILED_TILE_PLANS_OFF);
-    memset(tile, 0, sizeof(*tile));
+    memset(buf + TILED_TILE_PLANS_OFF, 0, sizeof(tigris_tile_plan_v11_t));
     tile->tileable = 1u;
     tile->axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
     tile->tiled_peak_bytes = 128u;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "compact transpose record loads");
-    TEST_ASSERT(plan.tile_plans == NULL && plan.tile_plans_v10 != NULL,
-                "record layouts have separate pointers");
+    TEST_ASSERT(plan.tile_plans == NULL && plan.tile_plans_v10 != NULL &&
+                plan.tile_plans_v11 == NULL, "record layouts have separate pointers");
     tile->input_channel_group = 1u;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
                    "unsupported grouping is refused");
@@ -1210,9 +1331,11 @@ static void test_compact_tile_record(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
                    "working-set ceiling must fit the plan budget");
     tile->tiled_peak_bytes = 128u;
-    header->file_size = TILED_PLAN_SIZE;
-    TEST_ASSERT_EQ(tigris_plan_load(buf, TILED_PLAN_SIZE, &plan), TIGRIS_ERR_BAD_SECTION,
-                   "truncated extended plan is refused");
+    /* The section ends where the record would if it were short. */
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
+    dir[4].offset = TILED_TILE_PLANS_OFF + (uint32_t)sizeof(*tile) - 2u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                   "truncated record is refused");
 }
 
 static void test_tiled_conversion_contract(void)
@@ -1264,17 +1387,20 @@ static void test_tiled_reduction_contract(void)
     tigris_plan_t plan;
     int32_t *shapes;
 
-    /* [1, 2, 4, 8] reduced to [1, 1, 1, 8]. */
+    /* [1, 2, 4, 8] reduced to [1, 1, 1, 8], walked one input row at a time. */
     build_tiled_stage_plan(buf, TIGRIS_OP_GLOBAL_AVG, 4);
     shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
     shapes[4] = 1; shapes[5] = 1; shapes[6] = 1; shapes[7] = 8;
     ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].size_bytes =
         8u * (uint32_t)sizeof(float);
+    tiled_record(buf)->choices.input_band_extent = 1u;
+    tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "a collapsed reduction may carry a height tile plan");
 
     /* An output that still has spatial extent is not a global reduction. */
     build_tiled_stage_plan(buf, TIGRIS_OP_GLOBAL_AVG, 4);
+    tiled_record(buf)->choices.input_band_extent = 1u;
     shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
     shapes[4] = 1; shapes[5] = 1; shapes[6] = 2; shapes[7] = 8;
     ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].size_bytes =
@@ -1324,7 +1450,7 @@ static void test_transpose_attribute_guards(void)
                    "duplicate operator attribute type rejected");
 
     build_transpose_plan(buf);
-    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V2);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION,
                    "v2 cannot claim the v4 attribute section");
@@ -1334,28 +1460,26 @@ static void test_transpose_attribute_guards(void)
      * loader must preserve that structural compatibility while v4 remains
      * strict. */
     build_transpose_plan(buf);
-    tigris_section_entry_t *dir = (tigris_section_entry_t *)(
-        buf + sizeof(tigris_file_header_t));
-    memset(&dir[6], 0, sizeof(dir[6]));
-    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
+    plan_drop_section(buf, 6u);
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V2);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "attribute-free v2 custom Transpose loads");
 
-    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V3;
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V3);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "attribute-free v3 custom Transpose loads");
 
-    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION;
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V4);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION,
                    "attribute-free v4 Transpose remains rejected");
 
-    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION_V2;
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V2);
     ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_UNKNOWN;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "v2 custom opcode loads for caller dispatcher");
 
-    ((tigris_file_header_t *)buf)->version = TIGRIS_SCHEMA_VERSION;
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V4);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_OPERATOR,
                    "v4 custom opcode remains fail-closed");
@@ -1368,8 +1492,7 @@ static void test_transpose_attribute_guards(void)
      * check. A plan whose normalization is otherwise well formed had nothing
      * left to catch it and failed at inference instead. */
     build_transpose_plan(buf);
-    dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
-    memset(&dir[6], 0, sizeof(dir[6]));
+    plan_drop_section(buf, 6u);
     ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type =
         TIGRIS_OP_LAYER_NORM;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
@@ -1424,13 +1547,13 @@ static void test_declared_interface_dtype_contract(void)
 
 
 /* A plan whose single stage splits one rank-3 input into two parts. */
-#define SPLIT_PLAN_SIZE     276u
-#define SPLIT_TENSORS_OFF   104u
-#define SPLIT_OPS_OFF       152u
-#define SPLIT_STAGES_OFF    190u
-#define SPLIT_INDEX_OFF     218u
-#define SPLIT_SHAPES_OFF    236u
-#define SPLIT_STRINGS_OFF   272u
+#define SPLIT_PLAN_SIZE     296u
+#define SPLIT_TENSORS_OFF   120u
+#define SPLIT_OPS_OFF       168u
+#define SPLIT_STAGES_OFF    206u
+#define SPLIT_INDEX_OFF     234u
+#define SPLIT_SHAPES_OFF    252u
+#define SPLIT_STRINGS_OFF   288u
 
 static void build_split_plan(uint8_t *buf)
 {
@@ -1449,6 +1572,7 @@ static void build_split_plan(uint8_t *buf)
     plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, SPLIT_INDEX_OFF);
     plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, SPLIT_SHAPES_OFF);
     plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, SPLIT_STRINGS_OFF);
+    plan_finish(buf);
 
     int32_t *shapes = (int32_t *)(buf + SPLIT_SHAPES_OFF);
     shapes[0] = 4; shapes[1] = 2; shapes[2] = 8;   /* input  */
@@ -1612,12 +1736,8 @@ static void build_unary_plan(uint8_t *buf)
 {
     build_transpose_plan(buf);
 
-    /* End the directory before the optional attribute section and turn the
-     * Transpose into a plain exact-shape Relu plan.  The remaining bytes are
-     * harmless string-section tail data. */
-    tigris_section_entry_t *dir = (tigris_section_entry_t *)(
-        buf + sizeof(tigris_file_header_t));
-    memset(&dir[6], 0, sizeof(dir[6]));
+    /* Drop the attribute section and make the Transpose an exact-shape Relu; the rest is string tail. */
+    plan_drop_section(buf, 6u);
 
     tigris_op_t *op = (tigris_op_t *)(buf + TRANSPOSE_OPS_OFF);
     op->op_type = TIGRIS_OP_RELU;
@@ -1645,11 +1765,8 @@ static void test_rank4_row_band_contract(void)
     tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
     tensors[0].flags |= TIGRIS_TENSOR_LINEAR;
     tensors[1].flags |= TIGRIS_TENSOR_LINEAR;
-    tigris_tile_plan_t *tile =
-        (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
-    tile->num_tiles = 2;
-    tile->tile_height = 2;
-    tile->original_height = 4;
+    tiled_record(buf)->choices.input_band_extent = 2u;
+    tiled_state_facts(buf, 2u, 2u, 4u, 0u, 2u);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "a rank-4 row band loads");
 
@@ -1658,10 +1775,8 @@ static void test_rank4_row_band_contract(void)
     build_tiled_stage_plan(buf, TIGRIS_OP_ERF, 4);
     shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
     shapes[4] = 1; shapes[5] = 2; shapes[6] = 4; shapes[7] = 8;
-    tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
-    tile->num_tiles = 2;
-    tile->tile_height = 1;
-    tile->original_height = 2;
+    tiled_record(buf)->choices.input_band_extent = 1u;
+    tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "the spatial reading of the same shapes still loads");
 }
@@ -1694,7 +1809,9 @@ static void test_reshape_band_contract(void)
     printf("  test_reshape_band_contract...\n");
     _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
     tigris_plan_t plan;
+    /* Schema 9's record states the band's counts; schema 11 has its own test. */
     build_tiled_stage_plan(buf, TIGRIS_OP_RESHAPE, 3);
+    tiled_plan_to_v9(buf);
     tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
     tensors[0].flags |= TIGRIS_TENSOR_LINEAR;
     tensors[1].flags |= TIGRIS_TENSOR_LINEAR;
@@ -1781,13 +1898,133 @@ static void test_reshape_band_contract(void)
                    "multiple leading output blocks are not a contiguous height band");
 }
 
+/* A schema 11 tile record states its tiling; the loader derives it and refuses a disagreeing record. */
+static int tile_facts_load(uint8_t *buf, tigris_plan_t *plan)
+{
+    return tigris_plan_load(buf, TILED_PLAN_SIZE, plan);
+}
+
+static void test_tile_facts_contract(void)
+{
+    printf("  test_tile_facts_contract...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_tile_facts_t derived;
+    tigris_tile_facts_t *facts = &tiled_record(buf)->facts;
+
+    /* A conversion of [1, 4, 8]: bands of one of the four rows. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 3u);
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_OK, "stated conversion facts load");
+    TEST_ASSERT(plan.tile_plans_v11 != NULL && plan.tile_plans_v10 == NULL &&
+                plan.tile_plans == NULL, "schema 11 records have their own pointer");
+    TEST_ASSERT_EQ(tigris_stage_tile_facts(&plan, &plan.stages[0], &derived), 1, "facts derived");
+    TEST_ASSERT(memcmp(&derived, facts, sizeof(derived)) == 0, "derived facts equal the record");
+    TEST_ASSERT_EQ(tigris_stage_tile_facts(NULL, &plan.stages[0], &derived), 0, "NULL plan");
+    TEST_ASSERT_EQ(tigris_stage_tile_facts(&plan, NULL, &derived), 0, "NULL stage");
+    TEST_ASSERT_EQ(tigris_stage_tile_facts(&plan, &plan.stages[0], NULL), 0, "NULL output");
+
+    facts->num_tiles = 5u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "wrong tile count refused");
+    facts->num_tiles = 4u;
+    facts->original_extent = 8u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS,
+                   "the unbanded axis is not the extent");
+    facts->original_extent = 4u;
+    facts->halo = 1u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "a conversion has no halo");
+    facts->halo = 0u;
+    facts->band_axis = 2u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "wrong band axis refused");
+    facts->band_axis = 1u;
+    facts->_reserved = 1u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "reserved byte must be zero");
+    facts->_reserved = 0u;
+
+    /* The run sizes a conversion's band, so the record's is only bounded, and the count follows it. */
+    facts->tile_extent = 3u;
+    facts->num_tiles = 2u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_OK, "a stated band of three loads");
+    facts->num_tiles = 4u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS,
+                   "the count follows the stated band");
+    facts->tile_extent = 0u;
+    facts->num_tiles = 0u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "an empty band refused");
+    facts->tile_extent = 5u;
+    facts->num_tiles = 1u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS,
+                   "a band past the extent refused");
+
+    /* Columns instead: the eight of them, one at a time. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 3u);
+    tiled_record(buf)->choices.flags = TIGRIS_TILE_FLAG_BAND_ON_COLUMNS;
+    tiled_state_facts(buf, 1u, 8u, 8u, 0u, 2u);
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_OK, "a band along the columns loads");
+
+    /* An untileable record states no tiling. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 3u);
+    memset(tiled_record(buf), 0, sizeof(tigris_tile_plan_v11_t));
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_OK, "an untileable record loads");
+    TEST_ASSERT_EQ(tigris_stage_tile_facts(&plan, &plan.stages[0], &derived), 1,
+                   "an untileable record has facts");
+    TEST_ASSERT(derived.num_tiles == 0u && derived.original_extent == 0u &&
+                derived.tile_extent == 0u, "and they are zero");
+    facts->num_tiles = 1u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS,
+                   "an untileable record with a count refused");
+
+    /* A reshape of [1, 4, 8] to [1, 8, 4] in bands of three of its four input rows. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_RESHAPE, 3u);
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    tensors[0].flags |= TIGRIS_TENSOR_LINEAR;
+    tensors[1].flags |= TIGRIS_TENSOR_LINEAR;
+    tiled_record(buf)->choices.input_band_extent = 3u;
+    tiled_state_facts(buf, 3u, 2u, 4u, 0u, 1u);
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_OK, "stated reshape facts load");
+    check_reshape_band_execution(&plan, 96u);
+    facts->original_extent = 8u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS,
+                   "the output extent is not the reshape's");
+    facts->original_extent = 4u;
+    facts->num_tiles = 1u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "wrong reshape count refused");
+    facts->num_tiles = 2u;
+    facts->tile_extent = 2u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS,
+                   "the band is the record's input band");
+
+    /* A sum over the last axis of [7, 1, 4] bands the leading axis, three rows at a time. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_REDUCE_MEAN, 3u);
+    ((tigris_op_t *)(buf + TILED_OPS_OFF))->op_type = TIGRIS_OP_REDUCE_SUM;
+    int32_t *dims = (int32_t *)(buf + TILED_SHAPES_OFF);
+    dims[0] = 7; dims[1] = 1; dims[2] = 4;
+    dims[4] = 7; dims[5] = 1; dims[6] = 1;
+    tensors[0].size_bytes = 112u;
+    tensors[1].size_bytes = 28u;
+    buf[TILED_ATTR_DATA_OFF] = 2;
+    tiled_record(buf)->choices.input_band_extent = 3u;
+    tiled_state_facts(buf, 3u, 3u, 7u, 0u, 0u);
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_OK, "stated leading-band facts load");
+    facts->band_axis = 1u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS,
+                   "the leading band is the first axis");
+    facts->band_axis = 0u;
+    facts->original_extent = 1u;
+    facts->num_tiles = 1u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "wrong leading extent refused");
+    facts->original_extent = 7u;
+    facts->num_tiles = 3u;
+    facts->halo = 2u;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "a leading band has no halo");
+}
+
 static void test_float_section(void)
 {
     printf("  test_float_section...\n");
-    _Alignas(32) uint8_t buf[332] = {0};
+    _Alignas(32) uint8_t buf[352] = {0};
     tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
     memcpy(hdr->magic, TIGRIS_MAGIC_BYTES, 4);
-    hdr->version = TIGRIS_SCHEMA_VERSION_BINARY_REQUANT;
+    hdr->version = TIGRIS_SCHEMA_VERSION;
     hdr->file_size = sizeof(buf);
     hdr->section_dir_off = 48;
     hdr->num_tensors = 3;
@@ -1799,14 +2036,15 @@ static void test_float_section(void)
     hdr->num_model_outputs = 1;
     hdr->num_quant_params = 1;
     tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + 48);
-    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, 112};
-    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, 160};
-    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, 240};
-    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, 268};
-    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, 288};
-    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, 300};
-    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, 304};
-    tigris_tensor_t *t = (tigris_tensor_t *)(buf + 112);
+    dir[0] = (tigris_section_entry_t){TIGRIS_SEC_TENSORS, 128};
+    dir[1] = (tigris_section_entry_t){TIGRIS_SEC_OPS, 176};
+    dir[2] = (tigris_section_entry_t){TIGRIS_SEC_STAGES, 256};
+    dir[3] = (tigris_section_entry_t){TIGRIS_SEC_INDEX_POOL, 284};
+    dir[4] = (tigris_section_entry_t){TIGRIS_SEC_SHAPE_POOL, 304};
+    dir[5] = (tigris_section_entry_t){TIGRIS_SEC_STRINGS, 316};
+    dir[6] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, 320};
+    plan_finish(buf);
+    tigris_tensor_t *t = (tigris_tensor_t *)(buf + 128);
     for (uint16_t i = 0; i < 3; i++) {
         t[i].dtype = i == 0 ? 3 : 1;
         t[i].ndim = 1;
@@ -1817,10 +2055,10 @@ static void test_float_section(void)
     t[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
     t[2].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
     const int32_t shape[3] = {4, 4, 4};
-    memcpy(buf + 288, shape, sizeof(shape));
+    memcpy(buf + 304, shape, sizeof(shape));
     const uint16_t indices[10] = {0, 1, 1, 2, 0, 1, 0, 2, 0, 2};
-    memcpy(buf + 268, indices, sizeof(indices));
-    tigris_op_t *ops = (tigris_op_t *)(buf + 160);
+    memcpy(buf + 284, indices, sizeof(indices));
+    tigris_op_t *ops = (tigris_op_t *)(buf + 176);
     for (uint8_t i = 0; i < 2; i++) {
         ops[i].op_type = i == 0 ? TIGRIS_OP_DEQUANTIZE : TIGRIS_OP_RELU;
         ops[i].num_inputs = 1;
@@ -1830,7 +2068,7 @@ static void test_float_section(void)
         ops[i].weight_idx = TIGRIS_NO_WEIGHT;
         ops[i].bias_idx = TIGRIS_NO_WEIGHT;
     }
-    tigris_stage_t *stage = (tigris_stage_t *)(buf + 240);
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + 256);
     stage->ops_off = 4;
     stage->ops_count = 2;
     stage->inputs_off = 8;
@@ -1839,10 +2077,10 @@ static void test_float_section(void)
     stage->outputs_count = 1;
     stage->tile_plan_idx = TIGRIS_NO_TILE_PLAN;
     stage->chain_id = TIGRIS_NO_CHAIN;
-    uint16_t *quant_header = (uint16_t *)(buf + 304);
+    uint16_t *quant_header = (uint16_t *)(buf + 320);
     quant_header[0] = 1;
     quant_header[1] = 1;
-    tigris_quant_param_t *quant = (tigris_quant_param_t *)(buf + 308);
+    tigris_quant_param_t *quant = (tigris_quant_param_t *)(buf + 324);
     quant->scale = 0.25f;
     quant->num_channels = 1;
     quant->shift_off = 1;
@@ -1929,13 +2167,14 @@ static void test_operator_semantic_guards(void)
 /* Compact one-op plans for exercising the loader's non-weighted operator
  * decision table. Keeping these plans in memory makes every condition
  * reproducible without generated fixtures or a compiler checkout. */
-#define SEMANTIC_PLAN_SIZE    289u
-#define SEMANTIC_TENSORS_OFF  112u
-#define SEMANTIC_OPS_OFF      160u
-#define SEMANTIC_STAGES_OFF   200u
-#define SEMANTIC_INDEX_OFF    228u
-#define SEMANTIC_SHAPES_OFF   240u
-#define SEMANTIC_STRINGS_OFF  288u
+/* The directory has room for the sections the plans built on this one add. */
+#define SEMANTIC_PLAN_SIZE    312u
+#define SEMANTIC_TENSORS_OFF  128u
+#define SEMANTIC_OPS_OFF      176u
+#define SEMANTIC_STAGES_OFF   216u
+#define SEMANTIC_INDEX_OFF    244u
+#define SEMANTIC_SHAPES_OFF   256u
+#define SEMANTIC_STRINGS_OFF  304u
 
 static void semantic_set_shape(
     uint8_t *buf, uint16_t tensor_index, uint8_t ndim,
@@ -1973,6 +2212,7 @@ static void build_semantic_plan(
     plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, SEMANTIC_INDEX_OFF);
     plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, SEMANTIC_SHAPES_OFF);
     plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, SEMANTIC_STRINGS_OFF);
+    plan_finish(buf);
 
     tigris_tensor_t *tensors =
         (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF);
@@ -2017,8 +2257,8 @@ static void build_semantic_plan(
     buf[SEMANTIC_STRINGS_OFF] = '\0';
 }
 
-#define ELEMENTWISE_QUANT_OFF 300u
-#define ELEMENTWISE_PLAN_SIZE 376u
+#define ELEMENTWISE_QUANT_OFF 320u
+#define ELEMENTWISE_PLAN_SIZE 400u
 
 static void build_elementwise_quant_plan(
     uint8_t *buf, tigris_op_type_t type, uint8_t inputs)
@@ -2033,6 +2273,7 @@ static void build_elementwise_quant_plan(
     tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
     for (int i = 0; i < 6; i++) dir[i].offset += 8u;
     dir[6] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, ELEMENTWISE_QUANT_OFF};
+    plan_finish(buf);
     uint16_t *quant_header = (uint16_t *)(buf + ELEMENTWISE_QUANT_OFF);
     quant_header[0] = 3;
     quant_header[1] = 1;
@@ -2052,7 +2293,9 @@ static void build_elementwise_quant_plan(
     op->act_max = 127;
 }
 
-#define NATIVE_REDUCTION_PLAN_SIZE (ELEMENTWISE_PLAN_SIZE + 24u)
+/* The attribute section follows the plan it is built on, and the record follows it. */
+#define NATIVE_ATTRS_OFF(quantized) ((quantized) ? ELEMENTWISE_PLAN_SIZE : SEMANTIC_PLAN_SIZE)
+#define NATIVE_REDUCTION_PLAN_SIZE (ELEMENTWISE_PLAN_SIZE + 28u)
 
 static void build_native_reduction_plan(
     uint8_t *buf, tigris_op_type_t type, int quantized, uint8_t axis)
@@ -2061,11 +2304,12 @@ static void build_native_reduction_plan(
     if (quantized) build_elementwise_quant_plan(buf, type, 1);
     else build_semantic_plan(buf, type, 1);
     uint32_t offset = quantized ? 8u : 0u;
-    uint32_t attrs_off = quantized ? ELEMENTWISE_PLAN_SIZE : 292u;
+    uint32_t attrs_off = NATIVE_ATTRS_OFF(quantized);
     tigris_file_header_t *header = (tigris_file_header_t *)buf;
-    header->file_size = attrs_off + 24u;
+    header->file_size = attrs_off + 28u;
     tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
     dir[quantized ? 7 : 6] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, attrs_off};
+    plan_finish(buf);
     tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + offset);
     int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + offset);
     uint32_t bytes = quantized ? 1u : sizeof(float);
@@ -2143,7 +2387,7 @@ static void test_arg_contract(void)
             t[0].ndim = 4; dims[0] = 2; dims[1] = 3; dims[2] = 2; dims[3] = 2;
             t[1].ndim = 3; dims[4] = 2; dims[5] = 3; dims[6] = 2;
             t[1].size_bytes = 12u * 4u;
-            buf[header->file_size - 24u + 12u] = 3;
+            buf[NATIVE_ATTRS_OFF(q) + 12u] = 3;
             TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_OK, "rank-four arg accepted");
             t[1].ndim = 1; dims[4] = 12;
             TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR, "arg drops only one axis");
@@ -2207,7 +2451,7 @@ static void test_native_reduction_contract(void)
             tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + offset);
             tigris_op_t *op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF + offset);
             int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + offset);
-            uint32_t attrs_off = quantized ? ELEMENTWISE_PLAN_SIZE : 292u;
+            uint32_t attrs_off = NATIVE_ATTRS_OFF(quantized);
             tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + attrs_off + 4u);
             op->num_inputs = 2;
             TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_OPERATOR,
@@ -2253,8 +2497,7 @@ static void test_native_reduction_contract(void)
                                k == 2u ? TIGRIS_OK : TIGRIS_ERR_BAD_OPERATOR,
                                "only SUM can change the reduction output zero point");
             }
-            tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
-            memset(&dir[quantized ? 7 : 6], 0, sizeof(*dir));
+            plan_drop_section(buf, quantized ? 7u : 6u);
             TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
                            "native reduction requires an axes attribute");
         }
@@ -2267,7 +2510,7 @@ static void test_cumsum_loader_contract(void)
     tigris_plan_t plan;
     for (int quantized = 0; quantized < 2; quantized++) {
         uint32_t offset = quantized ? 8u : 0u;
-        uint32_t attrs_off = quantized ? ELEMENTWISE_PLAN_SIZE : 292u;
+        uint32_t attrs_off = NATIVE_ATTRS_OFF(quantized);
         tigris_file_header_t *header = (tigris_file_header_t *)buf;
         for (uint8_t axis = 0; axis < 3u; axis++) {
             build_native_reduction_plan(buf, TIGRIS_OP_CUMSUM, quantized, axis);
@@ -2352,8 +2595,7 @@ static void test_cumsum_loader_contract(void)
         attrs[0] = attrs[1]; attrs[0].data_offset = 9;
         TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
                        "CumSum requires an axis beside its options");
-        tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + header->section_dir_off);
-        memset(&dir[quantized ? 7 : 6], 0, sizeof(*dir));
+        plan_drop_section(buf, quantized ? 7u : 6u);
         TEST_ASSERT_EQ(tigris_plan_load(buf, header->file_size, &plan), TIGRIS_ERR_BAD_SECTION,
                        "CumSum requires an attribute section");
     }
@@ -2370,6 +2612,10 @@ static void test_native_reduction_tiling_contract(void)
         build_tiled_stage_plan(buf, TIGRIS_OP_REDUCE_MEAN, 3);
         tigris_file_header_t *header = (tigris_file_header_t *)buf;
         header->file_size = sizeof(buf);
+        plan_finish(buf);
+        /* A band of one of the four rows. */
+        tiled_record(buf)->choices.input_band_extent = 1u;
+        tiled_state_facts(buf, 1u, 4u, 4u, 0u, 1u);
         ((tigris_op_t *)(buf + TILED_OPS_OFF))->op_type = kinds[k];
         tigris_stage_t *stage = (tigris_stage_t *)(buf + TILED_STAGES_OFF);
         tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
@@ -2389,7 +2635,8 @@ static void test_native_reduction_tiling_contract(void)
         TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                        "native reduction plan loads without tiling");
         stage->tile_plan_idx = 0;
-        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+        /* The stage bands along its trailing axis, so a stated height band disagrees with the plan. */
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_TILE_FACTS,
                        "native reductions and scans refuse height tiling");
     }
 }
@@ -2398,7 +2645,9 @@ static void test_leading_band_contract(void)
 {
     _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
     tigris_plan_t plan;
+    /* Schema 9's record states the band's counts; schema 11 has its own test. */
     build_tiled_stage_plan(buf, TIGRIS_OP_REDUCE_MEAN, 3);
+    tiled_plan_to_v9(buf);
     ((tigris_op_t *)(buf + TILED_OPS_OFF))->op_type = TIGRIS_OP_REDUCE_SUM;
     tigris_tensor_t *t = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
     int32_t *dims = (int32_t *)(buf + TILED_SHAPES_OFF);
@@ -2494,8 +2743,7 @@ static void test_gelu_attribute_contract(void)
     op->op_type = TIGRIS_OP_ERF;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION, "GELU options belong to GELU");
     op->op_type = TIGRIS_OP_GELU;
-    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
-    memset(&dir[6], 0, sizeof(dir[6]));
+    plan_drop_section(buf, 6u);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR, "GELU requires options");
 }
 
@@ -2539,8 +2787,7 @@ static void test_activation_attribute_contract(void)
         TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
                        "activation attributes cannot attach to Elu");
         op->op_type = kinds[k];
-        tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
-        memset(&dir[6], 0, sizeof(dir[6]));
+        plan_drop_section(buf, 6u);
         TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                        k == 0u ? TIGRIS_OK : TIGRIS_ERR_BAD_SECTION,
                        "LeakyRelu defaults alpha but L2Normalization requires epsilon");
@@ -2549,7 +2796,7 @@ static void test_activation_attribute_contract(void)
 
 static void test_activation_semantic_contract(void)
 {
-    _Alignas(4) uint8_t buf[ELEMENTWISE_PLAN_SIZE + 16u];
+    _Alignas(4) uint8_t buf[ELEMENTWISE_PLAN_SIZE + 20u];
     tigris_plan_t plan;
     const uint8_t kinds[] = {TIGRIS_OP_LEAKY_RELU, TIGRIS_OP_ELU,
                              TIGRIS_OP_LOG_SOFTMAX, TIGRIS_OP_L2_NORMALIZATION};
@@ -2564,9 +2811,10 @@ static void test_activation_semantic_contract(void)
             tigris_op_t *op = (tigris_op_t *)(buf + SEMANTIC_OPS_OFF + offset);
             if (kinds[k] == TIGRIS_OP_L2_NORMALIZATION) {
                 uint32_t attrs_off = quantized ? ELEMENTWISE_PLAN_SIZE : SEMANTIC_PLAN_SIZE;
-                header->file_size = attrs_off + 16u;
+                header->file_size = attrs_off + 20u;
                 dir[quantized ? 7 : 6] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, attrs_off};
                 memset(buf + attrs_off, 0, 16u);
+                plan_finish(buf);
                 uint16_t count = 1;
                 memcpy(buf + attrs_off, &count, sizeof(count));
                 tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_EPSILON, sizeof(float), 0};
@@ -2635,10 +2883,10 @@ static void test_activation_semantic_contract(void)
     }
 }
 
-#define PRELU_PLAN_SIZE 420u
-#define PRELU_ATTRS_OFF 404u
-#define PRELU_WEIGHTS_OFF 308u
-#define PRELU_QUANT_OFF 328u
+#define PRELU_PLAN_SIZE 448u
+#define PRELU_ATTRS_OFF 428u
+#define PRELU_WEIGHTS_OFF 328u
+#define PRELU_QUANT_OFF 348u
 
 static void build_prelu_contract_plan(uint8_t *buf, int quantized)
 {
@@ -2656,7 +2904,7 @@ static void build_prelu_contract_plan(uint8_t *buf, int quantized)
     dir[6] = (tigris_section_entry_t){TIGRIS_SEC_WEIGHTS, PRELU_WEIGHTS_OFF};
     dir[7] = (tigris_section_entry_t){TIGRIS_SEC_QUANT_PARAMS, PRELU_QUANT_OFF};
     dir[8] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, PRELU_ATTRS_OFF};
-    memset(&dir[9], 0, sizeof(dir[9]));
+    plan_finish(buf);
     uint16_t count = 1;
     memcpy(buf + PRELU_ATTRS_OFF, &count, sizeof(count));
     tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_CONSTANT_OPERAND, 4, 0};
@@ -2729,8 +2977,7 @@ static void test_prelu_loader_contract(void)
         TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
                        "PRelu refuses rank zero");
         build_prelu_contract_plan(buf, quantized);
-        tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
-        memset(&dir[8], 0, sizeof(dir[8]));
+        plan_drop_section(buf, 8u);
         TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
                        "PRelu refuses absent operand placement metadata");
     }
@@ -2741,43 +2988,49 @@ static void test_prelu_loader_contract(void)
 
 static void test_prelu_tiling_contract(void)
 {
-    _Alignas(4) uint8_t buf[PRELU_PLAN_SIZE + 32u];
+    _Alignas(4) uint8_t buf[PRELU_PLAN_SIZE + 60u];
     tigris_plan_t plan;
     for (uint8_t rank = 2; rank <= 4u; rank++) {
         build_prelu_contract_plan(buf, 0);
+        /* Room for one more directory entry, then a tile section ahead of the index pool. */
         memmove(buf + SEMANTIC_TENSORS_OFF + 24u, buf + SEMANTIC_TENSORS_OFF + 16u,
                 PRELU_PLAN_SIZE - SEMANTIC_TENSORS_OFF - 16u);
         tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
-        for (int i = 0; i < 9; i++) dir[i].offset += 8u;
+        for (int i = 0; i < 10; i++) dir[i].offset += 8u;
         const uint32_t tile_off = SEMANTIC_INDEX_OFF + 24u;
-        memmove(buf + tile_off + sizeof(tigris_tile_plan_t), buf + tile_off,
+        memmove(buf + tile_off + sizeof(tigris_tile_plan_v11_t), buf + tile_off,
                 PRELU_PLAN_SIZE + 8u - tile_off);
-        for (int i = 0; i < 9; i++)
-            if (dir[i].offset >= tile_off) dir[i].offset += sizeof(tigris_tile_plan_t);
-        memmove(&dir[4], &dir[3], 6u * sizeof(dir[0]));
+        for (int i = 0; i < 10; i++)
+            if (dir[i].offset >= tile_off) dir[i].offset += sizeof(tigris_tile_plan_v11_t);
+        memmove(&dir[4], &dir[3], 7u * sizeof(dir[0]));
         dir[3] = (tigris_section_entry_t){TIGRIS_SEC_TILE_PLANS, tile_off};
-        memset(&dir[10], 0, sizeof(dir[10]));
         tigris_file_header_t *header = (tigris_file_header_t *)buf;
         header->file_size = sizeof(buf);
         header->num_tile_plans = 1;
-        header->version = TIGRIS_SCHEMA_VERSION_V9;
+        plan_finish(buf);
         tigris_stage_t *stage = (tigris_stage_t *)(buf + SEMANTIC_STAGES_OFF + 24u);
         stage->tile_plan_idx = 0;
         stage->inputs_off = 3; stage->inputs_count = 1;
         stage->outputs_off = 4; stage->outputs_count = 1;
         tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + SEMANTIC_TENSORS_OFF + 24u);
-        int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + 48u);
+        int32_t *dims = (int32_t *)(buf + SEMANTIC_SHAPES_OFF + 72u);
         const int32_t shapes[3][4] = {{4, 2, 1, 1}, {1, 4, 2, 1}, {1, 2, 2, 2}};
         for (int t = 0; t < 2; t++) {
             tensors[t].ndim = rank;
             memcpy(dims + 4 * t, shapes[rank - 2u], 4u * sizeof(int32_t));
         }
-        tigris_tile_plan_t tile = {0};
-        tile.tileable = 1;
-        tile.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
-        tile.tile_height = 1;
-        tile.original_height = rank == 4u ? 2u : 4u;
-        tile.num_tiles = tile.original_height;
+        /* One row at a time: a matrix's rows at rank 2, the height otherwise. */
+        uint32_t rows = rank == 4u ? 2u : 4u;
+        tigris_tile_plan_v11_t tile;
+        memset(&tile, 0, sizeof(tile));
+        tile.choices.tileable = 1;
+        tile.choices.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+        tile.choices.input_band_extent = 1u;
+        tile.choices.tiled_peak_bytes = 128u;
+        tile.facts.tile_extent = 1u;
+        tile.facts.num_tiles = rows;
+        tile.facts.original_extent = rows;
+        tile.facts.band_axis = rank == 2u ? 0u : 1u;
         memcpy(buf + tile_off, &tile, sizeof(tile));
         TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                        "constant-alpha PRelu accepts row, sequence, and image height tiling");
@@ -2801,12 +3054,14 @@ static void test_activation_tiling_contract(void)
             }
             memcpy(dims + 4, dims, 4u * sizeof(int32_t));
             tensors[1].size_bytes = tensors[0].size_bytes;
-            tigris_tile_plan_t *tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
-            tile->original_height = rank == 2u ? dims[0] : dims[1];
-            tile->num_tiles = tile->original_height;
+            /* One row at a time: a matrix's rows at rank 2, the height otherwise. */
+            uint32_t rows = (uint32_t)(rank == 2u ? dims[0] : dims[1]);
+            tiled_record(buf)->choices.input_band_extent = 1u;
+            tiled_state_facts(buf, 1u, rows, rows, 0u, rank == 2u ? 0u : 1u);
             if (kinds[k] == TIGRIS_OP_L2_NORMALIZATION) {
                 tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
                 dir[7] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, TILED_ATTRS_OFF};
+                plan_finish(buf);
                 uint16_t count = 1;
                 memcpy(buf + TILED_ATTRS_OFF, &count, sizeof(count));
                 tigris_op_attribute_t attr = {0, TIGRIS_OP_ATTR_EPSILON, sizeof(float), 0};
@@ -2834,8 +3089,8 @@ static void test_activation_tiling_contract(void)
     op->spatial.stride_h = 1; op->spatial.stride_w = 1;
     int32_t *dims = (int32_t *)(buf + TILED_SHAPES_OFF);
     memcpy(dims + 4, dims, 4u * sizeof(int32_t));
-    tigris_tile_plan_t *tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
-    tile->original_height = 2; tile->num_tiles = 2;
+    tiled_record(buf)->choices.input_band_extent = 1u;
+    tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "L2Pool supports image height tiling");
 }
@@ -2846,6 +3101,7 @@ static void test_resize_scale_guards(void)
     tigris_plan_t plan;
     build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 4);
     ((tigris_file_header_t *)buf)->file_size = sizeof(buf);
+    plan_finish(buf);
     tigris_op_t *op = (tigris_op_t *)(buf + TILED_OPS_OFF);
     op->op_type = TIGRIS_OP_RESIZE_LINEAR;
     int32_t shapes[8] = {1, 10, 7, 4, 1, 7, 4, 4};
@@ -2853,9 +3109,9 @@ static void test_resize_scale_guards(void)
     tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
     tensors[0].size_bytes = 10u * 7u * 4u * 4u;
     tensors[1].size_bytes = 7u * 4u * 4u * 4u;
-    tigris_tile_plan_t *tile = (tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF);
-    tile->num_tiles = 7;
-    tile->original_height = 7;
+    /* One output row at a time, each reading the two source rows around it. */
+    tiled_record(buf)->choices.output_band_extent = 1u;
+    tiled_state_facts(buf, 1u, 7u, 7u, 1u, 1u);
     tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u);
     attr->type = TIGRIS_OP_ATTR_RESIZE_SCALES;
     attr->data_len = 8;
@@ -3160,14 +3416,14 @@ static void test_convolution_semantic_guards(void)
  * weight_idx convention kern_conv_transpose[_s8] actually reads (num_inputs
  * stays 1; the weight is addressed through op->weight_idx like Conv, not
  * appended to the input list). */
-#define CONVT_PLAN_SIZE    276u
-#define CONVT_TENSORS_OFF  112u
-#define CONVT_OPS_OFF      144u
-#define CONVT_STAGES_OFF   184u
-#define CONVT_INDEX_OFF    212u
-#define CONVT_SHAPES_OFF   224u
-#define CONVT_STRINGS_OFF  256u
-#define CONVT_WEIGHTS_OFF  260u
+#define CONVT_PLAN_SIZE    296u
+#define CONVT_TENSORS_OFF  128u
+#define CONVT_OPS_OFF      160u
+#define CONVT_STAGES_OFF   200u
+#define CONVT_INDEX_OFF    228u
+#define CONVT_SHAPES_OFF   240u
+#define CONVT_STRINGS_OFF  272u
+#define CONVT_WEIGHTS_OFF  276u
 
 static void build_conv_transpose_plan(uint8_t *buf)
 {
@@ -3188,6 +3444,7 @@ static void build_conv_transpose_plan(uint8_t *buf)
     plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, CONVT_SHAPES_OFF);
     plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, CONVT_STRINGS_OFF);
     plan_builder_section(&builder, 6u, TIGRIS_SEC_WEIGHTS, CONVT_WEIGHTS_OFF);
+    plan_finish(buf);
 
     tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + CONVT_TENSORS_OFF);
     int32_t *shapes = (int32_t *)(buf + CONVT_SHAPES_OFF);
@@ -3307,15 +3564,15 @@ static void test_conv_transpose_semantic_guards(void)
  * multiplier + 3 shift int32 elements = 24 bytes) and reused unchanged for
  * num_channels==1 and the malformed num_channels==2 case; only the quant
  * param's num_channels/shift_off fields move within that fixed span. */
-#define CONVTQ_PLAN_SIZE    328u
-#define CONVTQ_TENSORS_OFF  120u
-#define CONVTQ_OPS_OFF      152u
-#define CONVTQ_STAGES_OFF   190u
-#define CONVTQ_INDEX_OFF    218u
-#define CONVTQ_SHAPES_OFF   228u
-#define CONVTQ_STRINGS_OFF  260u
-#define CONVTQ_WEIGHTS_OFF  264u
-#define CONVTQ_QUANT_OFF    284u
+#define CONVTQ_PLAN_SIZE    348u
+#define CONVTQ_TENSORS_OFF  136u
+#define CONVTQ_OPS_OFF      168u
+#define CONVTQ_STAGES_OFF   206u
+#define CONVTQ_INDEX_OFF    234u
+#define CONVTQ_SHAPES_OFF   244u
+#define CONVTQ_STRINGS_OFF  276u
+#define CONVTQ_WEIGHTS_OFF  280u
+#define CONVTQ_QUANT_OFF    300u
 
 static void build_conv_transpose_quant_plan(uint8_t *buf, uint16_t num_channels)
 {
@@ -3338,6 +3595,7 @@ static void build_conv_transpose_quant_plan(uint8_t *buf, uint16_t num_channels)
     plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, CONVTQ_STRINGS_OFF);
     plan_builder_section(&builder, 6u, TIGRIS_SEC_WEIGHTS, CONVTQ_WEIGHTS_OFF);
     plan_builder_section(&builder, 7u, TIGRIS_SEC_QUANT_PARAMS, CONVTQ_QUANT_OFF);
+    plan_finish(buf);
 
     tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + CONVTQ_TENSORS_OFF);
     int32_t *shapes = (int32_t *)(buf + CONVTQ_SHAPES_OFF);
@@ -3699,6 +3957,8 @@ static void test_schema_compatibility_fixtures(void)
      *   v9 QDQ Add:  a quantized sum stating the multipliers that scale its
      *                two operands and its result
      *   v10 state:   a variable kept across invocations in the state buffer
+     *   v11 QDQ Conv:the fast-arena figure, below the budget of a compressed
+     *                tiled stage, and a tile record that states its tiling
      */
     static const struct {
         const char *filename;
@@ -3718,6 +3978,8 @@ static void test_schema_compatibility_fixtures(void)
         {"schema-v8-layer-norm.tgrs", TIGRIS_SCHEMA_VERSION_V8, 0, 3, 0, 0},
         {"schema-v9-binary-requant.tgrs", TIGRIS_SCHEMA_VERSION_V9, 3, 1, 0, 0},
         {"schema-v10-state.tgrs", TIGRIS_SCHEMA_VERSION_V10, 0, 3, 0, 0},
+        {"schema-v11-scheduled-peak.tgrs", TIGRIS_SCHEMA_VERSION_V11, 2, 0, 1,
+         TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH},
     };
     const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
 
@@ -3797,7 +4059,25 @@ static void test_schema_compatibility_fixtures(void)
                         0, "v7 model output keeps the channels-last convention");
                 }
             }
-            if (fixtures[i].tile_plans > 0) {
+            if (fixtures[i].version == TIGRIS_SCHEMA_VERSION_SCHEDULED_PEAK) {
+                /* 233 bytes for the tiled stage, 256 for the weights; seven one-row bands, halo 2. */
+                TEST_ASSERT_EQ(plan.scheduled_peak, 233u, "v11 states its scheduled peak");
+                TEST_ASSERT(plan.scheduled_peak < plan.header->budget,
+                            "v11 scheduled peak below the budget");
+                TEST_ASSERT_EQ(tigris_fast_arena_required(&plan),
+                               plan.scheduled_peak + tigris_weight_decompression_overhead(&plan),
+                               "v11 requirement is the scheduled peak and the weights");
+                const tigris_tile_facts_t *facts = &plan.tile_plans_v11[0].facts;
+                tigris_tile_facts_t derived;
+                TEST_ASSERT(facts->tile_extent == 1u && facts->num_tiles == 7u &&
+                            facts->original_extent == 7u && facts->halo == 2u &&
+                            facts->band_axis == 1u, "v11 tile record states its tiling");
+                TEST_ASSERT_EQ(tigris_stage_tile_facts(&plan, &plan.stages[0], &derived), 1,
+                               "v11 tiling derived");
+                TEST_ASSERT(memcmp(&derived, facts, sizeof(derived)) == 0,
+                            "v11 stated tiling is the derived one");
+            }
+            if (fixtures[i].version == TIGRIS_SCHEMA_VERSION_TILE_AXIS) {
                 TEST_ASSERT_EQ(plan.tile_plans[0].axis,
                                fixtures[i].tile_axis,
                                "schema fixture has expected explicit tile axis");
@@ -3844,7 +4124,8 @@ static void test_schema_compatibility_fixtures(void)
 
 /* Main */
 
-#define MOVEMENT_PLAN_SIZE 1280u
+/* The attribute section ends at 1280; the memory record follows. */
+#define MOVEMENT_PLAN_SIZE 1284u
 
 static void build_movement_plan(uint8_t *buf, const movement_golden_t *gold)
 {
@@ -3870,6 +4151,7 @@ static void build_movement_plan(uint8_t *buf, const movement_golden_t *gold)
     if (h->num_quant_params != 0u)
         plan_builder_section(&builder, section++, TIGRIS_SEC_QUANT_PARAMS, 1024u);
     plan_builder_section(&builder, section, TIGRIS_SEC_OP_ATTRIBUTES, 1152u);
+    plan_finish(buf);
     tigris_tensor_t *t = (tigris_tensor_t *)(buf + 144);
     uint32_t counts[] = {gold->input_count, gold->update_count ? gold->update_count : 1u, gold->output_count};
     uint8_t ranks[] = {gold->rank, gold->update_rank ? gold->update_rank : 1u, gold->output_rank};
@@ -4086,6 +4368,7 @@ static void build_bool_plan(uint8_t *buf, const bool_golden_t *gold)
     const int compare_s8 = gold->op >= TIGRIS_OP_EQUAL && gold->op <= TIGRIS_OP_GREATER_EQUAL && gold->dtypes[0] == 3;
     if (compare_s8)
         plan_builder_section(&builder, 7u, TIGRIS_SEC_OP_ATTRIBUTES, 672u);
+    plan_finish(buf);
     tigris_tensor_t *t = (tigris_tensor_t *)(buf + 160);
     int32_t *shapes = (int32_t *)(buf + 448);
     uint16_t *indices = (uint16_t *)(buf + 320);
@@ -4155,9 +4438,11 @@ static void test_bool_contract(void)
         if (gold->ranks[3] == 0u && gold->dtypes[0] != 3u && gold->dtypes[3] != 3u) {
             tigris_file_header_t *h = (tigris_file_header_t *)buf;
             tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + h->section_dir_off);
-            h->num_quant_params = 0; h->file_size = 531;
+            /* Three bytes of strings, then the memory record. */
+            h->num_quant_params = 0; h->file_size = 535;
             dir[4].offset = 528;
-            dir[6] = (tigris_section_entry_t){0, 0};
+            plan_drop_section(buf, 6u);
+            plan_finish(buf);
             for (uint8_t i = 0; i < h->num_tensors; i++) t[i].shape_off = 0;
             TEST_ASSERT_EQ(tigris_plan_load(buf, h->file_size, &plan), TIGRIS_OK,
                            "scalar plan permits an empty shape pool before an odd-sized string table");
@@ -4676,6 +4961,7 @@ int main(void)
     test_size_mismatch();
     test_error_strings();
     test_section_directory_guards();
+    test_memory_section();
     test_pool_alignment_guards();
     test_v2_quant_plan_is_still_accepted();
     test_counted_sections_required();
@@ -4697,6 +4983,7 @@ int main(void)
     test_tiled_reduction_contract();
     test_rank4_row_band_contract();
     test_reshape_band_contract();
+    test_tile_facts_contract();
     test_float_section();
     test_operator_semantic_guards();
     test_nonweighted_operator_semantics();

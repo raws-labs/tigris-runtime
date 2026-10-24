@@ -9,10 +9,10 @@
 } } while (0)
 
 /* A short buffer reports the full event count without overflowing; the first
- * event places the input in slow memory. A buffer of that size holds every
+ * event places the input in input_pool. A buffer of that size holds every
  * event, and their bytes equal the run's counters. */
 static void trace_checks(tigris_host_t *host, const void *const *inputs, const uint32_t *in_size,
-                         void *const *outputs, const uint32_t *out_size)
+                         void *const *outputs, const uint32_t *out_size, uint8_t input_pool)
 {
     tigris_trace_event_t guard[2];
     tigris_trace_event_t *events;
@@ -22,7 +22,7 @@ static void trace_checks(tigris_host_t *host, const void *const *inputs, const u
     tigris_host_trace_buffer(host, guard, 1u);
     CHECK(tigris_host_run(host, inputs, in_size, 1, outputs, out_size, 1) == NULL);
     count = tigris_host_trace_count(host);
-    CHECK(count >= 2u && guard[0].kind == TIGRIS_TRACE_ALLOC && guard[0].pool == TIGRIS_TRACE_POOL_SLOW);
+    CHECK(count >= 2u && guard[0].kind == TIGRIS_TRACE_ALLOC && guard[0].pool == input_pool);
     CHECK(guard[1].kind == 0xA5u);
     events = calloc(count, sizeof(*events));
     CHECK(events != NULL);
@@ -48,13 +48,15 @@ static void trace_checks(tigris_host_t *host, const void *const *inputs, const u
     free(events);
 }
 
-static void fixture(const char *name)
+/* input_pool: fast for a plan that reads its inputs in place, slow otherwise. */
+static void fixture(const char *name, uint8_t input_pool)
 {
     char path[1024];
     FILE *file;
     long size;
     void *data;
     tigris_host_t *host = NULL;
+    tigris_host_t *tight = NULL;
     const char *error;
     uint32_t in_size, out_size;
     void *input, *output;
@@ -78,6 +80,7 @@ static void fixture(const char *name)
     error = tigris_host_create(data, (uint32_t)size, 0, &host);
     if (error) fprintf(stderr, "%s: %s\n", name, error);
     CHECK(error == NULL && host != NULL);
+    CHECK(tigris_host_create(data, (uint32_t)size, 1, &tight) == NULL && tight != NULL);
     memset(data, 0, (size_t)size);
     free(data);
     CHECK(tigris_host_tensor_count(host, 0) == 1u);
@@ -102,6 +105,13 @@ static void fixture(const char *name)
         CHECK(in_size == 16u && out_size == 8u);
         for (int i = 0; i < 16; ++i) ((int8_t *)input)[i] = (int8_t)i;
     }
+    /* A one-byte slow arena holds no input that has to go there. */
+    error = tigris_host_run(tight, inputs, &in_size, 1, outputs, &out_size, 1);
+    if (input_pool == TIGRIS_TRACE_POOL_SLOW)
+        CHECK(error != NULL && strcmp(error, "arena cannot hold the tensor") == 0);
+    else
+        CHECK(error == NULL);
+    tigris_host_destroy(tight);
     for (int run = 0; run < 3; ++run) {
         error = tigris_host_run(host, inputs, &in_size, 1, outputs, &out_size, 1);
         if (error) fprintf(stderr, "%s: %s\n", name, error);
@@ -117,7 +127,7 @@ static void fixture(const char *name)
         CHECK(tigris_host_metric(host, TIGRIS_HOST_FAST_PEAK) <=
               tigris_host_metric(host, TIGRIS_HOST_FAST_CAPACITY));
     }
-    trace_checks(host, inputs, &in_size, outputs, &out_size);
+    trace_checks(host, inputs, &in_size, outputs, &out_size, input_pool);
     in_size--;
     CHECK(tigris_host_run(host, inputs, &in_size, 1, outputs, &out_size, 1) != NULL);
     in_size++;
@@ -136,10 +146,10 @@ int main(void)
     CHECK(tigris_host_create("bad", 3, 0, &host) != NULL && host == NULL);
     CHECK(tigris_host_tensor_count(NULL, 0) == 0u);
     tigris_host_destroy(NULL);
-    fixture("schema-v2-linear.tgrs");
-    fixture("schema-v3-qdq-conv.tgrs");
-    fixture("schema-v6-interface-dtype.tgrs");
-    fixture("schema-v8-layer-norm.tgrs");
+    fixture("schema-v2-linear.tgrs", TIGRIS_TRACE_POOL_SLOW);
+    fixture("schema-v3-qdq-conv.tgrs", TIGRIS_TRACE_POOL_SLOW);
+    fixture("schema-v6-interface-dtype.tgrs", TIGRIS_TRACE_POOL_FAST);
+    fixture("schema-v8-layer-norm.tgrs", TIGRIS_TRACE_POOL_FAST);
     puts("Host library checks passed");
     return 0;
 }

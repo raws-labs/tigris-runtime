@@ -227,10 +227,8 @@ const char *tigris_host_run(
     tigris_mem_set_trace(&host->mem, host->trace ? record_event : NULL, host);
     for (uint32_t i = 0; i < input_count; ++i) {
         uint16_t index = host->plan.model_inputs[i];
-        tigris_error_t written;
-        if (tigris_mem_alloc_slow(&host->mem, index, host->plan.tensors[index].size_bytes) != TIGRIS_MEM_OK)
-            return "Host slow arena cannot hold model inputs";
-        written = tigris_input_write(&host->plan, &host->mem, index, inputs[i], input_sizes[i]);
+        tigris_error_t written =
+            tigris_input_write(&host->plan, &host->mem, index, inputs[i], input_sizes[i]);
         if (written != TIGRIS_OK)
             return tigris_error_str(written);
     }

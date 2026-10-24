@@ -1,5 +1,6 @@
 /* Model interface conversion. See include/tigris_iface.h. */
 #include "tigris_iface.h"
+#include "tigris_io_in_fast.h"
 
 #include <math.h>
 #include <string.h>
@@ -98,6 +99,69 @@ static tigris_error_t resolve(
     return TIGRIS_OK;
 }
 
+static tigris_error_t placement_error(tigris_mem_error_t placed)
+{
+    tigris_error_t err;
+    if (placed == TIGRIS_MEM_OK) {
+        err = TIGRIS_OK;
+    } else if (placed == TIGRIS_MEM_ERR_OOM) {
+        err = TIGRIS_ERR_MEM;
+    } else {
+        err = TIGRIS_ERR_NULL;
+    }
+    return err;
+}
+
+/* Whether another model input already has a buffer. */
+static int other_input_placed(
+    const tigris_plan_t *plan, const tigris_mem_t *mem, uint16_t tensor_idx)
+{
+    int found = 0;
+    for (uint8_t i = 0u; i < plan->header->num_model_inputs; i++) {
+        uint16_t other = plan->model_inputs[i];
+        if ((other != tensor_idx) && (other < mem->num_tensors) &&
+            (mem->tensor_ptrs[other] != NULL)) {
+            found = 1;
+        }
+    }
+    return found;
+}
+
+tigris_error_t tigris_input_alloc(
+    const tigris_plan_t *plan, tigris_mem_t *mem, uint16_t tensor_idx)
+{
+    tigris_error_t err;
+    const tigris_tensor_t *tensor =
+        boundary_tensor(plan, tensor_idx, TIGRIS_TENSOR_MODEL_INPUT);
+    if ((plan == NULL) || (mem == NULL) || (mem->tensor_ptrs == NULL)) {
+        err = TIGRIS_ERR_NULL;
+    } else if (tensor == NULL) {
+        err = TIGRIS_ERR_BAD_TENSOR;
+    } else if (tensor_idx >= mem->num_tensors) {
+        err = TIGRIS_ERR_TENSOR_SLOTS;
+    } else if (mem->tensor_ptrs[tensor_idx] != NULL) {
+        err = TIGRIS_OK;
+    } else if (tigris_plan_io_in_fast(plan) == 0) {
+        err = placement_error(tigris_mem_alloc_slow(mem, tensor_idx, tensor->size_bytes));
+    } else {
+        /* The first input leaves the stage's decompressed weights room below it. */
+        uint32_t reserve = (other_input_placed(plan, mem, tensor_idx) != 0)
+            ? 0u : tigris_weight_decompression_overhead(plan);
+        uint32_t used = mem->fast_used;
+        if ((reserve == UINT32_MAX) || (used > mem->fast_size) ||
+            (reserve > (mem->fast_size - used))) {
+            err = TIGRIS_ERR_MEM;
+        } else {
+            mem->fast_used = used + reserve;
+            err = placement_error(tigris_mem_alloc_fast(mem, tensor_idx, tensor->size_bytes));
+            if (err != TIGRIS_OK) {
+                mem->fast_used = used;
+            }
+        }
+    }
+    return err;
+}
+
 tigris_error_t tigris_input_write(
     const tigris_plan_t *plan, tigris_mem_t *mem, uint16_t tensor_idx,
     const void *src, uint32_t src_bytes)
@@ -114,9 +178,10 @@ tigris_error_t tigris_input_write(
     if (err != TIGRIS_OK)
         return err;
 
-    void *dst = tigris_mem_tensor_ptr(mem, tensor_idx);
-    if (!dst)
-        return TIGRIS_ERR_NULL;
+    err = tigris_input_alloc(plan, mem, tensor_idx);
+    if (err != TIGRIS_OK)
+        return err;
+    void *dst = mem->tensor_ptrs[tensor_idx];
 
     if (tensor->dtype == 9u) {
         const uint8_t *values = (const uint8_t *)src;

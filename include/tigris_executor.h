@@ -19,7 +19,7 @@ extern "C" {
 typedef enum {
     TIGRIS_EXEC_OK          =  0,   /**< Success */
     TIGRIS_EXEC_ERR_NULL    = -1,   /**< Null pointer argument */
-    TIGRIS_EXEC_ERR_MEM     = -2,   /**< Memory allocation failed (arena OOM) */
+    TIGRIS_EXEC_ERR_MEM     = -2,   /**< Arena too small for the plan, found up front or in the run */
     TIGRIS_EXEC_ERR_KERNEL  = -3,   /**< Kernel callback returned error */
     TIGRIS_EXEC_ERR_NO_STAGES = -4, /**< Plan has no stages */
     TIGRIS_EXEC_ERR_TILE    = -5,   /**< Tiled execution error */
@@ -141,10 +141,24 @@ typedef union {
  *
  * Caller must:
  *   1. Load the plan with tigris_plan_load().
- *   2. Initialise tigris_mem_t with fast + slow buffers.
- *   3. Allocate model input tensors in slow and fill with data.
+ *   2. Initialize tigris_mem_t with a fast buffer and, unless the plan needs
+ *      none, a slow buffer.
+ *   3. Place every model input with tigris_input_alloc() or
+ *      tigris_input_write(), or allocate it in the slow arena, and fill it.
  *
- * After return, model output tensors are in the slow buffer.
+ * A plan of schema 11 or later is refused with TIGRIS_EXEC_ERR_MEM before any
+ * stage runs when the fast arena above the run's floor is smaller than
+ * tigris_fast_arena_required(). The floor is the arena's fill level on entry,
+ * or, for inputs read in place, the start of the room left below them. Earlier
+ * plans carry no requirement and are not checked.
+ *
+ * After return, model output tensors are in the slow buffer. A plan that reads
+ * its inputs in place (see tigris_input_alloc()) consumes the inputs at the top
+ * of the fast arena, decompresses its weights into the room left below them,
+ * and leaves its outputs there, readable until the next allocation in that
+ * arena. Inputs placed another way are read in place only with that room free.
+ * The compiler's slow figure assumes this placement; inputs allocated in slow
+ * need a slow arena that holds them and the outputs.
  *
  * This compatibility entry point uses one process-global workspace and is
  * therefore not re-entrant or safe for concurrent inference. Define

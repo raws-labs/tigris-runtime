@@ -61,13 +61,27 @@ tigris_error_t tigris_plan_load_ex(
  * slots state, which loading checks. */
 uint8_t tigris_plan_data_dtype(const tigris_plan_t *plan);
 
+/**
+ * Derive what a stage's tile record states about its tiling (schema 11+),
+ * by the rules the executor bands the stage with: the band axis, the extent
+ * the bands divide, the band, the tile count and the halo. A layout
+ * conversion sizes its band in the run, so its tile_extent is the record's,
+ * bounded by the extent. An untileable record yields all zero. The run may
+ * size its bands to the arena, so num_tiles counts the bands the plan states.
+ * The loader refuses a record that disagrees with TIGRIS_ERR_TILE_FACTS.
+ *
+ * @return 1 when derived, 0 when the stage's tiling has no such description.
+ */
+int tigris_stage_tile_facts(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                            tigris_tile_facts_t *out);
+
 /** The limits this build was compiled to allow. */
 void tigris_build_limits(tigris_plan_limits_t *out);
 
 /**
- * Return a human-readable string for a loader error code.
+ * Return a human-readable string for a tigris_error_t code.
  *
- * @param err  Loader error code.
+ * @param err  Error code.
  * @return Static string describing the error.
  */
 const char *tigris_error_str(tigris_error_t err);

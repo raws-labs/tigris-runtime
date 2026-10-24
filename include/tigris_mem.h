@@ -185,7 +185,8 @@ void tigris_trace_emit(tigris_mem_t *mem, tigris_trace_kind_t kind, uint8_t pool
  * @param num_tensors  Number of tensors in the plan.
  * @param fast_buf     Fast arena buffer (SRAM on embedded targets).
  * @param fast_size    Size of fast_buf in bytes.
- * @param slow_buf     Slow buffer (PSRAM or heap on embedded targets).
+ * @param slow_buf     Slow buffer (PSRAM or heap on embedded targets), or NULL
+ *                     when slow_size is 0.
  * @param slow_size    Size of slow_buf in bytes.
  * @return TIGRIS_MEM_OK on success, TIGRIS_MEM_ERR_NULL for a null argument,
  *         or TIGRIS_MEM_ERR_OOM if an unaligned buffer is too small to reach

@@ -193,7 +193,11 @@ void app_main(void) {
                     mem.fast_base, mem.fast_size, mem.slow_base, mem.slow_size);
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {
         uint16_t t = plan.model_inputs[i];
-        tigris_mem_alloc_slow(&mem, t, plan.tensors[t].size_bytes);
+        tigris_error_t placed = tigris_input_alloc(&plan, &mem, t);
+        if (placed != TIGRIS_OK) {
+            ESP_LOGE(TAG, "input placement failed: %s", tigris_error_str(placed));
+            return;
+        }
 
         uint32_t want = tigris_iface_bytes(&plan, t);
         if (want == 0) {

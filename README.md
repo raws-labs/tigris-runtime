@@ -68,11 +68,15 @@ workspace and is not safe for concurrent inference. Arena sizing, stack
 provisioning, and re-entrant execution are documented in the
 [runtime integration guide](https://tigris-ml.dev/runtime/integration/).
 
-The plan's `budget` is the modeled activation requirement. For an arena whose
-base satisfies `TIGRIS_TENSOR_ALIGN`, `tigris_fast_arena_required()` returns
-the core capacity needed for that budget plus any simultaneous compressed
-weights. Account for base-alignment padding when using an unaligned buffer and
-provision backend workspace separately.
+A plan of schema 11 or later states its scheduled peak: the fast-arena bytes
+its largest stage or chain holds at once, which the compiler checked against
+the budget. For an arena whose base satisfies `TIGRIS_TENSOR_ALIGN`,
+`tigris_fast_arena_required()` returns that peak plus any simultaneous
+compressed weights, and a run refuses a smaller fast arena with
+`TIGRIS_EXEC_ERR_MEM` before any stage runs. An earlier plan states no peak:
+the function returns its `budget` plus the compressed weights, and its run is
+not checked up front. Account for base-alignment padding when using an
+unaligned buffer and provision backend workspace separately.
 Optimized Cortex-M builds require the plan base and tensors to satisfy
 `TIGRIS_TENSOR_ALIGN` (16 bytes with DSP enabled).
 
@@ -94,6 +98,20 @@ The core executor performs no unbounded heap fallback. Normal stages may spill
 to the supplied slow arena; if neither bounded arena can satisfy an operation,
 the executor returns an error. `mem.fast_peak` records the measured core
 fast-arena high-water mark.
+
+A plan reads its inputs in place when it has schema 5 or later and a single
+stage, without a tile plan, chain, control flow or state, that reads every
+model input and writes every model output. `tigris_input_alloc()` places each
+input of such a plan in the fast arena and leaves room for the plan's
+compressed weights directly below the first one; `tigris_input_write()` calls
+it for an input without a buffer. The stage decompresses its weights into that
+room, reads the inputs where they are and leaves its outputs in the fast arena.
+Inputs placed another way are read in place only with that room free below
+them. The compiler's slow figure assumes this placement; when it is 0,
+`tigris_mem_init()` takes a NULL slow buffer of size 0. The run consumes the
+inputs: read the outputs, then place every input again before the next run.
+Inputs the caller allocates in the slow arena still run, through a copy, but
+the slow arena must then hold the inputs and the outputs.
 
 ## Build and test
 

@@ -63,7 +63,7 @@ tigris_mem_error_t tigris_mem_init(
     void *fast_buf, uint32_t fast_size,
     void *slow_buf, uint32_t slow_size)
 {
-    if (!mem || !tensor_ptrs || !fast_buf || !slow_buf)
+    if (!mem || !tensor_ptrs || !fast_buf || (!slow_buf && slow_size != 0u))
         return TIGRIS_MEM_ERR_NULL;
 
     /* Align initial bump offset so first allocation respects TIGRIS_TENSOR_ALIGN,
@@ -104,8 +104,11 @@ static tigris_mem_error_t alloc_bump(
     tigris_mem_t *mem, uint16_t tensor_idx, uint32_t size_bytes,
     uint8_t *base, uint32_t *used, uint32_t capacity)
 {
-    if (!mem || !mem->tensor_ptrs || !base || !used)
+    if (!mem || !mem->tensor_ptrs || !used)
         return TIGRIS_MEM_ERR_NULL;
+    /* An absent slow buffer has no capacity. */
+    if (!base)
+        return capacity == 0u ? TIGRIS_MEM_ERR_OOM : TIGRIS_MEM_ERR_NULL;
     if (tensor_idx >= mem->num_tensors) return TIGRIS_MEM_ERR_BAD_INDEX;
 
     uint32_t aligned;
@@ -512,5 +515,7 @@ uint32_t tigris_fast_arena_required(const tigris_plan_t *plan)
     uint32_t overhead = tigris_weight_decompression_overhead(plan);
     if (overhead == UINT32_MAX)
         return UINT32_MAX;
-    return saturating_add_u32(plan->header->budget, overhead);
+    uint32_t activations = plan->header->version >= TIGRIS_SCHEMA_VERSION_SCHEDULED_PEAK
+        ? plan->scheduled_peak : plan->header->budget;
+    return saturating_add_u32(activations, overhead);
 }

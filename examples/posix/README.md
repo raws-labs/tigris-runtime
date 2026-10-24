@@ -25,3 +25,5 @@ boundary is a separate question: `tigris_output_read()` returns the output in
 the dtype the model file declares, which for a quantized ONNX graph is float32,
 so the example prints floats whatever the plan stores. Arenas are host
 allocations, so the slow tier is sized generously and is not a device budget.
+The frozen plan runs as one stage, so its inputs and output stay in the fast
+arena and the slow tier goes unused.

@@ -7,6 +7,8 @@
  * workspace into their linked BSS.
  */
 
+#include <string.h>
+
 #include "tigris_executor.h"
 
 #if TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE
@@ -29,7 +31,9 @@ tigris_exec_error_t tigris_run(
     (void)mem;
     (void)kernel;
     (void)user_ctx;
-    (void)stats;
+    if (stats != NULL) {
+        (void)memset(stats, 0, sizeof(*stats));
+    }
     return TIGRIS_EXEC_ERR_WORKSPACE;
 #endif
 }

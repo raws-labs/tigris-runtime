@@ -3835,6 +3835,121 @@ static void test_exec_fast_requirement_checked_up_front(void)
     TEST_ASSERT(ptrs[0] == NULL, "the failed schema 10 run released its input");
 }
 
+/* Add(x, y) -> z, Relu(z) -> w, all 1x4x4x4 float, no tile record: x and y die after the
+ * Add, so the stage peaks at 768 bytes while its inputs and outputs sum to 1024. */
+static tigris_exec_error_t run_recordless_stage(uint8_t version, tigris_exec_stats_t *stats,
+                                                float *z_out, float *w_out)
+{
+    static const uint16_t indices[11] = {0, 1, 2, 2, 3, 0, 1, 0, 1, 2, 3};
+    static const int32_t shape[4] = {1, 4, 4, 4};
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[4];
+    tigris_op_t ops[2];
+    tigris_stage_t stage;
+    tigris_plan_t plan;
+    void *ptrs[4];
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t fast[768];
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[2048];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(4, 2, 2, 0, 0)];
+    tigris_mem_t mem;
+
+    memset(&header, 0, sizeof(header));
+    memset(tensors, 0, sizeof(tensors));
+    memset(ops, 0, sizeof(ops));
+    memset(&stage, 0, sizeof(stage));
+    memset(&plan, 0, sizeof(plan));
+    header.version = version;
+    header.num_tensors = 4;
+    header.num_ops = 2;
+    header.num_stages = 1;
+    header.num_model_inputs = 2;
+    header.num_model_outputs = 2;
+    header.budget = sizeof(fast);
+    for (uint16_t i = 0; i < 4; i++) {
+        tensors[i].dtype = 1;
+        tensors[i].ndim = 4;
+        tensors[i].size_bytes = 64u * sizeof(float);
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        tensors[i].flags = i < 2 ? TIGRIS_TENSOR_MODEL_INPUT : TIGRIS_TENSOR_MODEL_OUTPUT;
+    }
+    ops[0].op_type = TIGRIS_OP_ADD;
+    ops[0].num_inputs = 2;
+    ops[0].outputs_off = 2;
+    ops[1].op_type = TIGRIS_OP_RELU;
+    ops[1].num_inputs = 1;
+    ops[1].inputs_off = 3;
+    ops[1].outputs_off = 4;
+    for (uint16_t i = 0; i < 2; i++) {
+        ops[i].num_outputs = 1;
+        ops[i].weight_idx = TIGRIS_NO_WEIGHT;
+        ops[i].bias_idx = TIGRIS_NO_WEIGHT;
+    }
+    stage.ops_off = 5;
+    stage.ops_count = 2;
+    stage.inputs_off = 7;
+    stage.inputs_count = 2;
+    stage.outputs_off = 9;
+    stage.outputs_count = 2;
+    stage.peak_bytes = sizeof(fast);
+    stage.tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    stage.chain_id = TIGRIS_NO_CHAIN;
+    plan.header = &header;
+    plan.tensors = tensors;
+    plan.ops = ops;
+    plan.stages = &stage;
+    plan.index_pool = indices;
+    plan.shape_pool = shape;
+    plan.model_inputs = &indices[7];
+    plan.model_outputs = &indices[9];
+    plan.scheduled_peak = version >= TIGRIS_SCHEMA_VERSION_SCHEDULED_PEAK ? sizeof(fast) : 0u;
+
+    memset(stats, 0, sizeof(*stats));
+    if (tigris_mem_init(&mem, ptrs, 4, fast, sizeof(fast), slow, sizeof(slow)) != TIGRIS_MEM_OK)
+        return TIGRIS_EXEC_ERR_MEM;
+    for (uint16_t t = 0; t < 2; t++) {
+        if (tigris_mem_alloc_slow(&mem, t, tensors[t].size_bytes) != TIGRIS_MEM_OK)
+            return TIGRIS_EXEC_ERR_MEM;
+        float *values = (float *)mem.tensor_ptrs[t];
+        for (int i = 0; i < 64; i++)
+            values[i] = (float)((i * (t + 3)) % 13) - 6.0f;
+    }
+    tigris_exec_error_t err = tigris_run_with_workspace_buffer(
+        &plan, &mem, tigris_dispatch_kernel, NULL, stats, workspace, sizeof(workspace));
+    if (err == TIGRIS_EXEC_OK) {
+        memcpy(z_out, mem.tensor_ptrs[2], 64u * sizeof(float));
+        memcpy(w_out, mem.tensor_ptrs[3], 64u * sizeof(float));
+    }
+    return err;
+}
+
+static void test_exec_recordless_stage_runs_as_scheduled(void)
+{
+    printf("  test_exec_recordless_stage_runs_as_scheduled...\n");
+    float z[64], w[64], z_expected[64], w_expected[64];
+    tigris_exec_stats_t stats;
+    for (int i = 0; i < 64; i++) {
+        z_expected[i] = ((float)((i * 3) % 13) - 6.0f) + ((float)((i * 4) % 13) - 6.0f);
+        w_expected[i] = z_expected[i] > 0.0f ? z_expected[i] : 0.0f;
+    }
+
+    /* From schema 11 the stage runs whole within its stated peak, as scheduled. */
+    TEST_ASSERT_EQ(run_recordless_stage(TIGRIS_SCHEMA_VERSION_V11, &stats, z, w),
+                   TIGRIS_EXEC_OK, "schema 11 stage without a tile record runs");
+    TEST_ASSERT_EQ(stats.stages_normal, 1, "schema 11: the stage runs whole");
+    TEST_ASSERT_EQ(stats.stages_tiled, 0, "schema 11: the stage is not banded");
+    TEST_ASSERT_EQ(stats.slow_overflow_count, 0u, "schema 11: no allocation overflows to slow");
+    TEST_ASSERT(memcmp(z, z_expected, sizeof(z)) == 0 && memcmp(w, w_expected, sizeof(w)) == 0,
+                "schema 11: outputs match the reference");
+
+    /* Schema 10 keeps the automatic height stripe for the same stage. */
+    TEST_ASSERT_EQ(run_recordless_stage(TIGRIS_SCHEMA_VERSION_V10, &stats, z, w),
+                   TIGRIS_EXEC_OK, "schema 10 stage without a tile record runs");
+    TEST_ASSERT_EQ(stats.stages_tiled, 1, "schema 10: the stage takes the height stripe");
+    TEST_ASSERT_EQ(stats.stages_normal, 0, "schema 10: the stage is not run whole");
+    TEST_ASSERT(memcmp(z, z_expected, sizeof(z)) == 0 && memcmp(w, w_expected, sizeof(w)) == 0,
+                "schema 10: outputs match the reference");
+}
+
 static void test_exec_io_in_fast_run(void)
 {
     printf("  test_exec_io_in_fast_run...\n");
@@ -4028,6 +4143,7 @@ int main(void)
     test_exec_io_in_fast_run();
     test_exec_input_alloc();
     test_exec_fast_requirement_checked_up_front();
+    test_exec_recordless_stage_runs_as_scheduled();
     test_exec_error_strings();
 
 #ifdef TIGRIS_TRACE

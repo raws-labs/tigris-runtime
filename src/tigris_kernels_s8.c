@@ -1585,7 +1585,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_concat_s8(
         int32_t in_zp  = qp_i ? qp_i->zero_point : 0;
 
         /* Fast path: identical quant params -> memcpy */
-        int same_qp = (fabsf(in_scale - out_scale) < 1e-7f && in_zp == out_zp);
+        int same_qp = (in_scale == out_scale && in_zp == out_zp);
 
         if (Xi == NULL)
             return -1;

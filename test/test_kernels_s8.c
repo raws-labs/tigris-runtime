@@ -1479,6 +1479,33 @@ static void test_concat_s8_height(void)
                 "a tile across the joined axis is refused");
 }
 
+/* Two [1,2,2,4] inputs at scale 1e-6 joined on channels into scale 1.05e-6.
+ * The scales differ by only 5e-8, and code 100 still becomes 95. */
+static void test_concat_s8_small_scales(void)
+{
+    printf("  test_concat_s8_small_scales...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t in_qp = add_quant_param(1.0e-6f, 0, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(1.05e-6f, 0, 1, NULL, NULL);
+    int32_t part[] = {1, 2, 2, 4}, whole[] = {1, 2, 2, 8};
+    uint16_t t_a = add_tensor(&plan, "a", part, 4, 3, 16, in_qp);
+    uint16_t t_b = add_tensor(&plan, "b", part, 4, 3, 16, in_qp);
+    uint16_t t_y = add_tensor(&plan, "y", whole, 4, 3, 32, out_qp);
+    uint16_t ins[] = {t_a, t_b}, outs[] = {t_y};
+    one_op_s8(&plan, TIGRIS_OP_CONCAT, ins, 2, outs, 1, TIGRIS_NO_WEIGHT);
+    test_ops[0].spatial.kernel_h = 3;
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, t_a, 16); memset(ptrs[t_a], 100, 16);
+    tigris_mem_alloc_fast(&mem, t_b, 16); memset(ptrs[t_b], 100, 16);
+    tigris_mem_alloc_fast(&mem, t_y, 32);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0, "small-scale concat runs");
+    for (int i = 0; i < 32; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], 95, "small-scale concat requantizes");
+}
+
 /* One input channel, two filters of 1x1: output channel oc reads channel
  * oc / 2. The requantization is the identity. */
 static void test_depthwise_multiplier_s8(void)
@@ -2227,6 +2254,7 @@ int main(void)
     test_mul_s8_tflite_rounding();
     test_split_s8_inner_axis();
     test_concat_s8_height();
+    test_concat_s8_small_scales();
     test_depthwise_multiplier_s8();
     test_pad_s8();
     test_binary_s8_constant_operand();

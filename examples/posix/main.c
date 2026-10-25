@@ -20,7 +20,13 @@
 
 #define EXAMPLE_SLOW_BYTES (512u * 1024u)
 #define ONNX_DTYPE_FLOAT 1u
+#define ONNX_DTYPE_UINT8 2u
 #define ONNX_DTYPE_INT8 3u
+
+static uint8_t declared_dtype(const tigris_tensor_t *t)
+{
+    return t->iface_dtype ? t->iface_dtype : t->dtype;
+}
 
 static int plan_has_int8_io(const tigris_plan_t *plan)
 {
@@ -152,7 +158,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, "could not allocate input buffer\n");
                 goto cleanup;
             }
-            if ((t->iface_dtype ? t->iface_dtype : t->dtype) == ONNX_DTYPE_FLOAT) {
+            if (declared_dtype(t) == ONNX_DTYPE_FLOAT) {
                 for (j = 0; j < in_bytes / (uint32_t)sizeof(float); ++j)
                     ((float *)(void *)input)[j] = 0.1f;
             } else {
@@ -174,7 +180,8 @@ int main(int argc, char **argv)
                 &executor_workspace);
             uint16_t out_idx;
             uint32_t out_bytes;
-            float *output = NULL;
+            uint8_t out_dtype;
+            void *output = NULL;
             uint32_t count;
             uint32_t show;
             uint32_t j;
@@ -188,12 +195,13 @@ int main(int argc, char **argv)
             /* Read the output in the dtype the model declares, which the
              * runtime converts to from whatever the plan executes on. */
             out_idx = plan.model_outputs[0];
+            out_dtype = declared_dtype(&plan.tensors[out_idx]);
             out_bytes = tigris_iface_bytes(&plan, out_idx);
             if (out_bytes == 0) {
                 fprintf(stderr, "inference produced no first output\n");
                 goto cleanup;
             }
-            output = (float *)malloc(out_bytes);
+            output = malloc(out_bytes);
             if (output == NULL) {
                 fprintf(stderr, "output allocation failed\n");
                 goto cleanup;
@@ -205,13 +213,21 @@ int main(int argc, char **argv)
                 goto cleanup;
             }
 
-            count = out_bytes / (uint32_t)sizeof(float);
+            /* The loader admits only float32 or uint8 over a stored int8 output. */
+            count = out_dtype == ONNX_DTYPE_FLOAT
+                ? out_bytes / (uint32_t)sizeof(float) : out_bytes;
             show = count;
             if (show > 5)
                 show = 5;
             printf("Output:");
-            for (j = 0; j < show; ++j)
-                printf(" %.6g", (double)output[j]);
+            for (j = 0; j < show; ++j) {
+                if (out_dtype == ONNX_DTYPE_FLOAT)
+                    printf(" %.6g", (double)((const float *)output)[j]);
+                else if (out_dtype == ONNX_DTYPE_UINT8)
+                    printf(" %u", (unsigned)((const uint8_t *)output)[j]);
+                else
+                    printf(" %d", (int)((const int8_t *)output)[j]);
+            }
             printf("\nFast arena peak: %lu bytes\n",
                    (unsigned long)mem.fast_peak);
             free(output);

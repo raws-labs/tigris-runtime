@@ -759,8 +759,8 @@ int tigris_stage_band_mode(const tigris_plan_t *plan, const tigris_stage_t *stag
 {
     uint16_t index = tigris_stage_ops(plan, stage)[0];
     const tigris_op_t *op = &plan->ops[index];
-    /* The loader asks before it checks operand counts, and a legacy custom
-     * operator may have none. */
+    /* The loader asks before it checks operand counts, so the operator may
+     * have none. */
     if (op->num_inputs != 0u && op->num_outputs != 0u &&
         (op->op_type == TIGRIS_OP_SPLIT || op->op_type == TIGRIS_OP_CONCAT ||
          op->op_type == TIGRIS_OP_PAD || op->op_type == TIGRIS_OP_TRANSPOSE || is_binary_op(op->op_type) ||
@@ -1141,15 +1141,6 @@ static int attr_kind_matches_op(uint8_t kind, uint8_t op_type)
     const tigris_op_contract_t *row = tigris_op_contract(op_type);
     return row != NULL && kind < 32u &&
            (row->allowed_attributes & ((uint32_t)1u << kind)) != 0u;
-}
-
-/* Schemas v2/v3 let a custom dispatcher implement Transpose, MatMul and
- * opcodes the built-in table did not define yet, so only the built-in
- * operators whose meaning those schemas already fixed are validated there. */
-static int legacy_semantics_are_builtin(uint8_t op_type)
-{
-    const tigris_op_contract_t *row = tigris_op_contract(op_type);
-    return row != NULL && (row->flags & TIGRIS_CONTRACT_LEGACY) != 0u;
 }
 
 /* Whether two activations are encoded alike: the same scale and zero point,
@@ -2846,7 +2837,6 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 {
 
     const tigris_file_header_t *hdr = plan->header;
-    const int legacy = hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES;
     const uint8_t data_dtype = tigris_plan_data_dtype(plan);
     uint8_t section[(TIGRIS_MAX_TENSORS + 7u) / 8u];
     find_float_sections(plan, section);
@@ -2875,8 +2865,6 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
     }
     for (uint16_t op_index = 0; op_index < hdr->num_ops; op_index++) {
         const tigris_op_t *op = &plan->ops[op_index];
-        if (legacy && !legacy_semantics_are_builtin(op->op_type))
-            continue;
         uint8_t table_len = 0u;
         const uint8_t *table_attr = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_TABLE_SHAPE, &table_len);
         if ((op->num_inputs == 0 && table_attr == NULL) || op->num_outputs == 0 ||
@@ -3235,12 +3223,8 @@ static tigris_error_t locate_optional_sections(tigris_load_state_t *ctx)
         ctx->candidate.weight_blocks_data = ctx->buf + off + 4 + entries_size;
     }
 
-    /* Per-operator attributes (optional, schema v4+). Compare against the
-     * feature's introduction version, not the latest schema: otherwise a
-     * future schema bump would accidentally make valid v4 plans fail. */
+    /* Per-operator attributes (optional). */
     if (ctx->section_offsets[TIGRIS_SEC_OP_ATTRIBUTES]) {
-        if (ctx->hdr->version < TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES)
-            return TIGRIS_ERR_BAD_SECTION;
         uint32_t off = ctx->section_offsets[TIGRIS_SEC_OP_ATTRIBUTES];
         if (!bounds_ok(off, 4, ctx->section_ends[TIGRIS_SEC_OP_ATTRIBUTES]))
             return TIGRIS_ERR_BAD_SECTION;
@@ -3330,26 +3314,21 @@ static tigris_error_t locate_optional_sections(tigris_load_state_t *ctx)
         if (nqp != ctx->hdr->num_quant_params)
             return TIGRIS_ERR_BAD_SECTION;
         uint32_t entries_size = (uint32_t)nqp * sizeof(tigris_quant_param_t);
-        uint32_t data_size;
-        if (ctx->hdr->version == TIGRIS_SCHEMA_VERSION_V2)
-            data_size = (uint32_t)qd_field * sizeof(int32_t);
-        else {
-            if (ctx->section_ends[TIGRIS_SEC_QUANT_PARAMS] < off + 4u + entries_size)
-                return TIGRIS_ERR_BAD_SECTION;
-            data_size = ctx->section_ends[TIGRIS_SEC_QUANT_PARAMS] - off - 4u - entries_size;
-            if ((data_size % sizeof(int32_t)) != 0)
-                return TIGRIS_ERR_BAD_SECTION;
-            uint32_t physical_pages = (data_size / sizeof(int32_t) +
-                                       TIGRIS_QUANT_PAGE_ELEMS - 1u) /
-                                      TIGRIS_QUANT_PAGE_ELEMS;
-            /* The next aligned section can contribute up to 15 padding bytes
-             * to this section span. It may therefore extend an otherwise
-             * page-aligned pool into one physical page without changing the
-             * semantic v3 page count recorded by the compiler. */
-            if (qd_field == 0 || physical_pages < qd_field ||
-                physical_pages > (uint32_t)qd_field + 1u)
-                return TIGRIS_ERR_BAD_SECTION;
-        }
+        if (ctx->section_ends[TIGRIS_SEC_QUANT_PARAMS] < off + 4u + entries_size)
+            return TIGRIS_ERR_BAD_SECTION;
+        uint32_t data_size = ctx->section_ends[TIGRIS_SEC_QUANT_PARAMS] - off - 4u - entries_size;
+        if ((data_size % sizeof(int32_t)) != 0)
+            return TIGRIS_ERR_BAD_SECTION;
+        uint32_t physical_pages = (data_size / sizeof(int32_t) +
+                                   TIGRIS_QUANT_PAGE_ELEMS - 1u) /
+                                  TIGRIS_QUANT_PAGE_ELEMS;
+        /* The next aligned section can contribute up to 15 padding bytes
+         * to this section span. It may therefore extend an otherwise
+         * page-aligned pool into one physical page without changing the
+         * semantic page count recorded by the compiler. */
+        if (qd_field == 0 || physical_pages < qd_field ||
+            physical_pages > (uint32_t)qd_field + 1u)
+            return TIGRIS_ERR_BAD_SECTION;
         if (!bounds_ok(off + 4, entries_size + data_size,
                        ctx->section_ends[TIGRIS_SEC_QUANT_PARAMS]))
             return TIGRIS_ERR_BAD_SECTION;
@@ -3862,12 +3841,7 @@ static tigris_error_t validate_state_and_attributes(tigris_load_state_t *ctx)
     }
 
     /* Attribute records are ordered and typed.  Validate their payloads
-     * against the referenced operators before any kernel can use them.
-     *
-     * Schemas v2/v3 predate typed attributes and allowed custom dispatch
-     * callbacks to implement operators such as legacy Transpose, MatMul, and
-     * application opcodes; semantic validation leaves exactly those open
-     * there (legacy_semantics_are_builtin). */
+     * against the referenced operators before any kernel can use them. */
     if (ctx->candidate.op_attributes) {
         uint32_t attrs_off = ctx->section_offsets[TIGRIS_SEC_OP_ATTRIBUTES];
         uint32_t attrs_data_off = attrs_off + 4u +
@@ -3952,7 +3926,7 @@ static tigris_error_t validate_state_and_attributes(tigris_load_state_t *ctx)
                 (present & row->required_attributes) != row->required_attributes)
                 return TIGRIS_ERR_BAD_SECTION;
         }
-    } else if (ctx->hdr->version >= TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES) {
+    } else {
         for (uint16_t op_idx = 0u; op_idx < ctx->hdr->num_ops; op_idx++) {
             const tigris_op_contract_t *row =
                 tigris_op_contract(ctx->candidate.ops[op_idx].op_type);
@@ -4562,21 +4536,18 @@ static tigris_error_t validate_weights_and_stages(tigris_load_state_t *ctx)
         uint16_t nqp, qd_field;
         memcpy(&nqp, ctx->buf + qp_off, sizeof(nqp));
         memcpy(&qd_field, ctx->buf + qp_off + sizeof(nqp), sizeof(qd_field));
-        uint32_t qd_len = ctx->hdr->version == TIGRIS_SCHEMA_VERSION_V2 ? qd_field :
-            (ctx->section_ends[TIGRIS_SEC_QUANT_PARAMS] - qp_off - 4u -
-             (uint32_t)nqp * sizeof(tigris_quant_param_t)) / sizeof(int32_t);
+        uint32_t qd_len = (ctx->section_ends[TIGRIS_SEC_QUANT_PARAMS] - qp_off - 4u -
+                           (uint32_t)nqp * sizeof(tigris_quant_param_t)) / sizeof(int32_t);
         for (uint16_t i = 0; i < nqp; i++) {
             const tigris_quant_param_t *qp = &ctx->candidate.quant_params[i];
-            uint32_t page = ctx->hdr->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+            uint32_t page = qp->_pad;
             uint32_t moff = page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off;
             uint32_t soff = page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off;
             if (!isfinite(qp->scale) || qp->scale <= 0.0f)
                 return TIGRIS_ERR_BAD_TENSOR;
-            if (qp->num_channels == 0 ||
-                (ctx->hdr->version != TIGRIS_SCHEMA_VERSION_V2 &&
-                 (page >= qd_field ||
-                  (uint32_t)qp->multiplier_off + qp->num_channels > TIGRIS_QUANT_PAGE_ELEMS ||
-                  (uint32_t)qp->shift_off + qp->num_channels > TIGRIS_QUANT_PAGE_ELEMS)) ||
+            if (qp->num_channels == 0 || page >= qd_field ||
+                (uint32_t)qp->multiplier_off + qp->num_channels > TIGRIS_QUANT_PAGE_ELEMS ||
+                (uint32_t)qp->shift_off + qp->num_channels > TIGRIS_QUANT_PAGE_ELEMS ||
                 !elements_ok(moff, qp->num_channels, qd_len) ||
                 !elements_ok(soff, qp->num_channels, qd_len))
                 return TIGRIS_ERR_BAD_SECTION;

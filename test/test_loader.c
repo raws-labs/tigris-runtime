@@ -300,12 +300,16 @@ static void test_pool_alignment_guards(void)
                    TIGRIS_ERR_BAD_SECTION, "unaligned shape pool rejected");
 }
 
-#define V2_QUANT_PLAN_SIZE 136u
+/* Seven directory entries and the sentinel end at 112, where the empty pools
+ * sit; the quant section follows, and the memory record ends the plan. */
+#define QUANT_PLAN_POOLS_OFF 112u
+#define QUANT_PLAN_QUANT_OFF 116u
+#define QUANT_PLAN_SIZE 148u
 
-static void build_v2_quant_plan(uint8_t *buf)
+static void build_quant_plan(uint8_t *buf)
 {
-    plan_builder_t builder = plan_builder_begin(buf, V2_QUANT_PLAN_SIZE,
-                                                TIGRIS_SCHEMA_VERSION_V2);
+    plan_builder_t builder = plan_builder_begin(buf, QUANT_PLAN_SIZE,
+                                                TIGRIS_SCHEMA_VERSION);
     tigris_file_header_t *hdr = builder.header;
     hdr->num_quant_params = 1;
 
@@ -317,38 +321,39 @@ static void build_v2_quant_plan(uint8_t *buf)
         TIGRIS_SEC_STRINGS,
     };
     for (uint32_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
-        plan_builder_section(&builder, i, required[i], 104u);
+        plan_builder_section(&builder, i, required[i], QUANT_PLAN_POOLS_OFF);
     }
-    plan_builder_section(&builder, 5u, TIGRIS_SEC_QUANT_PARAMS, 108u);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_QUANT_PARAMS, QUANT_PLAN_QUANT_OFF);
+    plan_finish(buf);
 
-    uint16_t *quant_header = (uint16_t *)(buf + 108u);
+    uint16_t *quant_header = (uint16_t *)(buf + QUANT_PLAN_QUANT_OFF);
     quant_header[0] = 1;  /* num params */
-    quant_header[1] = 2;  /* v2 quant-data length */
-    tigris_quant_param_t *qp = (tigris_quant_param_t *)(buf + 112u);
+    quant_header[1] = 1;  /* quant-data pages */
+    tigris_quant_param_t *qp = (tigris_quant_param_t *)(buf + QUANT_PLAN_QUANT_OFF + 4u);
     qp->scale = 0.25f;
     qp->num_channels = 1;
     qp->multiplier_off = 0;
     qp->shift_off = 1;
-    int32_t *quant_data = (int32_t *)(buf + 128u);
+    int32_t *quant_data = (int32_t *)(buf + QUANT_PLAN_QUANT_OFF + 4u + sizeof(*qp));
     quant_data[0] = 123;
     quant_data[1] = -7;
 }
 
-static void test_v2_quant_plan_is_still_accepted(void)
+static void test_quant_plan_tables(void)
 {
-    printf("  test_v2_quant_plan_is_still_accepted...\n");
-    _Alignas(4) uint8_t buf[V2_QUANT_PLAN_SIZE];
+    printf("  test_quant_plan_tables...\n");
+    _Alignas(4) uint8_t buf[QUANT_PLAN_SIZE];
     tigris_plan_t plan;
 
-    build_v2_quant_plan(buf);
+    build_quant_plan(buf);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
-                   "v2 quantized plan loads");
-    TEST_ASSERT_EQ(plan.num_quant_params, 1, "v2 quant param count");
-    TEST_ASSERT_EQ(plan.quant_data[0], 123, "v2 multiplier data");
-    TEST_ASSERT_EQ(plan.quant_data[1], -7, "v2 shift data");
+                   "quantized plan loads");
+    TEST_ASSERT_EQ(plan.num_quant_params, 1, "quant param count");
+    TEST_ASSERT_EQ(plan.quant_data[0], 123, "multiplier data");
+    TEST_ASSERT_EQ(plan.quant_data[1], -7, "shift data");
 
-    build_v2_quant_plan(buf);
-    ((tigris_quant_param_t *)(buf + 112u))->scale = 0.0f;
+    build_quant_plan(buf);
+    ((tigris_quant_param_t *)(buf + QUANT_PLAN_QUANT_OFF + 4u))->scale = 0.0f;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_TENSOR, "non-positive quant scale rejected");
 }
@@ -1641,40 +1646,19 @@ static void test_transpose_attribute_guards(void)
                    TIGRIS_ERR_BAD_SECTION,
                    "duplicate operator attribute type rejected");
 
-    build_transpose_plan(buf);
-    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V2);
-    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
-                   TIGRIS_ERR_BAD_SECTION,
-                   "v2 cannot claim the v4 attribute section");
-
-    /* v2/v3 plans predate typed attributes and may rely on the public custom
-     * dispatcher for legacy Transpose and application operators. The hardened
-     * loader must preserve that structural compatibility while v4 remains
-     * strict. */
+    /* No supported schema leaves a Transpose without its permutation, or an
+     * opcode outside the built-in table, to a caller's dispatcher. */
     build_transpose_plan(buf);
     plan_drop_section(buf, 6u);
-    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V2);
-    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
-                   "attribute-free v2 custom Transpose loads");
-
-    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V3);
-    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
-                   "attribute-free v3 custom Transpose loads");
-
-    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V4);
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_MIN);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION,
-                   "attribute-free v4 Transpose remains rejected");
+                   "attribute-free v4 Transpose is rejected");
 
-    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V2);
     ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_UNKNOWN;
-    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
-                   "v2 custom opcode loads for caller dispatcher");
-
-    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V4);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_OPERATOR,
-                   "v4 custom opcode remains fail-closed");
+                   "v4 custom opcode is rejected");
 
     /* A normalization needs its variance floor as surely as a Transpose needs
      * its permutation, and the arm taken when there is no attribute section
@@ -2639,8 +2623,8 @@ static void test_band_kind_order(void)
 static void test_band_kind_fixtures(void)
 {
     static const char *const names[] = {
-        "schema-v2-linear.tgrs", "schema-v3-qdq-conv.tgrs", "schema-v4-transpose.tgrs",
-        "schema-v5-conv1d-axis.tgrs", "schema-v6-interface-dtype.tgrs",
+        "schema-v4-transpose.tgrs", "schema-v5-conv1d-axis.tgrs",
+        "schema-v6-interface-dtype.tgrs",
         "schema-v7-tensor-layout.tgrs", "schema-v8-layer-norm.tgrs",
         "schema-v9-binary-requant.tgrs", "schema-v10-state.tgrs",
         "schema-v11-scheduled-peak.tgrs",
@@ -4605,7 +4589,7 @@ static void test_quant_param_counts_are_reconciled(void)
     char path[512];
     int path_len = snprintf(path, sizeof(path), "%s/%s",
                             TIGRIS_SCHEMA_COMPAT_DIR,
-                            "schema-v3-qdq-conv.tgrs");
+                            "schema-v6-interface-dtype.tgrs");
     if (path_len <= 0 || (size_t)path_len >= sizeof(path))
         return;
     uint32_t buf_len = 0;
@@ -4648,46 +4632,74 @@ static void test_quant_param_counts_are_reconciled(void)
     free(buf);
 }
 
-/* Schema v3 predates typed attributes, but its built-in operators already had
- * their current meaning, so a record that no kernel can execute is refused.
- * An opcode the v3 table did not define stays open to custom dispatch. */
-static void test_legacy_schema_validates_builtin_operators(void)
+/* The oldest supported schema validates its built-in operators as the newest
+ * does: a record that no kernel can execute is refused, and so is an opcode
+ * outside the built-in table. */
+static void test_oldest_schema_validates_operators(void)
 {
-    printf("  test_legacy_schema_validates_builtin_operators...\n");
+    printf("  test_oldest_schema_validates_operators...\n");
     char path[512];
     int path_len = snprintf(path, sizeof(path), "%s/%s", TIGRIS_SCHEMA_COMPAT_DIR,
-                            "schema-v3-qdq-conv.tgrs");
+                            "schema-v4-transpose.tgrs");
     TEST_ASSERT(path_len > 0 && (size_t)path_len < sizeof(path), "fixture path fits");
     uint32_t len = 0;
     uint8_t *buf = load_file(path, &len);
-    TEST_ASSERT(buf != NULL, "v3 fixture is readable");
+    TEST_ASSERT(buf != NULL, "v4 fixture is readable");
     if (!buf)
         return;
 
     tigris_plan_t plan;
-    TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_OK, "v3 fixture loads");
-    tigris_op_t *conv = NULL;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_OK, "v4 fixture loads");
+    TEST_ASSERT_EQ(plan.header->version, TIGRIS_SCHEMA_VERSION_MIN, "fixture has the oldest schema");
+    tigris_op_t *relu = NULL;
     for (uint16_t i = 0; i < plan.header->num_ops; i++) {
-        if (plan.ops[i].op_type == TIGRIS_OP_CONV)
-            conv = (tigris_op_t *)&plan.ops[i];
+        if (plan.ops[i].op_type == TIGRIS_OP_RELU)
+            relu = (tigris_op_t *)&plan.ops[i];
     }
-    TEST_ASSERT(conv != NULL, "v3 fixture has a Conv");
-    if (conv) {
-        uint16_t group = conv->spatial.group;
-        conv->spatial.group = 2;
+    TEST_ASSERT(relu != NULL, "v4 fixture has a Relu");
+    if (relu) {
+        relu->fused_act = TIGRIS_ACT_RELU6 + 1u;
         TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_ERR_BAD_OPERATOR,
-                       "v3 Conv with a group no kernel runs is refused");
-        conv->spatial.group = group;
+                       "v4 Relu with an activation no kernel applies is refused");
+        relu->fused_act = TIGRIS_ACT_NONE;
 
-        uint8_t op_type = conv->op_type;
-        conv->op_type = 200;
+        relu->op_type = 200;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                       "v4 opcode outside the built-in table is refused");
+        relu->op_type = TIGRIS_OP_RELU;
         TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_OK,
-                       "v3 opcode outside the built-in table is left to dispatch");
-        conv->op_type = op_type;
-        TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_OK,
-                       "restored v3 fixture loads");
+                       "restored v4 fixture loads");
     }
     free(buf);
+}
+
+/* Schemas 2 and 3 leave the meaning of opcodes outside their table open, so
+ * operator validation cannot check them, and this MatMul with operands of 2x3
+ * and 1x6 would read past its arena. The loader refuses both schemas, and the
+ * same plan at the oldest supported schema fails operator validation. */
+static void test_schemas_before_4_are_refused(void)
+{
+    printf("  test_schemas_before_4_are_refused...\n");
+    _Alignas(4) uint8_t buf[TRANSPOSE_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_transpose_plan(buf);
+    plan_drop_section(buf, 6u);
+    tigris_op_t *op = (tigris_op_t *)(buf + TRANSPOSE_OPS_OFF);
+    op->op_type = TIGRIS_OP_MATMUL;
+    op->num_inputs = 2;
+    int32_t *shapes = (int32_t *)(buf + TRANSPOSE_SHAPES_OFF);
+    shapes[2] = 1;
+    shapes[3] = 6;
+    for (uint32_t version = 2u; version <= 3u; version++) {
+        plan_set_version(buf, version);
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                       TIGRIS_ERR_BAD_VERSION, "a schema 2 or 3 plan is refused");
+    }
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_MIN);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "the MatMul is refused at the oldest supported schema");
 }
 
 static void test_schema_compatibility_fixtures(void)
@@ -4695,8 +4707,6 @@ static void test_schema_compatibility_fixtures(void)
     /*
      * Immutable compiler-emitted artifacts, selected to exercise the feature
      * introduced by each supported schema:
-     *   v2 linear:   tigris b47664926e7a484d6638ecd0fd372da477236619
-     *   v3 QDQ Conv: tigris 0fe37d3a53292cf532ba8628d2284c00a896fbb2
      *   v4 Transpose:tigris 208b322cab7f97c9960c63a8075944374fdfff2c
      *   v5 Conv1D:   explicit serialized length axis
      *   v6 QDQ Conv: a boundary tensor declaring its float model interface
@@ -4716,8 +4726,6 @@ static void test_schema_compatibility_fixtures(void)
         uint16_t tile_plans;
         uint8_t tile_axis;
     } fixtures[] = {
-        {"schema-v2-linear.tgrs", TIGRIS_SCHEMA_VERSION_V2, 0, 0, 0, 0},
-        {"schema-v3-qdq-conv.tgrs", TIGRIS_SCHEMA_VERSION_V3, 3, 0, 0, 0},
         {"schema-v4-transpose.tgrs", TIGRIS_SCHEMA_VERSION_V4, 0, 1, 0, 0},
         {"schema-v5-conv1d-axis.tgrs", TIGRIS_SCHEMA_VERSION_V5, 0, 0, 1,
          TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH},
@@ -5711,7 +5719,7 @@ int main(void)
     test_section_directory_guards();
     test_memory_section();
     test_pool_alignment_guards();
-    test_v2_quant_plan_is_still_accepted();
+    test_quant_plan_tables();
     test_counted_sections_required();
     test_chain_limit_guards();
     test_chain_shape_guards();
@@ -5763,7 +5771,8 @@ int main(void)
     test_band_kind_fixtures();
     test_state_fixture();
     test_state_goldens();
-    test_legacy_schema_validates_builtin_operators();
+    test_oldest_schema_validates_operators();
+    test_schemas_before_4_are_refused();
     test_quant_param_counts_are_reconciled();
 
     printf("\nStruct size tests:\n");

@@ -43,9 +43,7 @@ extern "C" {
 #define TIGRIS_SCHEMA_VERSION_V5 5
 #define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V11
 #define TIGRIS_SCHEMA_VERSION_V4 4
-#define TIGRIS_SCHEMA_VERSION_V3 3
-#define TIGRIS_SCHEMA_VERSION_V2 2
-#define TIGRIS_SCHEMA_VERSION_MIN TIGRIS_SCHEMA_VERSION_V2
+#define TIGRIS_SCHEMA_VERSION_MIN TIGRIS_SCHEMA_VERSION_V4
 #define TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES TIGRIS_SCHEMA_VERSION_V4
 #define TIGRIS_SCHEMA_VERSION_TILE_AXIS TIGRIS_SCHEMA_VERSION_V5
 #define TIGRIS_SCHEMA_VERSION_STAGE_TABLE_AUTHORITY TIGRIS_SCHEMA_VERSION_V5
@@ -455,7 +453,7 @@ typedef struct {
     uint8_t     op_type;             /*  4: tigris_op_type_t */
     uint8_t     num_inputs;          /*  5 */
     uint8_t     num_outputs;         /*  6 */
-    uint8_t     stage;               /*  7: stage index (v2-v4); low-byte hint (v5+) */
+    uint8_t     stage;               /*  7: stage index (v4); low-byte hint (v5+) */
     uint16_t    inputs_off;          /*  8: offset into index pool */
     uint16_t    outputs_off;         /* 10: offset into index pool */
     tigris_spatial_attrs_t spatial;  /* 12-29: spatial attributes (18 bytes, v2) */
@@ -562,7 +560,7 @@ typedef struct {
     uint16_t    num_channels;       /*  8: 1=per-tensor, >1=per-channel */
     uint16_t    multiplier_off;     /* 10: offset into quant data (int32 elements) */
     uint16_t    shift_off;          /* 12: offset into quant data (int32 elements) */
-    uint16_t    _pad;               /* 14: v3 quant-data page (v2 reserved) */
+    uint16_t    _pad;               /* 14: quant-data page */
 } tigris_quant_param_t;             /* 16 bytes total */
 
 /**

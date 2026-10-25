@@ -27,14 +27,14 @@
 static inline int32_t get_mult(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    uint32_t page = qp->_pad;
     return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off + ch];
 }
 
 static inline int32_t get_shft(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    uint32_t page = qp->_pad;
     return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
 }
 
@@ -91,8 +91,7 @@ static int cmsis_per_channel_quant(
         return -1;
 
     if (qp && qp->num_channels == channels) {
-        uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2
-            ? 0u : qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
+        uint32_t page = qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
         /* MISRA 11.8 deviation: CMSIS-NN declares these fields non-const but
          * only reads them, so the plan's read-only arrays are passed as is. */
         quant->multiplier = (int32_t *)&plan->quant_data[
@@ -377,8 +376,8 @@ static int adapt_fully_connected(
     if (per_channel) {
         /* MISRA 11.8 deviation: read-only plan arrays, see cmsis_per_channel_quant. */
         cmsis_nn_per_channel_quant_params quant = {
-            .multiplier = (int32_t *)&plan->quant_data[(plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS) + out_qp->multiplier_off],
-            .shift      = (int32_t *)&plan->quant_data[(plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS) + out_qp->shift_off] };
+            .multiplier = (int32_t *)&plan->quant_data[out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS + out_qp->multiplier_off],
+            .shift      = (int32_t *)&plan->quant_data[out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS + out_qp->shift_off] };
         status = arm_fully_connected_per_channel_s8(
             &ctx, &fc_params, &quant, &input_dims, X,
             &filter_dims, W, &bias_dims, B, &output_dims, Y);

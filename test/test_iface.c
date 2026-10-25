@@ -190,12 +190,12 @@ static void test_non_boundary_tensors_are_refused(void)
 
 static void test_plain_interface_copies(void)
 {
-    /* A plan whose boundary needs no conversion: schema-v2, all float32. */
+    /* A plan whose boundary needs no conversion: schema-v4, all float32. */
     uint8_t *buf;
     uint32_t len = 0;
     char path[512];
     tigris_plan_t plan;
-    int n = snprintf(path, sizeof(path), "%s/schema-v2-linear.tgrs",
+    int n = snprintf(path, sizeof(path), "%s/schema-v4-transpose.tgrs",
                      TIGRIS_SCHEMA_COMPAT_DIR);
 
     printf("  test_plain_interface_copies...\n");

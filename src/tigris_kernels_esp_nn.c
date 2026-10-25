@@ -72,14 +72,14 @@ static uint32_t s_quant_channels = 0;
 static inline int32_t get_mult(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    uint32_t page = qp->_pad;
     return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off + ch];
 }
 
 static inline int32_t get_shft(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    uint32_t page = qp->_pad;
     return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
 }
 
@@ -91,8 +91,7 @@ static int esp_per_channel_quant(
         return -1;
 
     if (qp && qp->num_channels == channels) {
-        uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2
-            ? 0u : qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
+        uint32_t page = qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
         /* MISRA 11.8 deviation: ESP-NN declares these fields non-const but
          * only reads them, so the plan's read-only arrays are passed as is. */
         quant->mult = (int32_t *)&plan->quant_data[
@@ -808,8 +807,7 @@ static int adapt_fully_connected(
      * 8-byte aligned as required by ESP-NN S3 SIMD (ee.vld.l.64.ip). */
 
     if (out_qp && out_qp->num_channels > 1) {
-        uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2
-            ? 0u : out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
+        uint32_t page = out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
         const int32_t *mult_arr = &plan->quant_data[
             page + out_qp->multiplier_off];
         const int32_t *shift_arr = &plan->quant_data[

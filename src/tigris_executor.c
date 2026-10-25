@@ -556,9 +556,6 @@ static int is_pure_reinterpretation(
 static uint32_t stage_fast_limit(const tigris_plan_t *plan,
                                  const tigris_stage_t *stage, uint32_t available)
 {
-    /* Older schemas can state unaligned activation sizes. */
-    if (plan->header->version < TIGRIS_SCHEMA_VERSION_V4)
-        return available;
     uint32_t peak = stage->peak_bytes;
     tigris_tile_plan_v10_t tile = tigris_stage_tiles(plan, stage);
     if (tile.tileable)

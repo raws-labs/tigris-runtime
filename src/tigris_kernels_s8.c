@@ -179,7 +179,7 @@ static inline int32_t average_pool_quantize(
 static inline int32_t get_multiplier(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    uint32_t page = qp->_pad;
     return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off + ch];
 }
 
@@ -187,7 +187,7 @@ static inline int32_t get_multiplier(
 static inline int32_t get_shift(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
 {
-    uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2 ? 0u : qp->_pad;
+    uint32_t page = qp->_pad;
     return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
 }
 
@@ -270,8 +270,7 @@ static inline requant_params_t requant_resolve(
     rq.shift = NULL;
     rq.per_channel = 0;
     if (qp) {
-        uint32_t page = plan->header->version == TIGRIS_SCHEMA_VERSION_V2
-                            ? 0u : qp->_pad;
+        uint32_t page = qp->_pad;
         const int32_t *base = plan->quant_data +
                               (size_t)page * TIGRIS_QUANT_PAGE_ELEMS;
         rq.multiplier = base + qp->multiplier_off;

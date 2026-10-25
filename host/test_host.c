@@ -97,13 +97,13 @@ static void fixture(const char *name, uint8_t input_pool)
     CHECK(input && output);
     inputs[0] = input;
     outputs[0] = output;
-    if (strcmp(name, "schema-v2-linear.tgrs") == 0) {
-        CHECK(in_size == 256u && out_size == 256u);
-        for (int i = 0; i < 64; ++i) ((float *)input)[i] = (float)(i - 32);
+    if (strcmp(name, "schema-v4-transpose.tgrs") == 0) {
+        CHECK(in_size == 24u && out_size == 24u);
+        for (int i = 0; i < 6; ++i) ((float *)input)[i] = (float)(i - 3);
     }
-    if (strcmp(name, "schema-v3-qdq-conv.tgrs") == 0) {
-        CHECK(in_size == 16u && out_size == 8u);
-        for (int i = 0; i < 16; ++i) ((int8_t *)input)[i] = (int8_t)i;
+    if (strcmp(name, "schema-v6-interface-dtype.tgrs") == 0) {
+        CHECK(in_size == 64u && out_size == 64u);
+        for (int i = 0; i < 16; ++i) ((float *)input)[i] = (float)(2 * i - 16) * 0.25f;
     }
     /* A one-byte slow arena holds no input that has to go there. */
     error = tigris_host_run(tight, inputs, &in_size, 1, outputs, &out_size, 1);
@@ -116,14 +116,15 @@ static void fixture(const char *name, uint8_t input_pool)
         error = tigris_host_run(host, inputs, &in_size, 1, outputs, &out_size, 1);
         if (error) fprintf(stderr, "%s: %s\n", name, error);
         CHECK(error == NULL);
-        if (strcmp(name, "schema-v2-linear.tgrs") == 0)
-            for (int i = 0; i < 64; ++i)
-                CHECK(((float *)output)[i] == (float)(i < 32 ? 0 : i - 32));
-        if (strcmp(name, "schema-v3-qdq-conv.tgrs") == 0) {
-            /* Conv accumulators 199,239,359,399 scaled by .005; other channel is negative. */
-            const int8_t expected[8] = {1, 0, 1, 0, 2, 0, 2, 0};
-            CHECK(memcmp(output, expected, sizeof(expected)) == 0);
-        }
+        /* Relu, then a Transpose that keeps the element order. */
+        if (strcmp(name, "schema-v4-transpose.tgrs") == 0)
+            for (int i = 0; i < 6; ++i)
+                CHECK(((float *)output)[i] == (float)(i < 3 ? 0 : i - 3));
+        /* A 1x1 int8 Conv of weight 2 at scale 0.25 between scale 0.25
+         * boundaries halves each even step of the input grid. */
+        if (strcmp(name, "schema-v6-interface-dtype.tgrs") == 0)
+            for (int i = 0; i < 16; ++i)
+                CHECK(((float *)output)[i] == (float)(i - 8) * 0.25f);
         CHECK(tigris_host_metric(host, TIGRIS_HOST_FAST_PEAK) <=
               tigris_host_metric(host, TIGRIS_HOST_FAST_CAPACITY));
     }
@@ -146,8 +147,7 @@ int main(void)
     CHECK(tigris_host_create("bad", 3, 0, &host) != NULL && host == NULL);
     CHECK(tigris_host_tensor_count(NULL, 0) == 0u);
     tigris_host_destroy(NULL);
-    fixture("schema-v2-linear.tgrs", TIGRIS_TRACE_POOL_SLOW);
-    fixture("schema-v3-qdq-conv.tgrs", TIGRIS_TRACE_POOL_SLOW);
+    fixture("schema-v4-transpose.tgrs", TIGRIS_TRACE_POOL_SLOW);
     fixture("schema-v6-interface-dtype.tgrs", TIGRIS_TRACE_POOL_FAST);
     fixture("schema-v8-layer-norm.tgrs", TIGRIS_TRACE_POOL_FAST);
     puts("Host library checks passed");

@@ -1506,6 +1506,162 @@ static void test_concat_s8_small_scales(void)
         TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], 95, "small-scale concat requantizes");
 }
 
+/* Input scale 3/64, zp -10 and output scale 38/64, zp 3 put the centered
+ * values +-95 and +-57 on the exact halves +-7.5 and +-4.5. */
+static const int8_t tie_codes[] = {85, -105, 47, -67};
+static const int8_t tie_expected[] = {11, -5, 8, -2};
+
+static void run_tie_case(const char *what, uint8_t type, int pool_rounding,
+                         const int32_t *x_shape, const int32_t *y_shape,
+                         const int8_t *x, int nx, const int8_t *expected, int ny)
+{
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t in_qp = add_quant_param(3.0f / 64.0f, -10, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(38.0f / 64.0f, 3, 1, NULL, NULL);
+    uint16_t t_x = add_tensor(&plan, "x", x_shape, 4, 3, (uint32_t)nx, in_qp);
+    uint16_t t_y = add_tensor(&plan, "y", y_shape, 4, 3, (uint32_t)ny, out_qp);
+    one_op_s8(&plan, type, &t_x, 1, &t_y, 1, TIGRIS_NO_WEIGHT);
+    test_ops[0].spatial.kernel_h = (uint8_t)(x_shape[1] / y_shape[1]);
+    test_ops[0].spatial.kernel_w = (uint8_t)(x_shape[2] / y_shape[2]);
+    test_ops[0].spatial.stride_h = 1;
+    test_ops[0].spatial.stride_w = 1;
+    if (type == TIGRIS_OP_RESIZE)
+        test_ops[0].spatial.kernel_h = 0;
+    static const tigris_op_attribute_t rounding = {0, TIGRIS_OP_ATTR_POOL_ROUNDING, 1, 0};
+    static const uint8_t average[] = {TIGRIS_POOL_ROUNDING_AVERAGE};
+    if (pool_rounding) {
+        plan.op_attributes = &rounding;
+        plan.op_attribute_data = average;
+        plan.num_op_attributes = 1;
+    }
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, t_x, (uint32_t)nx); memcpy(ptrs[t_x], x, (size_t)nx);
+    tigris_mem_alloc_fast(&mem, t_y, (uint32_t)ny);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0, what);
+    for (int i = 0; i < ny; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], expected[i], what);
+}
+
+/* Every operator that carries its input values to a differently quantized
+ * output re-encodes them with one formula, so all of them round the same
+ * exact halves away from zero. */
+static void test_passthrough_requant_ties_s8(void)
+{
+    printf("  test_passthrough_requant_ties_s8...\n");
+    int32_t vec[] = {1, 1, 1, 4}, flat[] = {1, 4, 1, 1}, pair[] = {1, 1, 2, 4};
+    const int8_t clamped[] = {11, 3, 8, 3};
+    run_tie_case("relu ties", TIGRIS_OP_RELU, 0, vec, vec, tie_codes, 4, clamped, 4);
+    run_tie_case("relu6 ties", TIGRIS_OP_RELU6, 0, vec, vec, tie_codes, 4, clamped, 4);
+    run_tie_case("global max pool ties", TIGRIS_OP_GLOBAL_MAX, 0, vec, vec, tie_codes, 4,
+                 tie_expected, 4);
+    run_tie_case("reshape ties", TIGRIS_OP_RESHAPE, 0, vec, flat, tie_codes, 4,
+                 tie_expected, 4);
+    run_tie_case("max pool ties", TIGRIS_OP_MAX_POOL, 0, vec, vec, tie_codes, 4,
+                 tie_expected, 4);
+    run_tie_case("resize nearest ties", TIGRIS_OP_RESIZE, 0, vec, vec, tie_codes, 4,
+                 tie_expected, 4);
+    /* Centered pairs that sum to +-190 and +-114 average to the same halves. */
+    const int8_t pooled[] = {80, -100, 40, -60, 90, -110, 54, -74};
+    run_tie_case("average pool ties", TIGRIS_OP_AVG_POOL, 0, pair, vec, pooled, 8,
+                 tie_expected, 4);
+    run_tie_case("global average pool ties", TIGRIS_OP_GLOBAL_AVG, 1, pair, vec, pooled, 8,
+                 tie_expected, 4);
+
+    plan_reset();
+    tigris_plan_t plan;
+    uint16_t in_qp = add_quant_param(3.0f / 64.0f, -10, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(38.0f / 64.0f, 3, 1, NULL, NULL);
+    int32_t half[] = {1, 1, 1, 2};
+    uint16_t t_a = add_tensor(&plan, "a", half, 4, 3, 2, in_qp);
+    uint16_t t_b = add_tensor(&plan, "b", half, 4, 3, 2, in_qp);
+    uint16_t t_c = add_tensor(&plan, "c", half, 4, 3, 2, TIGRIS_NO_QUANT_PARAM);
+    uint16_t t_y = add_tensor(&plan, "y", vec, 4, 3, 4, out_qp);
+    uint16_t t_z = add_tensor(&plan, "z", vec, 4, 3, 4, out_qp);
+    uint16_t t_w = add_tensor(&plan, "w", vec, 4, 3, 4, TIGRIS_NO_QUANT_PARAM);
+    uint16_t ins[] = {t_a, t_b}, outs[] = {t_y};
+    one_op_s8(&plan, TIGRIS_OP_CONCAT, ins, 2, outs, 1, TIGRIS_NO_WEIGHT);
+    /* An input without quantization parameters passes its codes through. */
+    uint16_t raw_ins[] = {t_c, t_b};
+    test_ops[1] = test_ops[0];
+    test_ops[1].inputs_off = add_indices(raw_ins, 2);
+    test_ops[1].outputs_off = add_indices(&t_z, 1);
+    /* An output without quantization parameters takes the input codes as they are. */
+    test_ops[2] = test_ops[0];
+    test_ops[2].outputs_off = add_indices(&t_w, 1);
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, t_a, 2); memcpy(ptrs[t_a], tie_codes, 2);
+    tigris_mem_alloc_fast(&mem, t_b, 2); memcpy(ptrs[t_b], tie_codes + 2, 2);
+    tigris_mem_alloc_fast(&mem, t_c, 2); memcpy(ptrs[t_c], tie_codes, 2);
+    tigris_mem_alloc_fast(&mem, t_y, 4);
+    tigris_mem_alloc_fast(&mem, t_z, 4);
+    tigris_mem_alloc_fast(&mem, t_w, 4);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0, "concat ties");
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[1], 1, &mem, NULL), 0,
+                   "concat without input quantization");
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[2], 2, &mem, NULL), 0,
+                   "concat without output quantization");
+    const int8_t raw_expected[] = {85, -105, 8, -2};
+    for (int i = 0; i < 4; i++) {
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], tie_expected[i], "concat ties");
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_z])[i], raw_expected[i],
+                       "concat without input quantization");
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_w])[i], tie_codes[i],
+                       "concat without output quantization");
+    }
+}
+
+/* A concat input of more than 256 elements re-encodes through a table of all
+ * codes; every code must match the per-element formula, ties included. */
+static void test_concat_requant_all_codes_s8(void)
+{
+    printf("  test_concat_requant_all_codes_s8...\n");
+    plan_reset();
+    tigris_plan_t plan;
+    const float in_scale = 3.0f / 64.0f, out_scale = 38.0f / 64.0f;
+    uint16_t in_qp = add_quant_param(in_scale, -10, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(out_scale, 3, 1, NULL, NULL);
+    int32_t a_shape[] = {1, 1, 2, 256}, b_shape[] = {1, 1, 2, 1}, y_shape[] = {1, 1, 2, 257};
+    uint16_t t_a = add_tensor(&plan, "a", a_shape, 4, 3, 512, in_qp);
+    uint16_t t_b = add_tensor(&plan, "b", b_shape, 4, 3, 2, out_qp);
+    uint16_t t_y = add_tensor(&plan, "y", y_shape, 4, 3, 514, out_qp);
+    uint16_t ins[] = {t_a, t_b}, outs[] = {t_y};
+    one_op_s8(&plan, TIGRIS_OP_CONCAT, ins, 2, outs, 1, TIGRIS_NO_WEIGHT);
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[2048], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, t_a, 512);
+    tigris_mem_alloc_fast(&mem, t_b, 2);
+    tigris_mem_alloc_fast(&mem, t_y, 514);
+    int8_t *a = (int8_t *)ptrs[t_a], *b = (int8_t *)ptrs[t_b], *y = (int8_t *)ptrs[t_y];
+    for (int i = 0; i < 256; i++) {
+        a[i] = (int8_t)(i - 128);
+        a[256 + i] = (int8_t)(127 - i);
+    }
+    b[0] = 7; b[1] = -7;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0,
+                   "all-codes concat runs");
+    int mismatches = 0;
+    for (int row = 0; row < 2; row++) {
+        for (int i = 0; i < 256; i++) {
+            int32_t code = a[row * 256 + i];
+            double scaled = round((double)(code + 10) * (double)in_scale /
+                                  (double)out_scale) + 3.0;
+            int32_t expected = scaled < -128.0 ? -128 : scaled > 127.0 ? 127 : (int32_t)scaled;
+            if (y[row * 257 + i] != expected)
+                mismatches++;
+        }
+        TEST_ASSERT_EQ(y[row * 257 + 256], b[row], "all-codes concat copies the matching input");
+    }
+    TEST_ASSERT_EQ(mismatches, 0, "all-codes concat matches the per-element formula");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_EQ(y[tie_codes[i] + 128], tie_expected[i], "all-codes concat ties");
+}
+
 /* One input channel, two filters of 1x1: output channel oc reads channel
  * oc / 2. The requantization is the identity. */
 static void test_depthwise_multiplier_s8(void)
@@ -2255,6 +2411,8 @@ int main(void)
     test_split_s8_inner_axis();
     test_concat_s8_height();
     test_concat_s8_small_scales();
+    test_passthrough_requant_ties_s8();
+    test_concat_requant_all_codes_s8();
     test_depthwise_multiplier_s8();
     test_pad_s8();
     test_binary_s8_constant_operand();

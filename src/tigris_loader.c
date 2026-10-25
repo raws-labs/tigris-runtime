@@ -4593,16 +4593,87 @@ static tigris_error_t validate_weights_and_stages(tigris_load_state_t *ctx)
     return TIGRIS_OK;
 }
 
+/* Whether weight `index` (or none) lies inside a stage's decoded block. */
+static int weight_in_block(const tigris_plan_t *plan, uint16_t index,
+                           const tigris_weight_block_t *block)
+{
+    if (index == TIGRIS_NO_WEIGHT)
+        return 1;
+    return block != NULL &&
+           bounds_ok(plan->weight_entries[index].offset, plan->weight_entries[index].size_bytes,
+                     block->uncompressed_size);
+}
+
+/* The weights a stage's operators read, in turn: each operator's weight and
+ * bias, then every constant its attribute records list. */
+typedef struct {
+    uint16_t op, end_op;     /* operators still to read; a stage's are consecutive */
+    uint16_t attr, end_attr; /* their attribute records, sorted by operator */
+    uint8_t slot;            /* 0 weight or 1 bias, then the constant in the record */
+} weight_reads_t;
+
+static int next_weight_read(const tigris_plan_t *plan, weight_reads_t *reads, uint16_t *index)
+{
+    if (reads->op < reads->end_op) {
+        const tigris_op_t *op = &plan->ops[reads->op];
+        if (reads->slot == 0u) {
+            *index = op->weight_idx;
+            reads->slot = 1u;
+        } else {
+            *index = op->bias_idx;
+            reads->slot = 0u;
+            reads->op++;
+        }
+        return 1;
+    }
+    while (reads->attr < reads->end_attr) {
+        const tigris_op_attribute_t *attr = &plan->op_attributes[reads->attr];
+        const uint32_t at = (uint32_t)reads->slot * 2u;
+        if (attr->type == TIGRIS_OP_ATTR_CONSTANTS && at + 2u <= attr->data_len) {
+            const uint8_t *list = plan->op_attribute_data + attr->data_offset;
+            *index = (uint16_t)((uint16_t)list[at] | (uint16_t)((uint16_t)list[at + 1u] << 8));
+            reads->slot++;
+            return 1;
+        }
+        reads->attr++;
+        reads->slot = 0u;
+    }
+    return 0;
+}
+
+/* Whether weight `index` shares bytes with a weight read after it; all of
+ * them already lie inside the stage's block, so no end overflows. */
+static int weight_overlaps_later(const tigris_plan_t *plan, const weight_reads_t *later,
+                                 uint16_t index)
+{
+    if (index == TIGRIS_NO_WEIGHT || plan->weight_entries[index].size_bytes == 0u)
+        return 0;
+    const tigris_weight_entry_t *weight = &plan->weight_entries[index];
+    weight_reads_t reads = *later;
+    uint16_t other = TIGRIS_NO_WEIGHT;
+    while (next_weight_read(plan, &reads, &other)) {
+        if (other == TIGRIS_NO_WEIGHT || other == index)
+            continue;
+        const tigris_weight_entry_t *entry = &plan->weight_entries[other];
+        if (entry->size_bytes != 0u && entry->offset < weight->offset + weight->size_bytes &&
+            weight->offset < entry->offset + entry->size_bytes)
+            return 1;
+    }
+    return 0;
+}
+
 static tigris_error_t validate_graph_and_publish(tigris_load_state_t *ctx)
 {
     if (ctx->next_scheduled_op != ctx->hdr->num_ops)
         return TIGRIS_ERR_BAD_SECTION;
 
     /* A compressed stage redirects weight_entry offsets into its own decoded
-     * block.  Check that every referenced weight/bias is present in that
-     * block before any executor or kernel can dereference the offset. */
+     * block.  Check that every weight an operator reads (weight, bias and
+     * listed constants) lies inside that block, and that no two of them
+     * share bytes, before any executor or kernel can dereference the offset. */
     if (ctx->candidate.weight_blocks) {
         uint16_t block_cursor = 0;
+        uint16_t attr_cursor = 0;
         for (uint16_t s = 0; s < ctx->hdr->num_stages; s++) {
             const tigris_weight_block_t *block = NULL;
             if (block_cursor < ctx->candidate.num_weight_blocks &&
@@ -4611,19 +4682,29 @@ static tigris_error_t validate_graph_and_publish(tigris_load_state_t *ctx)
             }
 
             const tigris_stage_t *stage = &ctx->candidate.stages[s];
-            for (uint16_t j = 0; j < stage->ops_count; j++) {
-                const tigris_op_t *op =
-                    &ctx->candidate.ops[ctx->candidate.index_pool[stage->ops_off + j]];
-                uint16_t refs[2] = {op->weight_idx, op->bias_idx};
-                for (uint8_t r = 0; r < 2; r++) {
-                    if (refs[r] == TIGRIS_NO_WEIGHT)
-                        continue;
-                    if (!block ||
-                        !bounds_ok(ctx->candidate.weight_entries[refs[r]].offset,
-                                   ctx->candidate.weight_entries[refs[r]].size_bytes,
-                                   block->uncompressed_size))
-                        return TIGRIS_ERR_BAD_SECTION;
-                }
+            weight_reads_t stage_reads;
+            stage_reads.op = stage->ops_count > 0u ? ctx->candidate.index_pool[stage->ops_off] : 0u;
+            stage_reads.end_op = (uint16_t)(stage_reads.op + stage->ops_count);
+            while (attr_cursor < ctx->candidate.num_op_attributes &&
+                   ctx->candidate.op_attributes[attr_cursor].op_index < stage_reads.op)
+                attr_cursor++;
+            stage_reads.attr = attr_cursor;
+            while (attr_cursor < ctx->candidate.num_op_attributes &&
+                   ctx->candidate.op_attributes[attr_cursor].op_index < stage_reads.end_op)
+                attr_cursor++;
+            stage_reads.end_attr = attr_cursor;
+            stage_reads.slot = 0u;
+
+            weight_reads_t reads = stage_reads;
+            uint16_t index = TIGRIS_NO_WEIGHT;
+            while (next_weight_read(&ctx->candidate, &reads, &index)) {
+                if (!weight_in_block(&ctx->candidate, index, block))
+                    return TIGRIS_ERR_BAD_SECTION;
+            }
+            reads = stage_reads;
+            while (next_weight_read(&ctx->candidate, &reads, &index)) {
+                if (weight_overlaps_later(&ctx->candidate, &reads, index))
+                    return TIGRIS_ERR_BAD_SECTION;
             }
         }
     }

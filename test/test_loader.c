@@ -5637,6 +5637,160 @@ static void test_state_goldens(void)
     }
 }
 
+/* A compressed stage reads every weight from its own decoded block, the
+ * constants an operator lists included: one placed past the block is refused. */
+static void test_constants_stay_in_their_weight_block(void)
+{
+    printf("  test_constants_stay_in_their_weight_block...\n");
+    uint32_t checked = 0u;
+    for (size_t g = 0; g < sizeof(state_goldens) / sizeof(state_goldens[0]); g++) {
+        const state_golden_t *golden = &state_goldens[g];
+        const size_t padded = ((size_t)golden->plan_size + 63u) / 64u * 64u;
+        uint8_t *buf = aligned_alloc(64u, padded);
+        uint8_t *copy = aligned_alloc(64u, padded);
+        tigris_plan_t plan;
+        memset(&plan, 0, sizeof(plan));
+        TEST_ASSERT(buf != NULL && copy != NULL, "plan buffers");
+        if (buf && copy) {
+            memcpy(buf, golden->plan, golden->plan_size);
+            TEST_ASSERT_EQ(tigris_plan_load(buf, golden->plan_size, &plan), TIGRIS_OK, "plan loads");
+        }
+        if (!buf || !copy || plan.weight_blocks == NULL) {
+            free(buf);
+            free(copy);
+            continue;
+        }
+        uint32_t beyond = 0u;
+        for (uint16_t b = 0u; b < plan.num_weight_blocks; b++)
+            if (plan.weight_blocks[b].uncompressed_size > beyond)
+                beyond = plan.weight_blocks[b].uncompressed_size;
+        for (uint16_t n = 0u; n < plan.header->num_ops; n++) {
+            uint8_t len = 0u;
+            const uint8_t *list = tigris_op_attribute_data(&plan, n, TIGRIS_OP_ATTR_CONSTANTS, &len);
+            for (uint8_t k = 0u; list != NULL && k < len / 2u; k++) {
+                const uint16_t index = (uint16_t)((uint16_t)list[2u * k] |
+                                                  (uint16_t)((uint16_t)list[2u * k + 1u] << 8));
+                if (index == TIGRIS_NO_WEIGHT)
+                    continue;
+                const size_t at = (size_t)((const uint8_t *)&plan.weight_entries[index].offset - buf);
+                TEST_ASSERT_EQ(load_altered(golden, copy, at, &beyond, sizeof(beyond)),
+                               TIGRIS_ERR_BAD_SECTION, "a constant past its stage's weight block is refused");
+                checked++;
+            }
+        }
+        free(buf);
+        free(copy);
+    }
+    TEST_ASSERT_EQ(checked, 15u, "the 3 Svdf and 12 Lstm constants of the compressed goldens are checked");
+}
+
+/* Two constants an operator lists never share bytes of the decoded block:
+ * each one moved onto the lowest offset of its operator's list is refused. */
+static void test_constants_do_not_overlap_in_their_weight_block(void)
+{
+    printf("  test_constants_do_not_overlap_in_their_weight_block...\n");
+    uint32_t checked = 0u;
+    for (size_t g = 0; g < sizeof(state_goldens) / sizeof(state_goldens[0]); g++) {
+        const state_golden_t *golden = &state_goldens[g];
+        const size_t padded = ((size_t)golden->plan_size + 63u) / 64u * 64u;
+        uint8_t *buf = aligned_alloc(64u, padded);
+        uint8_t *copy = aligned_alloc(64u, padded);
+        tigris_plan_t plan;
+        memset(&plan, 0, sizeof(plan));
+        TEST_ASSERT(buf != NULL && copy != NULL, "plan buffers");
+        if (buf && copy) {
+            memcpy(buf, golden->plan, golden->plan_size);
+            TEST_ASSERT_EQ(tigris_plan_load(buf, golden->plan_size, &plan), TIGRIS_OK, "plan loads");
+        }
+        if (!buf || !copy || plan.weight_blocks == NULL) {
+            free(buf);
+            free(copy);
+            continue;
+        }
+        for (uint16_t n = 0u; n < plan.header->num_ops; n++) {
+            uint8_t len = 0u;
+            const uint8_t *list = tigris_op_attribute_data(&plan, n, TIGRIS_OP_ATTR_CONSTANTS, &len);
+            uint16_t lowest = TIGRIS_NO_WEIGHT;
+            for (uint8_t k = 0u; list != NULL && k < len / 2u; k++) {
+                const uint16_t index = (uint16_t)((uint16_t)list[2u * k] |
+                                                  (uint16_t)((uint16_t)list[2u * k + 1u] << 8));
+                if (index != TIGRIS_NO_WEIGHT && plan.weight_entries[index].size_bytes != 0u &&
+                    (lowest == TIGRIS_NO_WEIGHT ||
+                     plan.weight_entries[index].offset < plan.weight_entries[lowest].offset))
+                    lowest = index;
+            }
+            for (uint8_t k = 0u; list != NULL && k < len / 2u; k++) {
+                const uint16_t index = (uint16_t)((uint16_t)list[2u * k] |
+                                                  (uint16_t)((uint16_t)list[2u * k + 1u] << 8));
+                if (index == TIGRIS_NO_WEIGHT || index == lowest ||
+                    plan.weight_entries[index].size_bytes == 0u)
+                    continue;
+                const uint32_t onto = plan.weight_entries[lowest].offset;
+                const size_t at = (size_t)((const uint8_t *)&plan.weight_entries[index].offset - buf);
+                TEST_ASSERT_EQ(load_altered(golden, copy, at, &onto, sizeof(onto)),
+                               TIGRIS_ERR_BAD_SECTION, "two constants on the same block bytes are refused");
+                checked++;
+            }
+        }
+        free(buf);
+        free(copy);
+    }
+    TEST_ASSERT_EQ(checked, 13u, "2 Svdf and 11 Lstm constants of the compressed goldens are moved");
+}
+
+/* The staged plan with three 4-byte weights in two uncompressed blocks:
+ * stage 0 reads weight 0 at offset 0 of its block, stage 1 reads weight 1
+ * twice at offset 0 and weight 2 at offset 4 of its own. */
+#define BLOCKED_PLAN_SIZE  772u
+#define BLOCKED_BLOCKS_OFF 712u
+
+static void build_blocked_plan(uint8_t *buf)
+{
+    memset(buf, 0, BLOCKED_PLAN_SIZE);
+    build_staged_plan(buf);
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    hdr->file_size = BLOCKED_PLAN_SIZE;
+    hdr->num_weights = 3;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    dir[7].type = TIGRIS_SEC_WEIGHT_BLOCKS;
+    dir[7].offset = BLOCKED_BLOCKS_OFF;
+    plan_finish(buf);
+
+    const tigris_weight_entry_t weights[3] = {{0u, 0u, 4u}, {0u, 0u, 4u}, {0u, 4u, 4u}};
+    memcpy(buf + STAGED_WEIGHTS_OFF, weights, sizeof(weights));
+    const uint16_t header[2] = {2u, TIGRIS_COMPRESS_NONE};
+    memcpy(buf + BLOCKED_BLOCKS_OFF, header, sizeof(header));
+    const tigris_weight_block_t blocks[2] = {{0u, 0u, 1u, 0u, 0u, 4u, 4u},
+                                             {1u, 1u, 2u, 0u, 4u, 8u, 8u}};
+    memcpy(buf + BLOCKED_BLOCKS_OFF + sizeof(header), blocks, sizeof(blocks));
+
+    tigris_op_t *ops = (tigris_op_t *)(buf + STAGED_OPS_OFF);
+    for (uint16_t i = 4u; i < hdr->num_ops; i++)
+        ops[i].weight_idx = i < 6u ? 1u : 2u;
+}
+
+static void test_weight_ranges_overlap_only_across_blocks(void)
+{
+    printf("  test_weight_ranges_overlap_only_across_blocks...\n");
+    _Alignas(4) uint8_t buf[BLOCKED_PLAN_SIZE];
+    tigris_weight_entry_t *weights = (tigris_weight_entry_t *)(buf + STAGED_WEIGHTS_OFF);
+    tigris_plan_t plan;
+
+    build_blocked_plan(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "equal offsets in two blocks and one weight read twice load");
+
+    build_blocked_plan(buf);
+    weights[2].offset = 0u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                   "two weights at one offset of a block are refused");
+
+    build_blocked_plan(buf);
+    weights[2].offset = 2u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                   "two weights sharing bytes of a block are refused");
+}
+
 static void test_state_fixture(void)
 {
     printf("  test_state_fixture...\n");
@@ -5771,6 +5925,9 @@ int main(void)
     test_band_kind_fixtures();
     test_state_fixture();
     test_state_goldens();
+    test_constants_stay_in_their_weight_block();
+    test_constants_do_not_overlap_in_their_weight_block();
+    test_weight_ranges_overlap_only_across_blocks();
     test_oldest_schema_validates_operators();
     test_schemas_before_4_are_refused();
     test_quant_param_counts_are_reconciled();

@@ -1073,6 +1073,63 @@ static int is_axis1_binary_pointwise_op(uint8_t type)
 }
 
 /**
+ * Whether every operator of a stage implements the stripe contract along
+ * axis: a lone operator that keeps its rows independent, rank-3 unary
+ * pointwise ops around at most one Conv1D (binary pointwise ops only without
+ * one), or rank-4 height ops with at most one spatial or resampling op and no
+ * Resize in a chain. Along TIGRIS_TILE_AXIS_HW a ConvTranspose also counts as
+ * the spatial op, since only the 2D executor inverts its rectangle.
+ *
+ * This is an audited allow-list: an operator that runs on a full tensor does
+ * not necessarily consume the tile geometry correctly. Softmax and the other
+ * normalizations reduce along the channel axis, which a band never cuts.
+ */
+int tigris_stage_stripe_contract(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                 uint8_t rank, uint8_t axis)
+{
+    const uint16_t *sops = tigris_stage_ops(plan, stage);
+    uint16_t spatial_count = 0;
+
+    if (stage->ops_count == 1u && stage->chain_len == 0u &&
+        tigris_op_independent_band(plan, &plan->ops[sops[0]], sops[0], 0))
+        return 1;
+    if (rank == 3u) {
+        uint16_t binary_count = 0;
+        if (stage->chain_len != 0u)
+            return 0;
+        for (uint16_t j = 0; j < stage->ops_count; j++) {
+            uint8_t type = plan->ops[sops[j]].op_type;
+            if (type == TIGRIS_OP_CONV1D) {
+                spatial_count++;
+            } else if (is_axis1_binary_pointwise_op(type)) {
+                binary_count++;
+            } else if (!is_axis1_unary_pointwise_op(type)) {
+                return 0;
+            }
+        }
+        return spatial_count <= 1u && !(spatial_count == 1u && binary_count > 0u);
+    }
+    if (rank != 4u)
+        return 0;
+    for (uint16_t j = 0; j < stage->ops_count; j++) {
+        uint8_t type = plan->ops[sops[j]].op_type;
+        const tigris_op_contract_t *row = tigris_op_contract(type);
+        uint16_t flags = row != NULL ? row->flags : 0u;
+        if ((flags & TIGRIS_CONTRACT_SPATIAL) != 0u ||
+            (axis == TIGRIS_TILE_AXIS_HW && type == TIGRIS_OP_CONV_TRANSPOSE)) {
+            spatial_count++;
+        } else if ((flags & TIGRIS_CONTRACT_RESAMPLE) != 0u) {
+            if (stage->chain_len != 0u)
+                return 0;
+            spatial_count++;
+        } else if ((flags & TIGRIS_CONTRACT_HEIGHT) == 0u) {
+            return 0;
+        }
+    }
+    return spatial_count <= 1u;
+}
+
+/**
  * Whether an attribute kind belongs to this operator.
  *
  * Schema 8 declares every kind at once so the operators behind them can land
@@ -4189,8 +4246,8 @@ static tigris_error_t validate_stage_tile_band(
          * pointwise ops may surround one Conv1D. Dynamic binary ops
          * remain pointwise-only: mixing an external binary operand
          * with a strided Conv1D can expose different length
-         * resolutions. Rank-4 stages retain the existing audited
-         * height contract and are checked again by the executor. */
+         * resolutions. tigris_stage_stripe_contract states both
+         * rules, and the executor routes by the same predicate. */
         /* A per-channel operand is one row high, so a rank-4 height
          * stripe loads it whole for every band. The 2D, chain, row
          * band and rank-3 executors have no such rule, so there a
@@ -4246,27 +4303,6 @@ static tigris_error_t validate_stage_tile_band(
                        &ctx->candidate.ops[ctx->candidate.index_pool[stage->ops_off]],
                        ctx->candidate.index_pool[stage->ops_off], 0)) {
             /* The operator preserves serialized height on every operand. */
-        } else if (rank == 3) {
-            uint16_t conv_count = 0;
-            uint16_t binary_count = 0;
-            if (ctx->hdr->version < TIGRIS_SCHEMA_VERSION_TILE_AXIS ||
-                stage->chain_len != 0)
-                return TIGRIS_ERR_BAD_OPERATOR;
-            for (uint16_t j = 0; j < stage->ops_count; j++) {
-                uint8_t type = ctx->candidate.ops[
-                    ctx->candidate.index_pool[stage->ops_off + j]
-                ].op_type;
-                if (type == TIGRIS_OP_CONV1D) {
-                    conv_count++;
-                } else if (is_axis1_binary_pointwise_op(type)) {
-                    binary_count++;
-                } else if (!is_axis1_unary_pointwise_op(type)) {
-                    return TIGRIS_ERR_BAD_OPERATOR;
-                }
-            }
-            if (conv_count > 1 ||
-                (conv_count == 1 && binary_count > 0))
-                return TIGRIS_ERR_BAD_OPERATOR;
         } else if (stage->ops_count == 1 &&
                    ctx->candidate.ops[
                        ctx->candidate.index_pool[stage->ops_off]
@@ -4284,24 +4320,10 @@ static tigris_error_t validate_stage_tile_band(
                 rank != 4 ||
                 out_shape[1] != 1 || out_shape[2] != 1)
                 return TIGRIS_ERR_BAD_OPERATOR;
-        } else {
-            uint16_t spatial_count = 0;
-            for (uint16_t j = 0; j < stage->ops_count; j++) {
-                uint8_t type = ctx->candidate.ops[
-                    ctx->candidate.index_pool[stage->ops_off + j]
-                ].op_type;
-                const tigris_op_contract_t *row = tigris_op_contract(type);
-                if (row != NULL && (row->flags & TIGRIS_CONTRACT_SPATIAL) != 0u) {
-                    spatial_count++;
-                } else if (row != NULL && (row->flags & TIGRIS_CONTRACT_RESAMPLE) != 0u) {
-                    if (stage->chain_len != 0u) return TIGRIS_ERR_BAD_OPERATOR;
-                    spatial_count++;
-                } else if (row == NULL || (row->flags & TIGRIS_CONTRACT_HEIGHT) == 0u) {
-                    return TIGRIS_ERR_BAD_OPERATOR;
-                }
-            }
-            if (spatial_count > 1)
-                return TIGRIS_ERR_BAD_OPERATOR;
+        } else if ((rank == 3 && ctx->hdr->version < TIGRIS_SCHEMA_VERSION_TILE_AXIS) ||
+                   !tigris_stage_stripe_contract(&ctx->candidate, stage, rank,
+                                                 TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH)) {
+            return TIGRIS_ERR_BAD_OPERATOR;
         }
     }
     return TIGRIS_OK;

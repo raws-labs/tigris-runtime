@@ -172,39 +172,6 @@ static int is_height_tiling_op(uint8_t type)
            type == TIGRIS_OP_CONCAT;
 }
 
-static int is_axis1_unary_pointwise_op(uint8_t type)
-{
-    /* Softmax reduces along the final stored dimension, which is the channel
-     * axis in both NLC and NHWC. The axis a tile cuts is ahead of it, so a
-     * tile holds whole normalization rows and the operator is shape-preserving
-     * and halo-free like the unary ones beside it. */
-    return type == TIGRIS_OP_RELU ||
-           type == TIGRIS_OP_RELU6 ||
-           type == TIGRIS_OP_SIGMOID ||
-           type == TIGRIS_OP_TANH ||
-           type == TIGRIS_OP_SOFTMAX ||
-           type == TIGRIS_OP_LEAKY_RELU ||
-           type == TIGRIS_OP_ELU ||
-           type == TIGRIS_OP_LOG_SOFTMAX ||
-           type == TIGRIS_OP_L2_NORMALIZATION ||
-           type == TIGRIS_OP_ERF || type == TIGRIS_OP_GELU ||
-           type == TIGRIS_OP_HARDSWISH ||
-           type == TIGRIS_OP_ABS ||
-           type == TIGRIS_OP_RSQRT ||
-           type == TIGRIS_OP_NEG || type == TIGRIS_OP_LOGICAL_NOT || type == TIGRIS_OP_CAST ||
-           type == TIGRIS_OP_QUANTIZE || type == TIGRIS_OP_DEQUANTIZE ||
-           type == TIGRIS_OP_EXP ||
-           type == TIGRIS_OP_LOG ||
-           type == TIGRIS_OP_SQRT ||
-           type == TIGRIS_OP_SQUARE ||
-           type == TIGRIS_OP_FLOOR ||
-           type == TIGRIS_OP_CEIL ||
-           type == TIGRIS_OP_ROUND ||
-           type == TIGRIS_OP_SIN ||
-           type == TIGRIS_OP_COS ||
-           type == TIGRIS_OP_LAYER_NORM;
-}
-
 static int is_axis1_binary_pointwise_op(uint8_t type)
 {
     return type == TIGRIS_OP_ADD || type == TIGRIS_OP_SUB ||
@@ -501,63 +468,6 @@ static void compact_slow(tigris_mem_t *mem, const tigris_plan_t *plan)
 }
 
 /* Helpers */
-
-/**
- * Return whether every op in a standalone stage implements the selected
- * axis-1 stripe contract used by exec_stage_tiled.
- *
- * This is intentionally an audited allow-list.  An operator being executable
- * as a full tensor does not imply that its kernel consumes the tile geometry
- * correctly.  In particular, global reductions and shape-changing Resize
- * must stay on the normal path until they have dedicated range propagation.
- */
-static int stage_supports_axis1_tiling(
-    const tigris_plan_t *plan, const tigris_stage_t *stage, uint8_t rank)
-{
-    const uint16_t *sops = tigris_stage_ops(plan, stage);
-    int spatial_count = 0;
-
-    if (stage->ops_count == 1u && stage->chain_len == 0u &&
-        tigris_op_independent_band(plan, &plan->ops[sops[0]], sops[0], 0)) return 1;
-    if (rank == 3) {
-        int binary_count = 0;
-        if (stage->chain_len != 0)
-            return 0;
-        for (uint16_t j = 0; j < stage->ops_count; j++) {
-            uint8_t type = plan->ops[sops[j]].op_type;
-            if (type == TIGRIS_OP_CONV1D) {
-                spatial_count++;
-            } else if (is_axis1_binary_pointwise_op(type)) {
-                binary_count++;
-            } else if (!is_axis1_unary_pointwise_op(type)) {
-                return 0;
-            }
-        }
-        return spatial_count <= 1 &&
-               !(spatial_count == 1 && binary_count > 0);
-    }
-    if (rank != 4)
-        return 0;
-
-    for (uint16_t j = 0; j < stage->ops_count; j++) {
-        uint8_t type = plan->ops[sops[j]].op_type;
-        if (!is_height_tiling_op(type))
-            return 0;
-        /* ConvTranspose is counted as a spatial op here even though it is not
-         * in tigris_height_spatial_op: a stage is HW-tileable only when it holds a
-         * SINGLE spatial op. A mixed [Conv, ConvTranspose] stage would
-         * otherwise report spatial_count==1 (only the Conv counts), be routed
-         * to the 1D tiler, and misfind the leading Conv as the spatial op,
-         * sizing tiles from Conv geometry and OOMing on the expanding
-         * ConvTranspose output. Counting it here keeps mixed stages on the
-         * normal path; a pure ConvTranspose (optionally with pointwise) still
-         * has spatial_count==1 and takes the HW route. */
-        if (tigris_height_spatial_op(type) || tigris_height_upsample_op(type) ||
-            type == TIGRIS_OP_CONV_TRANSPOSE)
-            spatial_count++;
-    }
-    return spatial_count <= 1;
-}
 
 /* Rows of a tiled tensor: axis 1 of the stored NHWC/NLC shape. */
 static int32_t tensor_row_count(const tigris_plan_t *plan, uint16_t tidx)
@@ -3872,8 +3782,10 @@ static TIGRIS_NOINLINE tigris_exec_error_t route_stage(
      * their own terms, outside the stripe contract. */
     int own_band = kind == TIGRIS_BAND_KIND_ROWS || kind == TIGRIS_BAND_KIND_TRANSPOSE ||
                    kind == TIGRIS_BAND_KIND_BY_INPUT;
-    int axis1_tileable =
-        own_band || (common_tile_rank && stage_supports_axis1_tiling(plan, stage, rank));
+    /* The 2D contract is the stripe contract with a lone ConvTranspose
+     * admitted, which exec_stage_tiled refuses on its own. */
+    int axis1_tileable = own_band || (common_tile_rank &&
+        tigris_stage_stripe_contract(plan, stage, rank, TIGRIS_TILE_AXIS_HW));
     /* A stage that reads its inputs in place runs whole. */
     int needs_tiling = !io_in_fast &&
         (common_tile_rank || kind == TIGRIS_BAND_KIND_ROWS || kind == TIGRIS_BAND_KIND_TRANSPOSE) &&

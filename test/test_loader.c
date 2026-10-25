@@ -3996,6 +3996,101 @@ static void build_conv_transpose_quant_plan(uint8_t *buf, uint16_t num_channels)
         quant_data[3 + i] = 1; /* shifts */
 }
 
+/* Up to two chained operators t0 -> t1 -> t2 as one stage, held in memory. */
+typedef struct {
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[3];
+    tigris_op_t ops[2];
+    tigris_stage_t stage;
+    uint16_t pool[6];
+    int32_t shapes[15];
+    tigris_plan_t plan;
+} stripe_case_t;
+
+static int stripe_contract_case(uint8_t rank, int alone, uint8_t first, uint8_t second,
+                                uint16_t chain_len, uint8_t axis)
+{
+    static const int32_t rank3[3][3] = {{1, 8, 4}, {1, 8, 4}, {1, 8, 4}};
+    static const int32_t rank4[3][4] = {{1, 8, 8, 4}, {1, 8, 8, 4}, {1, 16, 16, 4}};
+    stripe_case_t c;
+    memset(&c, 0, sizeof(c));
+    c.header.version = TIGRIS_SCHEMA_VERSION;
+    c.header.num_tensors = 3;
+    c.header.num_ops = 2;
+    for (uint16_t t = 0; t < 3u; t++) {
+        c.tensors[t].ndim = rank;
+        c.tensors[t].shape_off = (uint16_t)(t * rank);
+        c.tensors[t].dtype = 1;
+        for (uint8_t d = 0; d < rank; d++)
+            c.shapes[t * rank + d] = rank == 3u ? rank3[t][d] :
+                                     rank == 4u ? rank4[t][d] : 2;
+    }
+    /* pool: op0 in/out, op1 in/out, stage ops */
+    c.pool[0] = 0; c.pool[1] = 1; c.pool[2] = 1; c.pool[3] = 2;
+    c.pool[4] = 0; c.pool[5] = 1;
+    for (uint16_t j = 0; j < 2u; j++) {
+        c.ops[j].op_type = j == 0u ? first : second;
+        c.ops[j].num_inputs = 1;
+        c.ops[j].num_outputs = 1;
+        c.ops[j].inputs_off = (uint16_t)(2u * j);
+        c.ops[j].outputs_off = (uint16_t)(2u * j + 1u);
+        c.ops[j].weight_idx = TIGRIS_NO_WEIGHT;
+        c.ops[j].bias_idx = TIGRIS_NO_WEIGHT;
+    }
+    c.stage.ops_off = alone ? 5u : 4u;
+    c.stage.ops_count = alone ? 1u : 2u;
+    c.stage.tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    c.stage.chain_len = chain_len;
+    c.stage.chain_id = chain_len != 0u ? 0u : TIGRIS_NO_CHAIN;
+    c.plan.header = &c.header;
+    c.plan.tensors = c.tensors;
+    c.plan.ops = c.ops;
+    c.plan.stages = &c.stage;
+    c.plan.index_pool = c.pool;
+    c.plan.shape_pool = c.shapes;
+    return tigris_stage_stripe_contract(&c.plan, &c.stage, rank, axis);
+}
+
+static void test_stage_stripe_contract_axes(void)
+{
+    printf("  test_stage_stripe_contract_axes...\n");
+    const uint8_t height = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    const uint8_t hw = TIGRIS_TILE_AXIS_HW;
+    struct {
+        uint8_t rank;
+        int alone;
+        uint8_t first, second;
+        uint16_t chain_len;
+        int height, hw;
+        const char *what;
+    } cases[] = {
+        {4, 1, 0, TIGRIS_OP_CONV_TRANSPOSE, 0, 0, 1, "ConvTranspose only along HW"},
+        {4, 0, TIGRIS_OP_RELU, TIGRIS_OP_CONV_TRANSPOSE, 0, 0, 1, "pointwise and ConvTranspose only along HW"},
+        {4, 0, TIGRIS_OP_CONV, TIGRIS_OP_CONV_TRANSPOSE, 0, 0, 0, "Conv with ConvTranspose holds two spatial ops"},
+        {4, 0, TIGRIS_OP_CONV, TIGRIS_OP_RELU, 0, 1, 1, "Conv with pointwise"},
+        {4, 0, TIGRIS_OP_CONV, TIGRIS_OP_RELU, 2, 1, 1, "Conv with pointwise in a chain"},
+        {4, 0, TIGRIS_OP_CONV, TIGRIS_OP_MAX_POOL, 0, 0, 0, "two spatial ops"},
+        {4, 0, TIGRIS_OP_CONV, TIGRIS_OP_GLOBAL_AVG, 0, 0, 0, "a global reduction is no height op"},
+        {4, 1, 0, TIGRIS_OP_RESIZE, 0, 1, 1, "Resize alone"},
+        {4, 0, TIGRIS_OP_RELU, TIGRIS_OP_RESIZE, 2, 0, 0, "Resize in a chain"},
+        {3, 0, TIGRIS_OP_CONV1D, TIGRIS_OP_RELU, 0, 1, 1, "Conv1D with unary pointwise"},
+        {3, 0, TIGRIS_OP_CONV1D, TIGRIS_OP_ADD, 0, 0, 0, "Conv1D with binary pointwise"},
+        {3, 0, TIGRIS_OP_ADD, TIGRIS_OP_RELU, 0, 1, 1, "binary pointwise without Conv1D"},
+        {3, 0, TIGRIS_OP_CONV1D, TIGRIS_OP_CONV1D, 0, 0, 0, "two Conv1D"},
+        {3, 0, TIGRIS_OP_CONV1D, TIGRIS_OP_RELU, 2, 0, 0, "rank 3 in a chain"},
+        {3, 0, TIGRIS_OP_CONV, TIGRIS_OP_RELU, 0, 0, 0, "rank-4 spatial op at rank 3"},
+        {5, 0, TIGRIS_OP_RELU, TIGRIS_OP_RELU, 0, 0, 0, "rank 5"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        TEST_ASSERT_EQ(stripe_contract_case(cases[i].rank, cases[i].alone, cases[i].first, cases[i].second,
+                                            cases[i].chain_len, height),
+                       cases[i].height, cases[i].what);
+        TEST_ASSERT_EQ(stripe_contract_case(cases[i].rank, cases[i].alone, cases[i].first, cases[i].second,
+                                            cases[i].chain_len, hw),
+                       cases[i].hw, cases[i].what);
+    }
+}
+
 static void test_conv_transpose_quant_channels_guard(void)
 {
     printf("  test_conv_transpose_quant_channels_guard...\n");
@@ -5317,6 +5412,7 @@ int main(void)
     test_activation_tiling_contract();
     test_convolution_semantic_guards();
     test_conv_transpose_semantic_guards();
+    test_stage_stripe_contract_axes();
     test_conv_transpose_quant_channels_guard();
 
     printf("\nSchema compatibility fixtures:\n");

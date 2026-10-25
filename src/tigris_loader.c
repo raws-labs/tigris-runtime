@@ -1738,6 +1738,13 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
         memcmp(plan->index_pool + main->outputs_off, plan->model_outputs,
                (size_t)main->outputs_count * sizeof(uint16_t)) != 0)
         return TIGRIS_ERR_BAD_SECTION;
+    /* A graph runs its stage range alone, so a chain stays inside one graph. */
+    for (uint16_t s = 0; s < num_stages; s++) {
+        const tigris_stage_t *stage = &plan->stages[s];
+        if (stage->chain_len >= 2u && stage->chain_id == s &&
+            graph_of_stage(plan, s) != graph_of_stage(plan, (uint16_t)(s + stage->chain_len - 1u)))
+            return TIGRIS_ERR_BAD_SECTION;
+    }
     /* Each graph's tensors form one index range, the ranges disjoint, so no
      * tensor is shared between graphs; the main graph's range also holds the
      * model interface and the state. */
@@ -4194,11 +4201,60 @@ int tigris_stage_tile_facts(const tigris_plan_t *plan, const tigris_stage_t *sta
     return 1;
 }
 
+/* Whether a stage's inputs and outputs are rank 4, with operators' operands and results too. */
+static int stage_tensors_rank4(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                               int operators)
+{
+    const uint16_t *inputs = tigris_stage_inputs(plan, stage);
+    const uint16_t *outputs = tigris_stage_outputs(plan, stage);
+    for (uint16_t i = 0; i < stage->inputs_count; i++)
+        if (plan->tensors[inputs[i]].ndim != 4u) return 0;
+    for (uint16_t i = 0; i < stage->outputs_count; i++)
+        if (plan->tensors[outputs[i]].ndim != 4u) return 0;
+    const uint16_t *ops = tigris_stage_ops(plan, stage);
+    for (uint16_t j = 0; operators && j < stage->ops_count; j++) {
+        const tigris_op_t *op = &plan->ops[ops[j]];
+        const uint16_t *op_inputs = tigris_op_inputs(plan, op);
+        const uint16_t *op_outputs = tigris_op_outputs(plan, op);
+        for (uint8_t k = 0; k < op->num_inputs; k++)
+            if (plan->tensors[op_inputs[k]].ndim != 4u) return 0;
+        for (uint8_t k = 0; k < op->num_outputs; k++)
+            if (plan->tensors[op_outputs[k]].ndim != 4u) return 0;
+    }
+    return 1;
+}
+
+/* Whether every binary pointwise operator of a stage takes operands of one shape. */
+static int stage_binary_operands_equal(const tigris_plan_t *plan, const tigris_stage_t *stage)
+{
+    const uint16_t *ops = tigris_stage_ops(plan, stage);
+    for (uint16_t j = 0; j < stage->ops_count; j++) {
+        const tigris_op_t *op = &plan->ops[ops[j]];
+        if (!is_axis1_binary_pointwise_op(op->op_type) || op->num_inputs < 2u) continue;
+        const uint16_t *inputs = tigris_op_inputs(plan, op);
+        for (uint8_t k = 1; k < op->num_inputs; k++)
+            if (!tensor_shapes_equal(plan, &plan->tensors[inputs[0]], &plan->tensors[inputs[k]]))
+                return 0;
+    }
+    return 1;
+}
+
 static tigris_error_t validate_stage_tile_band(
     tigris_load_state_t *ctx, const tigris_stage_t *stage,
     const tigris_tile_plan_t *tile, uint8_t axis, int reshape,
     int32_t leading_rows)
 {
+    if (!reshape && !leading_rows && tile->tileable && axis == TIGRIS_TILE_AXIS_HW) {
+        /* The 2D executor bands rank-4 stage tensors, in the stripe contract along HW. */
+        if (stage->inputs_count == 0 || stage->outputs_count == 0 ||
+            !stage_tensors_rank4(&ctx->candidate, stage, 0))
+            return TIGRIS_ERR_BAD_SECTION;
+        if (tigris_stage_band_kind(&ctx->candidate, stage, NULL) != TIGRIS_BAND_KIND_HW ||
+            !tigris_stage_stripe_contract(&ctx->candidate, stage, 4u, TIGRIS_TILE_AXIS_HW) ||
+            !stage_binary_operands_equal(&ctx->candidate, stage))
+            return TIGRIS_ERR_BAD_OPERATOR;
+        return TIGRIS_OK;
+    }
     if (!reshape && !leading_rows && tile->tileable &&
         axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) {
         if (stage->inputs_count == 0 || stage->outputs_count == 0)
@@ -4252,22 +4308,9 @@ static tigris_error_t validate_stage_tile_band(
          * stripe loads it whole for every band. The 2D, chain, row
          * band and rank-3 executors have no such rule, so there a
          * binary op may only take full-shape operands. */
-        for (uint16_t j = 0; j < stage->ops_count; j++) {
-            const tigris_op_t *bop = &ctx->candidate.ops[
-                ctx->candidate.index_pool[stage->ops_off + j]];
-            if (is_axis1_binary_pointwise_op(bop->op_type) &&
-                bop->num_inputs >= 2) {
-                const uint16_t *bin = tigris_op_inputs(&ctx->candidate, bop);
-                for (uint8_t operand = 1; operand < bop->num_inputs; operand++) {
-                    if (!tensor_shapes_equal(&ctx->candidate,
-                                             &ctx->candidate.tensors[bin[0]],
-                                             &ctx->candidate.tensors[bin[operand]]) &&
-                        (stage->chain_len != 0 || tile->tile_width != 0 ||
-                         rank != 4 || row_banded))
-                        return TIGRIS_ERR_BAD_OPERATOR;
-                }
-            }
-        }
+        if ((stage->chain_len != 0 || tile->tile_width != 0 || rank != 4 || row_banded) &&
+            !stage_binary_operands_equal(&ctx->candidate, stage))
+            return TIGRIS_ERR_BAD_OPERATOR;
 
         if (row_banded) {
             /* Already validated on its own terms above. */
@@ -4491,6 +4534,9 @@ static tigris_error_t validate_stage(tigris_load_state_t *ctx, uint16_t i)
                 return TIGRIS_ERR_BAD_OPERATOR;
             }
         }
+        /* The chain executor sizes every band it holds as [N, rows, W, C]. */
+        if (!stage_tensors_rank4(&ctx->candidate, stage, 1))
+            return TIGRIS_ERR_BAD_SECTION;
     }
     return TIGRIS_OK;
 }

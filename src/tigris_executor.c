@@ -2967,7 +2967,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                 uint16_t tidx = tigris_stage_inputs(plan, stages[0])[ii];
                 const tigris_tensor_t *t = &plan->tensors[tidx];
                 const int32_t *sh = tigris_tensor_shape(plan, t);
-                if (t->ndim == 4 && sh[0] && sh[1] && sh[2] && sh[3]) {
+                if (sh[0] && sh[1] && sh[2] && sh[3]) {
                     uint32_t numel = (uint32_t)sh[0] * (uint32_t)sh[1] * (uint32_t)sh[2] * (uint32_t)sh[3];
                     uint32_t elem = t->size_bytes / numel;
                     total += TILE_ALIGN_UP((uint32_t)sh[0] * (uint32_t)s_in[0] *
@@ -3002,7 +3002,6 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                     const uint16_t *outs = tigris_op_outputs(plan, op);
                     for (uint8_t k = 0; k < op->num_outputs; k++) {
                         const tigris_tensor_t *t = &plan->tensors[outs[k]];
-                        if (t->ndim != 4) continue;
                         const int32_t *shp = tigris_tensor_shape(plan, t);
                         if (!shp[0] || !shp[1] || !shp[2] || !shp[3]) continue;
                         uint32_t elem = t->size_bytes /
@@ -3108,9 +3107,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
      *     ONCE at its maximum (interior) tile height, so the buffers keep fixed
      *     addresses and surviving content across tiles. The first-input load
      *     and last-output spill continue to cycle above these persistent
-     *     buffers. Rank-4 sizes mirror the budget-validation forward pass, so
-     *     the reserved footprint equals the already-validated tile working set;
-     *     an output of another rank is reserved whole, which that pass skips. */
+     *     buffers. Sizes mirror the budget-validation forward pass, so the
+     *     reserved footprint equals the already-validated tile working set. */
     if (line_buffered) {
         /* Interior (unclamped) back-propagated heights for chain_tile_h.
          * roll_last_fast is sized TIGRIS_MAX_STAGE_OUTPUTS and indexed by
@@ -3146,17 +3144,12 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                 for (uint8_t k = 0; k < op->num_outputs; k++) {
                     uint16_t tidx = outs[k];
                     const tigris_tensor_t *t = &plan->tensors[tidx];
-                    uint32_t bytes;
-                    if (t->ndim == 4) {
-                        const int32_t *sh = tigris_tensor_shape(plan, t);
-                        uint32_t numel = (uint32_t)sh[0] * (uint32_t)sh[1] *
-                                         (uint32_t)sh[2] * (uint32_t)sh[3];
-                        uint32_t elem = t->size_bytes / numel;
-                        bytes = (uint32_t)sh[0] * (uint32_t)cur_h *
-                                (uint32_t)sh[2] * (uint32_t)sh[3] * elem;
-                    } else {
-                        bytes = t->size_bytes;
-                    }
+                    const int32_t *sh = tigris_tensor_shape(plan, t);
+                    uint32_t numel = (uint32_t)sh[0] * (uint32_t)sh[1] *
+                                     (uint32_t)sh[2] * (uint32_t)sh[3];
+                    uint32_t elem = t->size_bytes / numel;
+                    uint32_t bytes = (uint32_t)sh[0] * (uint32_t)cur_h *
+                                     (uint32_t)sh[2] * (uint32_t)sh[3] * elem;
                     tigris_mem_error_t merr =
                         tigris_mem_alloc_fast(mem, tidx, bytes);
                     if (merr != TIGRIS_MEM_OK) {
@@ -3415,33 +3408,19 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                 for (uint8_t k = 0; !line_buffered && k < op->num_outputs; k++) {
                     uint16_t tidx = outs[k];
                     const tigris_tensor_t *t = &cplan->tensors[tidx];
-                    if (t->ndim == 4) {
-                        const int32_t *sh = tigris_tensor_shape(cplan, t);
-                        uint32_t numel = (uint32_t)sh[0] * (uint32_t)sh[1] * (uint32_t)sh[2] * (uint32_t)sh[3];
-                        uint32_t elem_size = t->size_bytes / numel;
-                        uint32_t tile_bytes = (uint32_t)sh[0] *
-                            (uint32_t)alloc_h *
-                            (uint32_t)sh[2] * (uint32_t)sh[3] * elem_size;
-                        tigris_mem_error_t merr = tigris_mem_alloc_fast(
-                            mem, tidx, tile_bytes);
-                        if (merr != TIGRIS_MEM_OK) {
-                            TIGRIS_PLATFORM_DBG("MEM@%d f=%lu/%lu s=%lu/%lu\n", __LINE__,
-                    (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
-                    (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
-                            return TIGRIS_EXEC_ERR_MEM;
-                        }
-                    } else {
-                        /* Non-4D tensor: alloc full size */
-                        if (!mem->tensor_ptrs[tidx]) {
-                            tigris_mem_error_t merr = tigris_mem_alloc_fast(
-                                mem, tidx, t->size_bytes);
-                            if (merr != TIGRIS_MEM_OK) {
-                                TIGRIS_PLATFORM_DBG("MEM@%d f=%lu/%lu s=%lu/%lu\n", __LINE__,
-                    (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
-                    (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
-                                return TIGRIS_EXEC_ERR_MEM;
-                            }
-                        }
+                    const int32_t *sh = tigris_tensor_shape(cplan, t);
+                    uint32_t numel = (uint32_t)sh[0] * (uint32_t)sh[1] * (uint32_t)sh[2] * (uint32_t)sh[3];
+                    uint32_t elem_size = t->size_bytes / numel;
+                    uint32_t tile_bytes = (uint32_t)sh[0] *
+                        (uint32_t)alloc_h *
+                        (uint32_t)sh[2] * (uint32_t)sh[3] * elem_size;
+                    tigris_mem_error_t merr = tigris_mem_alloc_fast(
+                        mem, tidx, tile_bytes);
+                    if (merr != TIGRIS_MEM_OK) {
+                        TIGRIS_PLATFORM_DBG("MEM@%d f=%lu/%lu s=%lu/%lu\n", __LINE__,
+                (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
+                (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
+                        return TIGRIS_EXEC_ERR_MEM;
                     }
                 }
 
@@ -3459,8 +3438,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                 int32_t op_full_out_h = mem->tile.out_h;
 
                 /* Default: full compute (offsets 0, byte-identical to the
-                 * recompute path). Roll only a rank-4, batch-1, single-output
-                 * op whose reconstructed height matches the tile context, so a
+                 * recompute path). Roll only a batch-1, single-output op
+                 * whose reconstructed height matches the tile context, so a
                  * mismatch (e.g. a pointwise op ahead of the spatial op) safely
                  * falls back to full compute. */
                 mem->tile.out_row_start = 0;
@@ -3472,7 +3451,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
                     int32_t existing_out_h = op_full_out_h;
                     int32_t this_h = op_ge - op_gs;
                     const int32_t *osh = tigris_tensor_shape(cplan, ot);
-                    if (ot->ndim == 4 && osh[0] == 1 && this_h == existing_out_h) {
+                    if (osh[0] == 1 && this_h == existing_out_h) {
                         int32_t prev_gs = workspace->out_gs[otid];
                         int32_t prev_ge = workspace->out_ge[otid];
                         int32_t prev_h  = prev_ge - prev_gs;
@@ -4046,7 +4025,9 @@ tigris_exec_error_t tigris_run_with_state(
             /* Skip remaining chain stages (they were executed above) */
             s += stage->chain_len - 1;
         } else if (stage->chain_len >= 2) {
-            /* Non-head chain stage - should have been skipped; just in case */
+            /* A chain member runs from its head; the loader keeps chains inside one graph. */
+            result = TIGRIS_EXEC_ERR_TILE;
+            goto restore_fast_arena;
         } else {
             /* The arm an ESP32-S3 error print names; a Reshape or leading band prints none. */
             static const char *const names[TIGRIS_BAND_KIND_STRIPE + 1] = {

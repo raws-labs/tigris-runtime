@@ -400,8 +400,9 @@ static TIGRIS_NOINLINE int traced_kernel(tigris_kernel_fn kernel,
 /* Memory compaction */
 
 /**
- * Compact the fast pool: move alive tensors to the front, reclaim
- * space from dead ones.  Similar to compact_slow but for fast arena.
+ * Compact the fast or the slow pool: move alive tensors, in address order,
+ * to offset `first` and up, reclaim space from dead ones, and return the new
+ * used offset.
  */
 static uint32_t compact_pool(
     tigris_mem_t *mem, const tigris_plan_t *plan,
@@ -457,14 +458,18 @@ static void compact_fast(tigris_mem_t *mem, const tigris_plan_t *plan)
 }
 
 /**
- * Compact the slow pool: move alive tensors to the front, reclaim
- * space from dead ones.  Tensors must be processed in address order
- * so memmove never reads from already-overwritten memory.
+ * Compact the slow pool from its first aligned offset, where tigris_mem_init
+ * starts it, so slow tensors keep TIGRIS_TENSOR_ALIGN for an unaligned
+ * buffer.  Tensors must be processed in address order so memmove never
+ * reads from already-overwritten memory.
  */
 static void compact_slow(tigris_mem_t *mem, const tigris_plan_t *plan)
 {
+    const uint32_t mask = TIGRIS_TENSOR_ALIGN - 1u;
+    const uint32_t first =
+        (uint32_t)((TIGRIS_TENSOR_ALIGN - ((uintptr_t)mem->slow_base & mask)) & mask);
     if (mem->stats) mem->stats->compactions++;
-    mem->slow_used = compact_pool(mem, plan, mem->slow_base, 0, mem->slow_size);
+    mem->slow_used = compact_pool(mem, plan, mem->slow_base, first, mem->slow_size);
 }
 
 /* Helpers */

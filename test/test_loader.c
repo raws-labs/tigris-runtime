@@ -592,6 +592,197 @@ static uint32_t align4(uint32_t value)
     return (value + 3u) & ~3u;
 }
 
+/* Stages of one Relu each, stage i on its own tensor i of the given rank. With
+ * graph_count > 0 the plan has a subgraph section whose graph g starts at
+ * stage graph_first[g]; no operator runs the subgraphs, as the loader needs
+ * none to check their stage ranges. */
+static uint8_t *build_chain_plan(uint16_t stage_count, uint8_t ndim, const uint16_t *graph_first,
+                                 uint16_t graph_count, uint32_t *out_size)
+{
+    const uint32_t tensors_off = 128u;
+    const uint32_t ops_off = tensors_off + (uint32_t)stage_count * sizeof(tigris_tensor_t);
+    const uint32_t stages_off = align4(ops_off + (uint32_t)stage_count * sizeof(tigris_op_t));
+    const uint32_t index_off = stages_off + (uint32_t)stage_count * sizeof(tigris_stage_t);
+    const uint32_t shapes_off = align4(index_off + 5u * stage_count * (uint32_t)sizeof(uint16_t));
+    const uint32_t strings_off = shapes_off + 4u * stage_count * (uint32_t)sizeof(int32_t);
+    const uint32_t graphs_off = align4(strings_off + 1u);
+    const uint32_t plan_size = graphs_off +
+        (graph_count ? 4u + (uint32_t)graph_count * sizeof(tigris_subgraph_t) : 0u) +
+        (uint32_t)sizeof(tigris_memory_t);
+    uint8_t *buf = calloc(1, plan_size);
+    if (!buf)
+        return NULL;
+
+    plan_builder_t builder = plan_builder_begin(buf, plan_size, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
+    hdr->num_tensors = stage_count;
+    hdr->num_ops = stage_count;
+    hdr->num_stages = stage_count;
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, tensors_off);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, ops_off);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, stages_off);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, index_off);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, shapes_off);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, strings_off);
+    if (graph_count)
+        plan_builder_section(&builder, 6u, TIGRIS_SEC_SUBGRAPHS, graphs_off);
+    plan_finish(buf);
+
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + tensors_off);
+    tigris_op_t *ops = (tigris_op_t *)(buf + ops_off);
+    tigris_stage_t *stages = (tigris_stage_t *)(buf + stages_off);
+    uint16_t *indices = (uint16_t *)(buf + index_off);
+    int32_t *shapes = (int32_t *)(buf + shapes_off);
+    for (uint16_t i = 0; i < stage_count; i++) {
+        for (uint8_t d = 0; d < 4u; d++)
+            shapes[4u * i + d] = d == 0u ? 1 : 2;
+        tensors[i].size_bytes = (ndim == 4u ? 8u : 4u) * (uint32_t)sizeof(float);
+        tensors[i].shape_off = (uint16_t)(4u * i);
+        tensors[i].ndim = ndim;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        ops[i].op_type = TIGRIS_OP_RELU;
+        ops[i].num_inputs = 1;
+        ops[i].num_outputs = 1;
+        ops[i].stage = (uint8_t)i;
+        ops[i].inputs_off = (uint16_t)(5u * i);
+        ops[i].outputs_off = (uint16_t)(5u * i + 1u);
+        ops[i].weight_idx = TIGRIS_NO_WEIGHT;
+        ops[i].bias_idx = TIGRIS_NO_WEIGHT;
+        stages[i].ops_off = (uint16_t)(5u * i + 2u);
+        stages[i].ops_count = 1;
+        stages[i].inputs_off = (uint16_t)(5u * i + 3u);
+        stages[i].inputs_count = 1;
+        stages[i].outputs_off = (uint16_t)(5u * i + 4u);
+        stages[i].outputs_count = 1;
+        stages[i].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+        stages[i].chain_id = TIGRIS_NO_CHAIN;
+        indices[5u * i] = i;
+        indices[5u * i + 1u] = i;
+        indices[5u * i + 2u] = i;
+        indices[5u * i + 3u] = i;
+        indices[5u * i + 4u] = i;
+    }
+    if (graph_count) {
+        const uint16_t count = graph_count;
+        memcpy(buf + graphs_off, &count, sizeof(count));
+        tigris_subgraph_t *graphs = (tigris_subgraph_t *)(buf + graphs_off + 4u);
+        for (uint16_t g = 0; g < graph_count; g++) {
+            uint16_t end = g + 1u < graph_count ? graph_first[g + 1u] : stage_count;
+            graphs[g].first_stage = graph_first[g];
+            graphs[g].num_stages = (uint16_t)(end - graph_first[g]);
+        }
+    }
+    *out_size = plan_size;
+    return buf;
+}
+
+/* Marks stages head .. head + len - 1 of a build_chain_plan plan as one chain. */
+static void chain_plan_link(uint8_t *buf, uint16_t head, uint16_t len)
+{
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    tigris_stage_t *stages = (tigris_stage_t *)(buf + dir[2].offset);
+    for (uint16_t s = head; s < head + len; s++) {
+        stages[s].chain_id = head;
+        stages[s].chain_len = len;
+    }
+    stages[head].chain_tile_h = 1;
+}
+
+static void test_chain_shape_guards(void)
+{
+    printf("  test_chain_shape_guards...\n");
+    tigris_plan_t plan;
+    uint32_t size = 0;
+    uint8_t *buf = build_chain_plan(2, 4u, NULL, 0, &size);
+    TEST_ASSERT(buf != NULL, "chain plan allocation");
+    if (!buf)
+        return;
+    chain_plan_link(buf, 0, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_OK, "rank-4 chain loads");
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + dir[0].offset);
+    tensors[1].ndim = 3;
+    tensors[1].size_bytes = 4u * (uint32_t)sizeof(float);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_ERR_BAD_SECTION,
+                   "a chain member's rank-3 tensor is refused");
+    free(buf);
+
+    buf = build_chain_plan(2, 3u, NULL, 0, &size);
+    TEST_ASSERT(buf != NULL, "rank-3 plan allocation");
+    if (!buf)
+        return;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_OK, "rank-3 stages load unchained");
+    chain_plan_link(buf, 0, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_ERR_BAD_SECTION,
+                   "a rank-3 chain is refused");
+    free(buf);
+}
+
+static void test_chain_graph_guards(void)
+{
+    printf("  test_chain_graph_guards...\n");
+    tigris_plan_t plan;
+    uint32_t size = 0;
+    static const uint16_t two[2] = {0, 2};
+    uint8_t *buf = build_chain_plan(3, 4u, two, 2, &size);
+    TEST_ASSERT(buf != NULL, "graph plan allocation");
+    if (!buf)
+        return;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_OK, "a plan of two graphs loads");
+    chain_plan_link(buf, 0, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_OK, "a chain inside the main graph loads");
+    free(buf);
+
+    buf = build_chain_plan(3, 4u, two, 2, &size);
+    TEST_ASSERT(buf != NULL, "graph plan allocation");
+    if (!buf)
+        return;
+    chain_plan_link(buf, 1, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_ERR_BAD_SECTION,
+                   "a chain from the main graph into a subgraph is refused");
+    free(buf);
+
+    static const uint16_t three[3] = {0, 1, 2};
+    buf = build_chain_plan(3, 4u, three, 3, &size);
+    TEST_ASSERT(buf != NULL, "graph plan allocation");
+    if (!buf)
+        return;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_OK, "a plan of three graphs loads");
+    chain_plan_link(buf, 1, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_ERR_BAD_SECTION,
+                   "a chain past the end of a subgraph is refused");
+    free(buf);
+}
+
+/* The executor runs a chain from its head, so a hand-built plan that reaches a member first is refused. */
+static void test_chain_member_runs_from_its_head(void)
+{
+    printf("  test_chain_member_runs_from_its_head...\n");
+    tigris_plan_t plan;
+    uint32_t size = 0;
+    uint8_t *buf = build_chain_plan(2, 4u, NULL, 0, &size);
+    TEST_ASSERT(buf != NULL, "chain plan allocation");
+    if (!buf)
+        return;
+    chain_plan_link(buf, 0, 2);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_OK, "chain plan loads");
+    /* The loaded plan reads its stage table in place. */
+    tigris_file_header_t *hdr = (tigris_file_header_t *)buf;
+    tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + hdr->section_dir_off);
+    ((tigris_stage_t *)(buf + dir[2].offset))[0].chain_id = 1;
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[256], slow[256];
+    void *pointers[2] = {NULL, NULL};
+    tigris_mem_t mem;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, pointers, 2, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "chain arenas");
+    TEST_ASSERT_EQ(tigris_run(&plan, &mem, tigris_dispatch_kernel, NULL, NULL), TIGRIS_EXEC_ERR_TILE,
+                   "a chain member reached before its head is refused");
+    free(buf);
+}
+
 static uint8_t *build_many_stage_plan(uint16_t stage_count, uint32_t *out_size)
 {
     const uint32_t tensors_off = 112u;
@@ -2017,6 +2208,154 @@ static void test_tile_facts_contract(void)
     facts->num_tiles = 3u;
     facts->halo = 2u;
     TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "a leading band has no halo");
+}
+
+/* The tiled plan from [1, 2, 4, 8] to [1, out_h, out_w, 8] with a 2D record of one row by one column. */
+static void build_hw_record_plan(uint8_t *buf, uint8_t op_type, int32_t out_h, int32_t out_w)
+{
+    build_tiled_stage_plan(buf, op_type, 4u);
+    int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[4] = 1; shapes[5] = out_h; shapes[6] = out_w; shapes[7] = 8;
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    tensors[1].size_bytes = (uint32_t)(out_h * out_w * 8) * (uint32_t)sizeof(float);
+    tigris_tile_plan_v11_t *tile = tiled_record(buf);
+    tile->choices.axis = TIGRIS_TILE_AXIS_HW;
+    tile->choices.output_band_extent = 1u;
+    tile->choices.output_width_extent = 1u;
+    tiled_state_facts(buf, 1u, (uint32_t)(out_h * out_w), (uint32_t)out_h, 0u, 1u);
+}
+
+/* A stage over t0 [1, 4, 4, 8] and t1 of `shape` under a 2D record of one row
+ * by one column: one Add of both to t2, or with `pair` a Relu of each, t1's
+ * to its own output t3 of t1's shape. */
+#define HW_TWO_PLAN_SIZE 512u
+static void build_hw_two_input_plan(uint8_t *buf, const int32_t *shape, uint8_t rank, int pair)
+{
+    const uint16_t tensors_count = pair ? 4u : 3u;
+    const uint32_t tensors_off = 136u;
+    const uint32_t ops_off = tensors_off + tensors_count * (uint32_t)sizeof(tigris_tensor_t);
+    const uint32_t stages_off = ops_off + 2u * (uint32_t)sizeof(tigris_op_t);
+    const uint32_t tiles_off = stages_off + (uint32_t)sizeof(tigris_stage_t);
+    const uint32_t index_off = align4(tiles_off + (uint32_t)sizeof(tigris_tile_plan_v11_t));
+    const uint32_t shapes_off = index_off + 32u;
+    const uint32_t strings_off = shapes_off + 64u;
+    memset(buf, 0, HW_TWO_PLAN_SIZE);
+    plan_builder_t builder = plan_builder_begin(buf, HW_TWO_PLAN_SIZE, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
+    hdr->num_tensors = tensors_count;
+    hdr->num_ops = pair ? 2u : 1u;
+    hdr->num_stages = 1;
+    hdr->num_tile_plans = 1;
+    hdr->model_io_off = pair ? 4u : 3u;
+    hdr->num_model_inputs = 2;
+    hdr->num_model_outputs = pair ? 2u : 1u;
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, tensors_off);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, ops_off);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, stages_off);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_TILE_PLANS, tiles_off);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_INDEX_POOL, index_off);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_SHAPE_POOL, shapes_off);
+    plan_builder_section(&builder, 6u, TIGRIS_SEC_STRINGS, strings_off);
+    plan_finish(buf);
+
+    static const int32_t full[4] = {1, 4, 4, 8};
+    int32_t *shapes = (int32_t *)(buf + shapes_off);
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + tensors_off);
+    for (uint16_t i = 0; i < tensors_count; i++) {
+        int second = i == 1u || i == 3u;
+        uint8_t ndim = second ? rank : 4u;
+        uint32_t elements = 1u;
+        for (uint8_t d = 0; d < ndim; d++) {
+            shapes[4u * i + d] = second ? shape[d] : full[d];
+            elements *= (uint32_t)shapes[4u * i + d];
+        }
+        tensors[i].size_bytes = elements * (uint32_t)sizeof(float);
+        tensors[i].shape_off = (uint16_t)(4u * i);
+        tensors[i].ndim = ndim;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        tensors[i].flags = i < 2u ? TIGRIS_TENSOR_MODEL_INPUT : TIGRIS_TENSOR_MODEL_OUTPUT;
+    }
+
+    static const uint16_t add_pool[] = {0, 1, 2, 0, 1, 2, 0, 0, 1, 2};
+    static const uint16_t pair_pool[] = {0, 2, 1, 3, 0, 1, 2, 3, 0, 1, 0, 1, 2, 3};
+    memcpy(buf + index_off, pair ? pair_pool : add_pool, pair ? sizeof(pair_pool) : sizeof(add_pool));
+    tigris_op_t *ops = (tigris_op_t *)(buf + ops_off);
+    for (uint16_t j = 0; j < hdr->num_ops; j++) {
+        ops[j].op_type = pair ? TIGRIS_OP_RELU : TIGRIS_OP_ADD;
+        ops[j].num_inputs = pair ? 1u : 2u;
+        ops[j].num_outputs = 1;
+        ops[j].inputs_off = (uint16_t)(2u * j);
+        ops[j].outputs_off = pair ? (uint16_t)(2u * j + 1u) : 2u;
+        ops[j].weight_idx = TIGRIS_NO_WEIGHT;
+        ops[j].bias_idx = TIGRIS_NO_WEIGHT;
+    }
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + stages_off);
+    stage->ops_off = pair ? 8u : 6u;
+    stage->ops_count = hdr->num_ops;
+    stage->inputs_off = pair ? 10u : 7u;
+    stage->inputs_count = 2;
+    stage->outputs_off = pair ? 12u : 9u;
+    stage->outputs_count = pair ? 2u : 1u;
+    stage->tile_plan_idx = 0;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    tigris_tile_plan_v11_t *tile = (tigris_tile_plan_v11_t *)(buf + tiles_off);
+    tile->choices.tileable = 1;
+    tile->choices.axis = TIGRIS_TILE_AXIS_HW;
+    tile->choices.tiled_peak_bytes = 128u;
+    tile->choices.output_band_extent = 1u;
+    tile->choices.output_width_extent = 1u;
+    tile->facts = (tigris_tile_facts_t){.tile_extent = 1u, .num_tiles = 16u, .original_extent = 4u,
+                                        .halo = 0u, .band_axis = 1u};
+}
+
+/* A 2D record sends its stage to the 2D executor, which bands rank-4 stage
+ * tensors under the stripe contract along HW; a stage it cannot band that way
+ * is refused at load rather than on its first run. */
+static void test_hw_record_contract(void)
+{
+    printf("  test_hw_record_contract...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    build_hw_record_plan(buf, TIGRIS_OP_RELU, 2, 4);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "a pointwise 2D record loads");
+
+    build_hw_record_plan(buf, TIGRIS_OP_GLOBAL_MAX, 1, 1);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "a 2D record on an operator without a height contract is refused");
+
+    /* A global average bands by its input; a schema 10 record states no facts to disagree with. */
+    build_hw_record_plan(buf, TIGRIS_OP_GLOBAL_AVG, 1, 1);
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V10);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "a 2D record on a stage of another band kind is refused");
+
+    /* A schema 9 record carries no ranks of its own. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_RELU, 3u);
+    int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[5] = 4; shapes[6] = 8;
+    tiled_plan_to_v9(buf);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "a rank-3 height record loads");
+    ((tigris_tile_plan_t *)(buf + TILED_TILE_PLANS_OFF))->axis = TIGRIS_TILE_AXIS_HW;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                   "a 2D record on a rank-3 stage is refused");
+
+    /* A 2D band cuts every operand to its rectangle, so a binary op takes full-shape operands only. */
+    _Alignas(4) uint8_t two[HW_TWO_PLAN_SIZE];
+    static const int32_t full[4] = {1, 4, 4, 8}, channel[4] = {1, 1, 1, 8}, rows[2] = {4, 8};
+    build_hw_two_input_plan(two, full, 4u, 0);
+    TEST_ASSERT_EQ(tigris_plan_load(two, sizeof(two), &plan), TIGRIS_OK, "a full-shape Add on a 2D record loads");
+    build_hw_two_input_plan(two, channel, 4u, 0);
+    TEST_ASSERT_EQ(tigris_plan_load(two, sizeof(two), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "a per-channel Add on a 2D record is refused");
+    build_hw_two_input_plan(two, full, 4u, 1);
+    TEST_ASSERT_EQ(tigris_plan_load(two, sizeof(two), &plan), TIGRIS_OK,
+                   "a 2D record on a stage of two rank-4 inputs loads");
+    build_hw_two_input_plan(two, rows, 2u, 1);
+    TEST_ASSERT_EQ(tigris_plan_load(two, sizeof(two), &plan), TIGRIS_ERR_BAD_SECTION,
+                   "a 2D record on a stage with a rank-2 input is refused");
 }
 
 /* The executor's order, read off the band predicates one at a time. */
@@ -5375,6 +5714,9 @@ int main(void)
     test_v2_quant_plan_is_still_accepted();
     test_counted_sections_required();
     test_chain_limit_guards();
+    test_chain_shape_guards();
+    test_chain_graph_guards();
+    test_chain_member_runs_from_its_head();
     test_stage_schedule_guards();
     test_schema_v5_many_stage_schedule();
     test_compressed_block_guards();
@@ -5393,6 +5735,7 @@ int main(void)
     test_rank4_row_band_contract();
     test_reshape_band_contract();
     test_tile_facts_contract();
+    test_hw_record_contract();
     test_band_kind_order();
     test_float_section();
     test_operator_semantic_guards();

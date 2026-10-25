@@ -2828,15 +2828,63 @@ static int compaction_kernel(
     return 0;
 }
 
-static void test_exec_compaction_preserves_data(void)
-{
-    printf("  test_exec_compaction_preserves_data...\n");
+/* Op 0 writes t0 -> t1 and op 1 writes t1 -> t2 in one stage; t0 is the model input,
+ * t2 the model output. */
+typedef struct {
     tigris_file_header_t header;
     tigris_tensor_t tensors[3];
     tigris_op_t ops[2];
     tigris_stage_t stage;
-    const uint16_t indices[] = {0, 1, 1, 2, 0, 1, 0, 2};
     tigris_plan_t plan;
+} compaction_plan_t;
+
+static void build_compaction_plan(compaction_plan_t *p)
+{
+    static const uint16_t indices[] = {0, 1, 1, 2, 0, 1, 0, 2};
+
+    memset(p, 0, sizeof(*p));
+    p->header.num_tensors = 3;
+    p->header.num_ops = 2;
+    p->header.num_stages = 1;
+    p->header.num_model_inputs = 1;
+    p->header.num_model_outputs = 1;
+    p->tensors[0].size_bytes = 32;
+    p->tensors[1].size_bytes = 32;
+    p->tensors[2].size_bytes = 48;
+    for (size_t i = 0; i < 3; i++)
+        p->tensors[i].ndim = 1;
+
+    p->ops[0].num_inputs = 1;
+    p->ops[0].num_outputs = 1;
+    p->ops[0].inputs_off = 0;
+    p->ops[0].outputs_off = 1;
+    p->ops[1].num_inputs = 1;
+    p->ops[1].num_outputs = 1;
+    p->ops[1].inputs_off = 2;
+    p->ops[1].outputs_off = 3;
+
+    p->stage.ops_off = 4;
+    p->stage.ops_count = 2;
+    p->stage.inputs_off = 6;
+    p->stage.inputs_count = 1;
+    p->stage.outputs_off = 7;
+    p->stage.outputs_count = 1;
+    p->stage.tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    p->stage.chain_id = TIGRIS_NO_CHAIN;
+
+    p->plan.header = &p->header;
+    p->plan.tensors = p->tensors;
+    p->plan.ops = p->ops;
+    p->plan.stages = &p->stage;
+    p->plan.index_pool = indices;
+    p->plan.model_inputs = &indices[6];
+    p->plan.model_outputs = &indices[7];
+}
+
+static void test_exec_compaction_preserves_data(void)
+{
+    printf("  test_exec_compaction_preserves_data...\n");
+    compaction_plan_t cp;
     void *ptrs[3];
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[96];
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[128];
@@ -2846,50 +2894,9 @@ static void test_exec_compaction_preserves_data(void)
     tigris_exec_stats_t stats;
     compaction_ctx_t ctx = {0};
 
-    memset(&header, 0, sizeof(header));
-    memset(tensors, 0, sizeof(tensors));
-    memset(ops, 0, sizeof(ops));
-    memset(&stage, 0, sizeof(stage));
-    memset(&plan, 0, sizeof(plan));
+    build_compaction_plan(&cp);
 
-    header.num_tensors = 3;
-    header.num_ops = 2;
-    header.num_stages = 1;
-    header.num_model_inputs = 1;
-    header.num_model_outputs = 1;
-    tensors[0].size_bytes = 32;
-    tensors[1].size_bytes = 32;
-    tensors[2].size_bytes = 48;
-    for (size_t i = 0; i < 3; i++)
-        tensors[i].ndim = 1;
-
-    ops[0].num_inputs = 1;
-    ops[0].num_outputs = 1;
-    ops[0].inputs_off = 0;
-    ops[0].outputs_off = 1;
-    ops[1].num_inputs = 1;
-    ops[1].num_outputs = 1;
-    ops[1].inputs_off = 2;
-    ops[1].outputs_off = 3;
-
-    stage.ops_off = 4;
-    stage.ops_count = 2;
-    stage.inputs_off = 6;
-    stage.inputs_count = 1;
-    stage.outputs_off = 7;
-    stage.outputs_count = 1;
-    stage.tile_plan_idx = TIGRIS_NO_TILE_PLAN;
-    stage.chain_id = TIGRIS_NO_CHAIN;
-
-    plan.header = &header;
-    plan.tensors = tensors;
-    plan.ops = ops;
-    plan.stages = &stage;
-    plan.index_pool = indices;
-    plan.model_inputs = &indices[6];
-    plan.model_outputs = &indices[7];
-
-    size_t workspace_required = tigris_executor_workspace_required(&plan);
+    size_t workspace_required = tigris_executor_workspace_required(&cp.plan);
     TEST_ASSERT_EQ(workspace_required, sizeof(workspace),
                    "simple plan gets exact compile-time workspace size");
     TEST_ASSERT(workspace_required < tigris_executor_workspace_size(),
@@ -2898,17 +2905,17 @@ static void test_exec_compaction_preserves_data(void)
     TEST_ASSERT_EQ(tigris_mem_init(
                        &mem, ptrs, 3, fast, sizeof(fast), slow, sizeof(slow)),
                    TIGRIS_MEM_OK, "compaction memory init");
-    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes),
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, cp.tensors[0].size_bytes),
                    TIGRIS_MEM_OK, "compaction input allocation");
-    memset(mem.tensor_ptrs[0], 0x11, tensors[0].size_bytes);
+    memset(mem.tensor_ptrs[0], 0x11, cp.tensors[0].size_bytes);
 
     TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(
-                       &plan, &mem, compaction_kernel, &ctx, &stats,
+                       &cp.plan, &mem, compaction_kernel, &ctx, &stats,
                        workspace, workspace_required - 1),
                    TIGRIS_EXEC_ERR_WORKSPACE,
                    "one-byte-short workspace is rejected");
     TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(
-                       &plan, &mem, compaction_kernel, &ctx, &stats,
+                       &cp.plan, &mem, compaction_kernel, &ctx, &stats,
                        workspace, sizeof(workspace)),
                    TIGRIS_EXEC_OK, "compaction execution");
     TEST_ASSERT_EQ(stats.compactions, 2, "fast retry and slow cleanup both compact");
@@ -2923,10 +2930,10 @@ static void test_exec_compaction_preserves_data(void)
     mem.fast_size = 64u;
     mem.slow_size = 96u;
     mem.slow_used = 0u;
-    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes), TIGRIS_MEM_OK,
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, cp.tensors[0].size_bytes), TIGRIS_MEM_OK,
                    "output-overflow input");
-    memset(ptrs[0], 0x11, tensors[0].size_bytes);
-    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&plan, &mem, compaction_kernel, &ctx,
+    memset(ptrs[0], 0x11, cp.tensors[0].size_bytes);
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&cp.plan, &mem, compaction_kernel, &ctx,
                    &stats, workspace, sizeof(workspace)), TIGRIS_EXEC_OK,
                    "an output already in slow memory is not spilled again");
     TEST_ASSERT_EQ(stats.slow_overflow_count, 1u, "output takes the slow fallback");
@@ -2936,6 +2943,50 @@ static void test_exec_compaction_preserves_data(void)
     TEST_ASSERT_EQ(((uint8_t *)ptrs[2])[47], 0x6b, "overflow output preserved");
     for (size_t i = 96u; i < sizeof(slow); i++)
         TEST_ASSERT_EQ(slow[i], 0xa5, "slow arena canary");
+}
+
+/* tigris_mem_init starts an unaligned slow buffer at its first aligned address; compaction
+ * keeps that start. */
+static void test_exec_compact_slow_align(void)
+{
+    printf("  test_exec_compact_slow_align...\n");
+    compaction_plan_t cp;
+    void *ptrs[3];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[96];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow_storage[4u + 3u * TIGRIS_TENSOR_ALIGN + 128u];
+    uint8_t *slow = slow_storage + 4;
+    const uint32_t slow_size = (uint32_t)(sizeof(slow_storage) - 4u);
+    tigris_mem_t mem;
+    uint8_t workspace[
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+    tigris_exec_stats_t stats;
+    compaction_ctx_t ctx = {0};
+
+    build_compaction_plan(&cp);
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), slow, slow_size),
+                   TIGRIS_MEM_OK, "unaligned slow buffer init");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, cp.tensors[0].size_bytes),
+                   TIGRIS_MEM_OK, "slow input allocation");
+    memset(ptrs[0], 0x11, cp.tensors[0].size_bytes);
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(
+                       &cp.plan, &mem, compaction_kernel, &ctx, &stats,
+                       workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "run with an unaligned slow buffer");
+    TEST_ASSERT_EQ(stats.compactions, 2, "fast retry and slow cleanup both compact");
+    TEST_ASSERT(ctx.preserved, "live tensor data survives compaction");
+    for (size_t i = 0; i < 3; i++) {
+        uint8_t *q = (uint8_t *)ptrs[i];
+        if (q >= slow && q < slow + slow_size)
+            TEST_ASSERT_EQ((uintptr_t)q % TIGRIS_TENSOR_ALIGN, 0u,
+                           "slow tensor aligned after compaction");
+    }
+    TEST_ASSERT((uint8_t *)ptrs[2] >= slow && (uint8_t *)ptrs[2] < slow + slow_size,
+                "output stays in slow memory");
+    TEST_ASSERT_EQ(((uint8_t *)ptrs[2])[47], 0x6b, "output survives slow-arena compaction");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 1, cp.tensors[1].size_bytes),
+                   TIGRIS_MEM_OK, "slow allocation after compaction");
+    TEST_ASSERT_EQ((uintptr_t)ptrs[1] % TIGRIS_TENSOR_ALIGN, 0u,
+                   "slow allocation after compaction is aligned");
 }
 
 typedef struct {
@@ -3968,6 +4019,7 @@ int main(void)
     test_exec_chain_residual_rows();
     test_exec_chained_convtranspose_fails_closed();
     test_exec_compaction_preserves_data();
+    test_exec_compact_slow_align();
     test_exec_reshape_alias();
     test_exec_reshape_group_lifetime();
     test_exec_dispatch_counts_aligned_tensors();

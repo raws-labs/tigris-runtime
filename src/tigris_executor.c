@@ -3790,9 +3790,12 @@ static TIGRIS_NOINLINE tigris_exec_error_t route_stage(
         banded = needs_tiling && tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
     } else if (kind == TIGRIS_BAND_KIND_HW) {
         banded = needs_tiling && axis1_tileable;
+    } else if (plan->header->version >= TIGRIS_SCHEMA_VERSION_SCHEDULED_PEAK) {
+        /* A stage without a height record runs whole, within the stated peak. */
+        banded = needs_tiling && axis1_tileable && tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
     } else {
-        /* A rank-4 stage without a tile record also takes the height stripe,
-         * at every schema. Rank-3 length tiling requires the schema-v5 axis. */
+        /* Below schema 11 a rank-4 stage without a tile record also takes the
+         * height stripe. Rank-3 length tiling requires the schema-v5 axis. */
         banded = needs_tiling && axis1_tileable &&
             (rank == 4 ||
              (plan->header->version >= TIGRIS_SCHEMA_VERSION_TILE_AXIS &&

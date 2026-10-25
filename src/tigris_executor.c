@@ -412,7 +412,7 @@ static uint32_t compact_pool(
     uintptr_t end = (uintptr_t)(base + size);
     uint32_t wp = first;
 
-    /* Select the next live allocation by address on each pass.  This is O(n²)
+    /* Select the next live allocation by address on each pass.  This is O(n^2)
      * in the configured tensor limit, but compaction is an exceptional OOM
      * recovery path and no longer needs a max-tensor index array on the stack. */
     while (cursor < end) {

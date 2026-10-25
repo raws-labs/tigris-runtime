@@ -314,4 +314,9 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     set_tests_properties(posix_example PROPERTIES
         PASS_REGULAR_EXPRESSION "Output: 0\\.18 0\\.18 0\\.18 0\\.18 0\\.18\nFast arena peak: 768 bytes"
         FAIL_REGULAR_EXPRESSION "Sanitizer;runtime error")
+    add_test(NAME posix_example_int8_output COMMAND tigris_posix_example
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/schema_compat/schema-v11-scheduled-peak.tgrs)
+    set_tests_properties(posix_example_int8_output PROPERTIES
+        PASS_REGULAR_EXPRESSION "Output: -1 1 -14 -5 -1\n"
+        FAIL_REGULAR_EXPRESSION "Sanitizer;runtime error")
 endif()

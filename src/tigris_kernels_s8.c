@@ -137,11 +137,31 @@ static inline int32_t round_divide_away_from_zero(int32_t value, int32_t divisor
 }
 
 /**
+ * Re-encode the mean of `count` input values, given as their sum of codes
+ * minus `count` input zero points, at the output quantization: dequantize,
+ * divide, requantize with round() so half ties go away from zero, saturate to
+ * int8. The average pools, relu, relu6, the max pools, reshape/flatten,
+ * resize nearest and concat use it; a carried-through value is the mean of
+ * one value.
+ */
+static inline int32_t requantize_mean(
+    int32_t centered, int32_t count, float in_scale, float out_scale, int32_t out_zp)
+{
+    double scaled = ((double)centered * (double)in_scale) /
+                    ((double)count * (double)out_scale);
+    double quantized = round(scaled) + (double)out_zp;
+    if (quantized < -128.0)
+        return -128;
+    if (quantized > 127.0)
+        return 127;
+    return (int32_t)quantized;
+}
+
+/**
  * The int8 result of averaging `count` samples that sum to `sum`, with TFLite
  * AVERAGE_POOL_2D rounding. With equal input and output quantization this is
- * TFLite's integer division with ties away from zero. TFLite rejects differing
- * quantization for this op, so that case is defined as dequantize, mean and
- * requantize with round(), which keeps ties away from zero as the native
+ * TFLite's integer division with ties away from zero. Differing quantization
+ * goes through requantize_mean, which keeps ties away from zero as the native
  * ESP/CMSIS pool kernels do.
  */
 static inline int32_t average_pool_quantize(
@@ -149,21 +169,9 @@ static inline int32_t average_pool_quantize(
     float in_scale, float out_scale, int32_t output_zp,
     int8_t act_min, int8_t act_max)
 {
-    int32_t q;
-    if (same_quant) {
-        q = round_divide_away_from_zero(sum, count);
-    } else {
-        int32_t centered = sum - input_zp * count;
-        double scaled = ((double)centered * (double)in_scale) /
-                        ((double)count * (double)out_scale);
-        double quantized = round(scaled) + (double)output_zp;
-        if (quantized < (double)act_min)
-            q = act_min;
-        else if (quantized > (double)act_max)
-            q = act_max;
-        else
-            q = (int32_t)quantized;
-    }
+    int32_t q = same_quant
+        ? round_divide_away_from_zero(sum, count)
+        : requantize_mean(sum - input_zp * count, count, in_scale, out_scale, output_zp);
     return clamp_act(q, act_min, act_max);
 }
 
@@ -187,23 +195,14 @@ static inline int32_t get_shift(
  *
  * Max preserves the value, but not its encoding: when the output tensor
  * declares a different scale or zero point from the input's, the same value
- * is a different int8. Defined the way kern_avg_pool_s8 defines the mismatched
- * case, dequantize then requantize with round() so half ties go away from
- * zero, since TFLite rejects mismatched pool quantization and there is no
- * canonical integer-kernel result to match.
+ * is a different int8, computed by requantize_mean as the mean of one value.
  */
 static inline int32_t requantize_passthrough(
     int32_t q, int32_t in_zp, float in_scale, int32_t out_zp, float out_scale)
 {
     if (in_scale == out_scale && in_zp == out_zp)
         return q;
-    double value = (double)(q - in_zp) * (double)in_scale;
-    double scaled = round(value / (double)out_scale) + (double)out_zp;
-    if (scaled < -128.0)
-        return -128;
-    if (scaled > 127.0)
-        return 127;
-    return (int32_t)scaled;
+    return requantize_mean(q - in_zp, 1, in_scale, out_scale, out_zp);
 }
 
 /** The input and output quantization of a value-preserving operator. */
@@ -240,6 +239,14 @@ static inline passthrough_quant_t passthrough_quant(
         q.same = (q.in_scale == q.out_scale) && (q.in_zp == q.out_zp);
     }
     return q;
+}
+
+/** requantize_passthrough of every int8 code, indexed by the code as uint8_t. */
+static inline void passthrough_table(int8_t table[256], const passthrough_quant_t *q)
+{
+    for (int32_t code = -128; code <= 127; code++)
+        table[(uint8_t)code] = (int8_t)requantize_passthrough(
+            code, q->in_zp, q->in_scale, q->out_zp, q->out_scale);
 }
 
 /** The requantization parameters of an output tensor, resolved once.
@@ -1568,38 +1575,32 @@ static TIGRIS_KERNEL_NOINLINE int kern_concat_s8(
             positions *= mem->tile.out_w;
     }
     int total_OC = y_shape[axis] * inner;
-
-    const tigris_quant_param_t *qp_y =
-        tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
-    float out_scale = qp_y ? qp_y->scale : 1.0f;
-    int32_t out_zp  = qp_y ? qp_y->zero_point : 0;
+    int8_t codes[256];
 
     for (int i = 0; i < op->num_inputs; i++) {
         const int8_t *Xi = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[i]);
         const int32_t *xi_shape = tigris_tensor_shape(plan, &plan->tensors[ins[i]]);
         int Ci = xi_shape[axis] * inner;
-
-        const tigris_quant_param_t *qp_i =
-            tigris_tensor_quant(plan, &plan->tensors[ins[i]]);
-        float in_scale = qp_i ? qp_i->scale : 1.0f;
-        int32_t in_zp  = qp_i ? qp_i->zero_point : 0;
-
-        /* Fast path: identical quant params -> memcpy */
-        int same_qp = (in_scale == out_scale && in_zp == out_zp);
+        passthrough_quant_t q = passthrough_quant(plan, ins[i], outs[0]);
 
         if (Xi == NULL)
             return -1;
-        for (int q = 0; q < positions; q++) {
-            const int8_t *src = Xi + (size_t)q * Ci;
-            int8_t *dst = Y + (size_t)q * total_OC + out_c_offset;
-            if (same_qp) {
+        /* Past 256 elements, one evaluation per code costs less than one per element. */
+        int tabled = !q.same && (size_t)positions * (size_t)Ci > sizeof(codes);
+        if (tabled)
+            passthrough_table(codes, &q);
+        for (int p = 0; p < positions; p++) {
+            const int8_t *src = Xi + (size_t)p * Ci;
+            int8_t *dst = Y + (size_t)p * total_OC + out_c_offset;
+            if (q.same) {
                 memcpy(dst, src, (size_t)Ci);
+            } else if (tabled) {
+                for (int c = 0; c < Ci; c++)
+                    dst[c] = codes[(uint8_t)src[c]];
             } else {
-                float M = in_scale / out_scale;
-                for (int c = 0; c < Ci; c++) {
-                    float real = M * (float)((int32_t)src[c] - in_zp);
-                    dst[c] = clamp_s8((int32_t)roundf(real) + out_zp);
-                }
+                for (int c = 0; c < Ci; c++)
+                    dst[c] = (int8_t)requantize_passthrough(
+                        src[c], q.in_zp, q.in_scale, q.out_zp, q.out_scale);
             }
         }
         out_c_offset += Ci;

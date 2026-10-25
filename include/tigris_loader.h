@@ -61,6 +61,40 @@ tigris_error_t tigris_plan_load_ex(
  * slots state, which loading checks. */
 uint8_t tigris_plan_data_dtype(const tigris_plan_t *plan);
 
+/** How the executor bands a standalone stage. */
+typedef enum {
+    TIGRIS_BAND_KIND_NONE = 0,      /**< no band kind */
+    TIGRIS_BAND_KIND_RESHAPE = 1,   /**< a Reshape whose rows map onto the output's */
+    TIGRIS_BAND_KIND_LEADING = 2,   /**< one operator banded along an axis it keeps independent */
+    TIGRIS_BAND_KIND_ROWS = 3,      /**< a matrix pipeline banded along its rows */
+    TIGRIS_BAND_KIND_TRANSPOSE = 4, /**< a transpose banded along an axis group it swaps */
+    TIGRIS_BAND_KIND_BY_INPUT = 5,  /**< a global reduction walked along its input */
+    TIGRIS_BAND_KIND_HW = 6,        /**< height and width bands of a 2D record */
+    TIGRIS_BAND_KIND_STRIPE = 7     /**< the height or length stripe */
+} tigris_band_kind_t;
+
+/** The extent a band kind divides. */
+typedef struct {
+    int32_t batch;  /**< ROWS: the matrices each band repeats over, otherwise 0 */
+    int32_t rows;   /**< RESHAPE, LEADING and ROWS: the rows the bands divide, otherwise 0 */
+} tigris_stage_band_t;
+
+/**
+ * Classify how the executor bands a standalone stage, in the order it
+ * decides: a Reshape band, then a leading band (both only under a tileable
+ * record), a row band, a banded transpose, a global reduction by input, a 2D
+ * record, and otherwise the stripe. Whether the stage is banded at all also
+ * depends on its record and the arena, which the run checks. Chain members
+ * and control-flow stages run on their own paths and are not classified here.
+ *
+ * @param band  Output, may be NULL: the extent the kind divides.
+ * @return The kind, or TIGRIS_BAND_KIND_NONE for a NULL plan or stage, a
+ *         schema 11 stage without a tileable record, or a stated kind the
+ *         stage does not meet.
+ */
+tigris_band_kind_t tigris_stage_band_kind(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                          tigris_stage_band_t *band);
+
 /**
  * Derive what a stage's tile record states about its tiling (schema 11+),
  * by the rules the executor bands the stage with: the band axis, the extent

@@ -932,6 +932,40 @@ int tigris_reshape_tile_valid(const tigris_tile_plan_t *tile,
            ((int64_t)view->input_rows * view->input_width) % view->output_width == 0;
 }
 
+tigris_band_kind_t tigris_stage_band_kind(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                          tigris_stage_band_t *band)
+{
+    tigris_stage_band_t unused;
+    tigris_stage_band_t *out = band != NULL ? band : &unused;
+    out->batch = 0;
+    out->rows = 0;
+    if (plan == NULL || plan->header == NULL || stage == NULL)
+        return TIGRIS_BAND_KIND_NONE;
+    tigris_tile_plan_v10_t tile = tigris_stage_tiles(plan, stage);
+    int banded = tile.tileable != 0u && tile.axis != TIGRIS_TILE_AXIS_NONE;
+    if (banded) {
+        tigris_reshape_band_t view;
+        if (tigris_reshape_band(plan, stage, &view)) {
+            out->rows = view.input_rows;
+            return TIGRIS_BAND_KIND_RESHAPE;
+        }
+        int32_t leading = tigris_stage_leading_band(plan, stage);
+        if (leading > 0) {
+            out->rows = leading;
+            return TIGRIS_BAND_KIND_LEADING;
+        }
+    }
+    if (tigris_stage_row_tiled(plan, stage, &out->batch, &out->rows))
+        return TIGRIS_BAND_KIND_ROWS;
+    if (tigris_stage_tiled_transpose(plan, stage))
+        return TIGRIS_BAND_KIND_TRANSPOSE;
+    if (tigris_stage_input_driven_reduction(plan, stage))
+        return TIGRIS_BAND_KIND_BY_INPUT;
+    if (banded && tile.axis == TIGRIS_TILE_AXIS_HW)
+        return TIGRIS_BAND_KIND_HW;
+    return TIGRIS_BAND_KIND_STRIPE;
+}
+
 static int grouped_reduction_valid(const tigris_plan_t *plan, const tigris_stage_t *stage,
                                    const tigris_tile_plan_v10_t *tile)
 {
@@ -995,10 +1029,11 @@ static int tile_v10_valid(const tigris_plan_t *plan, const tigris_stage_t *stage
                tile->flags == 0u;
     if (tile->output_width_extent != 0u)
         return 0;
-    int32_t leading = tigris_stage_leading_band(plan, stage);
-    if (leading > 0)
+    tigris_stage_band_t band;
+    tigris_band_kind_t kind = tigris_stage_band_kind(plan, stage, &band);
+    if (kind == TIGRIS_BAND_KIND_LEADING)
         return tile->flags == 0u && tile->output_band_extent == 0u &&
-               tile->input_band_extent > 0u && tile->input_band_extent <= (uint32_t)leading;
+               tile->input_band_extent > 0u && tile->input_band_extent <= (uint32_t)band.rows;
     if (stage->ops_count == 1u && plan->ops[ops[0]].op_type == TIGRIS_OP_TRANSPOSE)
         return tile->input_band_extent == 0u && tile->output_band_extent == 0u;
     if (tile->flags != 0u)
@@ -1014,7 +1049,7 @@ static int tile_v10_valid(const tigris_plan_t *plan, const tigris_stage_t *stage
         tile->input_band_extent > INT32_MAX)
         return 0;
     tigris_reshape_band_t view;
-    if (tigris_reshape_band(plan, stage, &view))
+    if (kind == TIGRIS_BAND_KIND_RESHAPE && tigris_reshape_band(plan, stage, &view))
         return tile->input_band_extent <= (uint32_t)view.input_rows &&
                ((int64_t)tile->input_band_extent * view.input_width) % view.output_width == 0;
     int32_t batch = 0, rows = 0, cols = 0;
@@ -3996,25 +4031,24 @@ int tigris_stage_tile_facts(const tigris_plan_t *plan, const tigris_stage_t *sta
     uint64_t extent = 0u;
     uint64_t count = 0u;
     tigris_reshape_band_t view;
-    int32_t leading = tigris_stage_leading_band(plan, stage);
-    int32_t batch = 0;
-    int32_t rows = 0;
+    tigris_stage_band_t stage_band;
     uint8_t prefix = 0u;
     uint8_t split = 0u;
     uint8_t middle = 0u;
     uint32_t halo = 0u;
-    /* The executor's dispatch order: reshape, leading, rows, conversion, by input, 2D, stripe. */
-    if (tigris_reshape_band(plan, stage, &view)) {
+    /* The kind the executor bands the stage by. */
+    tigris_band_kind_t kind = tigris_stage_band_kind(plan, stage, &stage_band);
+    if (kind == TIGRIS_BAND_KIND_RESHAPE && tigris_reshape_band(plan, stage, &view)) {
         out->band_axis = view.input_axis;
         extent = (uint32_t)view.input_rows;
         out->tile_extent = tile.input_band_extent;
-    } else if (leading > 0) {
+    } else if (kind == TIGRIS_BAND_KIND_LEADING) {
         const tigris_op_t *op = &plan->ops[tigris_stage_ops(plan, stage)[0]];
         const tigris_tensor_t *band = &plan->tensors[tigris_op_inputs(plan, op)[0]];
         out->band_axis = tigris_band_axis(plan, band, tigris_stage_band_mode(plan, stage));
-        extent = (uint32_t)leading;
+        extent = (uint32_t)stage_band.rows;
         out->tile_extent = tile.input_band_extent;
-    } else if (tigris_stage_row_tiled(plan, stage, &batch, &rows)) {
+    } else if (kind == TIGRIS_BAND_KIND_ROWS) {
         /* The band input is the first stage input the band cuts. */
         for (uint16_t i = 0; i < stage->inputs_count; i++) {
             const tigris_tensor_t *t = &plan->tensors[inputs[i]];
@@ -4022,14 +4056,14 @@ int tigris_stage_tile_facts(const tigris_plan_t *plan, const tigris_stage_t *sta
             int32_t r = 0;
             int32_t c = 0;
             if (!tigris_whole_band_operand(plan, stage, inputs[i]) &&
-                tigris_tensor_row_view(plan, t, &b, &r, &c) && b == batch && r == rows) {
+                tigris_tensor_row_view(plan, t, &b, &r, &c) && b == stage_band.batch && r == stage_band.rows) {
                 out->band_axis = (uint8_t)(t->ndim - 2u);
                 break;
             }
         }
-        extent = (uint32_t)rows;
+        extent = (uint32_t)stage_band.rows;
         out->tile_extent = tile.input_band_extent;
-    } else if (tigris_stage_tiled_transpose(plan, stage)) {
+    } else if (kind == TIGRIS_BAND_KIND_TRANSPOSE) {
         uint16_t index = tigris_stage_ops(plan, stage)[0];
         uint8_t rank = 0u;
         const uint8_t *perm = tigris_op_attribute_data(plan, index, TIGRIS_OP_ATTR_TRANSPOSE_PERM, &rank);
@@ -4048,7 +4082,7 @@ int tigris_stage_tile_facts(const tigris_plan_t *plan, const tigris_stage_t *sta
             if (stated != 0u && stated <= extent)
                 out->tile_extent = stated;
         }
-    } else if (tigris_stage_input_driven_reduction(plan, stage)) {
+    } else if (kind == TIGRIS_BAND_KIND_BY_INPUT) {
         out->band_axis = 1u;
         if (tile.input_channel_group != 0u) {
             extent = (uint64_t)(uint32_t)in_shape[1] * (uint32_t)in_shape[2];
@@ -4060,7 +4094,7 @@ int tigris_stage_tile_facts(const tigris_plan_t *plan, const tigris_stage_t *sta
             extent = (uint32_t)in_shape[1];
             out->tile_extent = tile.input_band_extent;
         }
-    } else if (tile.axis == TIGRIS_TILE_AXIS_HW) {
+    } else if (kind == TIGRIS_BAND_KIND_HW) {
         if (in->ndim != 4u || output->ndim != 4u || tile.output_width_extent == 0u)
             return 0;
         out->band_axis = 1u;

@@ -4,6 +4,7 @@
  */
 
 #include "tigris_executor.h"
+#include "tigris_loader.h"
 #include "tigris_binary_operands.h"
 #include "tigris_io_in_fast.h"
 #include "tigris_lz4.h"
@@ -20,12 +21,11 @@
 #  endif
 #endif
 
-/* The stage executors (normal / standalone-tiled / chained) are mutually
- * exclusive per stage. Keeping the chained executor out of line stops the
- * compiler from folding its locals into the dispatcher frame alongside the
- * other executors, so each execution path stays within the per-frame stack
- * budget. It runs once per chain (the tile loop is inside it), so the extra
- * call is negligible. */
+/* A stage runs on exactly one executor path. Keeping the chained executor
+ * out of line stops the compiler from folding its locals into the dispatcher
+ * frame alongside the other executors, so each execution path stays within
+ * the per-frame stack budget. It runs once per chain (the tile loop is inside
+ * it), so the extra call is negligible. */
 #if defined(__GNUC__) || defined(__clang__)
 #  define TIGRIS_NOINLINE __attribute__((noinline))
 #else
@@ -2528,8 +2528,6 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_rows(
     return result;
 }
 
-/* Whether a stage is a Reshape whose rows map onto the output's. Kept out of
- * line so the mapping it builds stays off the run loop's frame. */
 /* The If or While a stage holds alone, or NULL. */
 static const tigris_op_t *stage_control(const tigris_plan_t *plan, const tigris_stage_t *stage)
 {
@@ -2754,13 +2752,6 @@ static TIGRIS_NOINLINE void free_dead_tensors(const tigris_plan_t *plan, tigris_
     }
     if (need_compact)
         compact_slow(mem, plan);
-}
-
-static TIGRIS_NOINLINE int stage_is_reshape_band(const tigris_plan_t *plan,
-                                                 const tigris_stage_t *stage)
-{
-    tigris_reshape_band_t view;
-    return tigris_reshape_band(plan, stage, &view);
 }
 
 static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_reshape(
@@ -3207,8 +3198,9 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_chain_tiled(
      *     ONCE at its maximum (interior) tile height, so the buffers keep fixed
      *     addresses and surviving content across tiles. The first-input load
      *     and last-output spill continue to cycle above these persistent
-     *     buffers. Sizes mirror the budget-validation forward pass exactly, so
-     *     the reserved footprint equals the already-validated tile working set. */
+     *     buffers. Rank-4 sizes mirror the budget-validation forward pass, so
+     *     the reserved footprint equals the already-validated tile working set;
+     *     an output of another rank is reserved whole, which that pass skips. */
     if (line_buffered) {
         /* Interior (unclamped) back-propagated heights for chain_tile_h.
          * roll_last_fast is sized TIGRIS_MAX_STAGE_OUTPUTS and indexed by
@@ -3837,6 +3829,84 @@ static uint32_t stage_dispatch_capacity(const tigris_plan_t *plan,
     return stage_fast_limit(plan, stage, available);
 }
 
+/* How a standalone stage runs: banded by its kind, or whole when arm is TIGRIS_BAND_KIND_NONE. */
+typedef struct {
+    tigris_band_kind_t arm;
+    tigris_stage_band_t band;
+    uint32_t total_io;
+} stage_route_t;
+
+static TIGRIS_NOINLINE tigris_exec_error_t route_stage(
+    const tigris_plan_t *plan, const tigris_stage_t *stage, const tigris_mem_t *mem,
+    int io_in_fast, stage_route_t *route)
+{
+    tigris_band_kind_t kind = tigris_stage_band_kind(plan, stage, &route->band);
+    route->arm = kind;
+    route->total_io = 0u;
+    /* A Reshape or leading band is banded whatever the arena holds. */
+    if (kind == TIGRIS_BAND_KIND_RESHAPE || kind == TIGRIS_BAND_KIND_LEADING)
+        return TIGRIS_EXEC_OK;
+
+    const uint16_t *sin  = tigris_stage_inputs(plan, stage);
+    const uint16_t *sout = tigris_stage_outputs(plan, stage);
+    uint32_t total_io = 0;
+    uint8_t rank = 0;
+    int common_tile_rank = 1;
+    for (uint16_t i = 0; i < stage->inputs_count; i++) {
+        total_io = add_allocation_bytes(total_io, plan->tensors[sin[i]].size_bytes);
+        uint8_t tensor_rank = plan->tensors[sin[i]].ndim;
+        if (rank == 0) rank = tensor_rank;
+        if (tensor_rank != rank) common_tile_rank = 0;
+    }
+    for (uint16_t i = 0; i < stage->outputs_count; i++) {
+        total_io = add_allocation_bytes(total_io, plan->tensors[sout[i]].size_bytes);
+        uint8_t tensor_rank = plan->tensors[sout[i]].ndim;
+        if (rank == 0) rank = tensor_rank;
+        if (tensor_rank != rank) common_tile_rank = 0;
+    }
+    if (rank != 3 && rank != 4) common_tile_rank = 0;
+    route->total_io = total_io;
+
+    uint8_t tile_axis = stage_tile_axis(plan, stage);
+    /* A row band, a banded transpose and a global reduction by input band on
+     * their own terms, outside the stripe contract. */
+    int own_band = kind == TIGRIS_BAND_KIND_ROWS || kind == TIGRIS_BAND_KIND_TRANSPOSE ||
+                   kind == TIGRIS_BAND_KIND_BY_INPUT;
+    int axis1_tileable =
+        own_band || (common_tile_rank && stage_supports_axis1_tiling(plan, stage, rank));
+    /* A stage that reads its inputs in place runs whole. */
+    int needs_tiling = !io_in_fast &&
+        (common_tile_rank || kind == TIGRIS_BAND_KIND_ROWS || kind == TIGRIS_BAND_KIND_TRANSPOSE) &&
+        total_io > stage_dispatch_capacity(plan, stage, mem);
+
+    /* A serialized tile plan is a compiler promise: fail closed if an older
+     * or malformed plan attaches it to a stage the runtime cannot tile
+     * safely. Without a tile plan, unsupported stages retain ordinary
+     * full-tensor execution and may use slow overflow. WIDTH and any other
+     * axis value remain fail-closed. */
+    if (needs_tiling && stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
+        ((tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH && tile_axis != TIGRIS_TILE_AXIS_HW) ||
+         (own_band && tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) || !axis1_tileable))
+        return TIGRIS_EXEC_ERR_TILE;
+
+    int banded;
+    if (own_band) {
+        banded = needs_tiling && tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    } else if (kind == TIGRIS_BAND_KIND_HW) {
+        banded = needs_tiling && axis1_tileable;
+    } else {
+        /* A rank-4 stage without a tile record also takes the height stripe,
+         * at every schema. Rank-3 length tiling requires the schema-v5 axis. */
+        banded = needs_tiling && axis1_tileable &&
+            (rank == 4 ||
+             (plan->header->version >= TIGRIS_SCHEMA_VERSION_TILE_AXIS &&
+              tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH));
+    }
+    if (!banded)
+        route->arm = TIGRIS_BAND_KIND_NONE;
+    return TIGRIS_EXEC_OK;
+}
+
 /* In place: inputs together at the top, above a room for the weights that holds no tensor. */
 static int fast_floor(const tigris_plan_t *plan, const tigris_mem_t *mem,
                       uint32_t *floor, uint32_t *gap)
@@ -4045,8 +4115,8 @@ tigris_exec_error_t tigris_run_with_state(
         tigris_plan_t stage_plan;
         const tigris_plan_t *run_plan = plan;
 
-        /* Decide: chain, tile, or normal */
-
+        /* A chain runs from its head; any other stage on the path its band
+         * kind, its record and the arena decide. */
         if (stage->chain_len >= 2 && stage->chain_id == s) {
             /* First stage of a chain - execute entire chain */
             tigris_exec_error_t err = exec_chain_tiled(
@@ -4065,242 +4135,82 @@ tigris_exec_error_t tigris_run_with_state(
             s += stage->chain_len - 1;
         } else if (stage->chain_len >= 2) {
             /* Non-head chain stage - should have been skipped; just in case */
-        } else if (stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
-                   stage->tile_plan_idx < run_plan->header->num_tile_plans &&
-                   stage_tile_axis(run_plan, stage) != TIGRIS_TILE_AXIS_NONE &&
-                   stage_is_reshape_band(run_plan, stage)) {
-            /* A Reshape banded along rows that map onto the output's. Decided
-             * here, apart from the stripe contract below, which it shares no
-             * state with. */
-            TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_RESHAPE);
-            result = prepare_stage_weights(plan, s, mem, weight_gap, &stage_plan, &run_plan, stats);
-            if (result != TIGRIS_EXEC_OK)
-                goto restore_fast_arena;
-            tigris_exec_error_t err = exec_stage_tiled_reshape(
-                run_plan, stage, mem, last_consumer, s, stats);
-            if (err != TIGRIS_EXEC_OK) {
-                result = err;
-                goto restore_fast_arena;
-            }
-            if (stats) stats->stages_tiled++;
-        } else if (stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
-                   stage->tile_plan_idx < run_plan->header->num_tile_plans &&
-                   stage_tile_axis(run_plan, stage) != TIGRIS_TILE_AXIS_NONE &&
-                   tigris_stage_leading_band(run_plan, stage)) {
-            TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_ROWS);
-            result = prepare_stage_weights(plan, s, mem, weight_gap, &stage_plan, &run_plan, stats);
-            if (result != TIGRIS_EXEC_OK)
-                goto restore_fast_arena;
-            tigris_exec_error_t err = exec_stage_tiled_rows(
-                run_plan, stage, mem, kernel, user_ctx, workspace, last_consumer, s,
-                tigris_stage_leading_band(run_plan, stage), tigris_stage_band_mode(run_plan, stage), stats);
-            if (err != TIGRIS_EXEC_OK) {
-                result = err;
-                goto restore_fast_arena;
-            }
-            if (stats) stats->stages_tiled++;
         } else {
-            const uint16_t *sin  = tigris_stage_inputs(run_plan, stage);
-            const uint16_t *sout = tigris_stage_outputs(run_plan, stage);
-            uint32_t total_io = 0;
-            uint8_t rank = 0;
-            int common_tile_rank = 1;
-            for (uint16_t i = 0; i < stage->inputs_count; i++) {
-                total_io = add_allocation_bytes(
-                    total_io, run_plan->tensors[sin[i]].size_bytes);
-                uint8_t tensor_rank = run_plan->tensors[sin[i]].ndim;
-                if (rank == 0) rank = tensor_rank;
-                if (tensor_rank != rank) common_tile_rank = 0;
-            }
-            for (uint16_t i = 0; i < stage->outputs_count; i++) {
-                total_io = add_allocation_bytes(
-                    total_io, run_plan->tensors[sout[i]].size_bytes);
-                uint8_t tensor_rank = run_plan->tensors[sout[i]].ndim;
-                if (rank == 0) rank = tensor_rank;
-                if (tensor_rank != rank) common_tile_rank = 0;
-            }
-            if (rank != 3 && rank != 4) common_tile_rank = 0;
-
-            /* Only tile stages whose complete operator sequence implements
-             * the selected axis-1 stripe contract. A serialized tile plan is
-             * a compiler promise: fail closed if an older or malformed plan
-             * attaches it to a stage the runtime cannot tile safely. Without
-             * a tile plan, unsupported stages retain ordinary full-tensor
-             * execution and may use slow overflow. */
-            uint8_t tile_axis = stage_tile_axis(run_plan, stage);
-            /* A global reduction has no output axis to tile, so it is walked
-             * along its input instead. Accepted here beside the stripe
-             * contract, not inside it: the stripe kernels propagate a height
-             * this stage collapses. */
-            int input_driven =
-                tigris_stage_input_driven_reduction(run_plan, stage);
-            /* A layout conversion swaps the two axes on either side of it, so
-             * its output rows come from a column range of its input. Same
-             * reason as above: the stripe contract cannot express it. */
-            int transposed = tigris_stage_tiled_transpose(run_plan, stage);
-            /* A rank-2 matrix pipeline has no axis the stripe contract names,
-             * but its rows are independent, so it bands along them. */
-            int32_t band_rows = 0;
-            int row_tiled =
-                tigris_stage_row_tiled(run_plan, stage, NULL, &band_rows);
-            int axis1_tileable =
-                input_driven || transposed || row_tiled ||
-                (common_tile_rank &&
-                 stage_supports_axis1_tiling(run_plan, stage, rank));
-            /* A stage that reads its inputs in place runs whole. */
-            int needs_tiling = !io_in_fast &&
-                (common_tile_rank || row_tiled || transposed) &&
-                total_io > stage_dispatch_capacity(run_plan, stage, mem);
-
-            /* Schema-v5 stages may serialize the height/length axis (1D) or the
-             * combined HW axis (2D). Both are accepted here; WIDTH and any other
-             * value remain fail-closed. */
-            int is_hw_axis =
-                run_plan->header->version >=
-                    TIGRIS_SCHEMA_VERSION_TILE_AXIS &&
-                tile_axis == TIGRIS_TILE_AXIS_HW;
-
-            if (needs_tiling &&
-                stage->tile_plan_idx != TIGRIS_NO_TILE_PLAN &&
-                (stage->tile_plan_idx >= run_plan->header->num_tile_plans ||
-                 stage_tile_axis(run_plan, stage) == TIGRIS_TILE_AXIS_NONE ||
-                 (tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH &&
-                  tile_axis != TIGRIS_TILE_AXIS_HW) ||
-                 ((input_driven || transposed || row_tiled) &&
-                  tile_axis != TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) ||
-                 !axis1_tileable)) {
-                result = TIGRIS_EXEC_ERR_TILE;
+            /* The arm an ESP32-S3 error print names; a Reshape or leading band prints none. */
+            static const char *const names[TIGRIS_BAND_KIND_STRIPE + 1] = {
+                [TIGRIS_BAND_KIND_NONE] = "normal", [TIGRIS_BAND_KIND_ROWS] = "rows",
+                [TIGRIS_BAND_KIND_TRANSPOSE] = "convert", [TIGRIS_BAND_KIND_BY_INPUT] = "reduce",
+                [TIGRIS_BAND_KIND_HW] = "tiled2d", [TIGRIS_BAND_KIND_STRIPE] = "tiled",
+            };
+#ifdef TIGRIS_TRACE
+            /* The path each arm traces: a leading band traces as rows. */
+            static const tigris_trace_path_t paths[TIGRIS_BAND_KIND_STRIPE + 1] = {
+                [TIGRIS_BAND_KIND_NONE] = TIGRIS_TRACE_PATH_NORMAL,
+                [TIGRIS_BAND_KIND_RESHAPE] = TIGRIS_TRACE_PATH_RESHAPE,
+                [TIGRIS_BAND_KIND_LEADING] = TIGRIS_TRACE_PATH_ROWS,
+                [TIGRIS_BAND_KIND_ROWS] = TIGRIS_TRACE_PATH_ROWS,
+                [TIGRIS_BAND_KIND_TRANSPOSE] = TIGRIS_TRACE_PATH_TRANSPOSE,
+                [TIGRIS_BAND_KIND_BY_INPUT] = TIGRIS_TRACE_PATH_BY_INPUT,
+                [TIGRIS_BAND_KIND_HW] = TIGRIS_TRACE_PATH_TILED_2D,
+                [TIGRIS_BAND_KIND_STRIPE] = TIGRIS_TRACE_PATH_TILED,
+            };
+#endif
+            stage_route_t route;
+            result = route_stage(run_plan, stage, mem, io_in_fast, &route);
+            if (result != TIGRIS_EXEC_OK)
                 goto restore_fast_arena;
-            }
-
-            /* Rank-4 schema-v2-v4 plans retain the historical automatic
-             * height path even when they carry no standalone tile record.
-             * Rank-3 length tiling is schema-v5-only and requires the explicit
-             * axis promise. */
-            /* Standalone 2D (HW) tiling. Checked before the height-only path
-             * because a rank-4 stage otherwise satisfies may_tile and would be
-             * misrouted to exec_stage_tiled. */
-            int may_tile_2d =
-                needs_tiling && is_hw_axis && axis1_tileable &&
-                !input_driven && !transposed && !row_tiled;
-            int may_tile_rows =
-                needs_tiling && row_tiled &&
-                tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
-            int may_tile_by_input =
-                needs_tiling && input_driven &&
-                tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
-            int may_tile_transpose =
-                needs_tiling && transposed &&
-                tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
-
-            int may_tile =
-                axis1_tileable && !input_driven && !transposed && !row_tiled &&
-                (rank == 4 ||
-                 (run_plan->header->version >=
-                      TIGRIS_SCHEMA_VERSION_TILE_AXIS &&
-                  tile_axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH));
-
-            if (may_tile_rows) {
-                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_ROWS);
-                result = prepare_stage_weights(plan, s, mem, weight_gap, &stage_plan, &run_plan, stats);
-                if (result != TIGRIS_EXEC_OK)
-                    goto restore_fast_arena;
-                tigris_exec_error_t err = exec_stage_tiled_rows(
-                    run_plan, stage, mem, kernel, user_ctx, workspace,
-                    last_consumer, s, band_rows, 0, stats);
-                if (err != TIGRIS_EXEC_OK) {
-                    TIGRIS_PLATFORM_DBG("S%u rows ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
-                        s, (int)err, (unsigned long)total_io,
-                        (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
-                        (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
-                    result = err;
-                    goto restore_fast_arena;
-                }
-                if (stats) stats->stages_tiled++;
-            } else if (may_tile_transpose) {
-                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_TRANSPOSE);
-                result = prepare_stage_weights(plan, s, mem, weight_gap, &stage_plan, &run_plan, stats);
-                if (result != TIGRIS_EXEC_OK)
-                    goto restore_fast_arena;
-                tigris_exec_error_t err = exec_stage_tiled_transpose(
-                    run_plan, stage, mem, kernel, user_ctx, stats);
-                if (err != TIGRIS_EXEC_OK) {
-                    TIGRIS_PLATFORM_DBG("S%u convert ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
-                        s, (int)err, (unsigned long)total_io,
-                        (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
-                        (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
-                    result = err;
-                    goto restore_fast_arena;
-                }
-                if (stats) stats->stages_tiled++;
-            } else if (may_tile_by_input) {
-                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_BY_INPUT);
-                result = prepare_stage_weights(plan, s, mem, weight_gap, &stage_plan, &run_plan, stats);
-                if (result != TIGRIS_EXEC_OK)
-                    goto restore_fast_arena;
-                tigris_tile_plan_v10_t reduction = tigris_stage_tiles(run_plan, stage);
-                tigris_exec_error_t err = reduction.input_channel_group != 0u
+            TRACE_STAGE_BEGIN(mem, s, paths[route.arm]);
+            result = prepare_stage_weights(plan, s, mem, weight_gap, &stage_plan, &run_plan, stats);
+            if (result != TIGRIS_EXEC_OK)
+                goto restore_fast_arena;
+            switch (route.arm) {
+            case TIGRIS_BAND_KIND_RESHAPE:
+                result = exec_stage_tiled_reshape(run_plan, stage, mem, last_consumer, s, stats);
+                break;
+            case TIGRIS_BAND_KIND_LEADING:
+                result = exec_stage_tiled_rows(
+                    run_plan, stage, mem, kernel, user_ctx, workspace, last_consumer, s,
+                    route.band.rows, tigris_stage_band_mode(run_plan, stage), stats);
+                break;
+            case TIGRIS_BAND_KIND_ROWS:
+                result = exec_stage_tiled_rows(
+                    run_plan, stage, mem, kernel, user_ctx, workspace, last_consumer, s,
+                    route.band.rows, 0, stats);
+                break;
+            case TIGRIS_BAND_KIND_TRANSPOSE:
+                result = exec_stage_tiled_transpose(run_plan, stage, mem, kernel, user_ctx, stats);
+                break;
+            case TIGRIS_BAND_KIND_BY_INPUT:
+                result = tigris_stage_tiles(run_plan, stage).input_channel_group != 0u
                     ? exec_stage_grouped_reduction(run_plan, stage, mem, kernel, user_ctx, stats)
                     : exec_stage_tiled_by_input(run_plan, stage, mem, kernel, user_ctx, stats);
-                if (err != TIGRIS_EXEC_OK) {
-                    TIGRIS_PLATFORM_DBG("S%u reduce ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
-                        s, (int)err, (unsigned long)total_io,
+                break;
+            case TIGRIS_BAND_KIND_HW:
+                result = exec_stage_tiled_2d(run_plan, stage, mem, kernel, user_ctx, workspace, stats);
+                break;
+            case TIGRIS_BAND_KIND_STRIPE:
+                result = exec_stage_tiled(
+                    run_plan, stage, mem, kernel, user_ctx, last_consumer, s, workspace, stats);
+                break;
+            default:
+                result = exec_stage_normal(
+                    run_plan, stage, mem, kernel, user_ctx, stats, workspace, io_in_fast);
+                break;
+            }
+            if (result != TIGRIS_EXEC_OK) {
+                if (names[route.arm] != NULL) {
+                    TIGRIS_PLATFORM_DBG("S%u %s ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
+                        s, names[route.arm], (int)result, (unsigned long)route.total_io,
                         (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
                         (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
-                    result = err;
-                    goto restore_fast_arena;
                 }
-                if (stats) stats->stages_tiled++;
-            } else if (may_tile_2d) {
-                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_TILED_2D);
-                result = prepare_stage_weights(plan, s, mem, weight_gap, &stage_plan, &run_plan, stats);
-                if (result != TIGRIS_EXEC_OK)
-                    goto restore_fast_arena;
-                tigris_exec_error_t err = exec_stage_tiled_2d(
-                    run_plan, stage, mem, kernel, user_ctx, workspace, stats);
-                if (err != TIGRIS_EXEC_OK) {
-                    TIGRIS_PLATFORM_DBG("S%u tiled2d ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
-                        s, (int)err, (unsigned long)total_io,
-                        (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
-                        (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
-                    result = err;
-                    goto restore_fast_arena;
-                }
-                if (stats) stats->stages_tiled++;
-            } else if (needs_tiling && may_tile) {
-                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_TILED);
-                result = prepare_stage_weights(plan, s, mem, weight_gap, &stage_plan, &run_plan, stats);
-                if (result != TIGRIS_EXEC_OK)
-                    goto restore_fast_arena;
-                tigris_exec_error_t err = exec_stage_tiled(
-                    run_plan, stage, mem, kernel, user_ctx,
-                    last_consumer, s, workspace, stats);
-                if (err != TIGRIS_EXEC_OK) {
-                    TIGRIS_PLATFORM_DBG("S%u tiled ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
-                        s, (int)err, (unsigned long)total_io,
-                        (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
-                        (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
-                    result = err;
-                    goto restore_fast_arena;
-                }
-                if (stats) stats->stages_tiled++;
-            } else {
-                TRACE_STAGE_BEGIN(mem, s, TIGRIS_TRACE_PATH_NORMAL);
-                result = prepare_stage_weights(plan, s, mem, weight_gap, &stage_plan, &run_plan, stats);
-                if (result != TIGRIS_EXEC_OK)
-                    goto restore_fast_arena;
-                tigris_exec_error_t err = exec_stage_normal(
-                    run_plan, stage, mem, kernel, user_ctx, stats, workspace,
-                    io_in_fast);
-                if (err != TIGRIS_EXEC_OK) {
-                    TIGRIS_PLATFORM_DBG("S%u normal ERR=%d io=%lu fast=%lu/%lu slow=%lu/%lu\n",
-                        s, (int)err, (unsigned long)total_io,
-                        (unsigned long)mem->fast_used, (unsigned long)mem->fast_size,
-                        (unsigned long)mem->slow_used, (unsigned long)mem->slow_size);
-                    result = err;
-                    goto restore_fast_arena;
-                }
-                if (stats) stats->stages_normal++;
+                goto restore_fast_arena;
+            }
+            if (stats) {
+                if (route.arm == TIGRIS_BAND_KIND_NONE)
+                    stats->stages_normal++;
+                else
+                    stats->stages_tiled++;
             }
         }
 

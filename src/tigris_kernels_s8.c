@@ -1047,7 +1047,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
     /* TFLite QuantizedMeanOrSum (reference/reduce.h), bit-exact:
      *   - requant multiplier/shift from (in_scale / out_scale)
      *   - fold the 1/HW mean into the multiplier
-     *   - per channel: MBQM(Σx - in_zp*HW, mult, shift) + out_zp */
+     *   - per channel: MBQM(sum(x) - in_zp*HW, mult, shift) + out_zp */
     int32_t mult;
     int shift0;
     compute_mean_quant_mult(
@@ -1069,7 +1069,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_global_avg_pool_s8(
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
             /* Walk the channel with a stride-C pointer - no per-element index
-             * arithmetic. temp_sum = Σ raw x (TFLite subtracts the zp after). */
+             * arithmetic. temp_sum = sum of raw x (TFLite subtracts the zp after). */
             const int8_t *xp = X + (size_t)(n * band) * C + c;
             int32_t sum = (acc && !mem->tile.reduce_first) ? acc[n * C + c] : 0;
             for (int p = 0; p < band; p++) {

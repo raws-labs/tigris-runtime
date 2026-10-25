@@ -17,6 +17,7 @@
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
 #include "tigris_iface.h"
+#include "tigris_binary_operands.h"
 #include "test_harness.h"
 
 /* Error tests (no fixtures needed) */
@@ -2016,6 +2017,319 @@ static void test_tile_facts_contract(void)
     facts->num_tiles = 3u;
     facts->halo = 2u;
     TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "a leading band has no halo");
+}
+
+/* The executor's order, read off the band predicates one at a time. */
+static tigris_band_kind_t replayed_band_kind(const tigris_plan_t *plan,
+                                             const tigris_stage_t *stage, int32_t *rows)
+{
+    tigris_tile_plan_v10_t tile = tigris_stage_tiles(plan, stage);
+    int banded = tile.tileable != 0u && tile.axis != TIGRIS_TILE_AXIS_NONE;
+    tigris_reshape_band_t view;
+    int32_t batch = 0;
+    *rows = 0;
+    if (banded && tigris_reshape_band(plan, stage, &view)) {
+        *rows = view.input_rows;
+        return TIGRIS_BAND_KIND_RESHAPE;
+    }
+    if (banded && tigris_stage_leading_band(plan, stage) > 0) {
+        *rows = tigris_stage_leading_band(plan, stage);
+        return TIGRIS_BAND_KIND_LEADING;
+    }
+    if (tigris_stage_row_tiled(plan, stage, &batch, rows))
+        return TIGRIS_BAND_KIND_ROWS;
+    if (tigris_stage_tiled_transpose(plan, stage))
+        return TIGRIS_BAND_KIND_TRANSPOSE;
+    if (tigris_stage_input_driven_reduction(plan, stage))
+        return TIGRIS_BAND_KIND_BY_INPUT;
+    return banded && tile.axis == TIGRIS_TILE_AXIS_HW ? TIGRIS_BAND_KIND_HW : TIGRIS_BAND_KIND_STRIPE;
+}
+
+/* One stage of one operator over up to two inputs, held in memory. */
+typedef struct {
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[3];
+    tigris_op_t op;
+    tigris_stage_t stage;
+    uint16_t pool[7];
+    int32_t shapes[24];
+    tigris_op_attribute_t attribute;
+    uint8_t attribute_data[48];
+    tigris_tile_plan_v11_t tile;
+    tigris_weight_entry_t weight;
+    tigris_plan_t plan;
+} band_sweep_t;
+
+typedef struct {
+    long cases;
+    long exclusive_failures;
+    long order_failures;
+    long reshape_rows;
+    long leading_rows;
+} band_sweep_counts_t;
+
+static uint32_t sweep_elements(const int32_t *shape, uint8_t rank)
+{
+    uint32_t elements = 1u;
+    for (uint8_t i = 0u; i < rank; i++)
+        elements *= (uint32_t)shape[i];
+    return elements;
+}
+
+/* Every permutation of `rank` axes, the index-th in lexicographic order. */
+static void sweep_permutation(uint32_t index, uint8_t rank, uint8_t *perm)
+{
+    uint8_t left[6] = {0, 1, 2, 3, 4, 5};
+    uint8_t count = rank;
+    for (uint8_t i = 0u; i < rank; i++) {
+        uint32_t block = 1u;
+        for (uint8_t j = 2u; j < count; j++)
+            block *= j;
+        uint8_t pick = (uint8_t)(index / block);
+        index %= block;
+        perm[i] = left[pick];
+        for (uint8_t j = pick; j + 1u < count; j++)
+            left[j] = left[j + 1u];
+        count--;
+    }
+}
+
+static void sweep_case(band_sweep_t *sweep, band_sweep_counts_t *counts)
+{
+    tigris_plan_t *plan = &sweep->plan;
+    const tigris_stage_t *stage = &sweep->stage;
+    tigris_reshape_band_t view;
+    int32_t batch = 0;
+    int32_t rows = 0;
+    static const uint8_t records[3][2] = {
+        {0u, TIGRIS_TILE_AXIS_NONE},
+        {1u, TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH},
+        {1u, TIGRIS_TILE_AXIS_HW},
+    };
+    int reshape = tigris_reshape_band(plan, stage, &view);
+    int leading = tigris_stage_leading_band(plan, stage) > 0;
+    int row = tigris_stage_row_tiled(plan, stage, &batch, &rows);
+    int transpose = tigris_stage_tiled_transpose(plan, stage);
+    int by_input = tigris_stage_input_driven_reduction(plan, stage);
+    counts->cases++;
+    if ((reshape && leading) ||
+        (transpose && (reshape || leading || row || by_input)) ||
+        (by_input && (reshape || leading || row)))
+        counts->exclusive_failures++;
+    if (reshape && row)
+        counts->reshape_rows++;
+    if (leading && row)
+        counts->leading_rows++;
+    for (uint8_t r = 0u; r < 3u; r++) {
+        sweep->stage.tile_plan_idx = records[r][0] != 0u ? 0u : TIGRIS_NO_TILE_PLAN;
+        sweep->tile.choices.tileable = records[r][0];
+        sweep->tile.choices.axis = records[r][1];
+        int banded = records[r][0] != 0u;
+        tigris_band_kind_t want =
+            banded && reshape ? TIGRIS_BAND_KIND_RESHAPE :
+            banded && leading ? TIGRIS_BAND_KIND_LEADING :
+            row ? TIGRIS_BAND_KIND_ROWS :
+            transpose ? TIGRIS_BAND_KIND_TRANSPOSE :
+            by_input ? TIGRIS_BAND_KIND_BY_INPUT :
+            records[r][1] == TIGRIS_TILE_AXIS_HW ? TIGRIS_BAND_KIND_HW : TIGRIS_BAND_KIND_STRIPE;
+        int32_t want_rows = want == TIGRIS_BAND_KIND_RESHAPE ? view.input_rows :
+            want == TIGRIS_BAND_KIND_LEADING ? tigris_stage_leading_band(plan, stage) :
+            want == TIGRIS_BAND_KIND_ROWS ? rows : 0;
+        tigris_stage_band_t band;
+        if (tigris_stage_band_kind(plan, stage, &band) != want || band.rows != want_rows ||
+            band.batch != (want == TIGRIS_BAND_KIND_ROWS ? batch : 0))
+            counts->order_failures++;
+    }
+}
+
+/* The operator's own attributes: a permutation, one reduced axis, or pads on one axis. */
+static void sweep_attributes(band_sweep_t *sweep, band_sweep_counts_t *counts)
+{
+    uint8_t rank = sweep->tensors[0].ndim;
+    sweep->plan.num_op_attributes = 0u;
+    sweep_case(sweep, counts);
+    sweep->plan.num_op_attributes = 1u;
+    if (sweep->op.op_type == TIGRIS_OP_TRANSPOSE) {
+        uint32_t perms = 1u;
+        for (uint8_t i = 2u; i <= rank; i++)
+            perms *= i;
+        sweep->attribute.type = TIGRIS_OP_ATTR_TRANSPOSE_PERM;
+        sweep->attribute.data_len = rank;
+        for (uint32_t p = 0u; p < perms; p++) {
+            sweep_permutation(p, rank, sweep->attribute_data);
+            sweep_case(sweep, counts);
+        }
+    } else if (sweep->op.op_type == TIGRIS_OP_REDUCE_MEAN || sweep->op.op_type == TIGRIS_OP_REDUCE_SUM ||
+               sweep->op.op_type == TIGRIS_OP_REDUCE_MAX || sweep->op.op_type == TIGRIS_OP_ARG_MAX ||
+               sweep->op.op_type == TIGRIS_OP_CUMSUM) {
+        sweep->attribute.type = TIGRIS_OP_ATTR_AXES;
+        sweep->attribute.data_len = 1u;
+        for (uint8_t axis = 0u; axis < rank; axis++) {
+            sweep->attribute_data[0] = axis;
+            sweep_case(sweep, counts);
+        }
+    } else if (sweep->op.op_type == TIGRIS_OP_PAD) {
+        sweep->attribute.type = TIGRIS_OP_ATTR_PADS;
+        sweep->attribute.data_len = (uint8_t)(8u * rank);
+        for (uint8_t axis = 0u; axis <= rank; axis++) {
+            memset(sweep->attribute_data, 0, sizeof(sweep->attribute_data));
+            if (axis > 0u)
+                sweep->attribute_data[8u * (axis - 1u)] = 1u;
+            sweep_case(sweep, counts);
+        }
+    }
+    sweep->plan.num_op_attributes = 0u;
+}
+
+/*
+ * The executor and the tile facts take a stage's band kind in one order:
+ * reshape, leading, rows, transpose, by input, 2D, stripe; a tile record
+ * checks leading before reshape. Over single-operator stages of every
+ * operator, shapes of rank 2 to 4 with extents 1 and 3, either axis order
+ * flag, unit and full second operands and a full-size constant, no Reshape is
+ * a leading band, and a banded transpose or a global reduction by input is no
+ * other kind. A row band can also be a Reshape or a leading band, and both
+ * orders put rows after them.
+ */
+static void test_band_kind_order(void)
+{
+    printf("  test_band_kind_order...\n");
+    band_sweep_t sweep;
+    band_sweep_counts_t counts;
+    memset(&sweep, 0, sizeof(sweep));
+    memset(&counts, 0, sizeof(counts));
+    tigris_plan_t *plan = &sweep.plan;
+    sweep.header.version = TIGRIS_SCHEMA_VERSION;
+    sweep.header.num_tensors = 3u;
+    sweep.header.num_ops = 1u;
+    sweep.header.num_stages = 1u;
+    sweep.header.num_tile_plans = 1u;
+    sweep.header.num_weights = 1u;
+    plan->header = &sweep.header;
+    plan->tensors = sweep.tensors;
+    plan->ops = &sweep.op;
+    plan->stages = &sweep.stage;
+    plan->index_pool = sweep.pool;
+    plan->shape_pool = sweep.shapes;
+    plan->op_attributes = &sweep.attribute;
+    plan->op_attribute_data = sweep.attribute_data;
+    plan->tile_plans_v11 = &sweep.tile;
+    plan->weight_entries = &sweep.weight;
+    /* Operator inputs 0 and 1, its output, the stage operator, stage inputs, stage output. */
+    const uint16_t pool[7] = {0u, 1u, 2u, 0u, 0u, 1u, 2u};
+    memcpy(sweep.pool, pool, sizeof(pool));
+    sweep.op.inputs_off = 0u;
+    sweep.op.outputs_off = 2u;
+    sweep.op.num_outputs = 1u;
+    sweep.op.bias_idx = TIGRIS_NO_WEIGHT;
+    sweep.stage.ops_off = 3u;
+    sweep.stage.ops_count = 1u;
+    sweep.stage.inputs_off = 4u;
+    sweep.stage.outputs_off = 6u;
+    sweep.stage.outputs_count = 1u;
+    sweep.stage.chain_id = TIGRIS_NO_CHAIN;
+    for (uint16_t t = 0u; t < 3u; t++) {
+        sweep.tensors[t].shape_off = (uint16_t)(8u * t);
+        sweep.tensors[t].dtype = 1u;
+        sweep.tensors[t].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+    int32_t *in_shape = &sweep.shapes[0];
+    int32_t *second_shape = &sweep.shapes[8];
+    int32_t *out_shape = &sweep.shapes[16];
+    for (uint16_t type = 1u; type <= (uint16_t)TIGRIS_OP_GELU; type++) {
+        sweep.op.op_type = (uint8_t)type;
+        for (uint8_t rank = 2u; rank <= 4u; rank++) {
+            for (uint32_t extents = 0u; extents < (1u << rank); extents++) {
+                for (uint8_t i = 0u; i < rank; i++)
+                    in_shape[i] = ((extents >> i) & 1u) != 0u ? 3 : 1;
+                /* Outputs: the input's shape, one axis at 1, the last two swapped or merged. */
+                for (uint8_t form = 0u; form <= rank + 2u; form++) {
+                    uint8_t out_rank = rank;
+                    memcpy(out_shape, in_shape, sizeof(int32_t) * rank);
+                    if (form > 0u && form <= rank) {
+                        out_shape[form - 1u] = 1;
+                    } else if (form == rank + 1u) {
+                        out_shape[rank - 2u] = in_shape[rank - 1u];
+                        out_shape[rank - 1u] = in_shape[rank - 2u];
+                    } else if (form == rank + 2u) {
+                        out_shape[rank - 2u] *= in_shape[rank - 1u];
+                        out_rank = (uint8_t)(rank - 1u);
+                        if (out_rank < 2u)
+                            continue;
+                    }
+                    for (uint8_t layout = 0u; layout < 4u; layout++) {
+                        sweep.tensors[0].ndim = rank;
+                        sweep.tensors[0].flags = (layout & 1u) != 0u ? TIGRIS_TENSOR_LINEAR : 0u;
+                        sweep.tensors[0].size_bytes = 4u * sweep_elements(in_shape, rank);
+                        sweep.tensors[2].ndim = out_rank;
+                        sweep.tensors[2].flags = (layout & 2u) != 0u ? TIGRIS_TENSOR_LINEAR : 0u;
+                        sweep.tensors[2].size_bytes = 4u * sweep_elements(out_shape, out_rank);
+                        sweep.weight.size_bytes = sweep.tensors[2].size_bytes;
+                        /* A second operand of the output's shape with any subset of its axes at 1. */
+                        for (uint32_t unit = 0u; unit <= (1u << out_rank); unit++) {
+                            uint8_t inputs = unit == (1u << out_rank) ? 1u : 2u;
+                            sweep.op.num_inputs = inputs;
+                            sweep.stage.inputs_count = inputs;
+                            for (uint8_t i = 0u; i < out_rank; i++)
+                                second_shape[i] = ((unit >> i) & 1u) != 0u ? 1 : out_shape[i];
+                            sweep.tensors[1] = sweep.tensors[2];
+                            sweep.tensors[1].shape_off = 8u;
+                            sweep.tensors[1].size_bytes = 4u * sweep_elements(second_shape, out_rank);
+                            sweep.op.weight_idx = TIGRIS_NO_WEIGHT;
+                            sweep_attributes(&sweep, &counts);
+                            sweep.op.weight_idx = 0u;
+                            sweep_attributes(&sweep, &counts);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    printf("    %ld stages, %ld reshape row bands, %ld leading row bands\n",
+           counts.cases, counts.reshape_rows, counts.leading_rows);
+    TEST_ASSERT_EQ(counts.exclusive_failures, 0, "reshape, leading, transpose and by-input bands exclude each other");
+    TEST_ASSERT_EQ(counts.order_failures, 0, "the band kind follows the executor's order");
+    TEST_ASSERT(counts.reshape_rows > 0, "the sweep reaches a Reshape that is also a row band");
+    TEST_ASSERT(counts.leading_rows > 0, "the sweep reaches a leading band that is also a row band");
+
+    TEST_ASSERT_EQ(tigris_stage_band_kind(NULL, &sweep.stage, NULL), TIGRIS_BAND_KIND_NONE, "NULL plan");
+    TEST_ASSERT_EQ(tigris_stage_band_kind(plan, NULL, NULL), TIGRIS_BAND_KIND_NONE, "NULL stage");
+}
+
+/* Every stage of the fixed fixtures of each schema has the replayed kind. */
+static void test_band_kind_fixtures(void)
+{
+    static const char *const names[] = {
+        "schema-v2-linear.tgrs", "schema-v3-qdq-conv.tgrs", "schema-v4-transpose.tgrs",
+        "schema-v5-conv1d-axis.tgrs", "schema-v6-interface-dtype.tgrs",
+        "schema-v7-tensor-layout.tgrs", "schema-v8-layer-norm.tgrs",
+        "schema-v9-binary-requant.tgrs", "schema-v10-state.tgrs",
+        "schema-v11-scheduled-peak.tgrs",
+    };
+    printf("  test_band_kind_fixtures...\n");
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", TIGRIS_SCHEMA_COMPAT_DIR, names[i]);
+        uint32_t len = 0;
+        uint8_t *buf = load_file(path, &len);
+        TEST_ASSERT(buf != NULL, "fixture readable");
+        if (buf == NULL)
+            continue;
+        tigris_plan_t plan;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), TIGRIS_OK, names[i]);
+        long mismatches = 0;
+        for (uint16_t s = 0; s < plan.header->num_stages; s++) {
+            const tigris_stage_t *stage = &plan.stages[s];
+            if (stage->chain_len != 0u)
+                continue;
+            int32_t rows = 0;
+            tigris_stage_band_t band;
+            if (tigris_stage_band_kind(&plan, stage, &band) != replayed_band_kind(&plan, stage, &rows))
+                mismatches++;
+        }
+        TEST_ASSERT_EQ(mismatches, 0, names[i]);
+        free(buf);
+    }
 }
 
 static void test_float_section(void)
@@ -4984,6 +5298,7 @@ int main(void)
     test_rank4_row_band_contract();
     test_reshape_band_contract();
     test_tile_facts_contract();
+    test_band_kind_order();
     test_float_section();
     test_operator_semantic_guards();
     test_nonweighted_operator_semantics();
@@ -5006,6 +5321,7 @@ int main(void)
 
     printf("\nSchema compatibility fixtures:\n");
     test_schema_compatibility_fixtures();
+    test_band_kind_fixtures();
     test_state_fixture();
     test_state_goldens();
     test_legacy_schema_validates_builtin_operators();

@@ -313,6 +313,56 @@ int tigris_whole_operand_op(uint8_t type)
     return row != NULL && (row->flags & TIGRIS_CONTRACT_WHOLE_OPERAND) != 0u;
 }
 
+/* Whether a binary operator's constant, held in a weight the caller has
+ * checked, holds one value per element of `output`. Its element is the data
+ * dtype's, or one byte for a selection's condition, as the kernel reads it;
+ * a comparison's bool output does not size it. */
+static int constant_is_dense(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    const tigris_tensor_t *output)
+{
+    uint8_t len = 0u;
+    const uint8_t *attr = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_CONSTANT_OPERAND, &len);
+    const int select = op->op_type == TIGRIS_OP_SELECT_V2;
+    const uint8_t position = attr != NULL ? attr[0] : 1u;
+    const uint8_t dtype = select ? output->dtype :
+        plan->tensors[tigris_op_inputs(plan, op)[0]].dtype;
+    const uint64_t element = select && position == 0u ? 1u : tigris_dtype_size(dtype);
+    return (uint64_t)plan->weight_entries[op->weight_idx].size_bytes ==
+        (uint64_t)tensor_elements(output) * element;
+}
+
+/* Whether a rank-2 binary operator's constant operand reads alike in every
+ * row. A row band hands the constant to the kernel whole and unshifted, so one
+ * that varies along the rows meets the wrong rows. At rank 2 the leading band
+ * defers to the row band, so such an operator has to leave the row band for
+ * the leading band, which offsets the constant. Mirrors
+ * _constant_repeats_every_row in the compiler. */
+static int constant_repeats_every_row(
+    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
+    const tigris_tensor_t *output)
+{
+    if (!is_binary_op(op->op_type) || op->weight_idx == TIGRIS_NO_WEIGHT || output->ndim != 2u)
+        return 1;
+    if (plan->weight_entries == NULL || op->weight_idx >= plan->header->num_weights ||
+        op->num_inputs == 0u)
+        return 0;
+    uint8_t len = 0u;
+    const uint8_t *attr = tigris_op_attribute_data(
+        plan, op_index, TIGRIS_OP_ATTR_CONSTANT_OPERAND, &len);
+    if (attr != NULL && len != TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN) {
+        int32_t rows = 0;
+        if (len != TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN + 8u)
+            return 0;
+        memcpy(&rows, attr + TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN, sizeof(rows));
+        return rows == 1;
+    }
+    /* The short form is one value, one per column, or one per element, told
+     * apart by length; only the last varies along the rows. */
+    return !constant_is_dense(plan, op, op_index, output);
+}
+
 /**
  * Whether a stage is a rank-2 matrix pipeline that tiles along its rows.
  *
@@ -365,7 +415,7 @@ int tigris_stage_row_tiled(
         int32_t b;
         int32_t r;
         if (!tigris_tensor_row_view(plan, out, &b, &r, &cols) ||
-            b != batch || r != rows)
+            b != batch || r != rows || !constant_repeats_every_row(plan, op, sops[j], out))
             return 0;
         /* A row view accepts a rank-3 [1, rows, cols] as the same memory, but
          * kern_fully_connected reads its channel count out of y_shape[1],
@@ -613,8 +663,7 @@ int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
         }
         if (op->weight_idx != TIGRIS_NO_WEIGHT) {
             if (!plan->weight_entries || op->weight_idx >= plan->header->num_weights) return 0;
-            uint32_t bytes = plan->weight_entries[op->weight_idx].size_bytes;
-            if (bytes == out->size_bytes && bytes > tigris_dtype_size(out->dtype)) broadcast = 1;
+            if (constant_is_dense(plan, op, op_index, out)) broadcast = 1;
             uint8_t len = 0u;
             const uint8_t *attr = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_CONSTANT_OPERAND, &len);
             if (attr && len == TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN + 4u * out->ndim) {
@@ -854,8 +903,11 @@ int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_
     }
     const tigris_tensor_t *in = &plan->tensors[tigris_op_inputs(plan, op)[0]];
     const int32_t *shape = tigris_tensor_shape(plan, in);
-    /* Preserve the meaning of existing matrix-row and height records. */
-    if (in->ndim == 2u && shape[0] > 1 && tigris_row_tiling_op(op->op_type)) return 0;
+    /* Preserve the meaning of existing matrix-row and height records. A rank-2
+     * stage the row band declines, such as one with a dense constant, stays leading. */
+    int32_t row_band = 0;
+    if (in->ndim == 2u && shape[0] > 1 && tigris_row_tiling_op(op->op_type) &&
+        tigris_stage_row_tiled(plan, stage, NULL, &row_band)) return 0;
     if ((in->ndim >= 2u && shape[in->ndim - 2u] > 1 && tigris_op_independent_band(plan, op, index, 1)) ||
         tigris_op_independent_band(plan, op, index, 0)) return 0;
     const tigris_tensor_t *out = &plan->tensors[tigris_op_outputs(plan, op)[0]];

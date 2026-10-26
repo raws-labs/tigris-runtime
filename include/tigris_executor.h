@@ -94,36 +94,53 @@ typedef struct {
  * Exact caller-buffer capacity for a plan's executor metadata.
  *
  * The leading alignment allowances let an arbitrary byte buffer be passed to
- * tigris_run_with_workspace_buffer().  Generated code supplies the actual plan
- * limits, so unused generic limits consume no SRAM.
+ * tigris_run_with_workspace_buffer().  Generated code supplies the plan's own
+ * figures, so the build limits consume no SRAM: chain_stages is the longest
+ * chain, chain_spatial_ops the most height-spatial operators in one chain
+ * (summed over its stages) and subgraph_depth the most control-flow operators
+ * running one inside another.
  */
 #define TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(                            \
-    tensors, inputs, outputs, chain_stages, spatial_ops)                       \
+    tensors, inputs, outputs, chain_stages, chain_spatial_ops, subgraph_depth) \
     ((TIGRIS_EXECUTOR_POINTER_ALIGNMENT - 1u) +                                \
      ((size_t)(inputs) + (size_t)(outputs) +                                   \
+      ((chain_stages) != 0u ? (size_t)(outputs) : 0u) +                        \
       2u * (size_t)(chain_stages)) * sizeof(void *) +                          \
      (TIGRIS_EXECUTOR_INT32_ALIGNMENT - 1u) +                                  \
-     ((size_t)(chain_stages) *                                                 \
-          (14u + 13u * (size_t)(spatial_ops)) +                                \
-      2u * (size_t)(tensors)) * sizeof(int32_t) +                              \
+     (15u * (size_t)(chain_stages) + 13u * (size_t)(chain_spatial_ops) +       \
+      2u * (size_t)(tensors) + (size_t)(outputs)) * sizeof(int32_t) +          \
      (TIGRIS_EXECUTOR_UINT16_ALIGNMENT - 1u) +                                 \
-     (2u * (size_t)(tensors) + 4u + 4u * (size_t)TIGRIS_MAX_SUBGRAPH_DEPTH) *  \
+     (2u * (size_t)(tensors) + 4u + 4u * (size_t)(subgraph_depth)) *           \
          sizeof(uint16_t))
 
 /**
- * Opaque workspace size derived from the configured plan limits.  Override
- * only to add target-specific headroom; a compile-time assertion prevents an
- * undersized value from building.
+ * The most height-spatial operators in one chain and the deepest control-flow
+ * nesting a plan within the configured limits can have: a plan has at most
+ * 65535 operators, and more graphs than its nesting depth.
+ */
+#define TIGRIS_EXECUTOR_BUILD_CHAIN_SPATIAL_OPS                                \
+    ((uint64_t)TIGRIS_MAX_CHAIN_STAGES * TIGRIS_MAX_SPATIAL_OPS_PER_STAGE < 65535u \
+         ? (uint64_t)TIGRIS_MAX_CHAIN_STAGES * TIGRIS_MAX_SPATIAL_OPS_PER_STAGE    \
+         : 65535u)
+#define TIGRIS_EXECUTOR_BUILD_SUBGRAPH_DEPTH                                   \
+    (TIGRIS_MAX_SUBGRAPH_DEPTH < TIGRIS_MAX_SUBGRAPHS                          \
+         ? TIGRIS_MAX_SUBGRAPH_DEPTH : TIGRIS_MAX_SUBGRAPHS - 1u)
+
+/**
+ * Opaque workspace size for the largest plan the configured limits admit, with
+ * 64 bytes of alignment headroom.  Override only to add target-specific
+ * headroom; a compile-time assertion prevents an undersized value from
+ * building.
  */
 #ifndef TIGRIS_EXECUTOR_WORKSPACE_BYTES
 #define TIGRIS_EXECUTOR_WORKSPACE_BYTES (                                      \
     64u +                                                                      \
-    (2u * TIGRIS_MAX_TENSORS + 4u + 4u * TIGRIS_MAX_SUBGRAPH_DEPTH) * sizeof(uint16_t) + \
-    2u * TIGRIS_MAX_TENSORS * sizeof(int32_t) +                                \
-    (TIGRIS_MAX_STAGE_INPUTS + TIGRIS_MAX_STAGE_OUTPUTS) * sizeof(void *) +     \
-    TIGRIS_MAX_CHAIN_STAGES * (                                                \
-        2u * sizeof(void *) +                                                  \
-        (14u + 13u * TIGRIS_MAX_SPATIAL_OPS_PER_STAGE) * sizeof(int32_t)))
+    (TIGRIS_MAX_STAGE_INPUTS + 2u * TIGRIS_MAX_STAGE_OUTPUTS +                 \
+     2u * TIGRIS_MAX_CHAIN_STAGES) * sizeof(void *) +                          \
+    (15u * TIGRIS_MAX_CHAIN_STAGES + 13u * TIGRIS_EXECUTOR_BUILD_CHAIN_SPATIAL_OPS + \
+     2u * TIGRIS_MAX_TENSORS + TIGRIS_MAX_STAGE_OUTPUTS) * sizeof(int32_t) +    \
+    (2u * TIGRIS_MAX_TENSORS + 4u + 4u * TIGRIS_EXECUTOR_BUILD_SUBGRAPH_DEPTH) * \
+        sizeof(uint16_t))
 #endif
 
 /** Caller-owned, naturally aligned executor working storage. */

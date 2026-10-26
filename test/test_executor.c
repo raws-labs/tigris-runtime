@@ -445,15 +445,17 @@ static void test_exec_workspace_chain_sizing(void)
     plan.stages = stages;
     plan.index_pool = indices;
 
+    /* Two spatial operators in the first stage and one in the second: three
+     * entries, not the longest stage's two for each chain stage. */
     TEST_ASSERT_EQ(
         tigris_executor_workspace_required(&plan),
-        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(5, 2, 3, 2, 2),
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(5, 2, 3, 2, 3, 0),
         "query includes pool in actual chain spatial capacity");
 
     stages[0]._reserved1 = TIGRIS_STAGE_FLAG_LINE_BUFFERED;
     TEST_ASSERT_EQ(
         tigris_executor_workspace_required(&plan),
-        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(5, 2, 3, 2, 2),
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(5, 2, 3, 2, 3, 0),
         "line-buffered flag on head stage does not change workspace sizing");
 }
 
@@ -1552,7 +1554,7 @@ static void test_exec_padding_range(void)
             _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t fast[1048576];
             _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[1024];
             uint8_t workspace[
-                TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 2, 1)];
+                TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 2, 1, 0)];
             tigris_mem_t mem;
             tile_probe_ctx_t ctx = {0};
 
@@ -1958,7 +1960,7 @@ static void run_height_tiling_contract_case(
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[2048];
     tigris_mem_t mem;
     uint8_t workspace[
-        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(2, 1, 1, 0, 0)];
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(2, 1, 1, 0, 0, 0)];
     tigris_exec_stats_t stats;
     tile_probe_ctx_t ctx = {0};
 
@@ -2068,7 +2070,7 @@ static tigris_exec_error_t run_band_fixture(
     void *ptrs[3];
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t fast[4096];
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[8192];
-    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 2, 1, 0, 0)];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 2, 1, 0, 0, 0)];
     tigris_mem_t mem;
     uint16_t n_in = fx->stage.inputs_count;
     uint16_t out_idx = fx->indices[fx->stage.outputs_off];
@@ -2274,7 +2276,7 @@ static void run_convtranspose_tiling_case(
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[2048];
     tigris_mem_t mem;
     uint8_t workspace[
-        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(2, 1, 1, 0, 0)];
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(2, 1, 1, 0, 0, 0)];
     tigris_exec_stats_t stats;
     tile_probe_ctx_t ctx = {0};
 
@@ -2411,7 +2413,7 @@ static void test_exec_mixed_conv_convtranspose_not_tiled(void)
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[4096];
     tigris_mem_t mem;
     uint8_t workspace[
-        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0, 0)];
     tigris_exec_stats_t stats;
     tile_probe_ctx_t ctx = {0};
 
@@ -2708,7 +2710,7 @@ static void test_exec_chained_convtranspose_fails_closed(void)
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[2048];
     tigris_mem_t mem;
     uint8_t workspace[
-        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(5, 2, 3, 2, 2)];
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(5, 2, 3, 2, 2, 0)];
     tigris_exec_stats_t stats;
     tile_probe_ctx_t ctx = {0};
 
@@ -2890,7 +2892,7 @@ static void test_exec_compaction_preserves_data(void)
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[128];
     tigris_mem_t mem;
     uint8_t workspace[
-        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0, 0)];
     tigris_exec_stats_t stats;
     compaction_ctx_t ctx = {0};
 
@@ -2958,7 +2960,7 @@ static void test_exec_compact_slow_align(void)
     const uint32_t slow_size = (uint32_t)(sizeof(slow_storage) - 4u);
     tigris_mem_t mem;
     uint8_t workspace[
-        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0, 0)];
     tigris_exec_stats_t stats;
     compaction_ctx_t ctx = {0};
 
@@ -3044,7 +3046,7 @@ static int reshape_passes_buffer_through(
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[256];
     tigris_mem_t mem;
     uint8_t workspace[
-        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0, 0)];
     tigris_exec_stats_t stats;
     alias_ctx_t ctx = {0};
 
@@ -3280,7 +3282,7 @@ static tigris_exec_error_t run_reshape_group(
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[512];
     tigris_mem_t mem;
     uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(
-        GROUP_TENSORS, 1, GROUP_MAX_OUTPUTS, 0, 0)];
+        GROUP_TENSORS, 1, GROUP_MAX_OUTPUTS, 0, 0, 0)];
     tigris_exec_stats_t stats;
 
     memset(&header, 0, sizeof(header));
@@ -3780,7 +3782,7 @@ static void test_exec_fast_requirement_checked_up_front(void)
     void *ptrs[3];
     tigris_mem_t mem;
     tigris_exec_stats_t stats;
-    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0, 0)];
     uint32_t short_arena = IO_PEAK - TIGRIS_TENSOR_ALIGN;
 
     memset(data, 3, sizeof(data));
@@ -3850,7 +3852,7 @@ static tigris_exec_error_t run_recordless_stage(uint8_t version, tigris_exec_sta
     void *ptrs[4];
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t fast[768];
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[2048];
-    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(4, 2, 2, 0, 0)];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(4, 2, 2, 0, 0, 0)];
     tigris_mem_t mem;
 
     memset(&header, 0, sizeof(header));
@@ -3963,7 +3965,7 @@ static void test_exec_io_in_fast_run(void)
     void *ptrs[3];
     tigris_mem_t mem;
     tigris_exec_stats_t stats;
-    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0, 0)];
 
     for (uint32_t i = 0; i < sizeof(data); i++)
         data[i] = (uint8_t)(5u * i + 1u);
@@ -4045,7 +4047,7 @@ static void test_exec_io_in_fast_run(void)
     TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), NULL, 0),
                    TIGRIS_MEM_OK, "memory for a plan with an extra stage output");
     for (int run = 0; run < 2; run++) {
-        uint8_t wide[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 2, 0, 0)];
+        uint8_t wide[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 2, 0, 0, 0)];
         memset(in_place, 0, sizeof(in_place));
         TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, data, sizeof(data)), TIGRIS_OK,
                        "input written for a plan with an extra stage output");

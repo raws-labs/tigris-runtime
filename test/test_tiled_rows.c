@@ -153,7 +153,7 @@ static tigris_exec_error_t run_case_full(
     const float *input, float *output, uint16_t *tiled)
 {
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[SLOW_SIZE];
-    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0, 0)];
     tigris_exec_stats_t stats;
     tigris_mem_t mem;
     void *ptrs[3];
@@ -510,7 +510,7 @@ static tigris_exec_error_t run_alias_case(
 {
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t fast[512];
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[SLOW_SIZE];
-    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0)];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0, 0)];
     tigris_mem_t mem;
     void *ptrs[3];
 
@@ -731,7 +731,7 @@ static tigris_exec_error_t run_const_case(const_fixture_t *fx, const float *inpu
 {
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t fast[512];
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[SLOW_SIZE];
-    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 2, 1, 0, 0)];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 2, 1, 0, 0, 0)];
     tigris_exec_stats_t stats;
     tigris_mem_t mem;
     void *ptrs[3];

@@ -266,6 +266,26 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(test_tiled_rows test/test_tiled_rows.c)
     target_link_libraries(test_tiled_rows tigris_runtime)
 
+    # The storage test against the default runtime and against one built with
+    # every limit at the plan format's maximum.
+    find_package(Threads REQUIRED)
+    add_executable(test_plan_storage test/test_plan_storage.c)
+    target_include_directories(test_plan_storage PRIVATE src)
+    target_link_libraries(test_plan_storage tigris_runtime Threads::Threads)
+    set(TIGRIS_FORMAT_MAXIMA
+        TIGRIS_MAX_TENSORS=65535u TIGRIS_MAX_STAGE_INPUTS=65535u
+        TIGRIS_MAX_STAGE_OUTPUTS=65535u TIGRIS_MAX_CHAIN_STAGES=65535u
+        TIGRIS_MAX_SUBGRAPHS=65535u TIGRIS_MAX_SUBGRAPH_DEPTH=65535u
+        TIGRIS_MAX_SPATIAL_OPS_PER_STAGE=65535u)
+    add_library(tigris_runtime_maxima_objects OBJECT ${TIGRIS_RUNTIME_SRCS})
+    target_include_directories(tigris_runtime_maxima_objects PRIVATE include)
+    target_compile_definitions(tigris_runtime_maxima_objects PRIVATE ${TIGRIS_FORMAT_MAXIMA})
+    add_executable(test_plan_storage_maxima test/test_plan_storage.c
+        $<TARGET_OBJECTS:tigris_runtime_maxima_objects>)
+    target_include_directories(test_plan_storage_maxima PRIVATE include src)
+    target_compile_definitions(test_plan_storage_maxima PRIVATE ${TIGRIS_FORMAT_MAXIMA})
+    target_link_libraries(test_plan_storage_maxima m Threads::Threads)
+
     add_executable(test_avg_pool_s8 test/test_avg_pool_s8.c)
     target_include_directories(test_avg_pool_s8 PRIVATE src)
     target_link_libraries(test_avg_pool_s8 tigris_runtime)
@@ -308,6 +328,8 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_test(NAME tiled_transpose COMMAND test_tiled_transpose)
     add_test(NAME tiled_rows COMMAND test_tiled_rows)
     add_test(NAME avg_pool_s8 COMMAND test_avg_pool_s8)
+    add_test(NAME plan_storage COMMAND test_plan_storage)
+    add_test(NAME plan_storage_maxima COMMAND test_plan_storage_maxima)
     add_test(NAME posix_example COMMAND tigris_posix_example
         ${CMAKE_CURRENT_SOURCE_DIR}/test/schema_compat/schema-v9-binary-requant.tgrs)
     # The output pattern replaces the exit-code check, so sanitizer reports fail it explicitly.

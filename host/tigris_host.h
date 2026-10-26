@@ -29,6 +29,14 @@ TIGRIS_HOST_API const char *tigris_host_create(
     const void *data, uint32_t size, uint32_t slow_capacity, tigris_host_t **out);
 TIGRIS_HOST_API void tigris_host_destroy(tigris_host_t *host);
 
+/* Loads a plan as a target's loader does, without creating a session: NULL
+ * when it loads, else the loader's error message. This library is built with
+ * every TIGRIS_MAX_* limit at 65535, which no plan exceeds. When required is
+ * not NULL, its five entries receive what the plan asks of a target build:
+ * tensors, stage inputs, stage outputs, chain stages and spatial operators per
+ * chained stage, as TIGRIS_MAX_* values; all zero when the plan is refused. */
+TIGRIS_HOST_API const char *tigris_host_check(const void *data, uint32_t size, uint16_t *required);
+
 /* Tensors use stored axis order and declared interface dtype. output is 0 for
  * inputs and 1 for outputs. Invalid queries return zero or NULL. */
 TIGRIS_HOST_API uint32_t tigris_host_tensor_count(const tigris_host_t *host, int output);

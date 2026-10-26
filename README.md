@@ -182,6 +182,9 @@ Inputs and outputs use stored axis order and the model's declared interface
 dtype. Sessions are independent; serialize calls on each session. The default
 slow arena is a conservative host allocation, not a compiled memory requirement.
 Reported peaks cover the arenas, not total process memory.
+`tigris_host_check` loads a plan without creating a session and returns the
+loader's refusal, or the build limits the plan needs. The host library is built
+with every `TIGRIS_MAX_*` limit at 65535, so no plan stops at a build limit.
 
 The archive contains the shared library, C header, license, and a manifest with
 the runtime version, host ABI, platform, source revision, and library checksum.

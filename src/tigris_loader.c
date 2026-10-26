@@ -209,18 +209,28 @@ static int is_axis1_unary_pointwise_op(uint8_t type)
     return row != NULL && (row->flags & TIGRIS_CONTRACT_AXIS_UNARY) != 0u;
 }
 
-int tigris_height_spatial_op(uint8_t type)
+tigris_height_op_t tigris_height_op(uint8_t type)
 {
-    return type == TIGRIS_OP_CONV ||
-           type == TIGRIS_OP_DEPTHWISE ||
-           type == TIGRIS_OP_MAX_POOL ||
-           type == TIGRIS_OP_AVG_POOL || type == TIGRIS_OP_L2_POOL;
+    const tigris_op_contract_t *row = tigris_op_contract(type);
+    const uint16_t flags = row != NULL ? row->flags : 0u;
+    tigris_height_op_t kind = TIGRIS_HEIGHT_OP_REFUSED;
+    if ((flags & TIGRIS_CONTRACT_SPATIAL) != 0u)
+        kind = TIGRIS_HEIGHT_OP_SPATIAL;
+    else if ((flags & TIGRIS_CONTRACT_RESAMPLE) != 0u)
+        kind = TIGRIS_HEIGHT_OP_RESAMPLE;
+    else if ((flags & TIGRIS_CONTRACT_HEIGHT) != 0u)
+        kind = TIGRIS_HEIGHT_OP_POINTWISE;
+    return kind;
 }
 
-/* Resize computes its source band from the full input and output extents. */
+int tigris_height_spatial_op(uint8_t type)
+{
+    return tigris_height_op(type) == TIGRIS_HEIGHT_OP_SPATIAL;
+}
+
 int tigris_height_upsample_op(uint8_t type)
 {
-    return type == TIGRIS_OP_RESIZE || type == TIGRIS_OP_RESIZE_LINEAR;
+    return tigris_height_op(type) == TIGRIS_HEIGHT_OP_RESAMPLE;
 }
 
 /**
@@ -946,6 +956,53 @@ int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_
 }
 
 
+static int states_its_own_order(const tigris_tensor_t *t)
+{
+    return (t->flags & TIGRIS_TENSOR_LINEAR) != 0u || t->ndim <= 2u;
+}
+
+/**
+ * Whether a reshape from in to out gives a tensor a new shape without moving a
+ * byte.
+ *
+ * A reshape produces the same bytes in the same order, and only the shape the
+ * consumer reads differs, in two cases. Two tensors that each state their own
+ * axis order hold their elements in the order the shape lists them, so
+ * regrouping the shape moves nothing. Two spatial tensors hold their channel
+ * axis last and their spatial axes in order ahead of it, so regrouping only
+ * the spatial axes moves nothing either: that is what an unfold is, and it is
+ * how a vision transformer turns a feature map into patches. There the batch
+ * and the channel extent have to survive, because they are the ends of the
+ * stored order and a reshape that changes either is moving bytes.
+ *
+ * The output can then share the input's buffer instead of being allocated and
+ * copied into. Mirrors pure_reinterpretations in the compiler, which counts
+ * the two as one allocation when it decides whether a stage fits.
+ */
+int tigris_pure_reinterpretation(const tigris_plan_t *plan, const tigris_tensor_t *in,
+                                 const tigris_tensor_t *out)
+{
+    if (in->size_bytes != out->size_bytes)
+        return 0;
+    /* The bytes are only the same bytes if they mean the same thing. A plan
+     * may give the two tensors different quantization, and then the reshape
+     * has to re-encode rather than pass through. */
+    const tigris_quant_param_t *iq = tigris_tensor_quant(plan, in);
+    const tigris_quant_param_t *oq = tigris_tensor_quant(plan, out);
+    if (iq != oq && (!iq || !oq || iq->scale != oq->scale || iq->zero_point != oq->zero_point))
+        return 0;
+    int in_own = states_its_own_order(in);
+    if (in_own != states_its_own_order(out))
+        return 0;
+    if (in_own)
+        return 1;
+    if (plan->shape_pool == NULL || in->ndim == 0u || out->ndim == 0u)
+        return 0;
+    const int32_t *a = tigris_tensor_shape(plan, in);
+    const int32_t *b = tigris_tensor_shape(plan, out);
+    return a[0] == b[0] && a[in->ndim - 1u] == b[out->ndim - 1u];
+}
+
 int tigris_reshape_band(const tigris_plan_t *plan, const tigris_stage_t *stage,
                         tigris_reshape_band_t *view)
 {
@@ -958,15 +1015,10 @@ int tigris_reshape_band(const tigris_plan_t *plan, const tigris_stage_t *stage,
     if (tigris_stage_inputs(plan, stage)[0] != x || tigris_stage_outputs(plan, stage)[0] != y) return 0;
     const tigris_tensor_t *in = &plan->tensors[x], *out = &plan->tensors[y];
     if ((in->dtype != 1u && in->dtype != 3u) || in->dtype != out->dtype ||
-        in->size_bytes != out->size_bytes || in->ndim < 2u || in->ndim > 6u ||
-        out->ndim < 2u || out->ndim > 6u) return 0;
-    const tigris_quant_param_t *iq = tigris_tensor_quant(plan, in);
-    const tigris_quant_param_t *oq = tigris_tensor_quant(plan, out);
-    if (iq != oq && (!iq || !oq || iq->scale != oq->scale || iq->zero_point != oq->zero_point)) return 0;
+        in->ndim < 2u || in->ndim > 6u || out->ndim < 2u || out->ndim > 6u ||
+        !tigris_pure_reinterpretation(plan, in, out)) return 0;
     const int32_t *a = tigris_tensor_shape(plan, in), *b = tigris_tensor_shape(plan, out);
-    int own_in = in->ndim == 2u || (in->flags & TIGRIS_TENSOR_LINEAR) != 0u;
-    int own_out = out->ndim == 2u || (out->flags & TIGRIS_TENSOR_LINEAR) != 0u;
-    if (own_in != own_out || (!own_in && (a[0] != b[0] || a[in->ndim - 1u] != b[out->ndim - 1u]))) return 0;
+    int own_in = states_its_own_order(in);
     for (int mode = own_in ? 0 : 1; mode < 3; mode++) {
         uint8_t ia = mode == 0 ? (uint8_t)(in->ndim - 2u) : 1u;
         uint8_t ib = mode == 0 ? (uint8_t)(out->ndim - 2u) : 1u;
@@ -1212,7 +1264,7 @@ static int tile_v10_valid(const tigris_plan_t *plan, const tigris_stage_t *stage
     return 0;
 }
 
-static int is_axis1_binary_pointwise_op(uint8_t type)
+int tigris_axis1_binary_pointwise_op(uint8_t type)
 {
     const tigris_op_contract_t *row = tigris_op_contract(type);
     return row != NULL && (row->flags & TIGRIS_CONTRACT_AXIS_BINARY) != 0u;
@@ -1247,7 +1299,7 @@ int tigris_stage_stripe_contract(const tigris_plan_t *plan, const tigris_stage_t
             uint8_t type = plan->ops[sops[j]].op_type;
             if (type == TIGRIS_OP_CONV1D) {
                 spatial_count++;
-            } else if (is_axis1_binary_pointwise_op(type)) {
+            } else if (tigris_axis1_binary_pointwise_op(type)) {
                 binary_count++;
             } else if (!is_axis1_unary_pointwise_op(type)) {
                 return 0;
@@ -1259,16 +1311,15 @@ int tigris_stage_stripe_contract(const tigris_plan_t *plan, const tigris_stage_t
         return 0;
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         uint8_t type = plan->ops[sops[j]].op_type;
-        const tigris_op_contract_t *row = tigris_op_contract(type);
-        uint16_t flags = row != NULL ? row->flags : 0u;
-        if ((flags & TIGRIS_CONTRACT_SPATIAL) != 0u ||
+        tigris_height_op_t kind = tigris_height_op(type);
+        if (kind == TIGRIS_HEIGHT_OP_SPATIAL ||
             (axis == TIGRIS_TILE_AXIS_HW && type == TIGRIS_OP_CONV_TRANSPOSE)) {
             spatial_count++;
-        } else if ((flags & TIGRIS_CONTRACT_RESAMPLE) != 0u) {
+        } else if (kind == TIGRIS_HEIGHT_OP_RESAMPLE) {
             if (stage->chain_len != 0u)
                 return 0;
             spatial_count++;
-        } else if ((flags & TIGRIS_CONTRACT_HEIGHT) == 0u) {
+        } else if (kind == TIGRIS_HEIGHT_OP_REFUSED) {
             return 0;
         }
     }
@@ -4402,7 +4453,7 @@ static int stage_binary_operands_equal(const tigris_plan_t *plan, const tigris_s
     const uint16_t *ops = tigris_stage_ops(plan, stage);
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         const tigris_op_t *op = &plan->ops[ops[j]];
-        if (!is_axis1_binary_pointwise_op(op->op_type) || op->num_inputs < 2u) continue;
+        if (!tigris_axis1_binary_pointwise_op(op->op_type) || op->num_inputs < 2u) continue;
         const uint16_t *inputs = tigris_op_inputs(plan, op);
         for (uint8_t k = 1; k < op->num_inputs; k++)
             if (!tensor_shapes_equal(plan, &plan->tensors[inputs[0]], &plan->tensors[inputs[k]]))
@@ -4710,16 +4761,15 @@ static tigris_error_t validate_stage(tigris_load_state_t *ctx, uint16_t i)
             if (op_idx >= ctx->hdr->num_ops)
                 return TIGRIS_ERR_BAD_SECTION;
 
-            uint8_t op_type = ctx->candidate.ops[op_idx].op_type;
-            const tigris_op_contract_t *row = tigris_op_contract(op_type);
-            if (row != NULL && (row->flags & TIGRIS_CONTRACT_SPATIAL) != 0u) {
+            tigris_height_op_t kind = tigris_height_op(ctx->candidate.ops[op_idx].op_type);
+            if (kind == TIGRIS_HEIGHT_OP_SPATIAL) {
                 spatial_count++;
                 if (note_requirement(&ctx->required.spatial_ops_per_stage, spatial_count,
                                      TIGRIS_MAX_SPATIAL_OPS_PER_STAGE)) {
                     if (ctx->out_required) *ctx->out_required = ctx->required;
                     return TIGRIS_ERR_PLAN_LIMITS;
                 }
-            } else if (row == NULL || (row->flags & TIGRIS_CONTRACT_HEIGHT) == 0u) {
+            } else if (kind != TIGRIS_HEIGHT_OP_POINTWISE) {
                 return TIGRIS_ERR_BAD_OPERATOR;
             }
         }

@@ -141,66 +141,6 @@ static int32_t floor_div(int32_t a, int32_t b)
     return (a >= 0) ? (a / b) : -(((-a) + b - 1) / b);
 }
 
-static int is_height_tiling_op(uint8_t type)
-{
-    return tigris_height_spatial_op(type) ||
-           tigris_height_upsample_op(type) ||
-           type == TIGRIS_OP_CONV_TRANSPOSE ||
-           type == TIGRIS_OP_RELU ||
-           type == TIGRIS_OP_RELU6 ||
-           type == TIGRIS_OP_SIGMOID ||
-           type == TIGRIS_OP_TANH ||
-           type == TIGRIS_OP_SOFTMAX ||
-           type == TIGRIS_OP_LEAKY_RELU ||
-           type == TIGRIS_OP_ELU ||
-           type == TIGRIS_OP_LOG_SOFTMAX ||
-           type == TIGRIS_OP_L2_NORMALIZATION ||
-           type == TIGRIS_OP_ERF || type == TIGRIS_OP_GELU ||
-           type == TIGRIS_OP_HARDSWISH ||
-           type == TIGRIS_OP_ABS ||
-           type == TIGRIS_OP_RSQRT ||
-           type == TIGRIS_OP_NEG || type == TIGRIS_OP_LOGICAL_NOT || type == TIGRIS_OP_CAST ||
-           type == TIGRIS_OP_QUANTIZE || type == TIGRIS_OP_DEQUANTIZE ||
-           type == TIGRIS_OP_EXP ||
-           type == TIGRIS_OP_LOG ||
-           type == TIGRIS_OP_SQRT ||
-           type == TIGRIS_OP_SQUARE ||
-           type == TIGRIS_OP_FLOOR ||
-           type == TIGRIS_OP_CEIL ||
-           type == TIGRIS_OP_ROUND ||
-           type == TIGRIS_OP_SIN ||
-           type == TIGRIS_OP_COS ||
-           type == TIGRIS_OP_LAYER_NORM ||
-           type == TIGRIS_OP_ADD ||
-           type == TIGRIS_OP_SUB ||
-           type == TIGRIS_OP_DIV ||
-           type == TIGRIS_OP_SQUARED_DIFFERENCE ||
-           type == TIGRIS_OP_MAXIMUM ||
-           type == TIGRIS_OP_MINIMUM ||
-           type == TIGRIS_OP_FLOOR_DIV ||
-           type == TIGRIS_OP_FLOOR_MOD ||
-           type == TIGRIS_OP_PRELU ||
-           (type >= TIGRIS_OP_EQUAL && type <= TIGRIS_OP_LOGICAL_OR) ||
-           type == TIGRIS_OP_SELECT_V2 || type == TIGRIS_OP_ADD_N ||
-           type == TIGRIS_OP_MUL ||
-           type == TIGRIS_OP_CONCAT;
-}
-
-static int is_axis1_binary_pointwise_op(uint8_t type)
-{
-    return type == TIGRIS_OP_ADD || type == TIGRIS_OP_SUB ||
-           type == TIGRIS_OP_DIV ||
-           type == TIGRIS_OP_SQUARED_DIFFERENCE ||
-           type == TIGRIS_OP_MAXIMUM ||
-           type == TIGRIS_OP_MINIMUM ||
-           type == TIGRIS_OP_FLOOR_DIV ||
-           type == TIGRIS_OP_FLOOR_MOD ||
-           type == TIGRIS_OP_PRELU ||
-           (type >= TIGRIS_OP_EQUAL && type <= TIGRIS_OP_LOGICAL_OR) ||
-           type == TIGRIS_OP_SELECT_V2 || type == TIGRIS_OP_ADD_N ||
-           type == TIGRIS_OP_MUL;
-}
-
 static int workspace_limits(
     const tigris_plan_t *plan, executor_workspace_limits_t *limits)
 {
@@ -511,64 +451,16 @@ static uint8_t stage_tile_axis(
 
 /* Non-tiled stage execution */
 
-/**
- * Whether an operator gives a tensor a new shape without moving a byte.
- *
- * A reshape produces the same bytes in the same order, and only the shape the
- * consumer reads differs, in two cases. Two tensors that each state their own
- * axis order hold their elements in the order the shape lists them, so
- * regrouping the shape moves nothing. Two spatial tensors hold their channel
- * axis last and their spatial axes in order ahead of it, so regrouping only
- * the spatial axes moves nothing either: that is what an unfold is, and it is
- * how a vision transformer turns a feature map into patches. There the batch
- * and the channel extent have to survive, because they are the ends of the
- * stored order and a reshape that changes either is moving bytes.
- *
- * The output can then share the input's buffer instead of being allocated and
- * copied into. Mirrors pure_reinterpretations in the compiler, which counts
- * the two as one allocation when it decides whether a stage fits.
- */
-static int states_its_own_order(const tigris_tensor_t *t)
-{
-    return (t->flags & TIGRIS_TENSOR_LINEAR) != 0u || t->ndim <= 2u;
-}
-
+/* A Reshape or Flatten whose output shares its input's buffer. */
 static int is_pure_reinterpretation(
     const tigris_plan_t *plan, const tigris_op_t *op)
 {
-    if (op->op_type != TIGRIS_OP_RESHAPE && op->op_type != TIGRIS_OP_FLATTEN)
+    if ((op->op_type != TIGRIS_OP_RESHAPE && op->op_type != TIGRIS_OP_FLATTEN) ||
+        op->num_inputs != 1u || op->num_outputs != 1u)
         return 0;
-    if (op->num_inputs != 1u || op->num_outputs != 1u)
-        return 0;
-    const tigris_tensor_t *in =
-        &plan->tensors[tigris_op_inputs(plan, op)[0]];
-    const tigris_tensor_t *out =
-        &plan->tensors[tigris_op_outputs(plan, op)[0]];
-    if (in->size_bytes != out->size_bytes)
-        return 0;
-    /* The bytes are only the same bytes if they mean the same thing. A plan
-     * may give the two tensors different quantization, and then the reshape
-     * has to re-encode rather than pass through. */
-    const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, in);
-    const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, out);
-    if (in_qp != out_qp) {
-        if (!in_qp || !out_qp)
-            return 0;
-        if (in_qp->scale != out_qp->scale ||
-            in_qp->zero_point != out_qp->zero_point)
-            return 0;
-    }
-    int in_own = states_its_own_order(in);
-    int out_own = states_its_own_order(out);
-    if (in_own && out_own)
-        return 1;
-    if (in_own || out_own)
-        return 0;
-    if (plan->shape_pool == NULL || in->ndim == 0u || out->ndim == 0u)
-        return 0;
-    const int32_t *a = tigris_tensor_shape(plan, in);
-    const int32_t *b = tigris_tensor_shape(plan, out);
-    return a[0] == b[0] && a[in->ndim - 1u] == b[out->ndim - 1u];
+    return tigris_pure_reinterpretation(
+        plan, &plan->tensors[tigris_op_inputs(plan, op)[0]],
+        &plan->tensors[tigris_op_outputs(plan, op)[0]]);
 }
 
 /* Keep a roomy caller arena within the serialized stage working set. */
@@ -2738,7 +2630,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t chain_kernel(
     const executor_workspace_impl_t *workspace, int32_t gs, int32_t ge)
 {
     int binary = op->num_inputs == 2 &&
-        is_axis1_binary_pointwise_op(op->op_type);
+        tigris_axis1_binary_pointwise_op(op->op_type);
     if (!binary)
         return TRACED_KERNEL(kernel, plan, op, op_idx, mem, user_ctx) != 0
             ? TIGRIS_EXEC_ERR_KERNEL : TIGRIS_EXEC_OK;
@@ -2805,23 +2697,16 @@ static TIGRIS_NOINLINE tigris_exec_error_t chain_setup(
 
         const uint16_t *sops = tigris_stage_ops(plan, stages[c]);
         for (uint16_t j = 0; j < stages[c]->ops_count; j++) {
-            uint8_t t = plan->ops[sops[j]].op_type;
-            if (!is_height_tiling_op(t))
+            tigris_height_op_t kind = tigris_height_op(plan->ops[sops[j]].op_type);
+            /* The chain composer models pointwise and shrinking spatial ops
+             * only. A ConvTranspose or a Resize would run with pointwise
+             * geometry, producing wrong output or an OOB write instead of
+             * expanding, so it fails closed here, in the pre-execution pass
+             * over every op of every chained stage. The loader refuses both in
+             * a chain; this defends against forged or malformed plans. */
+            if (kind != TIGRIS_HEIGHT_OP_POINTWISE && kind != TIGRIS_HEIGHT_OP_SPATIAL)
                 return TIGRIS_EXEC_ERR_TILE;
-            /* Fail closed on a chained ConvTranspose. is_height_tiling_op now
-             * admits it (the standalone 2D route needs that), but the chain
-             * composer only models shrinking spatial ops via
-             * tigris_height_spatial_op; a ConvTranspose would be skipped and run
-             * with shape-preserving pointwise geometry, producing wrong output
-             * or an OOB write instead of expanding. This mirrors the 1D guard
-             * in exec_stage_tiled. The guard sits in the pre-execution
-             * enumeration pass, so it covers every op across all chained stages
-             * before any tile geometry is composed or executed. The compiler
-             * never chains an (untileable) ConvTranspose; this defends against
-             * forged or malformed plans. */
-            if (t == TIGRIS_OP_CONV_TRANSPOSE || tigris_height_upsample_op(t))
-                return TIGRIS_EXEC_ERR_TILE;
-            if (tigris_height_spatial_op(t)) {
+            if (kind == TIGRIS_HEIGHT_OP_SPATIAL) {
                 const tigris_spatial_attrs_t *sp = &plan->ops[sops[j]].spatial;
                 int32_t sh = sp->stride_h;
                 int32_t dh = sp->dilation_h ? sp->dilation_h : 1;

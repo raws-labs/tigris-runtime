@@ -1,5 +1,6 @@
-/* One-operator plans compiled for a 256-byte fast budget, each with one
- * input and its TFLite Micro reference output. */
+/* The one-operator plans tigris v0.12.1 emits with -m 256 for the compiler's
+ * TFLite corpus cases relu, float_relu, abs and float_abs, each with the
+ * case's first recorded input and its TFLite Micro reference output. */
 #ifndef KERNEL_SELECTION_PLANS_H
 #define KERNEL_SELECTION_PLANS_H
 

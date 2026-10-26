@@ -1,11 +1,10 @@
 """Record resize outputs and source bands from the pinned TFLite Micro wheel."""
 
-from importlib.metadata import version
 from pathlib import Path
 import math
 
 from generate_elementwise_goldens import (
-    REFERENCE_VERSION, flatbuffers, model_bytes, np, runtime, schema,
+    c_array, check_reference, model_bytes, np, preamble, runtime, schema, serialize,
 )
 
 
@@ -33,9 +32,7 @@ def resize_model(shape, target, linear, convention, quantized):
     op.builtinOptions = getattr(schema, name + "T")()
     op.builtinOptions.alignCorners = convention == 2
     op.builtinOptions.halfPixelCenters = convention == (0 if linear else 3)
-    builder = flatbuffers.Builder(4096)
-    builder.Finish(model.Pack(builder), file_identifier=b"TFL3")
-    return bytes(builder.Output())
+    return serialize(model)
 
 
 def bands(ih, oh, linear, convention, quantized):
@@ -82,10 +79,8 @@ def cases():
 
 
 def main():
-    if version("tflite-micro") != REFERENCE_VERSION:
-        raise RuntimeError(f"Requires tflite-micro=={REFERENCE_VERSION}")
-    lines = [f"/* TFLite Micro {REFERENCE_VERSION}; test/generate_resize_goldens.py. */",
-             "#ifndef TIGRIS_RESIZE_GOLDEN_H", "#define TIGRIS_RESIZE_GOLDEN_H", "",
+    check_reference()
+    lines = [*preamble("generate_resize_goldens.py", "TIGRIS_RESIZE_GOLDEN_H"), "",
              "typedef struct {", "    uint8_t linear, convention, dtype;",
              "    int32_t shapes[8];", "    uint32_t input_count, output_count;",
              "    const void *input, *output;", "    uint16_t starts[17], ends[17];",
@@ -96,12 +91,8 @@ def main():
         linear, convention, quantized, shape, target, data, expected, (starts, ends) = case
         counts[quantized] += len(expected)
         for label, array in (("x", data), ("y", expected)):
-            ctype = "int8_t" if quantized else "float"
-            lines.append(f"static const {ctype} resize_{number}_{label}[] = {{")
-            for offset in range(0, len(array), 12):
-                values = [str(int(v)) if quantized else f"{float(v):.9e}f" for v in array[offset:offset + 12]]
-                lines.append("    " + ", ".join(values) + ",")
-            lines.append("};")
+            lines += c_array("int8_t" if quantized else "float", f"resize_{number}_{label}",
+                             array, 12, quantized)
         dims = ", ".join(map(str, (*shape, *target)))
         first, end = ", ".join(map(str, starts)), ", ".join(map(str, ends))
         records.append(f"    {{{int(linear)}, {convention}, {3 if quantized else 1}, {{{dims}}}, "

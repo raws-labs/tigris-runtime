@@ -1,9 +1,10 @@
 """Record data movement outputs from the pinned TFLite Micro kernels."""
 
-from importlib.metadata import version
 from pathlib import Path
 
-from generate_elementwise_goldens import REFERENCE_VERSION, flatbuffers, np, runtime, schema
+from generate_elementwise_goldens import (
+    c_array, check_reference, np, operator_model, preamble, runtime, schema, serialize,
+)
 
 KINDS = {"GATHER": 66, "GATHER_ND": 67, "STRIDED_SLICE": 68, "MIRROR_PAD": 69,
          "REVERSE_V2": 70, "EMBEDDING_LOOKUP": 71, "DYNAMIC_UPDATE_SLICE": 72}
@@ -70,16 +71,7 @@ def reference(kind, shape, constants, options, quantized, dynamic=False):
         target = shape
         clamped = np.clip(constants[0], 0, np.array(shape) - update.shape)
         metadata = [*clamped.tolist(), *update.shape]
-    model = schema.ModelT()
-    model.version = 3
-    code = schema.OperatorCodeT()
-    code.builtinCode = getattr(schema.BuiltinOperator, kind)
-    code.deprecatedBuiltinCode = min(code.builtinCode, 127)
-    code.version = 1
-    model.operatorCodes = [code]
-    model.buffers = [schema.BufferT()]
-    graph = schema.SubGraphT()
-    graph.tensors = []
+    model, graph = operator_model(kind)
     graph.inputs = []
 
     def tensor(array, constant=False):
@@ -130,10 +122,7 @@ def reference(kind, shape, constants, options, quantized, dynamic=False):
     graph.outputs = np.array([out], np.int32)
     graph.inputs = np.array(graph.inputs, np.int32)
     graph.operators = [op]
-    model.subgraphs = [graph]
-    builder = flatbuffers.Builder(4096)
-    builder.Finish(model.Pack(builder), file_identifier=b"TFL3")
-    interpreter = runtime.Interpreter.from_bytes(bytes(builder.Output()), arena_size=65536)
+    interpreter = runtime.Interpreter.from_bytes(serialize(model), arena_size=65536)
     interpreter.set_input(data, 0)
     if update is not None:
         interpreter.set_input(update, 1)
@@ -151,10 +140,8 @@ def reference(kind, shape, constants, options, quantized, dynamic=False):
 
 
 def main():
-    if version("tflite-micro") != REFERENCE_VERSION:
-        raise RuntimeError(f"Requires tflite-micro=={REFERENCE_VERSION}")
-    lines = [f"/* TFLite Micro {REFERENCE_VERSION}; test/generate_movement_goldens.py. */",
-             "#ifndef TIGRIS_MOVEMENT_GOLDEN_H", "#define TIGRIS_MOVEMENT_GOLDEN_H", "",
+    check_reference()
+    lines = [*preamble("generate_movement_goldens.py", "TIGRIS_MOVEMENT_GOLDEN_H"), "",
              "typedef struct {", "    uint8_t op, dtype, rank, output_rank, update_rank, metadata_count;",
              "    int32_t shapes[18], metadata[19];", "    uint32_t input_count, output_count, update_count, index_count;",
              "    const void *input, *update, *output;", "    const int32_t *indices;", "} movement_golden_t;", ""]
@@ -171,14 +158,9 @@ def main():
                     pointers.append("NULL")
                     continue
                 pointers.append(f"movement_{number}_{label}")
-                integer = label == "indices" or quantized
                 ctype = "int32_t" if label == "indices" else "int8_t" if quantized else "float"
-                lines.append(f"static const {ctype} {pointers[-1]}[] = {{")
-                array = array.reshape(-1)
-                for start in range(0, array.size, 12):
-                    values = [str(int(v)) if integer else f"{float(v):.9e}f" for v in array[start:start + 12]]
-                    lines.append("    " + ", ".join(values) + ",")
-                lines.append("};")
+                lines += c_array(ctype, pointers[-1], array.reshape(-1), 12,
+                                 label == "indices" or quantized)
             ushape = () if update is None else update.shape
             dims = [v for dims in (shape, ushape, result.shape) for v in (*dims, *([1] * (6 - len(dims))))]
             fmt = lambda values: ", ".join(map(str, values))

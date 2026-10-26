@@ -18,6 +18,8 @@
 #include "tigris_kernels_s8.h"
 #include "tigris_mem.h"
 #include "test_harness.h"
+#include "trace_assert.h"
+#include "plan_fixture.h"
 
 #define TEST_N   1
 #define TEST_H  16
@@ -37,25 +39,20 @@ typedef struct {
     tigris_tile_plan_v10_t grouped;
     tigris_quant_param_t quant_params[2];
     int32_t shapes[8];
-    uint16_t indices[7];
+    uint16_t indices[PLAN_FIXTURE_POOL(1)];
     tigris_plan_t plan;
 } reduce_fixture_t;
-
-#include "trace_assert.h"
 
 /** One GlobalAveragePool stage carrying a height tile plan. */
 static void build_fixture(reduce_fixture_t *fx, uint32_t elem_size)
 {
     memset(fx, 0, sizeof(*fx));
+    plan_fixture_chain(&fx->plan, &fx->header, fx->tensors, &fx->op, &fx->stage,
+                       fx->indices, fx->shapes, 1, 0);
 
     fx->header.version = TIGRIS_SCHEMA_VERSION_V9;
-    fx->header.num_tensors = 2;
-    fx->header.num_ops = 1;
-    fx->header.num_stages = 1;
     fx->header.num_tile_plans = 1;
     fx->header.num_quant_params = 2;
-    fx->header.num_model_inputs = 1;
-    fx->header.num_model_outputs = 1;
 
     fx->shapes[0] = TEST_N; fx->shapes[1] = TEST_H;
     fx->shapes[2] = TEST_W; fx->shapes[3] = TEST_C;
@@ -84,27 +81,7 @@ static void build_fixture(reduce_fixture_t *fx, uint32_t elem_size)
     fx->quant_params[1].num_channels = 1;
 
     fx->op.op_type = TIGRIS_OP_GLOBAL_AVG;
-    fx->op.num_inputs = 1;
-    fx->op.num_outputs = 1;
-    fx->op.inputs_off = 0;
-    fx->op.outputs_off = 1;
-
-    fx->indices[0] = 0;  /* op input */
-    fx->indices[1] = 1;  /* op output */
-    fx->indices[2] = 0;  /* stage op */
-    fx->indices[3] = 0;  /* stage input */
-    fx->indices[4] = 1;  /* stage output */
-    fx->indices[5] = 0;  /* model input */
-    fx->indices[6] = 1;  /* model output */
-
-    fx->stage.ops_off = 2;
-    fx->stage.ops_count = 1;
-    fx->stage.inputs_off = 3;
-    fx->stage.inputs_count = 1;
-    fx->stage.outputs_off = 4;
-    fx->stage.outputs_count = 1;
     fx->stage.tile_plan_idx = 0;
-    fx->stage.chain_id = TIGRIS_NO_CHAIN;
 
     fx->tile_plan.tileable = 1;
     fx->tile_plan.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
@@ -112,16 +89,8 @@ static void build_fixture(reduce_fixture_t *fx, uint32_t elem_size)
     fx->tile_plan.num_tiles = TEST_H;
     fx->tile_plan.original_height = TEST_H;
 
-    fx->plan.header = &fx->header;
-    fx->plan.tensors = fx->tensors;
-    fx->plan.ops = &fx->op;
-    fx->plan.stages = &fx->stage;
     fx->plan.tile_plans = &fx->tile_plan;
     fx->plan.quant_params = fx->quant_params;
-    fx->plan.index_pool = fx->indices;
-    fx->plan.shape_pool = fx->shapes;
-    fx->plan.model_inputs = &fx->indices[5];
-    fx->plan.model_outputs = &fx->indices[6];
 }
 
 /**
@@ -131,33 +100,12 @@ static void build_fixture(reduce_fixture_t *fx, uint32_t elem_size)
 static tigris_exec_error_t run_case(
     reduce_fixture_t *fx, tigris_kernel_fn kernel,
     uint8_t *fast, uint32_t fast_size,
-    const void *input, uint32_t input_bytes,
-    void *output, uint32_t output_bytes, uint16_t *tiled)
+    const void *input, void *output, uint16_t *tiled)
 {
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[SLOW_SIZE];
     uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(2, 1, 1, 0, 0, 0)];
-    tigris_exec_stats_t stats;
-    tigris_mem_t mem;
-    void *ptrs[2];
-
-    memset(&stats, 0, sizeof(stats));
-    memset(slow, 0, sizeof(slow));
-
-    if (tigris_mem_init(&mem, ptrs, 2, fast, fast_size,
-                        slow, sizeof(slow)) != TIGRIS_MEM_OK)
-        return TIGRIS_EXEC_ERR_MEM;
-    if (tigris_mem_alloc_slow(&mem, 0, input_bytes) != TIGRIS_MEM_OK)
-        return TIGRIS_EXEC_ERR_MEM;
-    memcpy(mem.tensor_ptrs[0], input, input_bytes);
-
-    tigris_exec_error_t err = tigris_run_with_workspace_buffer(
-        &fx->plan, &mem, kernel, NULL, &stats, workspace, sizeof(workspace));
-    if (err != TIGRIS_EXEC_OK)
-        return err;
-
-    memcpy(output, mem.tensor_ptrs[1], output_bytes);
-    *tiled = stats.stages_tiled;
-    return TIGRIS_EXEC_OK;
+    return run_fixture(&fx->plan, kernel, NULL, fast, fast_size, slow, sizeof(slow),
+                       workspace, sizeof(workspace), input, output, tiled);
 }
 
 typedef struct {
@@ -197,7 +145,6 @@ static void test_reduction_is_band_invariant(void)
         }
         const void *input = rc->elem_size == 1u ? (const void *)input_s8
                                                 : (const void *)input_f32;
-        const uint32_t input_bytes = TEST_ELEMENTS * rc->elem_size;
         const uint32_t output_bytes = TEST_N * TEST_C * rc->elem_size;
 
         float whole_out[TEST_N * TEST_C];
@@ -208,8 +155,8 @@ static void test_reduction_is_band_invariant(void)
 
         snprintf(msg, sizeof(msg), "%s whole-tensor run", rc->name);
         TEST_ASSERT_EQ(
-            run_case(&whole, rc->kernel, big, sizeof(big), input, input_bytes,
-                     whole_out, output_bytes, &whole_tiled),
+            run_case(&whole, rc->kernel, big, sizeof(big), input, whole_out,
+                     &whole_tiled),
             TIGRIS_EXEC_OK, msg);
         snprintf(msg, sizeof(msg), "%s whole-tensor run is not tiled", rc->name);
         TEST_ASSERT_EQ(whole_tiled, 0, msg);
@@ -217,7 +164,7 @@ static void test_reduction_is_band_invariant(void)
         snprintf(msg, sizeof(msg), "%s banded run", rc->name);
         TEST_ASSERT_EQ(
             run_case(&banded, rc->kernel, small, rc->small_fast_size, input,
-                     input_bytes, banded_out, output_bytes, &banded_tiled),
+                     banded_out, &banded_tiled),
             TIGRIS_EXEC_OK, msg);
         snprintf(msg, sizeof(msg), "%s banded run is tiled", rc->name);
         TEST_ASSERT_EQ(banded_tiled, 1, msg);
@@ -267,20 +214,14 @@ static void test_channel_and_spatial_groups(void)
         grouped.plan.tile_plans_v10 = &grouped.grouped;
         tigris_kernel_fn kernel = element == 1u ? tigris_dispatch_kernel_s8 : tigris_dispatch_kernel;
         uint16_t tiled = 0u;
-        uint32_t input_bytes = 2u * TEST_ELEMENTS * element;
         uint32_t output_bytes = 2u * TEST_C * element;
-        TEST_ASSERT_EQ(run_case(&whole, kernel, big, sizeof(big), input, input_bytes,
-                       expected, output_bytes, &tiled), TIGRIS_EXEC_OK, "whole batch reference");
-        TEST_ASSERT_EQ(run_case(&grouped, kernel, small, sizeof(small), input, input_bytes,
-                       actual, output_bytes, &tiled), TIGRIS_EXEC_OK, "partial channel and spatial groups");
+        TEST_ASSERT_EQ(run_case(&whole, kernel, big, sizeof(big), input, expected, &tiled), TIGRIS_EXEC_OK, "whole batch reference");
+        TEST_ASSERT_EQ(run_case(&grouped, kernel, small, sizeof(small), input, actual, &tiled), TIGRIS_EXEC_OK, "partial channel and spatial groups");
         TEST_ASSERT_EQ(tiled, 1u, "grouped stage executes tiles");
         TEST_ASSERT(memcmp(actual, expected, output_bytes) == 0, "grouped batches preserve output bits");
-        TEST_ASSERT_EQ(run_case(&grouped, kernel, small, 16u, input, input_bytes,
-                       actual, output_bytes, &tiled), TIGRIS_EXEC_ERR_MEM, "accumulator needs arena space");
-        TEST_ASSERT_EQ(run_case(&grouped, kernel, small, 63u, input, input_bytes,
-                       actual, output_bytes, &tiled), TIGRIS_EXEC_ERR_MEM, "packed buffers need arena space");
-        TEST_ASSERT_EQ(run_case(&grouped, fail_reduction, small, sizeof(small), input, input_bytes,
-                       actual, output_bytes, &tiled), TIGRIS_EXEC_ERR_KERNEL, "group kernel failure propagates");
+        TEST_ASSERT_EQ(run_case(&grouped, kernel, small, 16u, input, actual, &tiled), TIGRIS_EXEC_ERR_MEM, "accumulator needs arena space");
+        TEST_ASSERT_EQ(run_case(&grouped, kernel, small, 63u, input, actual, &tiled), TIGRIS_EXEC_ERR_MEM, "packed buffers need arena space");
+        TEST_ASSERT_EQ(run_case(&grouped, fail_reduction, small, sizeof(small), input, actual, &tiled), TIGRIS_EXEC_ERR_KERNEL, "group kernel failure propagates");
     }
 }
 

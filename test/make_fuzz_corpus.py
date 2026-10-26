@@ -16,7 +16,7 @@ from pathlib import Path
 
 PLAN_SIZE = 100
 SECTION_DIR_OFFSET = 48
-SCHEMA_VERSION = 4
+SEED_SCHEMA_VERSION = 4
 REQUIRED_SECTIONS = (1, 2, 5, 6, 7)
 FIXTURE_DIRS = ("schema_compat", "tile2d_fixtures", "fuzz_regressions")
 
@@ -37,7 +37,7 @@ def valid_plan() -> bytearray:
         plan,
         0,
         b"TGRS",
-        SCHEMA_VERSION,
+        SEED_SCHEMA_VERSION,
         PLAN_SIZE,
         SECTION_DIR_OFFSET,
     )
@@ -60,7 +60,7 @@ def valid_unary_plan() -> bytearray:
         plan,
         0,
         b"TGRS",
-        SCHEMA_VERSION,
+        SEED_SCHEMA_VERSION,
         UNARY_PLAN_SIZE,
         SECTION_DIR_OFFSET,
     )

@@ -23,6 +23,7 @@
 #define ALIGN_UP(x) (((x) + (TIGRIS_TENSOR_ALIGN - 1u)) & ~(TIGRIS_TENSOR_ALIGN - 1u))
 
 #include "trace_assert.h"
+#include "plan_fixture.h"
 
 /* Memory manager tests (no fixtures needed) */
 
@@ -1647,7 +1648,7 @@ typedef struct {
     tigris_op_t ops[2];
     tigris_stage_t stages[2];
     int32_t shapes[12];
-    uint16_t indices[12];
+    uint16_t indices[PLAN_FIXTURE_POOL(2)];
     tigris_weight_entry_t weight_entries[2];
     _Alignas(float) uint8_t weight_blob[6 * sizeof(float)];
     char strings[1];
@@ -1675,14 +1676,10 @@ static const float second_weight = 1.25f;
 static void build_padding_plan(padding_fixture_t *fx)
 {
     memset(fx, 0, sizeof(*fx));
+    plan_fixture_chain(&fx->plan, &fx->header, fx->tensors, fx->ops, fx->stages,
+                       fx->indices, fx->shapes, 2, 0);
 
-    fx->header.num_tensors = 3;
-    fx->header.num_ops = 2;
-    fx->header.num_stages = 2;
     fx->header.num_weights = 2;
-    fx->header.num_model_inputs = 1;
-    fx->header.num_model_outputs = 1;
-    fx->header.model_io_off = 10;
 
     const int32_t heights[3] = {INPUT_H, OUTPUT_H, OUTPUT_H};
     for (uint16_t i = 0; i < 3; i++) {
@@ -1699,26 +1696,9 @@ static void build_padding_plan(padding_fixture_t *fx)
     fx->tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
     fx->tensors[2].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
 
-    fx->indices[0] = 0;  /* op 0 input */
-    fx->indices[1] = 1;  /* op 0 output */
-    fx->indices[2] = 1;  /* op 1 input */
-    fx->indices[3] = 2;  /* op 1 output */
-    fx->indices[4] = 0;  /* stage 0 op */
-    fx->indices[5] = 0;  /* stage 0 input */
-    fx->indices[6] = 1;  /* stage 0 output */
-    fx->indices[7] = 1;  /* stage 1 op */
-    fx->indices[8] = 1;  /* stage 1 input */
-    fx->indices[9] = 2;  /* stage 1 output */
-    fx->indices[10] = 0; /* model input */
-    fx->indices[11] = 2; /* model output */
-
     for (uint16_t i = 0; i < 2; i++) {
         fx->ops[i].op_type = TIGRIS_OP_CONV;
-        fx->ops[i].num_inputs = 1;
-        fx->ops[i].num_outputs = 1;
         fx->ops[i].stage = (uint8_t)i;
-        fx->ops[i].inputs_off = (uint16_t)(i * 2);
-        fx->ops[i].outputs_off = (uint16_t)(i * 2 + 1);
         fx->ops[i].weight_idx = i;
         fx->ops[i].bias_idx = TIGRIS_NO_WEIGHT;
         fx->ops[i].spatial.kernel_w = 1;
@@ -1742,34 +1722,9 @@ static void build_padding_plan(padding_fixture_t *fx)
     memcpy(fx->weight_blob + sizeof(first_weights),
            &second_weight, sizeof(second_weight));
 
-    fx->stages[0].ops_off = 4;
-    fx->stages[0].ops_count = 1;
-    fx->stages[0].inputs_off = 5;
-    fx->stages[0].inputs_count = 1;
-    fx->stages[0].outputs_off = 6;
-    fx->stages[0].outputs_count = 1;
-    fx->stages[1].ops_off = 7;
-    fx->stages[1].ops_count = 1;
-    fx->stages[1].inputs_off = 8;
-    fx->stages[1].inputs_count = 1;
-    fx->stages[1].outputs_off = 9;
-    fx->stages[1].outputs_count = 1;
-    for (uint16_t i = 0; i < 2; i++) {
-        fx->stages[i].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
-        fx->stages[i].chain_id = TIGRIS_NO_CHAIN;
-    }
-
-    fx->plan.header = &fx->header;
-    fx->plan.tensors = fx->tensors;
-    fx->plan.ops = fx->ops;
-    fx->plan.stages = fx->stages;
-    fx->plan.index_pool = fx->indices;
-    fx->plan.shape_pool = fx->shapes;
     fx->plan.strings = fx->strings;
     fx->plan.weight_entries = fx->weight_entries;
     fx->plan.weight_blob = fx->weight_blob;
-    fx->plan.model_inputs = &fx->indices[10];
-    fx->plan.model_outputs = &fx->indices[11];
 }
 
 static void configure_padding_mode(padding_fixture_t *fx, padding_mode_t mode)
@@ -1942,15 +1897,7 @@ static void run_height_tiling_contract_case(
     tigris_op_t op;
     tigris_stage_t stage;
     tigris_tile_plan_t tile_plan;
-    const uint16_t indices[] = {
-        0, /* op input */
-        1, /* op output */
-        0, /* stage op */
-        0, /* stage input */
-        1, /* stage output */
-        0, /* model input */
-        1, /* model output */
-    };
+    uint16_t indices[PLAN_FIXTURE_POOL(1)];
     int32_t shapes[] = {
         1, 8, 8, rank == 3 ? 0 : 4,
         output_shape[0], output_shape[1], output_shape[2], output_shape[3],
@@ -1965,20 +1912,11 @@ static void run_height_tiling_contract_case(
     tigris_exec_stats_t stats;
     tile_probe_ctx_t ctx = {0};
 
-    memset(&header, 0, sizeof(header));
-    memset(tensors, 0, sizeof(tensors));
-    memset(&op, 0, sizeof(op));
-    memset(&stage, 0, sizeof(stage));
+    plan_fixture_chain(&plan, &header, tensors, &op, &stage, indices, shapes, 1, 0);
     memset(&tile_plan, 0, sizeof(tile_plan));
-    memset(&plan, 0, sizeof(plan));
 
     header.version = TIGRIS_SCHEMA_VERSION_V9;
-    header.num_tensors = 2;
-    header.num_ops = 1;
-    header.num_stages = 1;
     header.num_tile_plans = 1;
-    header.num_model_inputs = 1;
-    header.num_model_outputs = 1;
 
     tensors[0].size_bytes = rank == 3 ? 1u * 8u * 8u : 1u * 8u * 8u * 4u;
     tensors[0].shape_off = 0;
@@ -1992,22 +1930,11 @@ static void run_height_tiling_contract_case(
     tensors[1].ndim = rank;
 
     op.op_type = op_type;
-    op.num_inputs = 1;
-    op.num_outputs = 1;
-    op.inputs_off = 0;
-    op.outputs_off = 1;
     op.spatial.kernel_h = 1;
     op.spatial.stride_h = 1;
     op.spatial.dilation_h = 1;
 
-    stage.ops_off = 2;
-    stage.ops_count = 1;
-    stage.inputs_off = 3;
-    stage.inputs_count = 1;
-    stage.outputs_off = 4;
-    stage.outputs_count = 1;
     stage.tile_plan_idx = 0;
-    stage.chain_id = TIGRIS_NO_CHAIN;
 
     tile_plan.tileable = 1;
     tile_plan.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
@@ -2015,15 +1942,7 @@ static void run_height_tiling_contract_case(
     tile_plan.num_tiles = 8;
     tile_plan.original_height = 8;
 
-    plan.header = &header;
-    plan.tensors = tensors;
-    plan.ops = &op;
-    plan.stages = &stage;
     plan.tile_plans = &tile_plan;
-    plan.index_pool = indices;
-    plan.shape_pool = shapes;
-    plan.model_inputs = &indices[5];
-    plan.model_outputs = &indices[6];
 
     TEST_ASSERT_EQ(
         tigris_mem_init(
@@ -2258,15 +2177,7 @@ static void run_convtranspose_tiling_case(
     tigris_op_t op;
     tigris_stage_t stage;
     tigris_tile_plan_t tile_plan;
-    const uint16_t indices[] = {
-        0, /* op input */
-        1, /* op output */
-        0, /* stage op */
-        0, /* stage input */
-        1, /* stage output */
-        0, /* model input */
-        1, /* model output */
-    };
+    uint16_t indices[PLAN_FIXTURE_POOL(1)];
     int32_t shapes[] = {
         1, 8, 8, 4,    /* input:  1x8x8x4 */
         1, 16, 16, 4,  /* output: 1x16x16x4 (stride 2, kernel 2, pad 0) */
@@ -2281,20 +2192,11 @@ static void run_convtranspose_tiling_case(
     tigris_exec_stats_t stats;
     tile_probe_ctx_t ctx = {0};
 
-    memset(&header, 0, sizeof(header));
-    memset(tensors, 0, sizeof(tensors));
-    memset(&op, 0, sizeof(op));
-    memset(&stage, 0, sizeof(stage));
+    plan_fixture_chain(&plan, &header, tensors, &op, &stage, indices, shapes, 1, 0);
     memset(&tile_plan, 0, sizeof(tile_plan));
-    memset(&plan, 0, sizeof(plan));
 
     header.version = TIGRIS_SCHEMA_VERSION_V9;
-    header.num_tensors = 2;
-    header.num_ops = 1;
-    header.num_stages = 1;
     header.num_tile_plans = 1;
-    header.num_model_inputs = 1;
-    header.num_model_outputs = 1;
 
     tensors[0].size_bytes = 1u * 8u * 8u * 4u;    /* 256 */
     tensors[0].shape_off = 0;
@@ -2304,10 +2206,6 @@ static void run_convtranspose_tiling_case(
     tensors[1].ndim = 4;
 
     op.op_type = TIGRIS_OP_CONV_TRANSPOSE;
-    op.num_inputs = 1;
-    op.num_outputs = 1;
-    op.inputs_off = 0;
-    op.outputs_off = 1;
     op.spatial.kernel_h = 2;
     op.spatial.kernel_w = 2;
     op.spatial.stride_h = 2;
@@ -2315,14 +2213,7 @@ static void run_convtranspose_tiling_case(
     op.spatial.dilation_h = 1;
     op.spatial.dilation_w = 1;
 
-    stage.ops_off = 2;
-    stage.ops_count = 1;
-    stage.inputs_off = 3;
-    stage.inputs_count = 1;
-    stage.outputs_off = 4;
-    stage.outputs_count = 1;
     stage.tile_plan_idx = 0;
-    stage.chain_id = TIGRIS_NO_CHAIN;
 
     tile_plan.tileable = 1;
     tile_plan.axis = axis;
@@ -2331,15 +2222,7 @@ static void run_convtranspose_tiling_case(
     tile_plan.original_height = 16;
     tile_plan.tile_width = 8;
 
-    plan.header = &header;
-    plan.tensors = tensors;
-    plan.ops = &op;
-    plan.stages = &stage;
     plan.tile_plans = &tile_plan;
-    plan.index_pool = indices;
-    plan.shape_pool = shapes;
-    plan.model_inputs = &indices[5];
-    plan.model_outputs = &indices[6];
 
     TEST_ASSERT_EQ(
         tigris_mem_init(

@@ -1,10 +1,9 @@
 """Record reduction outputs from the pinned TFLite Micro reference kernels."""
 
-from importlib.metadata import version
 from pathlib import Path
 
 from generate_elementwise_goldens import (
-    REFERENCE_VERSION, flatbuffers, model_bytes, np, runtime, schema,
+    c_array, check_reference, model_bytes, np, preamble, runtime, schema, serialize,
 )
 
 
@@ -50,9 +49,7 @@ def reduction_model(kind, shape, axis, keep, exclusive, reverse, quantized, scal
         op.builtinOptionsType = getattr(schema.BuiltinOptions, options)
         op.builtinOptions = getattr(schema, options + "T")()
         op.builtinOptions.outputType = schema.TensorType.INT32
-    builder = flatbuffers.Builder(4096)
-    builder.Finish(model.Pack(builder), file_identifier=b"TFL3")
-    return bytes(builder.Output()), target
+    return serialize(model), target
 
 
 def cases():
@@ -82,10 +79,8 @@ def cases():
 
 
 def main():
-    if version("tflite-micro") != REFERENCE_VERSION:
-        raise RuntimeError(f"Requires tflite-micro=={REFERENCE_VERSION}")
-    lines = [f"/* TFLite Micro {REFERENCE_VERSION}; test/generate_reduction_goldens.py. */",
-             "#ifndef TIGRIS_REDUCTION_GOLDEN_H", "#define TIGRIS_REDUCTION_GOLDEN_H", "",
+    check_reference()
+    lines = [*preamble("generate_reduction_goldens.py", "TIGRIS_REDUCTION_GOLDEN_H"), "",
              "typedef struct {", "    uint8_t op, dtype, output_rank, axis, exclusive, reverse;",
              "    int32_t shapes[6];", "    float scales[2];", "    int32_t zeros[2];",
              "    uint32_t input_count, output_count;", "    const void *input, *output;",
@@ -96,13 +91,9 @@ def main():
         kind, quantized, shape, target, scales, zeros, axis, exclusive, reverse, data, expected = case
         counts[quantized] += len(expected)
         for label, array in (("x", data), ("y", expected)):
-            integer = quantized or (label == "y" and kind in {"ARG_MAX", "ARG_MIN"})
-            ctype = "int32_t" if label == "y" and kind in {"ARG_MAX", "ARG_MIN"} else "int8_t" if quantized else "float"
-            lines.append(f"static const {ctype} reduction_{number}_{label}[] = {{")
-            for offset in range(0, len(array), 12):
-                values = [str(int(v)) if integer else f"{float(v):.9e}f" for v in array[offset:offset + 12]]
-                lines.append("    " + ", ".join(values) + ",")
-            lines.append("};")
+            index = label == "y" and kind in {"ARG_MAX", "ARG_MIN"}
+            ctype = "int32_t" if index else "int8_t" if quantized else "float"
+            lines += c_array(ctype, f"reduction_{number}_{label}", array, 12, quantized or index)
         dims = ", ".join(map(str, (*shape, *target, *([1] * (3 - len(target))))))
         records.append(f"    {{{KINDS[kind]}, {3 if quantized else 1}, {len(target)}, {axis}, {int(exclusive)}, {int(reverse)}, "
                        f"{{{dims}}}, {{{scales[0]:.9e}f, {scales[2]:.9e}f}}, {{{zeros[0]}, {zeros[2]}}}, "

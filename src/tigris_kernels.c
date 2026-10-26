@@ -2861,7 +2861,7 @@ static int kern_resize_nearest(
  * tensor is aligned to at least TIGRIS_TENSOR_ALIGN, so the typed forms cover
  * every plan in practice and memcpy stays for anything else. */
 /* Ranks above this fall back to the general index walk rather than carry a
- * larger odometer. Every shape the compiler emits is rank 4 or less. */
+ * larger odometer. */
 #define TIGRIS_TRANSPOSE_MAX_RANK 8
 
 static int transpose_elements_are_typed(

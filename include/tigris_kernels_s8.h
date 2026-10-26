@@ -1,6 +1,6 @@
 /**
  * @file tigris_kernels_s8.h
- * @brief Reference int8 (symmetric) kernel dispatch for TiGrIS runtime.
+ * @brief Reference int8 (symmetric weights, asymmetric activations) kernel dispatch for TiGrIS runtime.
  *
  * Provides tigris_dispatch_kernel_s8(), a concrete tigris_kernel_fn that
  * switches on op_type and calls naive int8 implementations. Data layout: NHWC.

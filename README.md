@@ -15,15 +15,15 @@ strategy selected by the compiler. At runtime, TiGrIS:
 
 - validates the plan version and structural limits before exposing its tables;
 - assigns activation addresses from caller-provided fast and slow arenas;
-- executes normal, spatially tiled, and streamed-chain stages;
+- executes normal, spatially tiled, and streamed-chain stages, control flow,
+  and stateful plans;
 - reads uncompressed weights in place or decompresses stage blocks into the
   fast arena; and
 - reports allocation, tiling, and kernel failures to the caller.
 
 The schedule and activation bound are compiled, but addresses are assigned by
 bounded bump allocation, reset, and compaction during execution. A finite
-arena can still be exhausted. The loader validates plan-version compatibility
-before exposing plan tables.
+arena can still be exhausted.
 
 ## Kernel backends
 
@@ -92,31 +92,24 @@ requirement. Generated standalone CMSIS harnesses reserve 4 KiB by default,
 validate it at startup, and report the exact required total when a larger model
 needs `TIGRIS_CMSIS_NN_SCRATCH_BYTES` overridden at build time.
 
-The compiler's current cost model aligns each activation to 32 bytes, which is
-conservative for the supported host, Cortex-M, and ESP targets. `mem.fast_peak`
-is the observed allocator high-water mark, not the scheduled minimum: a roomy
-arena may defer compaction and therefore report a larger value. Contract tests
-run with the compiler's scheduled limit to prove that compaction, tiling, and
-weight reservation still execute within that bound.
+The compiler's cost model aligns each activation to 32 bytes, which covers
+every target except an SVE build (64). `mem.fast_peak` is the observed
+allocator high-water mark, not the scheduled minimum: a roomy arena may defer
+compaction and therefore report a larger value. Contract tests run with the
+compiler's scheduled limit to prove that compaction, tiling, and weight
+reservation still execute within that bound.
 
 The core executor performs no unbounded heap fallback. Normal stages may spill
 to the supplied slow arena; if neither bounded arena can satisfy an operation,
-the executor returns an error. `mem.fast_peak` records the measured core
-fast-arena high-water mark.
+the executor returns an error.
 
-A plan reads its inputs in place when it has schema 5 or later and a single
-stage, without a tile plan, chain, control flow or state, that reads every
-model input and writes every model output. `tigris_input_alloc()` places each
-input of such a plan in the fast arena and leaves room for the plan's
-compressed weights directly below the first one; `tigris_input_write()` calls
-it for an input without a buffer. The stage decompresses its weights into that
-room, reads the inputs where they are and leaves its outputs in the fast arena.
-Inputs placed another way are read in place only with that room free below
-them. The compiler's slow figure assumes this placement; when it is 0,
-`tigris_mem_init()` takes a NULL slow buffer of size 0. The run consumes the
-inputs: read the outputs, then place every input again before the next run.
-Inputs the caller allocates in the slow arena still run, through a copy, but
-the slow arena must then hold the inputs and the outputs.
+Plans that read their inputs in place are described at `tigris_input_alloc()`
+in `tigris_iface.h`. For such a plan, with its inputs placed this way, the slow
+memory the compiler reports can be 0, and `tigris_mem_init()` then takes a NULL
+slow buffer of size 0. The run consumes the inputs: read the outputs, then
+place every input again before the next run. Inputs the caller allocates in the
+slow arena still run, through a copy, but the slow arena must then hold the
+inputs and the outputs.
 
 ## Build and test
 
@@ -153,11 +146,12 @@ scripts/local_ci.sh --strict        # count a skipped gate as a failure
 scripts/local_ci.sh --build-cppcheck # build+cache the pinned Cppcheck, then run
 ```
 
-Static analysis needs Cppcheck 2.21.1 and coverage needs `gcc-13`/`gcov-13`,
-the exact tools the baseline and floors are calibrated against; a gate is
+Static analysis and coverage need the exact tools the baseline and floors are
+calibrated against; the pins are held in `scripts/local_ci.sh`,
+`scripts/check_static_analysis.py` and `.github/workflows/ci.yml`. A gate is
 skipped (reported, not silently passed) when its tool is missing. Point
-`TIGRIS_CPPCHECK` at an existing 2.21.1 binary to skip the source build. Wire
-it into git from the repo root with:
+`TIGRIS_CPPCHECK` at an existing pinned Cppcheck binary to skip the source
+build. Wire it into git from the repo root with:
 
 ```bash
 ln -s ../../scripts/local_ci.sh .git/hooks/pre-push

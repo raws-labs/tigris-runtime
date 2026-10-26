@@ -10,6 +10,14 @@
 #include "tigris_loader.h"
 #include "tigris_trace.h"
 
+/* Each count a limit applies to is a u16 in the plan, so at 65535 no plan stops at a limit. */
+#if TIGRIS_MAX_TENSORS != 65535u || TIGRIS_MAX_STAGE_INPUTS != 65535u || \
+    TIGRIS_MAX_STAGE_OUTPUTS != 65535u || TIGRIS_MAX_CHAIN_STAGES != 65535u || \
+    TIGRIS_MAX_SUBGRAPHS != 65535u || TIGRIS_MAX_SUBGRAPH_DEPTH != 65535u || \
+    TIGRIS_MAX_SPATIAL_OPS_PER_STAGE != 65535u
+#error "the host library must be built with every TIGRIS_MAX_* limit at 65535"
+#endif
+
 struct tigris_host {
     tigris_plan_t plan;
     tigris_mem_t mem;
@@ -152,6 +160,35 @@ const char *tigris_host_create(
 fail:
     tigris_host_destroy(host);
     return error;
+}
+
+const char *tigris_host_check(const void *data, uint32_t size, uint16_t *required)
+{
+    tigris_plan_t plan;
+    tigris_plan_limits_t needs;
+    void *allocation = NULL;
+    uint8_t *plan_data;
+    tigris_error_t loaded;
+    if (required)
+        memset(required, 0, 5u * sizeof(*required));
+    if (!data || size == 0u)
+        return "Missing plan data";
+    plan_data = allocate_aligned(size, &allocation);
+    if (!plan_data)
+        return "Host allocation failed";
+    memcpy(plan_data, data, size);
+    loaded = tigris_plan_load_ex(plan_data, size, &plan, &needs);
+    free(allocation);
+    if (loaded != TIGRIS_OK)
+        return tigris_error_str(loaded);
+    if (required) {
+        required[0] = needs.tensors;
+        required[1] = needs.stage_inputs;
+        required[2] = needs.stage_outputs;
+        required[3] = needs.chain_stages;
+        required[4] = needs.spatial_ops_per_stage;
+    }
+    return NULL;
 }
 
 uint32_t tigris_host_tensor_count(const tigris_host_t *host, int output)

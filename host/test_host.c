@@ -199,6 +199,25 @@ static void state_checks(void)
     tigris_host_destroy(host);
 }
 
+/* The check loads what creation loads and states the plan's build needs; a
+ * plan the loader refuses gets the loader's message and no figures. */
+static void check_checks(void)
+{
+    uint32_t size;
+    uint8_t *data = read_fixture("schema-v10-state.tgrs", &size);
+    uint16_t required[5];
+    CHECK(tigris_host_check(data, size, required) == NULL);
+    CHECK(required[0] > 0u && required[1] > 0u && required[2] > 0u);
+    CHECK(required[3] == 0u && required[4] == 0u);
+    CHECK(tigris_host_check(data, size, NULL) == NULL);
+    data[0] ^= 0xFFu;
+    CHECK(strcmp(tigris_host_check(data, size, required), "bad magic (expected TGRS)") == 0);
+    CHECK(required[0] == 0u && required[1] == 0u && required[2] == 0u);
+    CHECK(strcmp(tigris_host_check(data, 3u, NULL), "buffer too small for header") == 0);
+    CHECK(strcmp(tigris_host_check(NULL, size, NULL), "Missing plan data") == 0);
+    free(data);
+}
+
 int main(void)
 {
     tigris_host_t *host = NULL;
@@ -211,6 +230,7 @@ int main(void)
     fixture("schema-v6-interface-dtype.tgrs", TIGRIS_TRACE_POOL_FAST);
     fixture("schema-v8-layer-norm.tgrs", TIGRIS_TRACE_POOL_FAST);
     state_checks();
+    check_checks();
     puts("Host library checks passed");
     return 0;
 }

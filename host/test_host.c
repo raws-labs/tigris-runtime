@@ -48,20 +48,12 @@ static void trace_checks(tigris_host_t *host, const void *const *inputs, const u
     free(events);
 }
 
-/* input_pool: fast for a plan that reads its inputs in place, slow otherwise. */
-static void fixture(const char *name, uint8_t input_pool)
+static void *read_fixture(const char *name, uint32_t *size)
 {
     char path[1024];
     FILE *file;
-    long size;
+    long length;
     void *data;
-    tigris_host_t *host = NULL;
-    tigris_host_t *tight = NULL;
-    const char *error;
-    uint32_t in_size, out_size;
-    void *input, *output;
-    const void *inputs[1];
-    void *outputs[1];
     CHECK(snprintf(path, sizeof(path), "%s/%s", TIGRIS_SCHEMA_COMPAT_DIR, name) > 0);
 #if defined(_MSC_VER)
     CHECK(fopen_s(&file, path, "rb") == 0);
@@ -70,19 +62,39 @@ static void fixture(const char *name, uint8_t input_pool)
 #endif
     CHECK(file != NULL);
     CHECK(fseek(file, 0, SEEK_END) == 0);
-    size = ftell(file);
-    CHECK(size > 0 && (uint64_t)size <= UINT32_MAX);
+    length = ftell(file);
+    CHECK(length > 0 && (uint64_t)length <= UINT32_MAX);
     rewind(file);
-    data = malloc((size_t)size);
+    data = malloc((size_t)length);
     CHECK(data != NULL);
-    CHECK(fread(data, 1, (size_t)size, file) == (size_t)size);
+    CHECK(fread(data, 1, (size_t)length, file) == (size_t)length);
     CHECK(fclose(file) == 0);
-    error = tigris_host_create(data, (uint32_t)size, 0, &host);
+    *size = (uint32_t)length;
+    return data;
+}
+
+/* input_pool: fast for a plan that reads its inputs in place, slow otherwise. */
+static void fixture(const char *name, uint8_t input_pool)
+{
+    uint32_t size;
+    void *data = read_fixture(name, &size);
+    tigris_host_t *host = NULL;
+    tigris_host_t *tight = NULL;
+    const char *error;
+    uint32_t in_size, out_size;
+    void *input, *output;
+    const void *inputs[1];
+    void *outputs[1];
+    error = tigris_host_create(data, size, 0, &host);
     if (error) fprintf(stderr, "%s: %s\n", name, error);
     CHECK(error == NULL && host != NULL);
-    CHECK(tigris_host_create(data, (uint32_t)size, 1, &tight) == NULL && tight != NULL);
-    memset(data, 0, (size_t)size);
+    CHECK(tigris_host_create(data, size, 1, &tight) == NULL && tight != NULL);
+    memset(data, 0, size);
     free(data);
+    /* A stateless plan saves and restores nothing. */
+    CHECK(tigris_host_state_bytes(host) == 0u);
+    CHECK(tigris_host_save_state(host, NULL, 0u) == NULL);
+    CHECK(tigris_host_restore_state(host, NULL, 0u) == NULL);
     CHECK(tigris_host_tensor_count(host, 0) == 1u);
     CHECK(tigris_host_tensor_count(host, 1) == 1u);
     CHECK(tigris_host_tensor_name(host, 0, 0) != NULL);
@@ -139,10 +151,58 @@ static void fixture(const char *name, uint8_t input_pool)
     tigris_host_destroy(host);
 }
 
+/* Restoring a state saved before some runs makes the next run repeat the
+ * first run after the save and leave the state that run left. */
+static void state_checks(void)
+{
+    uint32_t size;
+    void *data = read_fixture("schema-v10-state.tgrs", &size);
+    tigris_host_t *host = NULL;
+    const float input[2] = {0.5f, -1.0f};
+    float output[3][4];
+    const void *inputs[1] = {input};
+    uint32_t in_size = sizeof(input), out_size = sizeof(output[0]), bytes;
+    void *outputs[1];
+    uint8_t *saved[3];
+    CHECK(tigris_host_create(data, size, 0, &host) == NULL && host != NULL);
+    free(data);
+    CHECK(tigris_host_tensor_bytes(host, 0, 0) == in_size && tigris_host_tensor_bytes(host, 1, 0) == out_size);
+    bytes = tigris_host_state_bytes(host);
+    CHECK(bytes > 0u);
+    for (int i = 0; i < 3; ++i) {
+        saved[i] = malloc(bytes);
+        CHECK(saved[i] != NULL);
+    }
+    outputs[0] = output[0];
+    CHECK(tigris_host_run(host, inputs, &in_size, 1, outputs, &out_size, 1) == NULL);
+    CHECK(tigris_host_save_state(host, saved[0], bytes) == NULL);
+    CHECK(tigris_host_run(host, inputs, &in_size, 1, outputs, &out_size, 1) == NULL);
+    CHECK(tigris_host_save_state(host, saved[1], bytes) == NULL);
+    outputs[0] = output[1];
+    CHECK(tigris_host_run(host, inputs, &in_size, 1, outputs, &out_size, 1) == NULL);
+    CHECK(memcmp(output[0], output[1], sizeof(output[0])) != 0);
+    CHECK(tigris_host_restore_state(host, saved[0], bytes) == NULL);
+    outputs[0] = output[2];
+    CHECK(tigris_host_run(host, inputs, &in_size, 1, outputs, &out_size, 1) == NULL);
+    CHECK(memcmp(output[0], output[2], sizeof(output[0])) == 0);
+    CHECK(tigris_host_save_state(host, saved[2], bytes) == NULL);
+    CHECK(memcmp(saved[1], saved[2], bytes) == 0);
+    CHECK(strcmp(tigris_host_save_state(host, saved[0], bytes - 1u),
+                 "State byte count does not match the plan") == 0);
+    CHECK(strcmp(tigris_host_restore_state(host, saved[0], bytes + 1u),
+                 "State byte count does not match the plan") == 0);
+    CHECK(strcmp(tigris_host_restore_state(host, NULL, bytes), "Missing state buffer") == 0);
+    CHECK(strcmp(tigris_host_save_state(NULL, saved[0], bytes), "Missing session") == 0);
+    CHECK(tigris_host_state_bytes(NULL) == 0u);
+    for (int i = 0; i < 3; ++i)
+        free(saved[i]);
+    tigris_host_destroy(host);
+}
+
 int main(void)
 {
     tigris_host_t *host = NULL;
-    CHECK(tigris_host_abi() == 2u);
+    CHECK(tigris_host_abi() == 3u);
     CHECK(strlen(tigris_host_version()) > 0u);
     CHECK(tigris_host_create("bad", 3, 0, &host) != NULL && host == NULL);
     CHECK(tigris_host_tensor_count(NULL, 0) == 0u);
@@ -150,6 +210,7 @@ int main(void)
     fixture("schema-v4-transpose.tgrs", TIGRIS_TRACE_POOL_SLOW);
     fixture("schema-v6-interface-dtype.tgrs", TIGRIS_TRACE_POOL_FAST);
     fixture("schema-v8-layer-norm.tgrs", TIGRIS_TRACE_POOL_FAST);
+    state_checks();
     puts("Host library checks passed");
     return 0;
 }

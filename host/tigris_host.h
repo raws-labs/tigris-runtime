@@ -69,6 +69,14 @@ TIGRIS_HOST_API uint32_t tigris_host_trace_count(const tigris_host_t *host);
  * success, else an error message. A stateless plan has nothing to reset. */
 TIGRIS_HOST_API const char *tigris_host_reset_state(tigris_host_t *host);
 
+/* Bytes of the variables a stateful plan keeps across runs; 0 for a stateless
+ * plan. Saving copies them into a caller-owned buffer of exactly that size and
+ * restoring copies them back, so the next run starts from the saved values;
+ * both return NULL on success, else an error message. */
+TIGRIS_HOST_API uint32_t tigris_host_state_bytes(const tigris_host_t *host);
+TIGRIS_HOST_API const char *tigris_host_save_state(const tigris_host_t *host, void *state, uint32_t size);
+TIGRIS_HOST_API const char *tigris_host_restore_state(tigris_host_t *host, const void *state, uint32_t size);
+
 #ifdef __cplusplus
 }
 #endif

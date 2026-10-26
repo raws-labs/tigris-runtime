@@ -910,6 +910,48 @@ static int stage_axis1_fast_bytes(
     return 1;
 }
 
+/* Output rows per band of a height stripe. From schema 11 the record states
+ * the band, and a band whose working set exceeds the stage's fast capacity
+ * fails closed; older plans take the largest band that fits. */
+static tigris_exec_error_t stripe_band_rows(
+    const tigris_plan_t *plan, const tigris_stage_t *stage, const tigris_mem_t *mem,
+    int spatial_op_idx, int32_t output_extent, int32_t stride, int32_t effective_kernel,
+    int32_t *rows)
+{
+    uint32_t available = stage_fast_capacity(plan, stage, mem);
+    uint32_t required;
+    if (plan->header->version >= TIGRIS_SCHEMA_VERSION_TILE_FACTS) {
+        uint32_t band = tigris_stage_tiles(plan, stage).output_band_extent;
+        if (band == 0u || output_extent <= 0 || band > (uint32_t)output_extent ||
+            !stage_axis1_fast_bytes(plan, stage, spatial_op_idx, (int32_t)band,
+                                    stride, effective_kernel, &required) ||
+            required > available)
+            return TIGRIS_EXEC_ERR_TILE;
+        *rows = (int32_t)band;
+        return TIGRIS_EXEC_OK;
+    }
+    int32_t low = 1;
+    int32_t high = output_extent;
+    int32_t best = 0;
+    while (low <= high) {
+        int32_t candidate = low + (high - low) / 2;
+        if (!stage_axis1_fast_bytes(
+                plan, stage, spatial_op_idx, candidate,
+                stride, effective_kernel, &required))
+            return TIGRIS_EXEC_ERR_TILE;
+        if (required <= available) {
+            best = candidate;
+            low = candidate + 1;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    if (best == 0)
+        return TIGRIS_EXEC_ERR_TILE;
+    *rows = best;
+    return TIGRIS_EXEC_OK;
+}
+
 static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled(
     const tigris_plan_t      *plan,
     const tigris_stage_t     *stage,
@@ -1013,26 +1055,11 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled(
     /* (Spatial op + image dims computed up front, above.) */
 
     const uint16_t *sops = tigris_stage_ops(plan, stage);
-    uint32_t available = stage_fast_capacity(plan, stage, mem);
-    int32_t low = 1;
-    int32_t high = full_out_h;
     int32_t out_tile_h = 0;
-    while (low <= high) {
-        int32_t candidate = low + (high - low) / 2;
-        uint32_t required;
-        if (!stage_axis1_fast_bytes(
-                plan, stage, sp_op_idx, candidate,
-                stride, eff_kh, &required))
-            return TIGRIS_EXEC_ERR_TILE;
-        if (required <= available) {
-            out_tile_h = candidate;
-            low = candidate + 1;
-        } else {
-            high = candidate - 1;
-        }
-    }
-    if (out_tile_h == 0)
-        return TIGRIS_EXEC_ERR_TILE;
+    tigris_exec_error_t band_error = stripe_band_rows(
+        plan, stage, mem, sp_op_idx, full_out_h, stride, eff_kh, &out_tile_h);
+    if (band_error != TIGRIS_EXEC_OK)
+        return band_error;
 
     int32_t num_tiles = 1 + (full_out_h - 1) / out_tile_h;
 

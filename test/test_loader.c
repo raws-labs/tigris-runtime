@@ -1597,7 +1597,8 @@ static void test_tiled_reduction_contract(void)
 
     /* An output that still has spatial extent is not a global reduction. */
     build_tiled_stage_plan(buf, TIGRIS_OP_GLOBAL_AVG, 4);
-    tiled_record(buf)->choices.input_band_extent = 1u;
+    tiled_record(buf)->choices.input_band_extent = 0u;
+    tiled_record(buf)->choices.output_band_extent = 1u;
     shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
     shapes[4] = 1; shapes[5] = 1; shapes[6] = 2; shapes[7] = 8;
     ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].size_bytes =
@@ -1951,7 +1952,7 @@ static void test_rank4_row_band_contract(void)
     build_tiled_stage_plan(buf, TIGRIS_OP_ERF, 4);
     shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
     shapes[4] = 1; shapes[5] = 2; shapes[6] = 4; shapes[7] = 8;
-    tiled_record(buf)->choices.input_band_extent = 1u;
+    tiled_record(buf)->choices.output_band_extent = 1u;
     tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "the spatial reading of the same shapes still loads");
@@ -2192,6 +2193,101 @@ static void test_tile_facts_contract(void)
     facts->num_tiles = 3u;
     facts->halo = 2u;
     TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "a leading band has no halo");
+}
+
+/* A 3x1 max pool, stride 2 and one row of padding each side, of [1, 8, 2, 2] to [1, 4, 2, 2],
+ * in a fast arena of 128 bytes. The schema 11 record states `band` output rows. */
+static void build_strided_stripe_plan(uint8_t *buf, uint32_t band)
+{
+    build_tiled_stage_plan(buf, TIGRIS_OP_MAX_POOL, 4u);
+    ((tigris_file_header_t *)buf)->budget = 128u;
+    int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[0] = 1; shapes[1] = 8; shapes[2] = 2; shapes[3] = 2;
+    shapes[4] = 1; shapes[5] = 4; shapes[6] = 2; shapes[7] = 2;
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    tensors[0].size_bytes = 32u * (uint32_t)sizeof(float);
+    tensors[1].size_bytes = 16u * (uint32_t)sizeof(float);
+    tigris_op_t *op = (tigris_op_t *)(buf + TILED_OPS_OFF);
+    op->spatial.kernel_h = 3; op->spatial.kernel_w = 1;
+    op->spatial.stride_h = 2; op->spatial.stride_w = 1;
+    op->spatial.pad_top = 1; op->spatial.pad_bottom = 1;
+    op->spatial.dilation_h = 1; op->spatial.dilation_w = 1;
+    tiled_record(buf)->choices.output_band_extent = band;
+    tiled_state_facts(buf, band, (4u + band - 1u) / band, 4u, 2u, 1u);
+}
+
+static tigris_exec_error_t run_strided_stripe(const tigris_plan_t *plan, const float *input,
+                                              float *output, tigris_exec_stats_t *stats)
+{
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[128], slow[512];
+    void *pointers[2] = {NULL, NULL};
+    tigris_mem_t mem;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, pointers, 2, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "stripe arenas");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, 32u * sizeof(float)), TIGRIS_MEM_OK, "input allocation");
+    TEST_ASSERT_EQ(tigris_input_write(plan, &mem, 0, input, 32u * sizeof(float)), TIGRIS_OK, "input write");
+    memset(stats, 0, sizeof(*stats));
+    tigris_exec_error_t err = tigris_run(plan, &mem, tigris_dispatch_kernel, NULL, stats);
+    if (err == TIGRIS_EXEC_OK)
+        TEST_ASSERT_EQ(tigris_output_read(plan, &mem, 1, output, 16u * sizeof(float)), TIGRIS_OK,
+                       "output read");
+    return err;
+}
+
+/* From schema 11 a height stripe states its band in output rows, and the run takes that band. */
+static void test_stripe_runs_its_stated_band(void)
+{
+    printf("  test_stripe_runs_its_stated_band...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_tile_facts_t derived;
+    tigris_exec_stats_t stats;
+    float input[32], output[16], expected[16];
+    for (uint32_t i = 0; i < 32u; i++)
+        input[i] = (float)((i * 7u) % 13u) - 6.0f;
+    for (uint32_t o = 0; o < 4u; o++) {
+        for (uint32_t k = 0; k < 4u; k++) {
+            float best = -1.0e30f;
+            for (int32_t r = 2 * (int32_t)o - 1; r <= 2 * (int32_t)o + 1; r++)
+                if (r >= 0 && r < 8 && input[(uint32_t)r * 4u + k] > best)
+                    best = input[(uint32_t)r * 4u + k];
+            expected[o * 4u + k] = best;
+        }
+    }
+
+    /* One output row per band: four bands, where the arena would take two rows at once. */
+    build_strided_stripe_plan(buf, 1u);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "an output band loads");
+    TEST_ASSERT_EQ(tigris_stage_tile_facts(&plan, &plan.stages[0], &derived), 1, "facts derived");
+    TEST_ASSERT(memcmp(&derived, &tiled_record(buf)->facts, sizeof(derived)) == 0,
+                "the facts count output bands of the output extent");
+    TEST_ASSERT_EQ(run_strided_stripe(&plan, input, output, &stats), TIGRIS_EXEC_OK, "the stripe runs");
+    TEST_ASSERT_EQ(stats.stages_tiled, 1u, "the stage ran as a height stripe");
+    TEST_ASSERT_EQ(stats.total_tiles, 4u, "the run takes the stated band");
+    TEST_ASSERT(memcmp(output, expected, sizeof(output)) == 0, "outputs match the reference");
+
+    /* A count of input rows over the band does not describe the run. */
+    tiled_record(buf)->facts.num_tiles = 8u;
+    tiled_record(buf)->facts.original_extent = 8u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_TILE_FACTS,
+                   "an input-row count refused");
+    /* Nor does a band of input rows. */
+    build_strided_stripe_plan(buf, 1u);
+    tiled_record(buf)->choices.output_band_extent = 0u;
+    tiled_record(buf)->choices.input_band_extent = 1u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "an input band refused");
+    build_strided_stripe_plan(buf, 5u);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "a band past the output refused");
+
+    /* The whole output in one band needs all eight input rows, more than the arena holds. */
+    build_strided_stripe_plan(buf, 4u);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "a whole-output band loads");
+    memset(output, 0, sizeof(output));
+    TEST_ASSERT_EQ(run_strided_stripe(&plan, input, output, &stats), TIGRIS_EXEC_ERR_TILE,
+                   "a band that does not fit fails closed");
+    TEST_ASSERT_EQ(stats.total_tiles, 0u, "before the first tile");
 }
 
 /* The tiled plan from [1, 2, 4, 8] to [1, out_h, out_w, 8] with a 2D record of one row by one column. */
@@ -3662,7 +3758,11 @@ static void test_prelu_tiling_contract(void)
         memset(&tile, 0, sizeof(tile));
         tile.choices.tileable = 1;
         tile.choices.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
-        tile.choices.input_band_extent = 1u;
+        /* A matrix bands its input rows; a height stripe states its output rows. */
+        if (rank == 2u)
+            tile.choices.input_band_extent = 1u;
+        else
+            tile.choices.output_band_extent = 1u;
         tile.choices.tiled_peak_bytes = 128u;
         tile.facts.tile_extent = 1u;
         tile.facts.num_tiles = rows;
@@ -3693,7 +3793,10 @@ static void test_activation_tiling_contract(void)
             tensors[1].size_bytes = tensors[0].size_bytes;
             /* One row at a time: a matrix's rows at rank 2, the height otherwise. */
             uint32_t rows = (uint32_t)(rank == 2u ? dims[0] : dims[1]);
-            tiled_record(buf)->choices.input_band_extent = 1u;
+            if (rank == 2u)
+                tiled_record(buf)->choices.input_band_extent = 1u;
+            else
+                tiled_record(buf)->choices.output_band_extent = 1u;
             tiled_state_facts(buf, 1u, rows, rows, 0u, rank == 2u ? 0u : 1u);
             if (kinds[k] == TIGRIS_OP_L2_NORMALIZATION) {
                 tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
@@ -3726,7 +3829,7 @@ static void test_activation_tiling_contract(void)
     op->spatial.stride_h = 1; op->spatial.stride_w = 1;
     int32_t *dims = (int32_t *)(buf + TILED_SHAPES_OFF);
     memcpy(dims + 4, dims, 4u * sizeof(int32_t));
-    tiled_record(buf)->choices.input_band_extent = 1u;
+    tiled_record(buf)->choices.output_band_extent = 1u;
     tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "L2Pool supports image height tiling");
@@ -5897,6 +6000,7 @@ int main(void)
     test_rank4_row_band_contract();
     test_reshape_band_contract();
     test_tile_facts_contract();
+    test_stripe_runs_its_stated_band();
     test_hw_record_contract();
     test_band_kind_order();
     test_float_section();

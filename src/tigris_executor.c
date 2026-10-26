@@ -4095,7 +4095,7 @@ tigris_exec_error_t tigris_run_with_state(
             case TIGRIS_BAND_KIND_LEADING:
                 result = exec_stage_tiled_rows(
                     run_plan, stage, mem, kernel, user_ctx, workspace, last_consumer, s,
-                    route.band.rows, tigris_stage_band_mode(run_plan, stage), stats);
+                    route.band.rows, route.band.mode, stats);
                 break;
             case TIGRIS_BAND_KIND_ROWS:
                 result = exec_stage_tiled_rows(

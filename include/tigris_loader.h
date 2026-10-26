@@ -75,10 +75,15 @@ typedef enum {
 typedef struct {
     int32_t batch;  /**< ROWS: the matrices each band repeats over, otherwise 0 */
     int32_t rows;   /**< RESHAPE, LEADING and ROWS: the rows the bands divide, otherwise 0 */
+    int32_t mode;   /**< LEADING: the band mode, TIGRIS_BAND_LEADING or a later one, otherwise 0 */
 } tigris_stage_band_t;
 
 /**
- * Classify how the executor bands a standalone stage, in the order it
+ * How the executor bands a standalone stage. From schema 11 a tileable record
+ * states the kind and a leading band's mode; the stated kind is returned when
+ * the stage meets that kind's conditions, and TIGRIS_BAND_KIND_NONE, which
+ * the loader refuses, when it does not. A stage without a tileable record has
+ * no kind. Below schema 11 the kind is derived in the order the executor
  * decides: a Reshape band, then a leading band (both only under a tileable
  * record), a row band, a banded transpose, a global reduction by input, a 2D
  * record, and otherwise the stripe. Whether the stage is banded at all also
@@ -96,7 +101,8 @@ tigris_band_kind_t tigris_stage_band_kind(const tigris_plan_t *plan, const tigri
 /**
  * Derive what a stage's tile record states about its tiling (schema 11+),
  * by the rules the executor bands the stage with: the band axis, the extent
- * the bands divide, the band, the tile count and the halo. A height stripe
+ * the bands divide, the band, the tile count, the halo, and the band byte of
+ * the kind the stage is banded by (tigris_stage_band_kind). A height stripe
  * divides its output rows into the stated output band, and num_tiles is the
  * number of bands the executor runs. A layout conversion sizes its band in
  * the run, so its tile_extent is the record's, bounded by the extent. An

@@ -42,8 +42,10 @@ static void test_declared_interface_sizes_the_caller_buffer(void)
     uint16_t idx = fixture_plan.model_inputs[0];
     const tigris_tensor_t *t = &fixture_plan.tensors[idx];
     printf("  test_declared_interface_sizes_the_caller_buffer...\n");
-    TEST_ASSERT_EQ(t->dtype, 3, "plan stores int8");
-    TEST_ASSERT_EQ(t->iface_dtype, 1, "model declares float32");
+    TEST_ASSERT_EQ(t->dtype, TIGRIS_DTYPE_INT8, "plan stores int8");
+    TEST_ASSERT_EQ(t->iface_dtype, TIGRIS_DTYPE_FLOAT32, "model declares float32");
+    TEST_ASSERT_EQ(tigris_tensor_declared_dtype(t), TIGRIS_DTYPE_FLOAT32,
+                   "the declared dtype is the interface dtype");
     /* Four bytes per element where the plan stores one. */
     TEST_ASSERT_EQ(tigris_iface_bytes(&fixture_plan, idx),
                    t->size_bytes * 4u, "float interface is four times as wide");

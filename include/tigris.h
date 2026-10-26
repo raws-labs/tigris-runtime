@@ -93,20 +93,30 @@ extern "C" {
 #define TIGRIS_SEC_MEMORY         14  /* tigris_memory_t, schema 11+ */
 #define TIGRIS_SEC_MAX            15  /* one past the last valid section */
 
+/* ONNX TensorProto.DataType values that a plan tensor or a model boundary
+ * can carry. */
+#define TIGRIS_DTYPE_FLOAT32 1u
+#define TIGRIS_DTYPE_UINT8   2u
+#define TIGRIS_DTYPE_INT8    3u
+#define TIGRIS_DTYPE_INT16   5u
+#define TIGRIS_DTYPE_INT32   6u
+#define TIGRIS_DTYPE_INT64   7u
+#define TIGRIS_DTYPE_BOOL    9u
+
 /* Auxiliary tensor placement is constrained by operator dtype slots. */
 static inline int tigris_dtype_requires_source(uint8_t dtype)
 {
-    return dtype == 6u;
+    return dtype == TIGRIS_DTYPE_INT32;
 }
 
 /* ONNX dtype element sizes; zero denotes an unsupported storage type. */
 static inline uint32_t tigris_dtype_size(uint8_t dtype)
 {
     switch (dtype) {
-    case 1: case 6: return 4u;
-    case 2: case 3: case 9: return 1u;
-    case 5: return 2u;
-    case 7: return 8u;
+    case TIGRIS_DTYPE_FLOAT32: case TIGRIS_DTYPE_INT32: return 4u;
+    case TIGRIS_DTYPE_UINT8: case TIGRIS_DTYPE_INT8: case TIGRIS_DTYPE_BOOL: return 1u;
+    case TIGRIS_DTYPE_INT16: return 2u;
+    case TIGRIS_DTYPE_INT64: return 8u;
     default: return 0u;
     }
 }
@@ -368,11 +378,10 @@ typedef enum {
 /* Sentinel: chain_id == 0xFFFF means stage is not part of a chain */
 #define TIGRIS_NO_CHAIN         0xFFFF
 
-/* Stage flags packed into the chain head stage's _reserved1 field.
+/* Stage flags stored in the chain head stage's _reserved1 field.
  * Set by the compiler when a recomputing chain's shared boundary rows
  * are eligible to be kept in a line buffer instead of recomputed per
- * tile. The runtime currently only reads this bit; the roll itself is
- * a later change. */
+ * tile. The executor rolls those rows when the bit is set. */
 #define TIGRIS_STAGE_FLAG_LINE_BUFFERED 0x0001u
 
 /* Packed struct definitions */
@@ -425,6 +434,13 @@ typedef struct {
     uint8_t     iface_dtype;        /* 15: ONNX dtype the model declares for this
                                      *     model input/output, 0 = same as dtype */
 } tigris_tensor_t;                  /* 16 bytes total */
+
+/* The dtype the model file declares for a boundary tensor, which is its own
+ * dtype when the plan records none. */
+static inline uint8_t tigris_tensor_declared_dtype(const tigris_tensor_t *tensor)
+{
+    return (tensor->iface_dtype != 0u) ? tensor->iface_dtype : tensor->dtype;
+}
 
 /**
  * Spatial attributes - 18 bytes, embedded in tigris_op_t.
@@ -481,7 +497,7 @@ typedef struct {
     uint16_t    chain_id;           /* 20: first stage of chain, 0xFFFF=standalone */
     uint16_t    chain_len;          /* 22: number of stages in chain (0=not in chain) */
     uint16_t    chain_tile_h;       /* 24: output tile height for last stage (on head) */
-    uint16_t    _reserved1;         /* 26 */
+    uint16_t    _reserved1;         /* 26: TIGRIS_STAGE_FLAG_* bits */
 } tigris_stage_t;                   /* 28 bytes total */
 
 /**

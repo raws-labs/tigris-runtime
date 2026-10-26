@@ -177,7 +177,6 @@ misra-c2012-21.15 src/tigris_loader.c
 misra-c2012-21.16 src/tigris_loader.c
 misra-c2012-21.3 src/tigris_kernels_esp_nn.c
 misra-c2012-5.9 src/tigris_executor.c
-misra-c2012-5.9 src/tigris_iface.c
 misra-c2012-5.9 src/tigris_kernels.c
 misra-c2012-5.9 src/tigris_kernels_s8.c
 misra-c2012-5.9 src/tigris_loader.c

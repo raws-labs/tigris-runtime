@@ -19,14 +19,6 @@
 #include "tigris_mem.h"
 
 #define EXAMPLE_SLOW_BYTES (512u * 1024u)
-#define ONNX_DTYPE_FLOAT 1u
-#define ONNX_DTYPE_UINT8 2u
-#define ONNX_DTYPE_INT8 3u
-
-static uint8_t declared_dtype(const tigris_tensor_t *t)
-{
-    return t->iface_dtype ? t->iface_dtype : t->dtype;
-}
 
 static int plan_has_int8_io(const tigris_plan_t *plan)
 {
@@ -39,12 +31,12 @@ static int plan_has_int8_io(const tigris_plan_t *plan)
 
     for (i = 0; i < plan->header->num_model_inputs; ++i) {
         uint16_t idx = plan->model_inputs[i];
-        if (plan->tensors[idx].dtype != ONNX_DTYPE_INT8)
+        if (plan->tensors[idx].dtype != TIGRIS_DTYPE_INT8)
             return 0;
     }
     for (i = 0; i < plan->header->num_model_outputs; ++i) {
         uint16_t idx = plan->model_outputs[i];
-        if (plan->tensors[idx].dtype != ONNX_DTYPE_INT8)
+        if (plan->tensors[idx].dtype != TIGRIS_DTYPE_INT8)
             return 0;
     }
     return 1;
@@ -158,7 +150,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, "could not allocate input buffer\n");
                 goto cleanup;
             }
-            if (declared_dtype(t) == ONNX_DTYPE_FLOAT) {
+            if (tigris_tensor_declared_dtype(t) == TIGRIS_DTYPE_FLOAT32) {
                 for (j = 0; j < in_bytes / (uint32_t)sizeof(float); ++j)
                     ((float *)(void *)input)[j] = 0.1f;
             } else {
@@ -195,7 +187,7 @@ int main(int argc, char **argv)
             /* Read the output in the dtype the model declares, which the
              * runtime converts to from whatever the plan executes on. */
             out_idx = plan.model_outputs[0];
-            out_dtype = declared_dtype(&plan.tensors[out_idx]);
+            out_dtype = tigris_tensor_declared_dtype(&plan.tensors[out_idx]);
             out_bytes = tigris_iface_bytes(&plan, out_idx);
             if (out_bytes == 0) {
                 fprintf(stderr, "inference produced no first output\n");
@@ -213,17 +205,18 @@ int main(int argc, char **argv)
                 goto cleanup;
             }
 
-            /* The loader admits only float32 or uint8 over a stored int8 output. */
-            count = out_dtype == ONNX_DTYPE_FLOAT
+            /* An int8 output is declared float32, uint8 or int8, and only
+             * float32 takes four bytes per value. */
+            count = out_dtype == TIGRIS_DTYPE_FLOAT32
                 ? out_bytes / (uint32_t)sizeof(float) : out_bytes;
             show = count;
             if (show > 5)
                 show = 5;
             printf("Output:");
             for (j = 0; j < show; ++j) {
-                if (out_dtype == ONNX_DTYPE_FLOAT)
+                if (out_dtype == TIGRIS_DTYPE_FLOAT32)
                     printf(" %.6g", (double)((const float *)output)[j]);
-                else if (out_dtype == ONNX_DTYPE_UINT8)
+                else if (out_dtype == TIGRIS_DTYPE_UINT8)
                     printf(" %u", (unsigned)((const uint8_t *)output)[j]);
                 else
                     printf(" %d", (int)((const int8_t *)output)[j]);

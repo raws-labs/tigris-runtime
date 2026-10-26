@@ -102,7 +102,7 @@ const char *tigris_host_create(
         goto fail;
     }
     dtype = tigris_plan_data_dtype(&host->plan);
-    if (dtype != 1u && dtype != 3u) {
+    if (dtype != TIGRIS_DTYPE_FLOAT32 && dtype != TIGRIS_DTYPE_INT8) {
         error = "Host execution supports float32 and int8 plans";
         goto fail;
     }
@@ -146,7 +146,7 @@ const char *tigris_host_create(
             goto fail;
         }
     }
-    host->dispatch = dtype == 1u ? tigris_dispatch_kernel : tigris_dispatch_kernel_s8;
+    host->dispatch = dtype == TIGRIS_DTYPE_FLOAT32 ? tigris_dispatch_kernel : tigris_dispatch_kernel_s8;
     *out = host;
     return NULL;
 fail:
@@ -186,7 +186,7 @@ uint32_t tigris_host_tensor_bytes(const tigris_host_t *host, int output, uint32_
 uint32_t tigris_host_tensor_dtype(const tigris_host_t *host, int output, uint32_t index)
 {
     const tigris_tensor_t *tensor = tensor_at(host, output, index);
-    return tensor ? (tensor->iface_dtype ? tensor->iface_dtype : tensor->dtype) : 0u;
+    return tensor ? tigris_tensor_declared_dtype(tensor) : 0u;
 }
 
 uint32_t tigris_host_tensor_rank(const tigris_host_t *host, int output, uint32_t index)

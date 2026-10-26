@@ -19,7 +19,7 @@
  * CONFIG_NN_OPTIMIZED routes to the S3 SIMD path (not ANSI C fallback).
  *
  * Memory: tigris_esp_nn_prepare() obtains platform-managed aligned workspace.
- * No workspace allocation occurs inside tigris_run().
+ * No workspace allocation occurs during inference.
  */
 
 #ifdef TIGRIS_HAS_ESP_NN

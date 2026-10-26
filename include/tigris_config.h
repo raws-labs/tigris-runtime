@@ -48,9 +48,10 @@
 #endif
 
 /**
- * Keep the source-compatible tigris_run() wrapper and its process-global
+ * Keep the compatibility tigris_run() wrapper and its process-global
  * workspace. Set to 0 for generated, re-entrant, or multi-task builds; those
- * builds use tigris_run_with_workspace_buffer() with plan-sized caller storage.
+ * call tigris_run_with_workspace() or tigris_run_with_workspace_buffer() with
+ * caller-owned storage.
  */
 #ifndef TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE
 #define TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE 1

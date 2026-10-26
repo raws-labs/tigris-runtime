@@ -378,10 +378,10 @@ typedef enum {
 /* Sentinel: chain_id == 0xFFFF means stage is not part of a chain */
 #define TIGRIS_NO_CHAIN         0xFFFF
 
-/* Stage flags stored in the chain head stage's _reserved1 field.
- * Set by the compiler when a recomputing chain's shared boundary rows
- * are eligible to be kept in a line buffer instead of recomputed per
- * tile. The executor rolls those rows when the bit is set. */
+/* Stage flags stored in the chain head stage's _reserved1 field. The
+ * compiler sets LINE_BUFFERED on a recomputing chain whose shared boundary
+ * rows can be kept in a line buffer; the executor then rolls those rows
+ * instead of recomputing them per tile. */
 #define TIGRIS_STAGE_FLAG_LINE_BUFFERED 0x0001u
 
 /* Packed struct definitions */
@@ -444,8 +444,7 @@ static inline uint8_t tigris_tensor_declared_dtype(const tigris_tensor_t *tensor
 
 /**
  * Spatial attributes - 18 bytes, embedded in tigris_op_t.
- * Zero for non-spatial ops (pointwise, reshape, etc.). pad/dilation are u16
- * (were u8) so deep dilated convs (dilation/pad up to 65535) don't overflow.
+ * Zero for non-spatial ops (pointwise, reshape, etc.).
  */
 typedef struct {
     uint8_t     kernel_h;
@@ -563,9 +562,9 @@ typedef struct {
 #define TIGRIS_BAND_TRAILING 5u         /* the last axis */
 #define TIGRIS_BAND_AXIS_BASE 6u        /* plus the serialized axis */
 
-/* Which of the two axes a layout conversion's band runs along. Both sides
- * used to pick the longer one and agree only by coincidence when the two are
- * equal, which is what a square attention block is. */
+/* Set when a layout conversion's band runs along the columns. The compiler
+ * records the axis, so the two sides agree when the extents are equal, as in a
+ * square attention block. */
 #define TIGRIS_TILE_FLAG_BAND_ON_COLUMNS 0x0001u
 
 /**

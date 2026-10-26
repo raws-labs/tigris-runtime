@@ -18,13 +18,13 @@ extern "C" {
  * Zero-copy, zero-alloc: all pointers in out_plan point directly into buf.
  * The caller must keep buf alive for the lifetime of out_plan.
  *
- * ALIGNMENT CONTRACT: buf must be aligned to TIGRIS_TENSOR_ALIGN (16 on DSP
- * Cortex-M) when the plan's weights are read in place (XIP / non-compressed)
- * and consumed by the optimized CMSIS-NN kernels. The compiler aligns every
- * weight blob to that boundary *relative to the file base*, so an unaligned buf
- * makes the weight pointers unaligned and the opt kernels fault (LDRD/SIMD).
- * bin2c emits the embedded blob aligned(16); mmap/flash bases satisfy this; a
- * malloc'd host buffer should use aligned_alloc(TIGRIS_TENSOR_ALIGN, ...). The
+ * ALIGNMENT CONTRACT: buf must be aligned to 16 bytes when the plan's weights
+ * are read in place (XIP / non-compressed) and consumed by the optimized
+ * CMSIS-NN kernels. The compiler aligns every weight blob to 16 bytes
+ * *relative to the file base*, whatever TIGRIS_TENSOR_ALIGN is, so an
+ * unaligned buf makes the weight pointers unaligned and the opt kernels fault
+ * (LDRD/SIMD). bin2c emits the embedded blob aligned(16); mmap/flash bases
+ * satisfy this; a malloc'd host buffer should use aligned_alloc(16, ...). The
  * reference (s8/f32) kernels do not require this; only the opt backends do.
  *
  * Structural bounds, cross-references, tensor metadata and the built-in

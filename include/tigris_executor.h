@@ -173,9 +173,7 @@ typedef union {
  * its inputs in place (see tigris_input_alloc()) consumes the inputs at the top
  * of the fast arena, decompresses its weights into the room left below them,
  * and leaves its outputs there, readable until the next allocation in that
- * arena. Inputs placed another way are read in place only with that room free.
- * The compiler's slow figure assumes this placement; inputs allocated in slow
- * need a slow arena that holds them and the outputs.
+ * arena.
  *
  * This is the primary entry point. It is re-entrant: concurrent inferences
  * each pass their own workspace and memory manager, with a kernel dispatcher

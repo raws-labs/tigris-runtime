@@ -1,6 +1,6 @@
 /**
  * @file tigris_kernels_s8.c
- * @brief Reference int8 (symmetric quantized) kernels + dispatch.
+ * @brief Reference int8 (symmetric weights, asymmetric activations) kernels + dispatch.
  *
  * All kernels are static. Data layout: NHWC, int8.
  * Quantization parameters accessed via tigris_tensor_quant().
@@ -3507,7 +3507,7 @@ int tigris_dispatch_kernel_s8(
 }
 
 /* Optional accelerator pre-routing. This lives with s8_ref so integrations
- * that enumerate the historical runtime sources explicitly do not need a new
+ * that enumerate the runtime sources explicitly do not need a new
  * translation unit merely to use the fallback policy. */
 
 static uint16_t effective_dilation(uint16_t dilation)

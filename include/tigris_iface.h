@@ -43,8 +43,11 @@ uint32_t tigris_iface_bytes(const tigris_plan_t *plan, uint16_t tensor_idx);
  * the run decompresses the stage's weights. Place every input of such a plan
  * this way, one after another, so they sit together at the top of the fast
  * arena; the run then reads them there, consumes them, and leaves the model
- * outputs in the fast arena. Any other plan's input goes in the slow buffer.
- * An input that already has a buffer keeps it.
+ * outputs in the fast arena. Inputs placed another way are read in place only
+ * when they sit together at the top of the fast arena with that room free below
+ * them. The slow memory the compiler reports assumes this placement. Any other
+ * plan's input goes in the slow buffer. An input that already has a buffer
+ * keeps it.
  *
  * @param plan        Loaded plan.
  * @param mem         Memory manager.

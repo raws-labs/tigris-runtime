@@ -641,9 +641,8 @@ extern int32_t g_tigris_interior_clamps;
  *       emit_binary(ag, 'linebuf_conv_chain.tgrs')
  *   "
  *
- * The head stage's compiled _reserved1 is 0 (the current compiler does not
- * flag Conv chains); the test sets the line-buffered bit itself so it can
- * drive both paths from one plan.
+ * The head stage's _reserved1 in this fixture is 0; the test sets the
+ * line-buffered bit itself so it can drive both paths from one plan.
  */
 static const uint8_t k_linebuf_conv_chain_plan[] = {
     0x54, 0x47, 0x52, 0x53, 0x05, 0x00, 0x00, 0x00, 0xf0, 0x0a, 0x00, 0x00,

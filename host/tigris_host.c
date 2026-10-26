@@ -49,7 +49,7 @@ static void *allocate_aligned(uint32_t size, void **allocation)
     return (void *)((address + alignment - 1u) & ~(uintptr_t)(alignment - 1u));
 }
 
-uint32_t tigris_host_abi(void) { return 2u; }
+uint32_t tigris_host_abi(void) { return 3u; }
 const char *tigris_host_version(void) { return TIGRIS_HOST_VERSION; }
 
 void tigris_host_destroy(tigris_host_t *host)
@@ -253,6 +253,38 @@ const char *tigris_host_reset_state(tigris_host_t *host)
     if (tigris_state_init(&host->plan, host->state, host->state_size) != TIGRIS_EXEC_OK)
         return "Host state reset failed";
     return NULL;
+}
+
+uint32_t tigris_host_state_bytes(const tigris_host_t *host)
+{
+    return host ? (uint32_t)host->state_size : 0u;
+}
+
+static const char *check_state_buffer(const tigris_host_t *host, const void *state, uint32_t size)
+{
+    if (!host)
+        return "Missing session";
+    if (size != host->state_size)
+        return "State byte count does not match the plan";
+    if (size != 0u && !state)
+        return "Missing state buffer";
+    return NULL;
+}
+
+const char *tigris_host_save_state(const tigris_host_t *host, void *state, uint32_t size)
+{
+    const char *error = check_state_buffer(host, state, size);
+    if (!error && size != 0u)
+        memcpy(state, host->state, size);
+    return error;
+}
+
+const char *tigris_host_restore_state(tigris_host_t *host, const void *state, uint32_t size)
+{
+    const char *error = check_state_buffer(host, state, size);
+    if (!error && size != 0u)
+        memcpy(host->state, state, size);
+    return error;
 }
 
 uint64_t tigris_host_metric(const tigris_host_t *host, uint32_t metric)

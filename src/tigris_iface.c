@@ -7,19 +7,6 @@
 #include <math.h>
 #include <string.h>
 
-/* ONNX TensorProto.DataType values this runtime can present at a boundary. */
-#define IFACE_DTYPE_FLOAT32 1
-#define IFACE_DTYPE_UINT8   2
-#define IFACE_DTYPE_INT8    3
-#define IFACE_DTYPE_INT32   6
-#define IFACE_DTYPE_INT64   7
-
-/* The tensor's declared dtype, which is its own dtype when none is recorded. */
-static uint8_t declared_dtype(const tigris_tensor_t *tensor)
-{
-    return (tensor->iface_dtype != 0u) ? tensor->iface_dtype : tensor->dtype;
-}
-
 static const tigris_tensor_t *boundary_tensor(
     const tigris_plan_t *plan, uint16_t tensor_idx, uint8_t flag)
 {
@@ -32,6 +19,22 @@ static const tigris_tensor_t *boundary_tensor(
     return tensor;
 }
 
+/* Element count and declared byte size of a boundary tensor. */
+static tigris_error_t iface_extent(
+    const tigris_tensor_t *tensor, uint32_t *out_elements, uint32_t *out_bytes)
+{
+    uint32_t stored_size = tigris_dtype_size(tensor->dtype);
+    uint32_t declared_size = tigris_dtype_size(tigris_tensor_declared_dtype(tensor));
+    if (stored_size == 0u || declared_size == 0u)
+        return TIGRIS_ERR_BAD_INTERFACE;
+    uint32_t elements = tensor->size_bytes / stored_size;
+    if (elements > UINT32_MAX / declared_size)
+        return TIGRIS_ERR_BAD_SIZE;
+    *out_elements = elements;
+    *out_bytes = elements * declared_size;
+    return TIGRIS_OK;
+}
+
 uint32_t tigris_iface_bytes(const tigris_plan_t *plan, uint16_t tensor_idx)
 {
     const tigris_tensor_t *tensor = boundary_tensor(
@@ -39,11 +42,9 @@ uint32_t tigris_iface_bytes(const tigris_plan_t *plan, uint16_t tensor_idx)
         (uint8_t)(TIGRIS_TENSOR_MODEL_INPUT | TIGRIS_TENSOR_MODEL_OUTPUT));
     if (!tensor)
         return 0u;
-    uint32_t stored = tigris_dtype_size(tensor->dtype);
-    uint32_t declared = tigris_dtype_size(declared_dtype(tensor));
-    if (stored == 0u || declared == 0u || tensor->size_bytes / stored > UINT32_MAX / declared)
-        return 0u;
-    return (tensor->size_bytes / stored) * declared;
+    uint32_t elements = 0u;
+    uint32_t bytes = 0u;
+    return (iface_extent(tensor, &elements, &bytes) == TIGRIS_OK) ? bytes : 0u;
 }
 
 /* Half away from zero, matching the rounding the compiler quantizes with. */
@@ -70,27 +71,26 @@ static tigris_error_t resolve(
     if (!tensor)
         return TIGRIS_ERR_BAD_TENSOR;
 
-    uint8_t declared = declared_dtype(tensor);
-    uint32_t stored_size = tigris_dtype_size(tensor->dtype);
-    uint32_t declared_size = tigris_dtype_size(declared);
-    if (stored_size == 0u || declared_size == 0u)
-        return TIGRIS_ERR_BAD_INTERFACE;
-
-    uint32_t elements = tensor->size_bytes / stored_size;
-    if (elements > UINT32_MAX / declared_size || buf_bytes != elements * declared_size)
+    uint8_t declared = tigris_tensor_declared_dtype(tensor);
+    uint32_t elements = 0u;
+    uint32_t declared_bytes = 0u;
+    tigris_error_t extent = iface_extent(tensor, &elements, &declared_bytes);
+    if (extent != TIGRIS_OK)
+        return extent;
+    if (buf_bytes != declared_bytes)
         return TIGRIS_ERR_BAD_SIZE;
 
     const tigris_quant_param_t *quant = tigris_tensor_quant(plan, tensor);
     if (declared != tensor->dtype &&
-        !(tensor->dtype == IFACE_DTYPE_INT32 && declared == IFACE_DTYPE_INT64)) {
+        !(tensor->dtype == TIGRIS_DTYPE_INT32 && declared == TIGRIS_DTYPE_INT64)) {
         /* The conversions this runtime performs are from a float or a uint8
          * interface to a quantized int8 plan tensor. uint8 v and int8 v - 128
          * are the same real value because the compiler moved the zero point
          * by the same 128, so that one is exact. Anything else is refused
          * rather than approximated. */
-        if ((declared != IFACE_DTYPE_FLOAT32 &&
-             declared != IFACE_DTYPE_UINT8) ||
-            tensor->dtype != IFACE_DTYPE_INT8 || !quant ||
+        if ((declared != TIGRIS_DTYPE_FLOAT32 &&
+             declared != TIGRIS_DTYPE_UINT8) ||
+            tensor->dtype != TIGRIS_DTYPE_INT8 || !quant ||
             !isfinite(quant->scale) || quant->scale <= 0.0f)
             return TIGRIS_ERR_BAD_INTERFACE;
     }
@@ -185,17 +185,17 @@ tigris_error_t tigris_input_write(
         return err;
     void *dst = mem->tensor_ptrs[tensor_idx];
 
-    if (tensor->dtype == 9u) {
+    if (tensor->dtype == TIGRIS_DTYPE_BOOL) {
         const uint8_t *values = (const uint8_t *)src;
         for (uint32_t i = 0u; i < elements; i++)
             if (values[i] > 1u) return TIGRIS_ERR_BAD_INTERFACE;
     }
-    if (declared_dtype(tensor) == tensor->dtype) {
+    if (tigris_tensor_declared_dtype(tensor) == tensor->dtype) {
         memcpy(dst, src, src_bytes);
         return TIGRIS_OK;
     }
 
-    if (tensor->dtype == IFACE_DTYPE_INT32) {
+    if (tensor->dtype == TIGRIS_DTYPE_INT32) {
         const int64_t *wide = (const int64_t *)src;
         int32_t *indices = (int32_t *)dst;
         for (uint32_t i = 0u; i < elements; i++) {
@@ -206,7 +206,7 @@ tigris_error_t tigris_input_write(
         return TIGRIS_OK;
     }
 
-    if (declared_dtype(tensor) == IFACE_DTYPE_UINT8) {
+    if (tigris_tensor_declared_dtype(tensor) == TIGRIS_DTYPE_UINT8) {
         const uint8_t *u = (const uint8_t *)src;
         int8_t *s = (int8_t *)dst;
         for (uint32_t i = 0u; i < elements; i++)
@@ -241,12 +241,12 @@ tigris_error_t tigris_output_read(
     if (!src)
         return TIGRIS_ERR_NULL;
 
-    if (declared_dtype(tensor) == tensor->dtype) {
+    if (tigris_tensor_declared_dtype(tensor) == tensor->dtype) {
         memcpy(dst, src, dst_bytes);
         return TIGRIS_OK;
     }
 
-    if (tensor->dtype == IFACE_DTYPE_INT32) {
+    if (tensor->dtype == TIGRIS_DTYPE_INT32) {
         const int32_t *indices = (const int32_t *)src;
         int64_t *wide = (int64_t *)dst;
         for (uint32_t i = 0u; i < elements; i++)
@@ -254,7 +254,7 @@ tigris_error_t tigris_output_read(
         return TIGRIS_OK;
     }
     const int8_t *in = (const int8_t *)src;
-    if (declared_dtype(tensor) == IFACE_DTYPE_UINT8) {
+    if (tigris_tensor_declared_dtype(tensor) == TIGRIS_DTYPE_UINT8) {
         uint8_t *u = (uint8_t *)dst;
         for (uint32_t i = 0u; i < elements; i++)
             u[i] = (uint8_t)((int32_t)in[i] + 128);

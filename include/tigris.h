@@ -565,12 +565,14 @@ typedef struct {
 
 /**
  * Weight block entry - 20 bytes.
- * Describes one per-stage compressed weight block.
+ * Describes one per-stage compressed weight block. Its weight indices need
+ * not be consecutive, so first_weight_idx and num_weights do not name a
+ * range; each weight entry locates its weight in the decoded block.
  */
 typedef struct {
     uint16_t    stage_idx;          /*  0: stage index */
-    uint16_t    first_weight_idx;   /*  2: first global weight index */
-    uint16_t    num_weights;        /*  4: count of weight entries in block */
+    uint16_t    first_weight_idx;   /*  2: lowest weight index in the block */
+    uint16_t    num_weights;        /*  4: number of weights in the block */
     uint16_t    _pad0;              /*  6 */
     uint32_t    blob_offset;        /*  8: offset into compressed data area */
     uint32_t    compressed_size;    /* 12 */

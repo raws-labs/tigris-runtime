@@ -22,22 +22,6 @@
 #include "arm_nnfunctions.h"
 #include <limits.h>
 
-/* Helpers */
-
-static inline int32_t get_mult(
-    const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
-{
-    uint32_t page = qp->_pad;
-    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off + ch];
-}
-
-static inline int32_t get_shft(
-    const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
-{
-    uint32_t page = qp->_pad;
-    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
-}
-
 /* Scratch reservation.
  *
  * tigris_cmsis_nn_prepare() reserves a single 16-aligned scratch buffer, sized
@@ -49,8 +33,7 @@ static inline int32_t get_shft(
  * A plan with a positive scratch query must be prepared before dispatch. */
 static uint8_t  *s_scratch = NULL;       /* arena region set by prepare(), or NULL */
 static uint32_t  s_scratch_size = 0;
-static int32_t  *s_quant_mult = NULL;
-static int32_t  *s_quant_shift = NULL;
+static int32_t  *s_quant_buf = NULL;     /* per-tensor to per-channel expansion */
 static uint32_t  s_quant_channels = 0;
 static uint32_t  s_workspace_size = 0;
 static tigris_mem_t *s_prepared_mem = NULL;
@@ -61,13 +44,11 @@ static uint8_t   s_zero_scratch[16]
 static void cmsis_partition_workspace(
     uint8_t *workspace, uint32_t workspace_size, uint32_t quant_bytes)
 {
-    s_quant_mult = NULL;
-    s_quant_shift = NULL;
+    s_quant_buf = NULL;
     s_quant_channels = 0;
     if (quant_bytes) {
-        s_quant_mult = (int32_t *)workspace;
+        s_quant_buf = (int32_t *)workspace;
         s_quant_channels = quant_bytes / (2u * sizeof(int32_t));
-        s_quant_shift = s_quant_mult + s_quant_channels;
     }
     s_scratch = workspace + quant_bytes;
     s_scratch_size = workspace_size - quant_bytes;
@@ -87,29 +68,15 @@ static int cmsis_per_channel_quant(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp,
     uint32_t channels, cmsis_nn_per_channel_quant_params *quant)
 {
-    if (!plan || !quant || channels == 0)
+    const int32_t *multipliers = NULL;
+    const int32_t *shifts = NULL;
+    if (!quant || !tigris_accel_channel_quant(plan, qp, channels, s_quant_buf,
+                                              s_quant_channels, &multipliers, &shifts))
         return -1;
-
-    if (qp && qp->num_channels == channels) {
-        uint32_t page = qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
-        /* MISRA 11.8 deviation: CMSIS-NN declares these fields non-const but
-         * only reads them, so the plan's read-only arrays are passed as is. */
-        quant->multiplier = (int32_t *)&plan->quant_data[
-            page + qp->multiplier_off];
-        quant->shift = (int32_t *)&plan->quant_data[page + qp->shift_off];
-        return 0;
-    }
-
-    if ((qp && qp->num_channels != 1u) ||
-        !s_quant_mult || !s_quant_shift || channels > s_quant_channels)
-        return -1;
-
-    for (uint32_t channel = 0; channel < channels; channel++) {
-        s_quant_mult[channel] = qp ? get_mult(plan, qp, 0) : 1;
-        s_quant_shift[channel] = qp ? get_shft(plan, qp, 0) : 0;
-    }
-    quant->multiplier = s_quant_mult;
-    quant->shift = s_quant_shift;
+    /* MISRA 11.8 deviation: CMSIS-NN declares these fields non-const but
+     * only reads them, so the read-only arrays are passed as is. */
+    quant->multiplier = (int32_t *)multipliers;
+    quant->shift = (int32_t *)shifts;
     return 0;
 }
 
@@ -376,15 +343,15 @@ static int adapt_fully_connected(
     if (per_channel) {
         /* MISRA 11.8 deviation: read-only plan arrays, see cmsis_per_channel_quant. */
         cmsis_nn_per_channel_quant_params quant = {
-            .multiplier = (int32_t *)&plan->quant_data[out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS + out_qp->multiplier_off],
-            .shift      = (int32_t *)&plan->quant_data[out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS + out_qp->shift_off] };
+            .multiplier = (int32_t *)tigris_quant_multipliers(plan, out_qp),
+            .shift      = (int32_t *)tigris_quant_shifts(plan, out_qp) };
         status = arm_fully_connected_per_channel_s8(
             &ctx, &fc_params, &quant, &input_dims, X,
             &filter_dims, W, &bias_dims, B, &output_dims, Y);
     } else {
         cmsis_nn_per_tensor_quant_params quant = {
-            .multiplier = out_qp ? get_mult(plan, out_qp, 0) : 1,
-            .shift      = out_qp ? get_shft(plan, out_qp, 0) : 0 };
+            .multiplier = out_qp ? tigris_quant_multipliers(plan, out_qp)[0] : 1,
+            .shift      = out_qp ? tigris_quant_shifts(plan, out_qp)[0] : 0 };
         status = arm_fully_connected_s8(
             &ctx, &fc_params, &quant, &input_dims, X,
             &filter_dims, W, &bias_dims, B, &output_dims, Y);
@@ -635,8 +602,7 @@ int tigris_cmsis_nn_deinit(tigris_mem_t *mem)
     mem->fast_size = s_prepared_fast_size;
     s_scratch = NULL;
     s_scratch_size = 0;
-    s_quant_mult = NULL;
-    s_quant_shift = NULL;
+    s_quant_buf = NULL;
     s_quant_channels = 0;
     s_workspace_size = 0;
     s_prepared_mem = NULL;

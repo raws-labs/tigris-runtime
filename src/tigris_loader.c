@@ -4755,12 +4755,12 @@ static tigris_error_t validate_weights_and_stages(tigris_load_state_t *ctx)
                            (uint32_t)nqp * sizeof(tigris_quant_param_t)) / sizeof(int32_t);
         for (uint16_t i = 0; i < nqp; i++) {
             const tigris_quant_param_t *qp = &ctx->candidate.quant_params[i];
-            uint32_t page = qp->_pad;
-            uint32_t moff = page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off;
-            uint32_t soff = page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off;
+            /* Indices rather than pointers: the offsets are checked below. */
+            uint32_t moff = tigris_quant_page_start(qp) + qp->multiplier_off;
+            uint32_t soff = tigris_quant_page_start(qp) + qp->shift_off;
             if (!isfinite(qp->scale) || qp->scale <= 0.0f)
                 return TIGRIS_ERR_BAD_TENSOR;
-            if (qp->num_channels == 0 || page >= qd_field ||
+            if (qp->num_channels == 0 || qp->_pad >= qd_field ||
                 (uint32_t)qp->multiplier_off + qp->num_channels > TIGRIS_QUANT_PAGE_ELEMS ||
                 (uint32_t)qp->shift_off + qp->num_channels > TIGRIS_QUANT_PAGE_ELEMS ||
                 !elements_ok(moff, qp->num_channels, qd_len) ||

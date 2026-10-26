@@ -1063,6 +1063,46 @@ static inline const tigris_quant_param_t *tigris_tensor_quant(
 }
 
 /**
+ * Get the index in quant_data where a quant param's page starts.
+ *
+ * quant_data is split into pages of TIGRIS_QUANT_PAGE_ELEMS elements, and
+ * multiplier_off and shift_off count from the start of the param's page.
+ *
+ * @param qp  Quant param.
+ * @return Element index of the page start.
+ */
+static inline uint32_t tigris_quant_page_start(const tigris_quant_param_t *qp)
+{
+    return (uint32_t)qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
+}
+
+/**
+ * Get the requantization multipliers of a quant param.
+ *
+ * @param plan  Loaded plan.
+ * @param qp    Quant param of that plan.
+ * @return Pointer to qp->num_channels Q0.31 multipliers in quant_data.
+ */
+static inline const int32_t *tigris_quant_multipliers(
+    const tigris_plan_t *plan, const tigris_quant_param_t *qp)
+{
+    return plan->quant_data + tigris_quant_page_start(qp) + qp->multiplier_off;
+}
+
+/**
+ * Get the requantization shifts of a quant param.
+ *
+ * @param plan  Loaded plan.
+ * @param qp    Quant param of that plan.
+ * @return Pointer to qp->num_channels shifts in quant_data.
+ */
+static inline const int32_t *tigris_quant_shifts(
+    const tigris_plan_t *plan, const tigris_quant_param_t *qp)
+{
+    return plan->quant_data + tigris_quant_page_start(qp) + qp->shift_off;
+}
+
+/**
  * Compute extra fast-arena bytes needed for weight decompression.
  *
  * Standalone stages decompress one block at a time. A tiled chain keeps every

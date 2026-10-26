@@ -1779,6 +1779,117 @@ static void cover(uint16_t *lo, uint16_t *hi, uint16_t t)
     if (t > *hi) *hi = t;
 }
 
+/* Whether a plan's count is above a build limit. The limit is a parameter so
+ * the comparison holds for every limit up to 65535. */
+static int above_limit(uint32_t seen, uint32_t limit)
+{
+    return seen > limit;
+}
+
+/* The index range [lo, hi] of the tensors graph g reads and writes, empty when
+ * lo > hi; the main graph's also holds the state. */
+static void graph_tensor_range(const tigris_plan_t *plan, uint16_t g, uint16_t *lo, uint16_t *hi)
+{
+    const tigris_subgraph_t *graph = &plan->subgraphs[g];
+    *lo = UINT16_MAX;
+    *hi = 0u;
+    for (uint16_t s = graph->first_stage; s < graph->first_stage + graph->num_stages; s++) {
+        const tigris_stage_t *stage = &plan->stages[s];
+        const uint16_t *ops = tigris_stage_ops(plan, stage);
+        for (uint16_t k = 0; k < stage->ops_count; k++) {
+            const tigris_op_t *op = &plan->ops[ops[k]];
+            const uint16_t *ins = tigris_op_inputs(plan, op);
+            const uint16_t *outs = tigris_op_outputs(plan, op);
+            for (uint8_t i = 0; i < op->num_inputs; i++) cover(lo, hi, ins[i]);
+            for (uint8_t i = 0; i < op->num_outputs; i++) cover(lo, hi, outs[i]);
+        }
+    }
+    for (uint16_t i = 0; i < graph->inputs_count; i++)
+        cover(lo, hi, plan->index_pool[graph->inputs_off + i]);
+    for (uint16_t i = 0; i < graph->outputs_count; i++)
+        cover(lo, hi, plan->index_pool[graph->outputs_off + i]);
+    for (uint16_t i = 0; g == 0u && i < plan->num_state; i++) {
+        cover(lo, hi, plan->state_entries[i].input);
+        if (plan->state_entries[i].output != 0xFFFFu)
+            cover(lo, hi, plan->state_entries[i].output);
+    }
+}
+
+/* Graph slot 0 or 1 of a control-flow operator's subgraphs attribute names. */
+static uint16_t named_graph(const uint8_t *runs, uint32_t slot)
+{
+    return (uint16_t)((uint16_t)runs[2u * slot] | (uint16_t)((uint16_t)runs[2u * slot + 1u] << 8));
+}
+
+/* The subgraphs attribute of the i-th attribute record, or NULL for another kind. */
+static const uint8_t *subgraphs_record(const tigris_plan_t *plan, uint16_t i)
+{
+    const tigris_op_attribute_t *attr = &plan->op_attributes[i];
+    return attr->type == TIGRIS_OP_ATTR_SUBGRAPHS ? plan->op_attribute_data + attr->data_offset : NULL;
+}
+
+/* The graph run at position p = 2 * stage + slot, slot 0 or 1 of a
+ * control-flow operator's two graphs; 0, never a run graph, when the stage has
+ * no control flow. */
+static uint16_t graph_run_at(const tigris_plan_t *plan, uint32_t p)
+{
+    const tigris_stage_t *stage = &plan->stages[p / 2u];
+    if (stage->ops_count != 1u) return 0u;
+    const uint16_t op_index = tigris_stage_ops(plan, stage)[0];
+    const uint8_t type = plan->ops[op_index].op_type;
+    if (type != TIGRIS_OP_IF && type != TIGRIS_OP_WHILE) return 0u;
+    return named_graph(tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_SUBGRAPHS, NULL), p % 2u);
+}
+
+/* The stage of the one control-flow operator that runs graph g, placed before
+ * g's own stages and alone in its stage. */
+static uint16_t runner_stage(const tigris_plan_t *plan, uint16_t g)
+{
+    uint16_t runner = 0u;
+    for (uint16_t i = 0u; i < plan->num_op_attributes; i++) {
+        const uint8_t *runs = subgraphs_record(plan, i);
+        if (runs != NULL && (named_graph(runs, 0u) == g || named_graph(runs, 1u) == g))
+            runner = plan->op_attributes[i].op_index;
+    }
+    uint16_t s = plan->subgraphs[g].first_stage;
+    while (s > 0u) {
+        s--;
+        if (plan->stages[s].ops_count == 1u && tigris_stage_ops(plan, &plan->stages[s])[0] == runner)
+            break;
+    }
+    return s;
+}
+
+/* How deep control flow nests. The graphs form a tree below the main graph,
+ * each run by one operator, so the walk enters each graph an operator runs and
+ * returns to the position after the slot that ran it, keeping no storage per
+ * graph. An If whose two branches name one graph enters it once. */
+static uint32_t subgraph_depth(const tigris_plan_t *plan)
+{
+    uint32_t depth = 0u, deepest = 0u;
+    uint16_t graph = 0u;
+    uint32_t p = 0u;
+    for (;;) {
+        const tigris_subgraph_t *running = &plan->subgraphs[graph];
+        const uint32_t end = 2u * ((uint32_t)running->first_stage + running->num_stages);
+        uint16_t child = 0u;
+        while (p < end && child == 0u) child = graph_run_at(plan, p++);
+        if (child != 0u) {
+            depth++;
+            if (depth > deepest) deepest = depth;
+            graph = child;
+            p = 2u * (uint32_t)plan->subgraphs[child].first_stage;
+        } else if (graph == 0u) {
+            return deepest;
+        } else {
+            const uint16_t s = runner_stage(plan, graph);
+            p = 2u * (uint32_t)s + (graph_run_at(plan, 2u * (uint32_t)s + 1u) == graph ? 2u : 1u);
+            graph = graph_of_stage(plan, s);
+            depth--;
+        }
+    }
+}
+
 static int same_tensor_form(const tigris_plan_t *plan, uint16_t a, uint16_t b)
 {
     const tigris_tensor_t *x = &plan->tensors[a];
@@ -1841,16 +1952,18 @@ static int while_graphs_valid(const tigris_plan_t *plan, const tigris_op_t *op, 
  * main graph first and at stage 0; a subgraph's tensors belong to it alone; an
  * If sits alone in a main-graph stage and its operands and results match both
  * branches' inputs and outputs. A plan without the section has no If. */
-static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t index_count)
+static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t index_count,
+                                         uint16_t *depth)
 {
     const uint16_t num_stages = plan->header->num_stages;
+    *depth = 0u;
     if (plan->num_subgraphs == 0u) {
         for (uint16_t n = 0; n < plan->header->num_ops; n++)
             if (plan->ops[n].op_type == TIGRIS_OP_IF || plan->ops[n].op_type == TIGRIS_OP_WHILE)
                 return TIGRIS_ERR_BAD_OPERATOR;
         return TIGRIS_OK;
     }
-    if (plan->num_subgraphs > TIGRIS_MAX_SUBGRAPHS)
+    if (above_limit(plan->num_subgraphs, TIGRIS_MAX_SUBGRAPHS))
         return TIGRIS_ERR_BAD_SECTION;
     uint32_t next = 0u;
     for (uint16_t g = 0; g < plan->num_subgraphs; g++) {
@@ -1884,39 +1997,20 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
     }
     /* Each graph's tensors form one index range, the ranges disjoint, so no
      * tensor is shared between graphs; the main graph's range also holds the
-     * model interface and the state. */
-    uint16_t lo[TIGRIS_MAX_SUBGRAPHS];
-    uint16_t hi[TIGRIS_MAX_SUBGRAPHS];
+     * model interface and the state. A range is derived where it is compared,
+     * so no storage grows with the graph count. */
     for (uint16_t g = 0; g < plan->num_subgraphs; g++) {
-        const tigris_subgraph_t *graph = &plan->subgraphs[g];
-        lo[g] = UINT16_MAX;
-        hi[g] = 0u;
-        for (uint16_t s = graph->first_stage; s < graph->first_stage + graph->num_stages; s++) {
-            const tigris_stage_t *stage = &plan->stages[s];
-            const uint16_t *ops = tigris_stage_ops(plan, stage);
-            for (uint16_t k = 0; k < stage->ops_count; k++) {
-                const tigris_op_t *op = &plan->ops[ops[k]];
-                const uint16_t *ins = tigris_op_inputs(plan, op);
-                const uint16_t *outs = tigris_op_outputs(plan, op);
-                for (uint8_t i = 0; i < op->num_inputs; i++) cover(&lo[g], &hi[g], ins[i]);
-                for (uint8_t i = 0; i < op->num_outputs; i++) cover(&lo[g], &hi[g], outs[i]);
-            }
-        }
-        for (uint16_t i = 0; i < graph->inputs_count; i++)
-            cover(&lo[g], &hi[g], plan->index_pool[graph->inputs_off + i]);
-        for (uint16_t i = 0; i < graph->outputs_count; i++)
-            cover(&lo[g], &hi[g], plan->index_pool[graph->outputs_off + i]);
-    }
-    for (uint16_t i = 0; i < plan->num_state; i++) {
-        cover(&lo[0], &hi[0], plan->state_entries[i].input);
-        if (plan->state_entries[i].output != 0xFFFFu)
-            cover(&lo[0], &hi[0], plan->state_entries[i].output);
-    }
-    for (uint16_t g = 0; g < plan->num_subgraphs; g++) {
-        for (uint16_t h = (uint16_t)(g + 1u); h < plan->num_subgraphs; h++)
-            if (lo[g] <= hi[g] && lo[h] <= hi[h] && lo[g] <= hi[h] && lo[h] <= hi[g])
+        uint16_t lo = 0u;
+        uint16_t hi = 0u;
+        graph_tensor_range(plan, g, &lo, &hi);
+        for (uint16_t h = (uint16_t)(g + 1u); h < plan->num_subgraphs; h++) {
+            uint16_t h_lo = 0u;
+            uint16_t h_hi = 0u;
+            graph_tensor_range(plan, h, &h_lo, &h_hi);
+            if (lo <= hi && h_lo <= h_hi && lo <= h_hi && h_lo <= hi)
                 return TIGRIS_ERR_BAD_TENSOR;
-        for (uint32_t t = lo[g]; g > 0u && t <= hi[g]; t++)
+        }
+        for (uint32_t t = lo; g > 0u && t <= hi; t++)
             if ((plan->tensors[t].flags & (TIGRIS_TENSOR_MODEL_INPUT | TIGRIS_TENSOR_MODEL_OUTPUT |
                                            TIGRIS_TENSOR_STATE)) != 0u)
                 return TIGRIS_ERR_BAD_TENSOR;
@@ -1970,29 +2064,22 @@ static tigris_error_t validate_subgraphs(const tigris_plan_t *plan, uint32_t ind
             }
         }
     }
-    /* Nesting depth: a graph's is one more than the deepest graph any of its
-     * control-flow operators runs; graphs after it are already known. */
-    uint16_t nesting[TIGRIS_MAX_SUBGRAPHS];
-    for (uint16_t k = 0; k < plan->num_subgraphs; k++) {
-        const uint16_t g = (uint16_t)(plan->num_subgraphs - 1u - k);
-        const tigris_subgraph_t *graph = &plan->subgraphs[g];
-        nesting[g] = 0u;
-        for (uint16_t s = graph->first_stage; s < graph->first_stage + graph->num_stages; s++) {
-            const tigris_stage_t *stage = &plan->stages[s];
-            if (stage->ops_count != 1u) continue;
-            const uint16_t op_index = tigris_stage_ops(plan, stage)[0];
-            const uint8_t type = plan->ops[op_index].op_type;
-            if (type != TIGRIS_OP_IF && type != TIGRIS_OP_WHILE) continue;
-            const uint8_t *runs = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_SUBGRAPHS, NULL);
-            for (uint8_t b = 0u; b < 2u; b++) {
-                uint16_t child = (uint16_t)((uint16_t)runs[2u * b] | (uint16_t)((uint16_t)runs[2u * b + 1u] << 8));
-                if ((uint16_t)(nesting[child] + 1u) > nesting[g])
-                    nesting[g] = (uint16_t)(nesting[child] + 1u);
-            }
+    /* Each subgraph is run by one control-flow operator at most, so the depth
+     * walk can return from a graph to the operator that ran it. Each such
+     * operator has one subgraphs record. */
+    for (uint16_t i = 0u; i < plan->num_op_attributes; i++) {
+        const uint8_t *runs = subgraphs_record(plan, i);
+        for (uint16_t j = (uint16_t)(i + 1u); runs != NULL && j < plan->num_op_attributes; j++) {
+            const uint8_t *other = subgraphs_record(plan, j);
+            for (uint32_t k = 0u; other != NULL && k < 4u; k++)
+                if (named_graph(runs, k / 2u) == named_graph(other, k % 2u))
+                    return TIGRIS_ERR_BAD_OPERATOR;
         }
     }
-    if (nesting[0] > TIGRIS_MAX_SUBGRAPH_DEPTH)
+    const uint32_t nesting = subgraph_depth(plan);
+    if (nesting > TIGRIS_MAX_SUBGRAPH_DEPTH)
         return TIGRIS_ERR_BAD_OPERATOR;
+    *depth = (uint16_t)nesting;
     return TIGRIS_OK;
 }
 
@@ -2007,52 +2094,30 @@ static int subgraph_input(const tigris_plan_t *plan, uint16_t t)
     return 0;
 }
 
-static int float_section_contains(const uint8_t *section, uint16_t tensor)
+/* A float activation of an int8 plan is in a float section: an operator
+ * placed before index `before` writes it and is a Dequantize, an If, a While,
+ * or a float operator without int8 operands, whose own operands are checked
+ * in its turn. Operators run in index order, so an operand is written first. */
+static int float_section_written(const tigris_plan_t *plan, uint16_t tensor, uint16_t before)
 {
-    const uint8_t mask = (uint8_t)(1u << (tensor % 8u));
-    return (section[tensor / 8u] & mask) != 0u;
-}
-
-static void float_section_add(uint8_t *section, uint16_t tensor)
-{
-    const uint8_t mask = (uint8_t)(1u << (tensor % 8u));
-    section[tensor / 8u] = (uint8_t)(section[tensor / 8u] | mask);
-}
-
-/* A float activation must be reachable from a typed conversion or control flow. */
-static void find_float_sections(const tigris_plan_t *plan, uint8_t *section)
-{
-    memset(section, 0, (TIGRIS_MAX_TENSORS + 7u) / 8u);
-    for (uint16_t n = 0u; n < plan->header->num_ops; n++) {
+    for (uint16_t n = 0u; n < before; n++) {
         const tigris_op_t *op = &plan->ops[n];
-        if (op->op_type != TIGRIS_OP_DEQUANTIZE && op->op_type != TIGRIS_OP_IF &&
-            op->op_type != TIGRIS_OP_WHILE) continue;
         const uint16_t *outs = tigris_op_outputs(plan, op);
+        int writes = 0;
         for (uint8_t k = 0u; k < op->num_outputs; k++)
-            if (plan->tensors[outs[k]].dtype == 1u) float_section_add(section, outs[k]);
+            if (outs[k] == tensor) writes = 1;
+        if (!writes) continue;
+        if (op->op_type == TIGRIS_OP_DEQUANTIZE || op->op_type == TIGRIS_OP_IF ||
+            op->op_type == TIGRIS_OP_WHILE)
+            return 1;
+        if (!tigris_float_operator(plan, op)) continue;
+        const uint16_t *ins = tigris_op_inputs(plan, op);
+        int int8_operand = 0;
+        for (uint8_t k = 0u; k < op->num_inputs; k++)
+            if (plan->tensors[ins[k]].dtype == 3u) int8_operand = 1;
+        if (!int8_operand) return 1;
     }
-    int changed = 1;
-    while (changed) {
-        changed = 0;
-        for (uint16_t n = 0u; n < plan->header->num_ops; n++) {
-            const tigris_op_t *op = &plan->ops[n];
-            if (!tigris_float_operator(plan, op)) continue;
-            const uint16_t *ins = tigris_op_inputs(plan, op);
-            int valid = 1;
-            for (uint8_t k = 0u; k < op->num_inputs; k++) {
-                const tigris_tensor_t *t = &plan->tensors[ins[k]];
-                if (t->dtype == 3u || (t->dtype == 1u && !float_section_contains(section, ins[k]) &&
-                    (t->flags & TIGRIS_TENSOR_CONSTANT) == 0u)) valid = 0;
-            }
-            if (!valid) continue;
-            const uint16_t *outs = tigris_op_outputs(plan, op);
-            for (uint8_t k = 0u; k < op->num_outputs; k++)
-                if (plan->tensors[outs[k]].dtype == 1u && !float_section_contains(section, outs[k])) {
-                    float_section_add(section, outs[k]);
-                    changed = 1;
-                }
-        }
-    }
+    return 0;
 }
 
 static int kernel_linked(const tigris_plan_t *plan, const tigris_op_t *op)
@@ -2984,8 +3049,6 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
 
     const tigris_file_header_t *hdr = plan->header;
     const uint8_t data_dtype = tigris_plan_data_dtype(plan);
-    uint8_t section[(TIGRIS_MAX_TENSORS + 7u) / 8u];
-    find_float_sections(plan, section);
     for (uint16_t t = 0; t < hdr->num_tensors; t++) {
         if (!tigris_dtype_requires_source(plan->tensors[t].dtype)) continue;
         if ((plan->tensors[t].flags & TIGRIS_TENSOR_CONSTANT) != 0u)
@@ -3028,11 +3091,13 @@ static tigris_error_t validate_operator_semantics(const tigris_plan_t *plan)
         const uint8_t op_dtype = data_dtype == 3u && tigris_float_operator(plan, op) ? 1u : data_dtype;
         if (data_dtype == 3u && op_dtype == 1u) {
             for (uint8_t i = 0u; i < op->num_inputs; i++)
-                if (plan->tensors[inputs[i]].dtype == 1u && !float_section_contains(section, inputs[i]) &&
-                    (plan->tensors[inputs[i]].flags & TIGRIS_TENSOR_CONSTANT) == 0u)
+                if (plan->tensors[inputs[i]].dtype == 1u &&
+                    (plan->tensors[inputs[i]].flags & TIGRIS_TENSOR_CONSTANT) == 0u &&
+                    !float_section_written(plan, inputs[i], op_index))
                     return TIGRIS_ERR_BAD_OPERATOR;
             for (uint8_t i = 0u; i < op->num_outputs; i++)
-                if (plan->tensors[outputs[i]].dtype == 1u && !float_section_contains(section, outputs[i]))
+                if (plan->tensors[outputs[i]].dtype == 1u &&
+                    !float_section_written(plan, outputs[i], hdr->num_ops))
                     return TIGRIS_ERR_BAD_OPERATOR;
         }
         uint8_t slot_constant_len = 0u;
@@ -3089,11 +3154,13 @@ void tigris_build_limits(tigris_plan_limits_t *out)
     out->spatial_ops_per_stage = (uint16_t)TIGRIS_MAX_SPATIAL_OPS_PER_STAGE;
 }
 
-/* Raise a reported requirement to cover one more observation. */
-static void note_requirement(uint16_t *slot, uint32_t seen)
+/* Raise a reported requirement to cover one more observation; nonzero when
+ * the observation is above this build's limit. */
+static int note_requirement(uint16_t *slot, uint32_t seen, uint32_t limit)
 {
     if (slot != NULL && seen > (uint32_t)*slot)
         *slot = (seen > 65535u) ? 65535u : (uint16_t)seen;
+    return above_limit(seen, limit);
 }
 
 tigris_error_t tigris_plan_load(
@@ -3537,8 +3604,7 @@ static tigris_error_t validate_tables_and_ops(tigris_load_state_t *ctx)
             return TIGRIS_ERR_BAD_SECTION;
     }
 
-    note_requirement(&ctx->required.tensors, ctx->hdr->num_tensors);
-    if (ctx->hdr->num_tensors > TIGRIS_MAX_TENSORS) {
+    if (note_requirement(&ctx->required.tensors, ctx->hdr->num_tensors, TIGRIS_MAX_TENSORS)) {
         if (ctx->out_required)
             *ctx->out_required = ctx->required;
         return TIGRIS_ERR_PLAN_LIMITS;
@@ -4489,12 +4555,13 @@ static tigris_error_t validate_stage(tigris_load_state_t *ctx, uint16_t i)
         (stage->chain_len == 0 && stage->chain_id != TIGRIS_NO_CHAIN) ||
         (stage->chain_len > 0 && stage->chain_id == TIGRIS_NO_CHAIN))
         return TIGRIS_ERR_BAD_SECTION;
-    note_requirement(&ctx->required.stage_inputs, stage->inputs_count);
-    note_requirement(&ctx->required.stage_outputs, stage->outputs_count);
-    note_requirement(&ctx->required.chain_stages, stage->chain_len);
-    if (stage->inputs_count > TIGRIS_MAX_STAGE_INPUTS ||
-        stage->outputs_count > TIGRIS_MAX_STAGE_OUTPUTS ||
-        stage->chain_len > TIGRIS_MAX_CHAIN_STAGES) {
+    const int inputs_above = note_requirement(&ctx->required.stage_inputs, stage->inputs_count,
+                                              TIGRIS_MAX_STAGE_INPUTS);
+    const int outputs_above = note_requirement(&ctx->required.stage_outputs, stage->outputs_count,
+                                               TIGRIS_MAX_STAGE_OUTPUTS);
+    const int chain_above = note_requirement(&ctx->required.chain_stages, stage->chain_len,
+                                             TIGRIS_MAX_CHAIN_STAGES);
+    if (inputs_above || outputs_above || chain_above) {
         if (ctx->out_required)
             *ctx->out_required = ctx->required;
         return TIGRIS_ERR_PLAN_LIMITS;
@@ -4647,8 +4714,8 @@ static tigris_error_t validate_stage(tigris_load_state_t *ctx, uint16_t i)
             const tigris_op_contract_t *row = tigris_op_contract(op_type);
             if (row != NULL && (row->flags & TIGRIS_CONTRACT_SPATIAL) != 0u) {
                 spatial_count++;
-                note_requirement(&ctx->required.spatial_ops_per_stage, spatial_count);
-                if (spatial_count > TIGRIS_MAX_SPATIAL_OPS_PER_STAGE) {
+                if (note_requirement(&ctx->required.spatial_ops_per_stage, spatial_count,
+                                     TIGRIS_MAX_SPATIAL_OPS_PER_STAGE)) {
                     if (ctx->out_required) *ctx->out_required = ctx->required;
                     return TIGRIS_ERR_PLAN_LIMITS;
                 }
@@ -4858,9 +4925,11 @@ static tigris_error_t validate_graph_and_publish(tigris_load_state_t *ctx)
     }
 
     {
-        tigris_error_t graph_error = validate_subgraphs(&ctx->candidate, ctx->index_count);
+        uint16_t depth = 0u;
+        tigris_error_t graph_error = validate_subgraphs(&ctx->candidate, ctx->index_count, &depth);
         if (graph_error != TIGRIS_OK)
             return graph_error;
+        ctx->candidate.subgraph_depth = depth;
     }
 
     {

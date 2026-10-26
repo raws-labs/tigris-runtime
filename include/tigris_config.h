@@ -4,7 +4,9 @@
  *
  * Define any value on the compiler command line before including TiGrIS
  * headers to tune the runtime for a target.  The loader rejects plans that
- * exceed the selected limits before the executor can index bounded storage.
+ * exceed the selected limits, and tigris_executor_workspace_t is sized for the
+ * largest plan they admit; other loader and executor storage follows the
+ * loaded plan.
  */
 
 #ifndef TIGRIS_CONFIG_H
@@ -55,11 +57,10 @@
 #endif
 
 /**
- * What a plan asks of the build that loads it, in the same terms as the
- * limits above. A build states these at compile time because they size fixed
- * storage; a plan carries what it needs in its own tables. Where the two
- * disagree the loader refuses, and reports this so the refusal names the
- * build the plan wants rather than only that it was refused.
+ * Build limits in the terms of the limits above: what a plan needs, as
+ * tigris_plan_load_ex() reports it, or what this build allows, as
+ * tigris_build_limits() reports it. The loader refuses a plan that needs more
+ * than this build allows.
  */
 typedef struct {
     uint16_t tensors;

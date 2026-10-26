@@ -744,6 +744,7 @@ typedef struct {
     uint32_t                     state_bytes;    /* size of the caller's state buffer */
     const tigris_subgraph_t     *subgraphs;      /* [num_subgraphs] or NULL */
     uint16_t                     num_subgraphs;  /* 0 without control flow */
+    uint16_t                     subgraph_depth; /* most control-flow operators running one inside another */
 
     const tigris_tile_plan_v10_t *tile_plans_v10; /* schema 10 only, otherwise NULL */
 

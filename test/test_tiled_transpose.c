@@ -125,7 +125,7 @@ static tigris_exec_error_t run_case(
     const float *input, float *output, uint16_t *tiled)
 {
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[SLOW_SIZE];
-    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(2, 1, 1, 0, 0)];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(2, 1, 1, 0, 0, 0)];
     tigris_exec_stats_t stats;
     tigris_mem_t mem;
     void *ptrs[2];

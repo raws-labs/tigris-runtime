@@ -3100,6 +3100,14 @@ static void test_float_section(void)
     ops[0].op_type = TIGRIS_OP_RELU;
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
                    "a float activation without a conversion is refused");
+    /* The float Relu first, reading what the Dequantize after it writes. */
+    ops[0].inputs_off = 2;
+    ops[0].outputs_off = 3;
+    ops[1].op_type = TIGRIS_OP_DEQUANTIZE;
+    ops[1].inputs_off = 0;
+    ops[1].outputs_off = 1;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "a float operator reads a float activation only after it is written");
 }
 
 static void test_operator_semantic_guards(void)
@@ -5892,6 +5900,24 @@ static void test_state_goldens(void)
             TEST_ASSERT_EQ(load_altered(golden, copy, (size_t)(runs - buf) + 2u, &main_graph, 2u),
                            TIGRIS_ERR_BAD_OPERATOR, "an If cannot run a graph placed before it");
         }
+        /* A subgraph is run by one control-flow operator: the inner If may
+         * not also run the outer If's second branch. */
+        uint16_t outer = plan.header->num_ops, inner = plan.header->num_ops;
+        for (uint16_t n = 0; n < plan.header->num_ops; n++)
+            if (plan.ops[n].op_type == TIGRIS_OP_IF) {
+                if (outer == plan.header->num_ops) outer = n;
+                inner = n;
+            }
+        if (plan.num_subgraphs > 3u && outer != inner) {
+            uint8_t len = 0u;
+            const uint8_t *outer_runs = tigris_op_attribute_data(&plan, outer, TIGRIS_OP_ATTR_SUBGRAPHS, &len);
+            const uint8_t *inner_runs = tigris_op_attribute_data(&plan, inner, TIGRIS_OP_ATTR_SUBGRAPHS, &len);
+            uint16_t shared;
+            memcpy(&shared, outer_runs + 2, 2u);
+            TEST_ASSERT_EQ(load_altered(golden, copy, (size_t)(inner_runs - buf) + 2u, &shared, 2u),
+                           TIGRIS_ERR_BAD_OPERATOR, "two control-flow operators cannot run one graph");
+            TEST_ASSERT_EQ(plan.subgraph_depth, 2, "an If in a branch nests two deep");
+        }
         /* The main graph's If: the first one placed. */
         if (looping < plan.header->num_ops) {
             uint8_t len = 0u;
@@ -6022,6 +6048,67 @@ static void test_state_goldens(void)
         free(copy);
         free(buf);
     }
+}
+
+/* How deep control flow nests below graph g, by recursion over the graphs it runs. */
+static uint16_t nesting_below(const tigris_plan_t *plan, uint16_t g)
+{
+    const tigris_subgraph_t *graph = &plan->subgraphs[g];
+    uint16_t height = 0u;
+    for (uint16_t s = graph->first_stage; s < graph->first_stage + graph->num_stages; s++) {
+        const tigris_stage_t *stage = &plan->stages[s];
+        if (stage->ops_count != 1u) continue;
+        const uint16_t op = tigris_stage_ops(plan, stage)[0];
+        if (plan->ops[op].op_type != TIGRIS_OP_IF && plan->ops[op].op_type != TIGRIS_OP_WHILE)
+            continue;
+        const uint8_t *runs = tigris_op_attribute_data(plan, op, TIGRIS_OP_ATTR_SUBGRAPHS, NULL);
+        for (uint8_t b = 0u; b < 2u; b++) {
+            const uint16_t child = (uint16_t)(runs[2u * b] | (runs[2u * b + 1u] << 8));
+            const uint16_t below = (uint16_t)(nesting_below(plan, child) + 1u);
+            if (below > height) height = below;
+        }
+    }
+    return height;
+}
+
+/* An If whose two branches name one graph loads and states its nesting depth. */
+static void test_if_runs_one_graph_for_both_branches(void)
+{
+    printf("  test_if_runs_one_graph_for_both_branches...\n");
+    uint32_t checked = 0u;
+    uint16_t deepest = 0u;
+    for (size_t g = 0; g < sizeof(state_goldens) / sizeof(state_goldens[0]); g++) {
+        const state_golden_t *golden = &state_goldens[g];
+        const size_t padded = ((size_t)golden->plan_size + 63u) / 64u * 64u;
+        uint8_t *buf = aligned_alloc(64u, padded);
+        uint8_t *copy = aligned_alloc(64u, padded);
+        tigris_plan_t plan;
+        memset(&plan, 0, sizeof(plan));
+        TEST_ASSERT(buf != NULL && copy != NULL, "plan buffers");
+        if (buf && copy) {
+            memcpy(buf, golden->plan, golden->plan_size);
+            TEST_ASSERT_EQ(tigris_plan_load(buf, golden->plan_size, &plan), TIGRIS_OK, "plan loads");
+        }
+        for (uint16_t n = 0u; plan.header != NULL && n < plan.header->num_ops; n++) {
+            if (plan.ops[n].op_type != TIGRIS_OP_IF) continue;
+            const uint8_t *runs = tigris_op_attribute_data(&plan, n, TIGRIS_OP_ATTR_SUBGRAPHS, NULL);
+            tigris_plan_t same;
+            memset(&same, 0, sizeof(same));
+            memcpy(copy, golden->plan, golden->plan_size);
+            memcpy(copy + (size_t)(runs - buf) + 2u, runs, 2u);
+            TEST_ASSERT_EQ(tigris_plan_load(copy, golden->plan_size, &same), TIGRIS_OK,
+                           "an If may run one graph for both branches");
+            if (same.header == NULL) continue;
+            const uint16_t depth = nesting_below(&same, 0u);
+            TEST_ASSERT_EQ(same.subgraph_depth, depth, "the loader states the nesting depth");
+            if (depth > deepest) deepest = depth;
+            checked++;
+        }
+        free(buf);
+        free(copy);
+    }
+    TEST_ASSERT_EQ(checked, 8u, "every If of the goldens is checked");
+    TEST_ASSERT_EQ(deepest, 2, "one graph for both branches, two deep");
 }
 
 /* A compressed stage reads every weight from its own decoded block, the
@@ -6315,6 +6402,7 @@ int main(void)
     test_band_kind_fixtures();
     test_state_fixture();
     test_state_goldens();
+    test_if_runs_one_graph_for_both_branches();
     test_constants_stay_in_their_weight_block();
     test_constants_do_not_overlap_in_their_weight_block();
     test_weight_ranges_overlap_only_across_blocks();

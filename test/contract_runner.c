@@ -3,7 +3,7 @@
  *
  * Usage:
  *   tigris_contract_runner plan.tgrs inputs.bin outputs.bin [activation-limit]
- *       [--no-linebuffer] [--workspace-limits=T,I,O,C,S] [--slow-arena=BYTES]
+ *       [--no-linebuffer] [--workspace-limits=T,I,O,C,S,D] [--slow-arena=BYTES]
  *       [--inputs-in-slow]
  *
  * inputs.bin and outputs.bin concatenate model tensors in model-I/O order.
@@ -261,7 +261,7 @@ int main(int argc, char **argv)
     int no_linebuffer = 0;
     /* Workspace limits as generated code states them, or all zero to run
      * with the executor's own global workspace. */
-    unsigned long limits[5] = {0, 0, 0, 0, 0};
+    unsigned long limits[6] = {0, 0, 0, 0, 0, 0};
     int have_limits = 0;
     /* Exact slow arena size, 0 for none. */
     unsigned long slow_arena = 0;
@@ -283,8 +283,8 @@ int main(int argc, char **argv)
         if (strcmp(argv[arg_index], "--no-linebuffer") == 0) {
             no_linebuffer = 1;
         } else if (strncmp(argv[arg_index], "--workspace-limits=", 19) == 0) {
-            if (sscanf(argv[arg_index] + 19, "%lu,%lu,%lu,%lu,%lu", &limits[0],
-                       &limits[1], &limits[2], &limits[3], &limits[4]) != 5) {
+            if (sscanf(argv[arg_index] + 19, "%lu,%lu,%lu,%lu,%lu,%lu", &limits[0],
+                       &limits[1], &limits[2], &limits[3], &limits[4], &limits[5]) != 6) {
                 fprintf(stderr, "invalid workspace limits: %s\n", argv[arg_index]);
                 return 2;
             }
@@ -310,7 +310,7 @@ int main(int argc, char **argv)
     if (pos_argc != 4 && pos_argc != 5) {
         fprintf(stderr,
                 "usage: %s plan.tgrs inputs.bin outputs.bin [activation-limit] "
-                "[--no-linebuffer] [--workspace-limits=T,I,O,C,S] [--slow-arena=BYTES] "
+                "[--no-linebuffer] [--workspace-limits=T,I,O,C,S,D] [--slow-arena=BYTES] "
                 "[--inputs-in-slow]\n",
                 pos_argv[0]);
         return 2;
@@ -409,7 +409,7 @@ int main(int argc, char **argv)
         } else if (have_limits) {
             /* Exactly what generated code reserves for these limits. */
             size_t workspace_size = TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(
-                limits[0], limits[1], limits[2], limits[3], limits[4]);
+                limits[0], limits[1], limits[2], limits[3], limits[4], limits[5]);
             workspace = malloc(workspace_size);
             if (!workspace) {
                 fprintf(stderr, "could not allocate the executor workspace\n");

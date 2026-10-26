@@ -11,6 +11,7 @@
 #include "tigris_executor.h"
 #include "tigris_iface.h"
 #include "tigris_mem.h"
+#include "tigris_mem_internal.h"
 #include "test_harness.h"
 
 #define TEST_ALIGN_UP(x) \

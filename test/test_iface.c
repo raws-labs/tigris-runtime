@@ -14,6 +14,7 @@
 
 #include "tigris.h"
 #include "tigris_iface.h"
+#include "tigris_iface_internal.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "test_harness.h"

@@ -7,8 +7,8 @@
  */
 
 #include "tigris_kernels.h"
-#include "tigris_iface.h"
 
+#include "tigris_iface_internal.h"
 #include "tigris_kernel_window.h"
 #include "tigris_binary_operands.h"
 #include "tigris_op_config.h"

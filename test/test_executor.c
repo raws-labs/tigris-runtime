@@ -11,6 +11,7 @@
 #include "tigris.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
+#include "tigris_mem_internal.h"
 #include "tigris_executor.h"
 #include "tigris_iface.h"
 #include "tigris_kernels.h"

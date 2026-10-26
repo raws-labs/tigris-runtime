@@ -159,6 +159,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_link_libraries(test_loader tigris_runtime)
 
     add_executable(test_executor test/test_executor.c)
+    target_include_directories(test_executor PRIVATE src)
     target_link_libraries(test_executor tigris_runtime)
 
     # Runtime sources compiled once with TIGRIS_COUNT_KERNEL_ROWS for the two
@@ -174,7 +175,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     # output-row counts.
     add_executable(test_executor_rows test/test_executor.c
         $<TARGET_OBJECTS:tigris_runtime_rows_objects>)
-    target_include_directories(test_executor_rows PRIVATE include)
+    target_include_directories(test_executor_rows PRIVATE include src)
     target_compile_definitions(test_executor_rows PRIVATE TIGRIS_COUNT_KERNEL_ROWS)
     target_link_libraries(test_executor_rows m)
 
@@ -197,26 +198,31 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_link_libraries(explicit_workspace_link_smoke tigris_runtime)
 
     add_executable(test_kernels test/test_kernels.c)
+    target_include_directories(test_kernels PRIVATE src)
     target_link_libraries(test_kernels tigris_runtime)
 
     add_executable(test_kernels_s8 test/test_kernels_s8.c)
+    target_include_directories(test_kernels_s8 PRIVATE src)
     target_link_libraries(test_kernels_s8 tigris_runtime)
 
     add_executable(test_lz4 test/test_lz4.c)
     target_link_libraries(test_lz4 tigris_runtime)
 
     add_executable(test_weight_arena test/test_weight_arena.c)
+    target_include_directories(test_weight_arena PRIVATE src)
     target_link_libraries(test_weight_arena tigris_runtime)
 
     add_executable(test_row_offset test/test_row_offset.c)
     target_link_libraries(test_row_offset tigris_runtime)
 
     add_executable(test_iface test/test_iface.c)
+    target_include_directories(test_iface PRIVATE src)
     target_compile_definitions(test_iface PRIVATE
         TIGRIS_SCHEMA_COMPAT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/schema_compat")
     target_link_libraries(test_iface tigris_runtime)
 
     add_executable(test_tile_2d test/test_tile_2d.c)
+    target_include_directories(test_tile_2d PRIVATE src)
     target_compile_definitions(test_tile_2d PRIVATE
         TIGRIS_TILE2D_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/tile2d_fixtures")
     target_link_libraries(test_tile_2d tigris_runtime)

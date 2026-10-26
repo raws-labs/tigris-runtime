@@ -1,6 +1,8 @@
 /* Model interface conversion. See include/tigris_iface.h. */
 #include "tigris_iface.h"
+#include "tigris_iface_internal.h"
 #include "tigris_io_in_fast.h"
+#include "tigris_mem_internal.h"
 
 #include <math.h>
 #include <string.h>

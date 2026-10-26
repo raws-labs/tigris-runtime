@@ -474,6 +474,79 @@ static void test_row_band_matches_unsplit_op(void)
                    "missing output is refused");
 }
 
+/* Quant data spanning two pages, so a param on page 1 reads past the first. */
+static int32_t channel_quant_data[TIGRIS_QUANT_PAGE_ELEMS + 8];
+
+static void test_channel_quant(void)
+{
+    printf("  test_channel_quant...\n");
+    tigris_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.quant_data = channel_quant_data;
+    int32_t *page1 = channel_quant_data + TIGRIS_QUANT_PAGE_ELEMS;
+    /* Page 0 holds other values at the same offsets. */
+    for (int i = 0; i < 8; i++) {
+        channel_quant_data[i] = -100 - i;
+        page1[i] = 100 + i;
+    }
+    tigris_quant_param_t per_channel = {0.5f, 0, 3, 0, 4, 1};
+    tigris_quant_param_t per_tensor = {0.5f, 0, 1, 6, 7, 1};
+
+    TEST_ASSERT_EQ(tigris_quant_page_start(&per_channel),
+                   TIGRIS_QUANT_PAGE_ELEMS, "page 1 starts one page in");
+    TEST_ASSERT_EQ(tigris_quant_multipliers(&plan, &per_channel), page1,
+                   "multipliers on the param's page");
+    TEST_ASSERT_EQ(tigris_quant_shifts(&plan, &per_channel), page1 + 4,
+                   "shifts on the param's page");
+
+    int32_t buffer[8];
+    const int32_t *mult = NULL;
+    const int32_t *shift = NULL;
+    TEST_ASSERT_EQ(tigris_accel_channel_quant(&plan, &per_channel, 3, NULL, 0,
+                                              &mult, &shift), 1,
+                   "per-channel param of the op's width");
+    TEST_ASSERT_EQ(mult, page1, "per-channel multipliers used in place");
+    TEST_ASSERT_EQ(shift, page1 + 4, "per-channel shifts used in place");
+
+    for (int i = 0; i < 8; i++)
+        buffer[i] = -1;
+    TEST_ASSERT_EQ(tigris_accel_channel_quant(&plan, &per_tensor, 3, buffer, 4,
+                                              &mult, &shift), 1,
+                   "per-tensor param broadcast");
+    TEST_ASSERT_EQ(mult, buffer, "multipliers start the buffer");
+    TEST_ASSERT_EQ(shift, buffer + 4, "shifts follow the buffer's capacity");
+    for (int c = 0; c < 3; c++) {
+        TEST_ASSERT_EQ(buffer[c], 106, "per-tensor multiplier per channel");
+        TEST_ASSERT_EQ(buffer[4 + c], 107, "per-tensor shift per channel");
+    }
+    TEST_ASSERT_EQ(buffer[3], -1, "multiplier past the channels untouched");
+    TEST_ASSERT_EQ(buffer[7], -1, "shift past the channels untouched");
+
+    TEST_ASSERT_EQ(tigris_accel_channel_quant(&plan, NULL, 2, buffer, 4,
+                                              &mult, &shift), 1,
+                   "no param broadcast");
+    TEST_ASSERT_EQ(buffer[0], 1, "no param multiplies by 1");
+    TEST_ASSERT_EQ(buffer[1], 1, "no param multiplies by 1 per channel");
+    TEST_ASSERT_EQ(buffer[4], 0, "no param shifts by 0");
+    TEST_ASSERT_EQ(buffer[5], 0, "no param shifts by 0 per channel");
+
+    TEST_ASSERT_EQ(tigris_accel_channel_quant(&plan, &per_channel, 0, buffer, 4,
+                                              &mult, &shift), 0,
+                   "zero channels refused");
+    TEST_ASSERT_EQ(tigris_accel_channel_quant(&plan, &per_channel, 4, buffer, 4,
+                                              &mult, &shift), 0,
+                   "per-channel param of another width refused");
+    TEST_ASSERT_EQ(tigris_accel_channel_quant(&plan, &per_tensor, 3, NULL, 4,
+                                              &mult, &shift), 0,
+                   "broadcast without a buffer refused");
+    TEST_ASSERT_EQ(tigris_accel_channel_quant(&plan, &per_tensor, 5, buffer, 4,
+                                              &mult, &shift), 0,
+                   "broadcast past the capacity refused");
+    TEST_ASSERT_EQ(tigris_accel_channel_quant(&plan, &per_channel, 3, NULL, 0,
+                                              NULL, &shift), 0,
+                   "missing output refused");
+}
+
 /* A line-buffered chain sets mem->tile.out_row_start / in_row_start on rolled
  * interior tiles. 1.5b: the ESP-NN/CMSIS-NN Conv/Depthwise adapters now honor
  * those offsets natively, so a rolled conv/depthwise stays on the vendor path;
@@ -805,6 +878,7 @@ int main(void)
     test_row_banded_ops_route_to_reference();
     test_esp_asymmetric_pad_workspace_policy();
     test_row_band_matches_unsplit_op();
+    test_channel_quant();
 
     return test_report();
 }

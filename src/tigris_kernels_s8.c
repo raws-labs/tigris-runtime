@@ -175,22 +175,6 @@ static inline int32_t average_pool_quantize(
     return clamp_act(q, act_min, act_max);
 }
 
-/** Get multiplier from quant data (works for both per-tensor and per-channel). */
-static inline int32_t get_multiplier(
-    const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
-{
-    uint32_t page = qp->_pad;
-    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off + ch];
-}
-
-/** Get shift from quant data (works for both per-tensor and per-channel). */
-static inline int32_t get_shift(
-    const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
-{
-    uint32_t page = qp->_pad;
-    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
-}
-
 /** Re-encode a value that a kernel carried through unchanged.
  *
  * Max preserves the value, but not its encoding: when the output tensor
@@ -249,13 +233,8 @@ static inline void passthrough_table(int8_t table[256], const passthrough_quant_
             code, q->in_zp, q->in_scale, q->out_zp, q->out_scale);
 }
 
-/** The requantization parameters of an output tensor, resolved once.
- *
- * get_multiplier and get_shift chase plan->header and recompute the page
- * offset on every call, and the weighted kernels called them once per output
- * element for two numbers that vary only with the channel. The arrays sit
- * next to each other in one page, so one resolution serves the whole kernel.
- */
+/** The requantization parameters of an output tensor, resolved once per
+ * kernel call rather than once per output element. */
 typedef struct {
     const int32_t *multiplier;  /* NULL when the tensor carries no params */
     const int32_t *shift;
@@ -270,11 +249,8 @@ static inline requant_params_t requant_resolve(
     rq.shift = NULL;
     rq.per_channel = 0;
     if (qp) {
-        uint32_t page = qp->_pad;
-        const int32_t *base = plan->quant_data +
-                              (size_t)page * TIGRIS_QUANT_PAGE_ELEMS;
-        rq.multiplier = base + qp->multiplier_off;
-        rq.shift = base + qp->shift_off;
+        rq.multiplier = tigris_quant_multipliers(plan, qp);
+        rq.shift = tigris_quant_shifts(plan, qp);
         rq.per_channel = qp->num_channels > 1 ? 1 : 0;
     }
     return rq;
@@ -1354,8 +1330,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_matmul_s8(
     int32_t a_zp = qp_a ? qp_a->zero_point : 0;
     int32_t b_zp = qp_b ? qp_b->zero_point : 0;
     int32_t y_zp = qp_y ? qp_y->zero_point : 0;
-    int32_t mult = qp_y ? get_multiplier(plan, qp_y, 0) : 1;
-    int32_t shift = qp_y ? get_shift(plan, qp_y, 0) : 0;
+    requant_params_t rq = requant_resolve(plan, qp_y);
 
     uint8_t last = (uint8_t)(a_tensor->ndim - 1u);
     int M = a_shape[last - 1u];
@@ -1383,10 +1358,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_matmul_s8(
                     int32_t bv = (int32_t)w[k * N + n] - b_zp;
                     acc += av * bv;
                 }
-                int32_t scaled =
-                    multiply_by_quantized_multiplier(acc, mult, shift);
-                y[m * N + n] =
-                    clamp_act(scaled + y_zp, op->act_min, op->act_max);
+                y[m * N + n] = clamp_act(requant_apply(&rq, acc, 0) + y_zp,
+                                         op->act_min, op->act_max);
             }
         }
     }
@@ -3672,6 +3645,38 @@ int tigris_accel_row_band(
     *in_start = (int32_t)start;
     *in_rows = (int32_t)(stop - start);
     *band_pad_top = (uint16_t)pad;
+    return 1;
+}
+
+int tigris_accel_channel_quant(
+    const tigris_plan_t *plan,
+    const tigris_quant_param_t *qp,
+    uint32_t channels,
+    int32_t *buffer,
+    uint32_t capacity,
+    const int32_t **multipliers,
+    const int32_t **shifts)
+{
+    if (!plan || !multipliers || !shifts || channels == 0u)
+        return 0;
+
+    if (qp && qp->num_channels == channels) {
+        *multipliers = tigris_quant_multipliers(plan, qp);
+        *shifts = tigris_quant_shifts(plan, qp);
+        return 1;
+    }
+
+    if ((qp && qp->num_channels != 1u) || !buffer || channels > capacity)
+        return 0;
+
+    int32_t multiplier = qp ? tigris_quant_multipliers(plan, qp)[0] : 1;
+    int32_t shift = qp ? tigris_quant_shifts(plan, qp)[0] : 0;
+    for (uint32_t channel = 0; channel < channels; channel++) {
+        buffer[channel] = multiplier;
+        buffer[capacity + channel] = shift;
+    }
+    *multipliers = buffer;
+    *shifts = buffer + capacity;
     return 1;
 }
 

@@ -69,49 +69,19 @@ static uint32_t s_quant_channels = 0;
 
 /* Helpers */
 
-static inline int32_t get_mult(
-    const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
-{
-    uint32_t page = qp->_pad;
-    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->multiplier_off + ch];
-}
-
-static inline int32_t get_shft(
-    const tigris_plan_t *plan, const tigris_quant_param_t *qp, int ch)
-{
-    uint32_t page = qp->_pad;
-    return plan->quant_data[page * TIGRIS_QUANT_PAGE_ELEMS + qp->shift_off + ch];
-}
-
 static int esp_per_channel_quant(
     const tigris_plan_t *plan, const tigris_quant_param_t *qp,
     uint32_t channels, quant_data_t *quant)
 {
-    if (!plan || !quant || channels == 0)
+    const int32_t *multipliers = NULL;
+    const int32_t *shifts = NULL;
+    if (!quant || !tigris_accel_channel_quant(plan, qp, channels, s_quant_buf,
+                                              s_quant_channels, &multipliers, &shifts))
         return -1;
-
-    if (qp && qp->num_channels == channels) {
-        uint32_t page = qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
-        /* MISRA 11.8 deviation: ESP-NN declares these fields non-const but
-         * only reads them, so the plan's read-only arrays are passed as is. */
-        quant->mult = (int32_t *)&plan->quant_data[
-            page + qp->multiplier_off];
-        quant->shift = (int32_t *)&plan->quant_data[page + qp->shift_off];
-        return 0;
-    }
-
-    if ((qp && qp->num_channels != 1u) || !s_quant_buf ||
-        channels > s_quant_channels)
-        return -1;
-
-    int32_t *mult = s_quant_buf;
-    int32_t *shift = s_quant_buf + s_quant_channels;
-    for (uint32_t channel = 0; channel < channels; channel++) {
-        mult[channel] = qp ? get_mult(plan, qp, 0) : 1;
-        shift[channel] = qp ? get_shft(plan, qp, 0) : 0;
-    }
-    quant->mult = mult;
-    quant->shift = shift;
+    /* MISRA 11.8 deviation: ESP-NN declares these fields non-const but
+     * only reads them, so the read-only arrays are passed as is. */
+    quant->mult = (int32_t *)multipliers;
+    quant->shift = (int32_t *)shifts;
     return 0;
 }
 
@@ -807,11 +777,8 @@ static int adapt_fully_connected(
      * 8-byte aligned as required by ESP-NN S3 SIMD (ee.vld.l.64.ip). */
 
     if (out_qp && out_qp->num_channels > 1) {
-        uint32_t page = out_qp->_pad * TIGRIS_QUANT_PAGE_ELEMS;
-        const int32_t *mult_arr = &plan->quant_data[
-            page + out_qp->multiplier_off];
-        const int32_t *shift_arr = &plan->quant_data[
-            page + out_qp->shift_off];
+        const int32_t *mult_arr = tigris_quant_multipliers(plan, out_qp);
+        const int32_t *shift_arr = tigris_quant_shifts(plan, out_qp);
         for (int n = 0; n < N; n++) {
             esp_nn_fully_connected_per_ch_s8(
                 X + n * row_len, in_offset, row_len,
@@ -821,8 +788,8 @@ static int adapt_fully_connected(
                 op->act_min, op->act_max);
         }
     } else {
-        int32_t m = out_qp ? get_mult(plan, out_qp, 0) : 1;
-        int32_t s = out_qp ? get_shft(plan, out_qp, 0) : 0;
+        int32_t m = out_qp ? tigris_quant_multipliers(plan, out_qp)[0] : 1;
+        int32_t s = out_qp ? tigris_quant_shifts(plan, out_qp)[0] : 0;
         for (int n = 0; n < N; n++) {
             esp_nn_fully_connected_s8(
                 X + n * row_len, in_offset, row_len,

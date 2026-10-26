@@ -94,6 +94,25 @@ int tigris_accel_row_band(
     uint16_t *band_pad_top);
 
 /**
+ * Per-channel requantization arrays for an op with `channels` output channels.
+ *
+ * A quant param with one entry per channel is returned in place. A per-tensor
+ * param, or none (multiplier 1, shift 0), is copied to every channel of
+ * `buffer`, which holds `capacity` multipliers followed by `capacity` shifts.
+ *
+ * @return 1 on success; 0 for zero channels, a param with another channel
+ *         count, or a missing or too small buffer.
+ */
+int tigris_accel_channel_quant(
+    const tigris_plan_t *plan,
+    const tigris_quant_param_t *qp,
+    uint32_t channels,
+    int32_t *buffer,
+    uint32_t capacity,
+    const int32_t **multipliers,
+    const int32_t **shifts);
+
+/**
  * Execute the reference route selected by tigris_accel_pre_route().
  *
  * @param handled  Set to 1 when s8_ref ran, or 0 when the caller should invoke

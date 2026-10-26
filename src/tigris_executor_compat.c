@@ -3,7 +3,7 @@
  * @brief Source-compatible executor wrapper with process-global workspace.
  *
  * This wrapper intentionally lives in its own translation unit. Static-library
- * consumers of tigris_run_with_workspace() therefore do not pull the legacy
+ * consumers of tigris_run_with_workspace() therefore do not pull the default
  * workspace into their linked BSS.
  */
 

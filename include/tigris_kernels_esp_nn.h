@@ -31,11 +31,11 @@ extern "C" {
  * internal SRAM for faster Conv scratch.
  * The supplied TiGrIS fast arena is not reduced. Missing optional workspace
  * causes the affected op to fall back to s8_ref rather than changing its
- * semantics, and no workspace allocation occurs inside tigris_run().
+ * semantics, and no workspace allocation occurs during inference.
  *
- * Call after tigris_mem_init() and before tigris_run(). A repeated call safely
- * replaces the previous adapter workspace for this process; preparation and
- * dispatch are not concurrent/thread-safe.
+ * Call after tigris_mem_init() and before the first inference. A repeated
+ * call safely replaces the previous adapter workspace for this process;
+ * preparation and dispatch are not concurrent/thread-safe.
  *
  * @param plan  Loaded plan (read-only, used to scan op shapes).
  * @param mem   Initialized memory manager (read-only sizing input).
@@ -64,8 +64,8 @@ void tigris_esp_nn_deinit(void);
  * a worker task pinned to the other core, which is the embedding application's
  * decision, so preparation never does it on its own.
  *
- * Call after tigris_esp_nn_prepare() and before tigris_run(). Repeated calls
- * are harmless. The worker outlives tigris_esp_nn_deinit().
+ * Call after tigris_esp_nn_prepare() and before the first inference. Repeated
+ * calls are harmless. The worker outlives tigris_esp_nn_deinit().
  *
  * @return 1 when the worker is running, 0 on a single-core target or build.
  */

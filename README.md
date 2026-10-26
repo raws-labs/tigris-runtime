@@ -59,12 +59,17 @@ The caller owns:
 - one `void *` entry per tensor.
 
 Generated integrations reserve a plan-sized executor buffer automatically; no
-workspace limit tuning is required. Manual integrations can query
-`tigris_executor_workspace_required()` after loading the plan and pass that many
-caller-owned bytes to `tigris_run_with_workspace_buffer()`. The fixed
-`tigris_executor_workspace_t` and `tigris_run_with_workspace()` remain available
-for source compatibility. `tigris_run()` uses one process-global fixed
-workspace and is not safe for concurrent inference. Arena sizing, stack
+workspace limit tuning is required. Manual integrations call
+`tigris_run_with_workspace()` with a caller-owned `tigris_executor_workspace_t`.
+The executor itself keeps no process-wide state, so concurrent inferences each
+pass their own workspace and `tigris_mem_t`; the ESP-NN and CMSIS-NN
+dispatchers keep process-wide scratch and serve one inference at a time.
+`tigris_run_with_workspace_buffer()` takes plan-sized caller bytes instead of
+the fixed type (`tigris_executor_workspace_required()` after loading the plan
+gives the size). The fixed type is sized for the build's limits
+(`tigris_executor_workspace_size()`); the plan-sized buffer is usually much
+smaller. `tigris_run()` is a compatibility wrapper over one process-global
+fixed workspace and is not safe for concurrent inference. Arena sizing, stack
 provisioning, and re-entrant execution are documented in the
 [runtime integration guide](https://tigris-ml.dev/runtime/integration/).
 
@@ -222,11 +227,12 @@ without extra options. The same project can be created from the registry with
 The plan should live in a memory-mapped flash partition. Allocate the fast
 arena from internal SRAM and the slow arena from PSRAM when available. When
 using ESP-NN, call `tigris_esp_nn_prepare()` and check its return value before
-`tigris_run()`, then call `tigris_esp_nn_deinit()` after the final inference.
+the first inference, then call `tigris_esp_nn_deinit()` after the final
+inference.
 
-`tigris_run()` does not yield: an inference runs to completion on the calling
-task. If an inference outlasts the task watchdog timeout, feed the watchdog from
-a wrapper around the kernel dispatch function or disable the idle-task check.
+An inference does not yield: it runs to completion on the calling task. If an
+inference outlasts the task watchdog timeout, feed the watchdog from a wrapper
+around the kernel dispatch function or disable the idle-task check.
 
 ## Further reading
 

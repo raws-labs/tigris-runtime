@@ -190,9 +190,9 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
         "TIGRIS_OP_CONFIG=\"${CMAKE_CURRENT_SOURCE_DIR}/test/kernel_selection_config.h\"")
     target_link_libraries(test_kernel_selection_selected m)
 
-    # This executable references only the explicit executor API. The legacy
-    # wrapper lives in a separate archive member and must not add its second
-    # workspace to the linked BSS.
+    # This executable references only the explicit executor API. The
+    # compatibility wrapper lives in a separate archive member and must not
+    # add its second workspace to the linked BSS.
     add_executable(explicit_workspace_link_smoke
         test/explicit_workspace_link_smoke.c)
     target_link_libraries(explicit_workspace_link_smoke tigris_runtime)
@@ -244,7 +244,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
 
     # Compile the executor and loader with reduced public limits and without
     # the compatibility workspace. This keeps every loader limit and the
-    # legacy fixed-workspace sizing contract live.
+    # fixed-workspace sizing contract live.
     add_library(stack_config_compile OBJECT
         src/tigris_executor.c src/tigris_executor_compat.c
         src/tigris_loader.c)

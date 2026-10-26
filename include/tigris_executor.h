@@ -39,7 +39,7 @@ typedef enum {
  * @param op        Current operator descriptor.
  * @param op_index  Global index of the op in plan->ops[].
  * @param mem       Memory manager with tensor pointers set.
- * @param user_ctx  Opaque user context passed through from tigris_run().
+ * @param user_ctx  Opaque user context passed through from the run call.
  * @return 0 on success, negative on error.
  */
 typedef int (*tigris_kernel_fn)(
@@ -51,7 +51,7 @@ typedef int (*tigris_kernel_fn)(
 
 /* Execution statistics */
 
-/** Per-inference execution statistics populated by tigris_run(). */
+/** Per-inference execution statistics filled by the executor entry points. */
 typedef struct tigris_exec_stats {
     uint16_t stages_normal;        /* stages executed without tiling */
     uint16_t stages_tiled;         /* stages executed with spatial tiling */
@@ -177,31 +177,19 @@ typedef union {
  * The compiler's slow figure assumes this placement; inputs allocated in slow
  * need a slow arena that holds them and the outputs.
  *
- * This compatibility entry point uses one process-global workspace and is
- * therefore not re-entrant or safe for concurrent inference. Define
- * TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE=0 to omit that storage and use
- * tigris_run_with_workspace() instead; this function then returns
- * TIGRIS_EXEC_ERR_WORKSPACE.
+ * This is the primary entry point. It is re-entrant: concurrent inferences
+ * each pass their own workspace and memory manager, with a kernel dispatcher
+ * that is itself safe to call concurrently. The workspace may be static,
+ * global, heap-backed, or task-local, but must remain exclusively owned for the
+ * duration of the call. A caller that prefers a plan-sized buffer to the fixed
+ * workspace type uses tigris_run_with_workspace_buffer().
  *
  * @param plan      Loaded plan (read-only).
  * @param mem       Initialised memory manager.
  * @param kernel    Kernel dispatch callback (e.g. tigris_dispatch_kernel_s8).
  * @param user_ctx  Opaque context forwarded to every kernel call.
  * @param stats     Optional stats output (may be NULL).
- * @return TIGRIS_EXEC_OK on success, negative error code on failure.
- */
-tigris_exec_error_t tigris_run(
-    const tigris_plan_t *plan,
-    tigris_mem_t        *mem,
-    tigris_kernel_fn     kernel,
-    void                *user_ctx,
-    tigris_exec_stats_t *stats);
-
-/**
- * Re-entrant executor entry point using explicit caller-owned workspace.
- * The workspace may be static, global, heap-backed, or task-local, but must
- * remain exclusively owned for the duration of the call.
- *
+ * @param workspace Caller-owned executor workspace.
  * @return TIGRIS_EXEC_OK on success, TIGRIS_EXEC_ERR_WORKSPACE when workspace
  *         is NULL, or another negative executor error.
  */
@@ -222,7 +210,8 @@ tigris_exec_error_t tigris_run_with_workspace(
 size_t tigris_executor_workspace_required(const tigris_plan_t *plan);
 
 /**
- * Re-entrant executor entry point using an arbitrary caller-owned buffer.
+ * Convenience form of tigris_run_with_workspace() for a caller-owned byte
+ * buffer instead of the fixed workspace type.
  *
  * This is the plan-sized API used by generated code.  The buffer may be
  * statically allocated, task-local, or heap-backed; the runtime never allocates
@@ -241,6 +230,20 @@ tigris_exec_error_t tigris_run_with_workspace_buffer(
     tigris_exec_stats_t *stats,
     void                *workspace,
     size_t               workspace_size);
+
+/**
+ * Compatibility entry point: tigris_run_with_workspace() with one
+ * process-global workspace, so it is not re-entrant or safe for concurrent
+ * inference. Define TIGRIS_ENABLE_DEFAULT_EXECUTOR_WORKSPACE=0 to omit that
+ * storage; this function then returns TIGRIS_EXEC_ERR_WORKSPACE. Contract and
+ * remaining parameters as tigris_run_with_workspace().
+ */
+tigris_exec_error_t tigris_run(
+    const tigris_plan_t *plan,
+    tigris_mem_t        *mem,
+    tigris_kernel_fn     kernel,
+    void                *user_ctx,
+    tigris_exec_stats_t *stats);
 
 /**
  * Run a plan that keeps variables across invocations.

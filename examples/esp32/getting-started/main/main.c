@@ -150,6 +150,7 @@ void app_main(void) {
     void *slow_buf = heap_caps_malloc(slow_size, MALLOC_CAP_SPIRAM);
     void **tensor_ptrs = heap_caps_calloc(plan.header->num_tensors, sizeof(void *),
                                           MALLOC_CAP_SPIRAM);
+    /* Plan-sized workspace keeps internal SRAM to what this plan needs. */
     size_t ws_size = tigris_executor_workspace_required(&plan);
     void *ws = ws_size ? heap_caps_malloc(ws_size,
                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)

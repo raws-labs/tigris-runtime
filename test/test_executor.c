@@ -483,7 +483,7 @@ static uint32_t total_tensor_bytes(const tigris_plan_t *plan)
  *
  *   python3 -c "
  *   import sys; sys.path.insert(0, 'scripts')
- *   from crossrepo_contract import _tiled_pool_chain_case
+ *   from contract_cases.chains import _tiled_pool_chain_case
  *   from tigris.cli import _run_pipeline
  *   from tigris.emitters.binary.writer import emit_binary
  *   import tempfile, onnx, os
@@ -630,7 +630,7 @@ extern int32_t g_tigris_interior_clamps;
  *   python3 -c "
  *   import sys, os, tempfile
  *   sys.path.insert(0, os.path.abspath('src')); sys.path.insert(0, os.path.abspath('scripts'))
- *   from crossrepo_contract import _tiled_chain_case
+ *   from contract_cases.chains import _tiled_chain_case
  *   from tigris.cli import _run_pipeline
  *   from tigris.emitters.binary.writer import emit_binary
  *   import onnx

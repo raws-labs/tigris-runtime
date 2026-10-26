@@ -14,6 +14,7 @@
 #include "tigris.h"
 #include "tigris_executor.h"
 #include "tigris_kernels.h"
+#include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "test_harness.h"
 
@@ -608,6 +609,212 @@ static void test_a_band_never_writes_over_a_model_input(void)
     TEST_ASSERT(1, "the model input survives the run");
 }
 
+/* One rank-2 binary operator against a constant held as its weight: dense
+ * [rows, cols], one value per row [rows, 1], or one row [cols]. A selection
+ * takes a second input and holds its bool condition as the constant. */
+#define CONST_COLS 8
+#define CONST_ELEMS (TEST_ROWS * CONST_COLS)
+
+typedef enum { CONST_DENSE, CONST_PER_ROW, CONST_ONE_ROW } const_form_t;
+
+typedef struct {
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[3];
+    tigris_op_t op;
+    tigris_stage_t stage;
+    tigris_tile_plan_t tile_plan;
+    tigris_weight_entry_t weight;
+    tigris_op_attribute_t attribute;
+    uint8_t attribute_data[12];
+    float blob[CONST_ELEMS];
+    uint8_t condition[CONST_ELEMS];
+    int32_t shapes[6];
+    uint16_t indices[4];
+    tigris_plan_t plan;
+} const_fixture_t;
+
+static void build_const_fixture(const_fixture_t *fx, uint8_t op_type, const_form_t form)
+{
+    const int select = op_type == TIGRIS_OP_SELECT_V2;
+    const uint16_t inputs = select ? 2u : 1u;
+    memset(fx, 0, sizeof(*fx));
+    fx->header.version = TIGRIS_SCHEMA_VERSION_V9;
+    fx->header.num_tensors = (uint16_t)(inputs + 1u);
+    fx->header.num_ops = 1;
+    fx->header.num_stages = 1;
+    fx->header.num_tile_plans = 1;
+    fx->header.num_weights = 1;
+    fx->header.num_model_inputs = inputs;
+    fx->header.num_model_outputs = 1;
+
+    for (uint16_t i = 0; i < 3u; i++) {
+        fx->shapes[2u * i] = TEST_ROWS;
+        fx->shapes[2u * i + 1u] = CONST_COLS;
+        fx->tensors[i].shape_off = (uint16_t)(2u * i);
+        fx->tensors[i].ndim = 2;
+        fx->tensors[i].dtype = 1;
+        fx->tensors[i].quant_param_idx = 0xFFFFu;
+        fx->tensors[i].size_bytes = CONST_ELEMS * (uint32_t)sizeof(float);
+        fx->tensors[i].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    }
+    fx->tensors[1].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+    if (op_type == TIGRIS_OP_LESS) {
+        fx->tensors[1].dtype = 9;
+        fx->tensors[1].size_bytes = CONST_ELEMS;
+    }
+
+    uint32_t count = form == CONST_DENSE ? CONST_ELEMS : form == CONST_PER_ROW ? TEST_ROWS : CONST_COLS;
+    for (uint32_t i = 0; i < count; i++) {
+        fx->blob[i] = (float)((int)(i % 9u) - 4) * 0.5f;
+        fx->condition[i] = (uint8_t)(i % 3u == 0u);
+    }
+    fx->weight.size_bytes = count * (select ? 1u : (uint32_t)sizeof(float));
+
+    fx->op.op_type = op_type;
+    fx->op.num_inputs = (uint8_t)inputs; fx->op.num_outputs = 1;
+    fx->op.inputs_off = 0; fx->op.outputs_off = 2;
+    fx->op.weight_idx = 0;
+    fx->op.bias_idx = TIGRIS_NO_WEIGHT;
+
+    /* A float Add reads its constant without the attribute; the others and
+     * the per-row shape need it, the latter in its long form. */
+    if (op_type != TIGRIS_OP_ADD || form == CONST_PER_ROW) {
+        const int32_t shape[2] = {TEST_ROWS, 1};
+        fx->attribute_data[0] = select ? 0u : 1u;
+        fx->attribute_data[2] = 0xFFu;
+        fx->attribute_data[3] = 0xFFu;
+        fx->attribute.type = TIGRIS_OP_ATTR_CONSTANT_OPERAND;
+        fx->attribute.data_len = TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN;
+        if (form == CONST_PER_ROW) {
+            memcpy(fx->attribute_data + TIGRIS_OP_ATTR_CONSTANT_OPERAND_LEN, shape, sizeof(shape));
+            fx->attribute.data_len += (uint8_t)sizeof(shape);
+        }
+        fx->plan.num_op_attributes = 1;
+        fx->plan.op_attributes = &fx->attribute;
+        fx->plan.op_attribute_data = fx->attribute_data;
+    }
+
+    fx->indices[0] = 0;  /* op inputs, stage inputs, model inputs */
+    fx->indices[1] = 2;
+    fx->indices[2] = 1;  /* op output, stage output, model output */
+    fx->indices[3] = 0;  /* stage op */
+    fx->stage.ops_off = 3;
+    fx->stage.ops_count = 1;
+    fx->stage.inputs_off = 0;
+    fx->stage.inputs_count = inputs;
+    fx->stage.outputs_off = 2;
+    fx->stage.outputs_count = 1;
+    fx->stage.tile_plan_idx = 0;
+    fx->stage.chain_id = TIGRIS_NO_CHAIN;
+
+    fx->tile_plan.tileable = 1;
+    fx->tile_plan.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    fx->tile_plan.tile_height = 1;
+    fx->tile_plan.num_tiles = TEST_ROWS;
+    fx->tile_plan.original_height = TEST_ROWS;
+
+    fx->plan.header = &fx->header;
+    fx->plan.tensors = fx->tensors;
+    fx->plan.ops = &fx->op;
+    fx->plan.stages = &fx->stage;
+    fx->plan.tile_plans = &fx->tile_plan;
+    fx->plan.weight_entries = &fx->weight;
+    fx->plan.weight_blob = select ? fx->condition : (const uint8_t *)fx->blob;
+    fx->plan.index_pool = fx->indices;
+    fx->plan.shape_pool = fx->shapes;
+    fx->plan.model_inputs = &fx->indices[0];
+    fx->plan.model_outputs = &fx->indices[2];
+}
+
+static tigris_exec_error_t run_const_case(const_fixture_t *fx, const float *input, const float *second,
+                                          uint8_t *output)
+{
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t fast[512];
+    _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[SLOW_SIZE];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 2, 1, 0, 0)];
+    tigris_exec_stats_t stats;
+    tigris_mem_t mem;
+    void *ptrs[3];
+
+    memset(&stats, 0, sizeof(stats));
+    memset(slow, 0, sizeof(slow));
+    if (tigris_mem_init(&mem, ptrs, fx->header.num_tensors, fast, sizeof(fast), slow, sizeof(slow)) != TIGRIS_MEM_OK ||
+        tigris_mem_alloc_slow(&mem, 0, fx->tensors[0].size_bytes) != TIGRIS_MEM_OK ||
+        (fx->op.num_inputs == 2u &&
+         tigris_mem_alloc_slow(&mem, 2, fx->tensors[2].size_bytes) != TIGRIS_MEM_OK))
+        return TIGRIS_EXEC_ERR_MEM;
+    memcpy(mem.tensor_ptrs[0], input, fx->tensors[0].size_bytes);
+    if (fx->op.num_inputs == 2u)
+        memcpy(mem.tensor_ptrs[2], second, fx->tensors[2].size_bytes);
+    tigris_exec_error_t err = tigris_run_with_workspace_buffer(
+        &fx->plan, &mem, tigris_dispatch_kernel, NULL, &stats, workspace, sizeof(workspace));
+    if (err != TIGRIS_EXEC_OK)
+        return err;
+    if (stats.stages_tiled != 1u)
+        return TIGRIS_EXEC_ERR_TILE;
+    memcpy(output, mem.tensor_ptrs[1], fx->tensors[1].size_bytes);
+    return TIGRIS_EXEC_OK;
+}
+
+/**
+ * A row band hands a constant operand to the kernel whole, so only a constant
+ * that every row reads alike may ride it. A dense or per-row constant takes
+ * the leading band, which offsets it to the band's rows; one row of values
+ * stays a row band. A dense constant is one element of its own type per
+ * output element, whatever the output's type: a comparison writes bool, a
+ * selection's condition is bool. Each runs banded and matches the operator
+ * computed here.
+ */
+static void test_a_constant_that_varies_by_row_takes_the_leading_band(void)
+{
+    printf("  test_a_constant_that_varies_by_row_takes_the_leading_band...\n");
+    static const struct {
+        uint8_t op_type;
+        const_form_t form;
+        tigris_band_kind_t kind;
+        const char *name;
+    } cases[] = {
+        {TIGRIS_OP_ADD, CONST_DENSE, TIGRIS_BAND_KIND_LEADING, "Add, dense constant"},
+        {TIGRIS_OP_MAXIMUM, CONST_DENSE, TIGRIS_BAND_KIND_LEADING, "Max, dense constant"},
+        {TIGRIS_OP_LESS, CONST_DENSE, TIGRIS_BAND_KIND_LEADING, "Less, dense constant"},
+        {TIGRIS_OP_SELECT_V2, CONST_DENSE, TIGRIS_BAND_KIND_LEADING, "Select, dense condition"},
+        {TIGRIS_OP_ADD, CONST_PER_ROW, TIGRIS_BAND_KIND_LEADING, "Add, one value per row"},
+        {TIGRIS_OP_ADD, CONST_ONE_ROW, TIGRIS_BAND_KIND_ROWS, "Add, one row of values"},
+        {TIGRIS_OP_MAXIMUM, CONST_ONE_ROW, TIGRIS_BAND_KIND_ROWS, "Max, one row of values"},
+    };
+    float input[CONST_ELEMS];
+    float second[CONST_ELEMS];
+    for (int i = 0; i < CONST_ELEMS; i++) {
+        input[i] = (float)((i % 13) - 6) * 0.25f;
+        second[i] = (float)((i % 7) - 3) * 0.75f;
+    }
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const_fixture_t fx;
+        build_const_fixture(&fx, cases[c].op_type, cases[c].form);
+        TEST_ASSERT_EQ(tigris_stage_band_kind(&fx.plan, &fx.stage, NULL), cases[c].kind, cases[c].name);
+        float out[CONST_ELEMS];
+        uint8_t *bytes = (uint8_t *)out;
+        TEST_ASSERT_EQ(run_const_case(&fx, input, second, bytes), TIGRIS_EXEC_OK, cases[c].name);
+        int same = 1;
+        for (int i = 0; i < CONST_ELEMS; i++) {
+            int row = i / CONST_COLS, col = i % CONST_COLS;
+            int at = cases[c].form == CONST_DENSE ? i : cases[c].form == CONST_PER_ROW ? row : col;
+            float k = fx.blob[at];
+            if (cases[c].op_type == TIGRIS_OP_LESS) {
+                if (bytes[i] != (uint8_t)(input[i] < k))
+                    same = 0;
+                continue;
+            }
+            float want = cases[c].op_type == TIGRIS_OP_ADD ? input[i] + k :
+                cases[c].op_type == TIGRIS_OP_SELECT_V2 ? (fx.condition[at] ? input[i] : second[i]) :
+                (input[i] > k ? input[i] : k);
+            if (out[i] != want)
+                same = 0;
+        }
+        TEST_ASSERT(same, cases[c].name);
+    }
+}
+
 int main(void)
 {
     printf("Row-banded matrix tiling tests:\n");
@@ -617,6 +824,7 @@ int main(void)
     test_row_band_failures_are_reported();
     test_a_band_writes_over_an_input_that_dies();
     test_a_band_never_writes_over_a_model_input();
+    test_a_constant_that_varies_by_row_takes_the_leading_band();
 
 #ifdef TIGRIS_TRACE
     TEST_ASSERT_EQ((trace_paths_seen & (1u << TIGRIS_TRACE_PATH_ROWS)) != 0u,

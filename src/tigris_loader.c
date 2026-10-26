@@ -804,7 +804,29 @@ int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
            metadata[row] == 0 && metadata[in->ndim + row] == shape[row];
 }
 
-int tigris_stage_band_mode(const tigris_plan_t *plan, const tigris_stage_t *stage)
+/* The band mode an SVDF or LSTM defines for itself: its batch. */
+static int recurrent_band_mode(const tigris_plan_t *plan, uint16_t index, const tigris_op_t *op)
+{
+    if (op->op_type == TIGRIS_OP_SVDF) return TIGRIS_BAND_BATCH;
+    const uint8_t *params = tigris_op_attribute_data(plan, index, TIGRIS_OP_ATTR_LSTM, NULL);
+    int32_t time_major = 0;
+    if (params) memcpy(&time_major, params, sizeof(time_major));
+    return time_major ? TIGRIS_BAND_TIME_MAJOR_BATCH : TIGRIS_BAND_BATCH;
+}
+
+/* Whether a stage has the form a leading band needs: one unchained operator
+ * with stage inputs and outputs, and a shape pool. The band mode helpers read
+ * that operator and its shapes, so this holds before either runs. */
+static int leading_band_stage(const tigris_plan_t *plan, const tigris_stage_t *stage)
+{
+    return plan->shape_pool != NULL && stage->ops_count == 1u && stage->chain_len == 0u &&
+        stage->inputs_count != 0u && stage->outputs_count != 0u;
+}
+
+/* Below schema 11, the band mode a leading band runs by: the axis whose band
+ * costs least, or the operator's own. The stage has a leading band's form
+ * (leading_band_stage). */
+static int derived_band_mode(const tigris_plan_t *plan, const tigris_stage_t *stage)
 {
     uint16_t index = tigris_stage_ops(plan, stage)[0];
     const tigris_op_t *op = &plan->ops[index];
@@ -848,28 +870,24 @@ int tigris_stage_band_mode(const tigris_plan_t *plan, const tigris_stage_t *stag
         }
         if (best_cost != UINT64_MAX) return mode;
     }
-    if (op->op_type == TIGRIS_OP_SVDF) return TIGRIS_BAND_BATCH;
-    if (op->op_type == TIGRIS_OP_LSTM) {
-        const uint8_t *params = tigris_op_attribute_data(plan, index, TIGRIS_OP_ATTR_LSTM, NULL);
-        int32_t time_major = 0;
-        if (params) memcpy(&time_major, params, sizeof(time_major));
-        return time_major ? TIGRIS_BAND_TIME_MAJOR_BATCH : TIGRIS_BAND_BATCH;
-    }
+    if (op->op_type == TIGRIS_OP_SVDF || op->op_type == TIGRIS_OP_LSTM)
+        return recurrent_band_mode(plan, index, op);
     return !tigris_op_independent_band(plan, op, index, TIGRIS_BAND_LEADING) &&
         tigris_op_independent_band(plan, op, index, TIGRIS_BAND_TRAILING) ?
         TIGRIS_BAND_TRAILING : TIGRIS_BAND_LEADING;
 }
 
-int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_t *stage)
+/* The rows a one-operator stage bands along under a leading band mode, or 0
+ * when the operator does not keep that axis independent. */
+static int32_t leading_band_rows(const tigris_plan_t *plan, const tigris_stage_t *stage, int mode)
 {
-    if (!plan->shape_pool || stage->ops_count != 1u || stage->chain_len != 0u ||
-        stage->inputs_count == 0u || stage->outputs_count == 0u) return 0;
+    if (!leading_band_stage(plan, stage)) return 0;
     uint16_t index = tigris_stage_ops(plan, stage)[0];
     const tigris_op_t *op = &plan->ops[index];
     if (op->op_type == TIGRIS_OP_SVDF || op->op_type == TIGRIS_OP_LSTM) {
-        if (op->num_inputs != stage->inputs_count || op->num_outputs != stage->outputs_count)
+        if (op->num_inputs != stage->inputs_count || op->num_outputs != stage->outputs_count ||
+            mode != recurrent_band_mode(plan, index, op))
             return 0;
-        int mode = tigris_stage_band_mode(plan, stage);
         int32_t rows = 0;
         for (uint8_t i = 0; i < op->num_inputs + op->num_outputs; i++) {
             uint16_t tidx = i < op->num_inputs ? tigris_op_inputs(plan, op)[i] :
@@ -882,7 +900,9 @@ int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_
         }
         return rows;
     }
-    if (!tigris_op_independent_band(plan, op, index, tigris_stage_band_mode(plan, stage))) return 0;
+    if ((mode != (int)TIGRIS_BAND_LEADING && mode != (int)TIGRIS_BAND_TRAILING &&
+         mode < (int)TIGRIS_BAND_AXIS_BASE) || !tigris_op_independent_band(plan, op, index, mode))
+        return 0;
     for (uint16_t i = 0u; i < stage->inputs_count; i++) {
         int found = 0;
         for (uint8_t j = 0u; j < op->num_inputs; j++)
@@ -901,6 +921,18 @@ int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_
             if (tigris_op_inputs(plan, op)[i] == tigris_stage_inputs(plan, stage)[j]) found = 1;
         if (!found) return 0;
     }
+    const tigris_tensor_t *out = &plan->tensors[tigris_op_outputs(plan, op)[0]];
+    return tigris_tensor_shape(plan, out)[tigris_band_axis(plan, out, mode)];
+}
+
+int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_t *stage)
+{
+    if (!leading_band_stage(plan, stage)) return 0;
+    int32_t rows = leading_band_rows(plan, stage, derived_band_mode(plan, stage));
+    if (rows == 0) return 0;
+    uint16_t index = tigris_stage_ops(plan, stage)[0];
+    const tigris_op_t *op = &plan->ops[index];
+    if (op->op_type == TIGRIS_OP_SVDF || op->op_type == TIGRIS_OP_LSTM) return rows;
     const tigris_tensor_t *in = &plan->tensors[tigris_op_inputs(plan, op)[0]];
     const int32_t *shape = tigris_tensor_shape(plan, in);
     /* Preserve the meaning of existing matrix-row and height records. A rank-2
@@ -910,8 +942,7 @@ int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_
         tigris_stage_row_tiled(plan, stage, NULL, &row_band)) return 0;
     if ((in->ndim >= 2u && shape[in->ndim - 2u] > 1 && tigris_op_independent_band(plan, op, index, 1)) ||
         tigris_op_independent_band(plan, op, index, 0)) return 0;
-    const tigris_tensor_t *out = &plan->tensors[tigris_op_outputs(plan, op)[0]];
-    return tigris_tensor_shape(plan, out)[tigris_band_axis(plan, out, tigris_stage_band_mode(plan, stage))];
+    return rows;
 }
 
 
@@ -984,6 +1015,62 @@ int tigris_reshape_tile_valid(const tigris_tile_plan_t *tile,
            ((int64_t)view->input_rows * view->input_width) % view->output_width == 0;
 }
 
+/* The band kind a schema 11 record states, when the stage meets that kind's
+ * conditions: a 2D band exactly under an HW record, a band mode exactly for a
+ * leading band, and each kind's own rule. The loader checks the stripe and 2D
+ * contracts of the record's axis. */
+static tigris_band_kind_t stated_band_kind(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                           uint8_t axis, tigris_stage_band_t *out)
+{
+    static const tigris_band_kind_t kinds[TIGRIS_BAND_KIND_STRIPE + 1] = {
+        TIGRIS_BAND_KIND_NONE, TIGRIS_BAND_KIND_RESHAPE, TIGRIS_BAND_KIND_LEADING,
+        TIGRIS_BAND_KIND_ROWS, TIGRIS_BAND_KIND_TRANSPOSE, TIGRIS_BAND_KIND_BY_INPUT,
+        TIGRIS_BAND_KIND_HW, TIGRIS_BAND_KIND_STRIPE,
+    };
+    uint8_t stated = plan->tile_plans_v11[stage->tile_plan_idx].facts.band;
+    tigris_band_kind_t kind = TIGRIS_TILE_BAND_KIND(stated) <= (uint8_t)TIGRIS_BAND_KIND_STRIPE ?
+        kinds[TIGRIS_TILE_BAND_KIND(stated)] : TIGRIS_BAND_KIND_NONE;
+    int mode = (int)TIGRIS_TILE_BAND_MODE(stated);
+    if ((kind == TIGRIS_BAND_KIND_HW) != (axis == TIGRIS_TILE_AXIS_HW) ||
+        (kind == TIGRIS_BAND_KIND_LEADING) != (mode != 0))
+        return TIGRIS_BAND_KIND_NONE;
+    tigris_reshape_band_t view;
+    int holds = 0;
+    switch (kind) {
+    case TIGRIS_BAND_KIND_RESHAPE:
+        holds = tigris_reshape_band(plan, stage, &view);
+        out->rows = holds ? view.input_rows : 0;
+        break;
+    case TIGRIS_BAND_KIND_LEADING:
+        out->rows = leading_band_rows(plan, stage, mode);
+        out->mode = mode;
+        holds = out->rows > 0;
+        break;
+    case TIGRIS_BAND_KIND_ROWS:
+        holds = tigris_stage_row_tiled(plan, stage, &out->batch, &out->rows);
+        break;
+    case TIGRIS_BAND_KIND_TRANSPOSE:
+        holds = tigris_stage_tiled_transpose(plan, stage);
+        break;
+    case TIGRIS_BAND_KIND_BY_INPUT:
+        holds = tigris_stage_input_driven_reduction(plan, stage);
+        break;
+    case TIGRIS_BAND_KIND_HW:
+    case TIGRIS_BAND_KIND_STRIPE:
+        holds = 1;
+        break;
+    default:
+        break;
+    }
+    if (!holds) {
+        out->batch = 0;
+        out->rows = 0;
+        out->mode = 0;
+        return TIGRIS_BAND_KIND_NONE;
+    }
+    return kind;
+}
+
 tigris_band_kind_t tigris_stage_band_kind(const tigris_plan_t *plan, const tigris_stage_t *stage,
                                           tigris_stage_band_t *band)
 {
@@ -991,10 +1078,14 @@ tigris_band_kind_t tigris_stage_band_kind(const tigris_plan_t *plan, const tigri
     tigris_stage_band_t *out = band != NULL ? band : &unused;
     out->batch = 0;
     out->rows = 0;
+    out->mode = 0;
     if (plan == NULL || plan->header == NULL || stage == NULL)
         return TIGRIS_BAND_KIND_NONE;
     tigris_tile_plan_v10_t tile = tigris_stage_tiles(plan, stage);
     int banded = tile.tileable != 0u && tile.axis != TIGRIS_TILE_AXIS_NONE;
+    /* A schema 11 record comes from tile_plans_v11, which banded implies. */
+    if (plan->header->version >= TIGRIS_SCHEMA_VERSION_TILE_FACTS)
+        return banded ? stated_band_kind(plan, stage, tile.axis, out) : TIGRIS_BAND_KIND_NONE;
     if (banded) {
         tigris_reshape_band_t view;
         if (tigris_reshape_band(plan, stage, &view)) {
@@ -1004,6 +1095,7 @@ tigris_band_kind_t tigris_stage_band_kind(const tigris_plan_t *plan, const tigri
         int32_t leading = tigris_stage_leading_band(plan, stage);
         if (leading > 0) {
             out->rows = leading;
+            out->mode = derived_band_mode(plan, stage);
             return TIGRIS_BAND_KIND_LEADING;
         }
     }
@@ -4137,7 +4229,7 @@ int tigris_stage_tile_facts(const tigris_plan_t *plan, const tigris_stage_t *sta
     } else if (kind == TIGRIS_BAND_KIND_LEADING) {
         const tigris_op_t *op = &plan->ops[tigris_stage_ops(plan, stage)[0]];
         const tigris_tensor_t *band = &plan->tensors[tigris_op_inputs(plan, op)[0]];
-        out->band_axis = tigris_band_axis(plan, band, tigris_stage_band_mode(plan, stage));
+        out->band_axis = tigris_band_axis(plan, band, stage_band.mode);
         extent = (uint32_t)stage_band.rows;
         out->tile_extent = tile.input_band_extent;
     } else if (kind == TIGRIS_BAND_KIND_ROWS) {
@@ -4210,6 +4302,8 @@ int tigris_stage_tile_facts(const tigris_plan_t *plan, const tigris_stage_t *sta
     out->original_extent = (uint32_t)extent;
     out->num_tiles = (uint32_t)count;
     out->halo = (uint16_t)halo;
+    if (plan->header->version >= TIGRIS_SCHEMA_VERSION_TILE_FACTS)
+        out->band = (uint8_t)((uint32_t)kind | (uint32_t)stage_band.mode << 4);
     return 1;
 }
 
@@ -4470,6 +4564,15 @@ static tigris_error_t validate_stage(tigris_load_state_t *ctx, uint16_t i)
         const tigris_tile_plan_v10_t *wide = ctx->candidate.tile_plans_v11
             ? &ctx->candidate.tile_plans_v11[stage->tile_plan_idx].choices
             : ctx->candidate.tile_plans_v10 ? &ctx->candidate.tile_plans_v10[stage->tile_plan_idx] : NULL;
+        /* From schema 11 a tileable record states the band kind the stage
+         * runs by, and the stage has to meet that kind's conditions. */
+        tigris_stage_band_t stated_band = {0, 0, 0};
+        tigris_band_kind_t kind = TIGRIS_BAND_KIND_NONE;
+        if (ctx->candidate.tile_plans_v11) {
+            kind = tigris_stage_band_kind(&ctx->candidate, stage, &stated_band);
+            if (wide->tileable && kind == TIGRIS_BAND_KIND_NONE)
+                return TIGRIS_ERR_TILE_FACTS;
+        }
         if (wide) {
             if (!tile_v10_valid(&ctx->candidate, stage, wide))
                 return TIGRIS_ERR_BAD_OPERATOR;
@@ -4487,10 +4590,17 @@ static tigris_error_t validate_stage(tigris_load_state_t *ctx, uint16_t i)
                        ? TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH
                        : TIGRIS_TILE_AXIS_NONE);
         tigris_reshape_band_t reshape_view;
-        int reshape = tigris_reshape_band(&ctx->candidate, stage, &reshape_view);
-        if (reshape && tile->tileable && !wide && !tigris_reshape_tile_valid(tile, &reshape_view))
-            return TIGRIS_ERR_BAD_OPERATOR;
-        int32_t leading_rows = tigris_stage_leading_band(&ctx->candidate, stage);
+        int reshape;
+        int32_t leading_rows;
+        if (ctx->candidate.tile_plans_v11) {
+            reshape = kind == TIGRIS_BAND_KIND_RESHAPE;
+            leading_rows = kind == TIGRIS_BAND_KIND_LEADING ? stated_band.rows : 0;
+        } else {
+            reshape = tigris_reshape_band(&ctx->candidate, stage, &reshape_view);
+            if (reshape && tile->tileable && !wide && !tigris_reshape_tile_valid(tile, &reshape_view))
+                return TIGRIS_ERR_BAD_OPERATOR;
+            leading_rows = tigris_stage_leading_band(&ctx->candidate, stage);
+        }
         if (leading_rows && tile->tileable) {
             tigris_reshape_band_t band = {1, leading_rows, 1, leading_rows, 1, 0u};
             if (!wide && !tigris_reshape_tile_valid(tile, &band)) return TIGRIS_ERR_BAD_OPERATOR;

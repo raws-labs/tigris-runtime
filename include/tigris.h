@@ -525,7 +525,7 @@ typedef struct {
     uint32_t original_extent;         /*  8: extent the bands divide */
     uint16_t halo;                    /* 12: rows a band reads beyond its own */
     uint8_t band_axis;                /* 14: serialized axis the bands run along */
-    uint8_t _reserved;                /* 15: 0 */
+    uint8_t band;                     /* 15: band kind and mode, TIGRIS_TILE_BAND_* */
 } tigris_tile_facts_t;
 
 /** Schema-11 tile record, 48 bytes: the schema-10 choices and their facts. */
@@ -533,6 +533,19 @@ typedef struct {
     tigris_tile_plan_v10_t choices;   /*  0 */
     tigris_tile_facts_t facts;        /* 32 */
 } tigris_tile_plan_v11_t;
+
+/* The band byte of a schema 11 tile record states how the executor bands the
+ * stage: a tigris_band_kind_t (tigris_loader.h) in the low four bits and, for
+ * a leading band, its band mode in the high four, otherwise 0. */
+#define TIGRIS_TILE_BAND_KIND(band) ((uint8_t)((band) & 0x0Fu))
+#define TIGRIS_TILE_BAND_MODE(band) ((uint8_t)((band) >> 4))
+
+/* Leading band modes: the axis of each tensor a leading band runs along. */
+#define TIGRIS_BAND_LEADING 2u          /* the first axis whose extent is not 1 */
+#define TIGRIS_BAND_BATCH 3u            /* axis 0 */
+#define TIGRIS_BAND_TIME_MAJOR_BATCH 4u /* axis 1 of a rank-3 tensor, else axis 0 */
+#define TIGRIS_BAND_TRAILING 5u         /* the last axis */
+#define TIGRIS_BAND_AXIS_BASE 6u        /* plus the serialized axis */
 
 /* Which of the two axes a layout conversion's band runs along. Both sides
  * used to pick the longer one and agree only by coincidence when the two are

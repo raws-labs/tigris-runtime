@@ -1136,9 +1136,10 @@ static tigris_tile_plan_v11_t *tiled_record(uint8_t *buf)
     return (tigris_tile_plan_v11_t *)(buf + TILED_TILE_PLANS_OFF);
 }
 
-/* What the record states about its tiling. */
+/* What the record states about its tiling, and the band byte of its kind. */
 static void tiled_state_facts(uint8_t *buf, uint32_t tile_extent, uint32_t num_tiles,
-                              uint32_t original_extent, uint16_t halo, uint8_t band_axis)
+                              uint32_t original_extent, uint16_t halo, uint8_t band_axis,
+                              uint8_t band)
 {
     tigris_tile_facts_t *facts = &tiled_record(buf)->facts;
     facts->tile_extent = tile_extent;
@@ -1146,7 +1147,7 @@ static void tiled_state_facts(uint8_t *buf, uint32_t tile_extent, uint32_t num_t
     facts->original_extent = original_extent;
     facts->halo = halo;
     facts->band_axis = band_axis;
-    facts->_reserved = 0u;
+    facts->band = band;
 }
 
 /**
@@ -1231,7 +1232,7 @@ static void build_tiled_stage_plan(uint8_t *buf, uint8_t op_type, uint8_t ndim)
     tile->choices.tileable = 1;
     tile->choices.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
     tile->choices.tiled_peak_bytes = 128u;
-    tiled_state_facts(buf, 1u, ndim == 3u ? 4u : 8u, ndim == 3u ? 4u : 8u, 0u, 1u);
+    tiled_state_facts(buf, 1u, ndim == 3u ? 4u : 8u, ndim == 3u ? 4u : 8u, 0u, 1u, TIGRIS_BAND_KIND_TRANSPOSE);
 
     uint16_t *indices = (uint16_t *)(buf + TILED_INDEX_OFF);
     indices[0] = 0;  /* op input */
@@ -1549,8 +1550,10 @@ static void test_tiled_conversion_contract(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "rank-4 conversion may carry a height tile plan");
 
-    /* A permutation that also reorders the spatial pair is not a conversion. */
+    /* A permutation that also reorders the spatial pair is not a conversion,
+     * nor a height stripe. */
     build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 4);
+    tiled_record(buf)->facts.band = TIGRIS_BAND_KIND_STRIPE;
     buf[TILED_ATTR_DATA_OFF + 2u] = 2;
     buf[TILED_ATTR_DATA_OFF + 3u] = 1;
     ((int32_t *)(buf + TILED_SHAPES_OFF))[5] = 8;
@@ -1559,6 +1562,9 @@ static void test_tiled_conversion_contract(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_OPERATOR,
                    "a non-conversion permutation may not claim a tile plan");
+    tiled_record(buf)->facts.band = TIGRIS_BAND_KIND_TRANSPOSE;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_TILE_FACTS,
+                   "a non-conversion permutation is no banded transpose");
 
     /* Rank 2 has only the row band, and a Transpose does not keep rows
      * independent, so the stage qualifies for no tiling contract at all. */
@@ -1591,7 +1597,7 @@ static void test_tiled_reduction_contract(void)
     ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].size_bytes =
         8u * (uint32_t)sizeof(float);
     tiled_record(buf)->choices.input_band_extent = 1u;
-    tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u);
+    tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u, TIGRIS_BAND_KIND_BY_INPUT);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "a collapsed reduction may carry a height tile plan");
 
@@ -1599,6 +1605,7 @@ static void test_tiled_reduction_contract(void)
     build_tiled_stage_plan(buf, TIGRIS_OP_GLOBAL_AVG, 4);
     tiled_record(buf)->choices.input_band_extent = 0u;
     tiled_record(buf)->choices.output_band_extent = 1u;
+    tiled_record(buf)->facts.band = TIGRIS_BAND_KIND_STRIPE;
     shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
     shapes[4] = 1; shapes[5] = 1; shapes[6] = 2; shapes[7] = 8;
     ((tigris_tensor_t *)(buf + TILED_TENSORS_OFF))[1].size_bytes =
@@ -1943,7 +1950,7 @@ static void test_rank4_row_band_contract(void)
     tensors[0].flags |= TIGRIS_TENSOR_LINEAR;
     tensors[1].flags |= TIGRIS_TENSOR_LINEAR;
     tiled_record(buf)->choices.input_band_extent = 2u;
-    tiled_state_facts(buf, 2u, 2u, 4u, 0u, 2u);
+    tiled_state_facts(buf, 2u, 2u, 4u, 0u, 2u, TIGRIS_BAND_KIND_ROWS);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "a rank-4 row band loads");
 
@@ -1953,7 +1960,7 @@ static void test_rank4_row_band_contract(void)
     shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
     shapes[4] = 1; shapes[5] = 2; shapes[6] = 4; shapes[7] = 8;
     tiled_record(buf)->choices.output_band_extent = 1u;
-    tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u);
+    tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u, TIGRIS_BAND_KIND_STRIPE);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "the spatial reading of the same shapes still loads");
 }
@@ -2113,9 +2120,9 @@ static void test_tile_facts_contract(void)
     facts->band_axis = 2u;
     TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "wrong band axis refused");
     facts->band_axis = 1u;
-    facts->_reserved = 1u;
-    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "reserved byte must be zero");
-    facts->_reserved = 0u;
+    facts->band = TIGRIS_BAND_KIND_TRANSPOSE | TIGRIS_BAND_LEADING << 4;
+    TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS, "only a leading band states a mode");
+    facts->band = TIGRIS_BAND_KIND_TRANSPOSE;
 
     /* The run sizes a conversion's band, so the record's is only bounded, and the count follows it. */
     facts->tile_extent = 3u;
@@ -2135,7 +2142,7 @@ static void test_tile_facts_contract(void)
     /* Columns instead: the eight of them, one at a time. */
     build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 3u);
     tiled_record(buf)->choices.flags = TIGRIS_TILE_FLAG_BAND_ON_COLUMNS;
-    tiled_state_facts(buf, 1u, 8u, 8u, 0u, 2u);
+    tiled_state_facts(buf, 1u, 8u, 8u, 0u, 2u, TIGRIS_BAND_KIND_TRANSPOSE);
     TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_OK, "a band along the columns loads");
 
     /* An untileable record states no tiling. */
@@ -2156,7 +2163,7 @@ static void test_tile_facts_contract(void)
     tensors[0].flags |= TIGRIS_TENSOR_LINEAR;
     tensors[1].flags |= TIGRIS_TENSOR_LINEAR;
     tiled_record(buf)->choices.input_band_extent = 3u;
-    tiled_state_facts(buf, 3u, 2u, 4u, 0u, 1u);
+    tiled_state_facts(buf, 3u, 2u, 4u, 0u, 1u, TIGRIS_BAND_KIND_RESHAPE);
     TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_OK, "stated reshape facts load");
     check_reshape_band_execution(&plan, 96u);
     facts->original_extent = 8u;
@@ -2180,7 +2187,7 @@ static void test_tile_facts_contract(void)
     tensors[1].size_bytes = 28u;
     buf[TILED_ATTR_DATA_OFF] = 2;
     tiled_record(buf)->choices.input_band_extent = 3u;
-    tiled_state_facts(buf, 3u, 3u, 7u, 0u, 0u);
+    tiled_state_facts(buf, 3u, 3u, 7u, 0u, 0u, TIGRIS_BAND_KIND_LEADING | TIGRIS_BAND_LEADING << 4);
     TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_OK, "stated leading-band facts load");
     facts->band_axis = 1u;
     TEST_ASSERT_EQ(tile_facts_load(buf, &plan), TIGRIS_ERR_TILE_FACTS,
@@ -2213,7 +2220,7 @@ static void build_strided_stripe_plan(uint8_t *buf, uint32_t band)
     op->spatial.pad_top = 1; op->spatial.pad_bottom = 1;
     op->spatial.dilation_h = 1; op->spatial.dilation_w = 1;
     tiled_record(buf)->choices.output_band_extent = band;
-    tiled_state_facts(buf, band, (4u + band - 1u) / band, 4u, 2u, 1u);
+    tiled_state_facts(buf, band, (4u + band - 1u) / band, 4u, 2u, 1u, TIGRIS_BAND_KIND_STRIPE);
 }
 
 static tigris_exec_error_t run_strided_stripe(const tigris_plan_t *plan, const float *input,
@@ -2290,6 +2297,211 @@ static void test_stripe_runs_its_stated_band(void)
     TEST_ASSERT_EQ(stats.total_tiles, 0u, "before the first tile");
 }
 
+/* A sum over the last axis of [3, 2, 8] to [3, 2, 1], both in their own axis order, in a fast
+ * arena of 128 bytes. A row band cuts the two rows of each of the three matrices, a leading band
+ * the three matrices; the record states `band` and the facts of that kind. */
+static void build_reduce_band_plan(uint8_t *buf, uint8_t band)
+{
+    build_tiled_stage_plan(buf, TIGRIS_OP_REDUCE_MEAN, 3u);
+    ((tigris_file_header_t *)buf)->budget = 128u;
+    ((tigris_op_t *)(buf + TILED_OPS_OFF))->op_type = TIGRIS_OP_REDUCE_SUM;
+    int32_t *dims = (int32_t *)(buf + TILED_SHAPES_OFF);
+    dims[0] = 3; dims[1] = 2; dims[2] = 8;
+    dims[4] = 3; dims[5] = 2; dims[6] = 1;
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    tensors[0].size_bytes = 48u * (uint32_t)sizeof(float);
+    tensors[1].size_bytes = 6u * (uint32_t)sizeof(float);
+    tensors[0].flags |= TIGRIS_TENSOR_LINEAR;
+    tensors[1].flags |= TIGRIS_TENSOR_LINEAR;
+    buf[TILED_ATTR_DATA_OFF] = 2;
+    tiled_record(buf)->choices.input_band_extent = 1u;
+    if (TIGRIS_TILE_BAND_KIND(band) == TIGRIS_BAND_KIND_ROWS)
+        tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u, band);
+    else
+        tiled_state_facts(buf, 1u, 3u, 3u, 0u, 0u, band);
+}
+
+static tigris_exec_error_t run_reduce_band(const tigris_plan_t *plan, float *output,
+                                           tigris_exec_stats_t *stats)
+{
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[128], slow[512];
+    void *pointers[2] = {NULL, NULL};
+    float input[48];
+    for (uint32_t i = 0; i < 48u; i++)
+        input[i] = (float)((i * 5u) % 11u) - 5.0f;
+    tigris_mem_t mem;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, pointers, 2, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "reduction arenas");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, sizeof(input)), TIGRIS_MEM_OK, "input allocation");
+    TEST_ASSERT_EQ(tigris_input_write(plan, &mem, 0, input, sizeof(input)), TIGRIS_OK, "input write");
+    memset(stats, 0, sizeof(*stats));
+    tigris_exec_error_t err = tigris_run(plan, &mem, tigris_dispatch_kernel, NULL, stats);
+    if (err == TIGRIS_EXEC_OK)
+        TEST_ASSERT_EQ(tigris_output_read(plan, &mem, 1, output, 6u * sizeof(float)), TIGRIS_OK,
+                       "output read");
+    return err;
+}
+
+/* From schema 11 the record states the band kind, a leading band its mode,
+ * and the stage runs by the kind it states when it meets that kind's rule. */
+static void test_stated_band_kind(void)
+{
+    printf("  test_stated_band_kind...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+    tigris_tile_facts_t derived;
+    tigris_exec_stats_t stats;
+    float output[6], expected[6];
+    for (uint32_t m = 0; m < 6u; m++) {
+        expected[m] = 0.0f;
+        for (uint32_t c = 0; c < 8u; c++)
+            expected[m] += (float)(((m * 8u + c) * 5u) % 11u) - 5.0f;
+    }
+
+    /* The reduction meets both rules; each stated kind runs its own bands. */
+    build_reduce_band_plan(buf, TIGRIS_BAND_KIND_ROWS);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "a stated row band loads");
+    TEST_ASSERT_EQ(tigris_stage_tile_facts(&plan, &plan.stages[0], &derived), 1, "row facts derived");
+    TEST_ASSERT(memcmp(&derived, &tiled_record(buf)->facts, sizeof(derived)) == 0,
+                "the derived facts carry the stated row band");
+    TEST_ASSERT_EQ(run_reduce_band(&plan, output, &stats), TIGRIS_EXEC_OK, "the row band runs");
+    TEST_ASSERT_EQ(stats.total_tiles, 2u, "one band per row");
+    TEST_ASSERT(memcmp(output, expected, sizeof(output)) == 0, "row-banded sums match the reference");
+
+    build_reduce_band_plan(buf, TIGRIS_BAND_KIND_LEADING | TIGRIS_BAND_LEADING << 4);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "a stated leading band loads");
+    TEST_ASSERT_EQ(tigris_stage_tile_facts(&plan, &plan.stages[0], &derived), 1, "leading facts derived");
+    TEST_ASSERT(memcmp(&derived, &tiled_record(buf)->facts, sizeof(derived)) == 0,
+                "the derived facts carry the stated leading band");
+    memset(output, 0, sizeof(output));
+    TEST_ASSERT_EQ(run_reduce_band(&plan, output, &stats), TIGRIS_EXEC_OK, "the leading band runs");
+    TEST_ASSERT_EQ(stats.total_tiles, 3u, "one band per matrix");
+    TEST_ASSERT(memcmp(output, expected, sizeof(output)) == 0, "leading-banded sums match the reference");
+
+    /* A tileable record states a kind the stage meets, with a mode exactly for a leading band. */
+    static const struct {
+        uint8_t band;
+        const char *name;
+    } refused[] = {
+        {0u, "a tileable record without a band kind refused"},
+        {TIGRIS_BAND_KIND_RESHAPE, "a reduction is no Reshape band"},
+        {TIGRIS_BAND_KIND_TRANSPOSE, "a reduction is no banded transpose"},
+        {TIGRIS_BAND_KIND_BY_INPUT, "a reduction that keeps rows is not walked by input"},
+        {TIGRIS_BAND_KIND_HW, "a 2D band needs a 2D record"},
+        {8u, "an unknown band kind refused"},
+        {TIGRIS_BAND_KIND_ROWS | TIGRIS_BAND_LEADING << 4, "only a leading band states a mode"},
+        {TIGRIS_BAND_KIND_LEADING, "a leading band states its mode"},
+        {TIGRIS_BAND_KIND_LEADING | 1u << 4, "the row view is no leading band mode"},
+        {TIGRIS_BAND_KIND_LEADING | TIGRIS_BAND_BATCH << 4, "a batch band is a recurrent operator's"},
+        {TIGRIS_BAND_KIND_LEADING | TIGRIS_BAND_TRAILING << 4, "the summed axis cannot be banded"},
+        {TIGRIS_BAND_KIND_LEADING | (TIGRIS_BAND_AXIS_BASE + 3u) << 4, "an axis past the rank refused"},
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        build_reduce_band_plan(buf, TIGRIS_BAND_KIND_ROWS);
+        tiled_record(buf)->facts.band = refused[i].band;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_TILE_FACTS, refused[i].name);
+    }
+    build_reduce_band_plan(buf, TIGRIS_BAND_KIND_LEADING | TIGRIS_BAND_LEADING << 4);
+    tiled_record(buf)->choices.input_band_extent = 0u;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "a leading band states its input band");
+    /* The explicit axis of the leading band is the same band. */
+    build_reduce_band_plan(buf, TIGRIS_BAND_KIND_LEADING | TIGRIS_BAND_AXIS_BASE << 4);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "a leading band on axis 0 loads");
+    /* An untileable record states no kind. */
+    build_reduce_band_plan(buf, TIGRIS_BAND_KIND_ROWS);
+    memset(tiled_record(buf), 0, sizeof(tigris_tile_plan_v11_t));
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK, "an untileable record loads");
+    tiled_record(buf)->facts.band = TIGRIS_BAND_KIND_STRIPE;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_TILE_FACTS,
+                   "an untileable record with a band kind refused");
+}
+
+/* A rank-2 Relu on [8, 4], or a Transpose to [4, 8], at `version` with an untileable record. */
+static void build_untiled_matrix_plan(uint8_t *buf, uint8_t op_type, uint32_t version)
+{
+    build_tiled_stage_plan(buf, op_type, 2u);
+    ((tigris_file_header_t *)buf)->budget = 128u;
+    int32_t *shapes = (int32_t *)(buf + TILED_SHAPES_OFF);
+    shapes[0] = 8; shapes[1] = 4;
+    shapes[4] = op_type == TIGRIS_OP_TRANSPOSE ? 4 : 8;
+    shapes[5] = op_type == TIGRIS_OP_TRANSPOSE ? 8 : 4;
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
+    tensors[0].size_bytes = 32u * (uint32_t)sizeof(float);
+    tensors[1].size_bytes = 32u * (uint32_t)sizeof(float);
+    if (op_type == TIGRIS_OP_TRANSPOSE) {
+        ((tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u))->data_len = 2;
+        buf[TILED_ATTR_DATA_OFF] = 1;
+        buf[TILED_ATTR_DATA_OFF + 1u] = 0;
+    }
+    memset(tiled_record(buf), 0, sizeof(tigris_tile_plan_v11_t));
+    plan_set_version(buf, version);
+}
+
+/* Below schema 11 the runtime derives a row band or a banded transpose for a
+ * rank-2 stage and fails closed when the record leaves it untiled and it does
+ * not fit. From schema 11 an untileable record states no band kind, so the
+ * stage runs whole like any rank-2 stage without a band. */
+static void test_untileable_matrix_stage(void)
+{
+    printf("  test_untileable_matrix_stage...\n");
+    static const struct {
+        uint8_t op_type;
+        tigris_band_kind_t derived;
+        const char *name;
+    } stages[] = {
+        {TIGRIS_OP_RELU, TIGRIS_BAND_KIND_ROWS, "row"},
+        {TIGRIS_OP_TRANSPOSE, TIGRIS_BAND_KIND_TRANSPOSE, "transpose"},
+    };
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    float input[32], output[32], expected[32];
+    for (uint32_t i = 0; i < 32u; i++)
+        input[i] = (float)((i * 7u) % 13u) - 6.0f;
+    for (size_t c = 0; c < sizeof(stages) / sizeof(stages[0]); c++) {
+        for (uint32_t r = 0; r < 8u; r++) {
+            for (uint32_t k = 0; k < 4u; k++) {
+                float x = input[r * 4u + k];
+                if (stages[c].op_type == TIGRIS_OP_TRANSPOSE)
+                    expected[k * 8u + r] = x;
+                else
+                    expected[r * 4u + k] = x > 0.0f ? x : 0.0f;
+            }
+        }
+        for (uint32_t version = TIGRIS_SCHEMA_VERSION_V10; version <= TIGRIS_SCHEMA_VERSION_V11; version++) {
+            tigris_plan_t plan;
+            tigris_exec_stats_t stats;
+            _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[128], slow[512];
+            void *pointers[2] = {NULL, NULL};
+            tigris_mem_t mem;
+            int stated = version >= TIGRIS_SCHEMA_VERSION_V11;
+            printf("    %s stage, schema %u\n", stages[c].name, (unsigned)version);
+            build_untiled_matrix_plan(buf, stages[c].op_type, version);
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                           "an untileable matrix record loads");
+            TEST_ASSERT_EQ(tigris_stage_band_kind(&plan, &plan.stages[0], NULL),
+                           stated ? TIGRIS_BAND_KIND_NONE : stages[c].derived,
+                           "the band kind is derived below schema 11 and stated from it");
+            TEST_ASSERT_EQ(tigris_mem_init(&mem, pointers, 2, fast, sizeof(fast), slow, sizeof(slow)),
+                           TIGRIS_MEM_OK, "matrix arenas");
+            TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, sizeof(input)), TIGRIS_MEM_OK, "input allocation");
+            TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, input, sizeof(input)), TIGRIS_OK, "input write");
+            memset(&stats, 0, sizeof(stats));
+            memset(output, 0, sizeof(output));
+            tigris_exec_error_t err = tigris_run(&plan, &mem, tigris_dispatch_kernel, NULL, &stats);
+            if (!stated) {
+                TEST_ASSERT_EQ(err, TIGRIS_EXEC_ERR_TILE, "a derived band the record leaves untiled fails closed");
+                continue;
+            }
+            TEST_ASSERT_EQ(err, TIGRIS_EXEC_OK, "a stage without a stated band kind runs");
+            TEST_ASSERT_EQ(stats.stages_normal, 1u, "the stage ran whole");
+            TEST_ASSERT_EQ(stats.stages_tiled, 0u, "the stage ran in no band");
+            TEST_ASSERT_EQ(tigris_output_read(&plan, &mem, 1, output, sizeof(output)), TIGRIS_OK,
+                           "output read");
+            TEST_ASSERT(memcmp(output, expected, sizeof(output)) == 0, "whole-stage outputs match the reference");
+        }
+    }
+}
+
 /* The tiled plan from [1, 2, 4, 8] to [1, out_h, out_w, 8] with a 2D record of one row by one column. */
 static void build_hw_record_plan(uint8_t *buf, uint8_t op_type, int32_t out_h, int32_t out_w)
 {
@@ -2302,7 +2514,7 @@ static void build_hw_record_plan(uint8_t *buf, uint8_t op_type, int32_t out_h, i
     tile->choices.axis = TIGRIS_TILE_AXIS_HW;
     tile->choices.output_band_extent = 1u;
     tile->choices.output_width_extent = 1u;
-    tiled_state_facts(buf, 1u, (uint32_t)(out_h * out_w), (uint32_t)out_h, 0u, 1u);
+    tiled_state_facts(buf, 1u, (uint32_t)(out_h * out_w), (uint32_t)out_h, 0u, 1u, TIGRIS_BAND_KIND_HW);
 }
 
 /* A stage over t0 [1, 4, 4, 8] and t1 of `shape` under a 2D record of one row
@@ -2387,7 +2599,7 @@ static void build_hw_two_input_plan(uint8_t *buf, const int32_t *shape, uint8_t 
     tile->choices.output_band_extent = 1u;
     tile->choices.output_width_extent = 1u;
     tile->facts = (tigris_tile_facts_t){.tile_extent = 1u, .num_tiles = 16u, .original_extent = 4u,
-                                        .halo = 0u, .band_axis = 1u};
+                                        .halo = 0u, .band_axis = 1u, .band = TIGRIS_BAND_KIND_HW};
 }
 
 /* A 2D record sends its stage to the 2D executor, which bands rank-4 stage
@@ -2483,6 +2695,7 @@ typedef struct {
     long cases;
     long exclusive_failures;
     long order_failures;
+    long stated_failures;
     long reshape_rows;
     long leading_rows;
 } band_sweep_counts_t;
@@ -2525,6 +2738,7 @@ static void sweep_case(band_sweep_t *sweep, band_sweep_counts_t *counts)
         {1u, TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH},
         {1u, TIGRIS_TILE_AXIS_HW},
     };
+    int mode = 0;
     int reshape = tigris_reshape_band(plan, stage, &view);
     int leading = tigris_stage_leading_band(plan, stage) > 0;
     int row = tigris_stage_row_tiled(plan, stage, &batch, &rows);
@@ -2558,7 +2772,44 @@ static void sweep_case(band_sweep_t *sweep, band_sweep_counts_t *counts)
         if (tigris_stage_band_kind(plan, stage, &band) != want || band.rows != want_rows ||
             band.batch != (want == TIGRIS_BAND_KIND_ROWS ? batch : 0))
             counts->order_failures++;
+        if (want == TIGRIS_BAND_KIND_LEADING)
+            mode = band.mode;
     }
+    /* From schema 11 the record states the kind, which the stage meets exactly
+     * when that kind's own rule holds, and a leading band where the order
+     * above finds one with the mode it found. */
+    sweep->header.version = TIGRIS_SCHEMA_VERSION_V11;
+    plan->tile_plans_v10 = NULL;
+    plan->tile_plans_v11 = &sweep->tile;
+    sweep->stage.tile_plan_idx = 0u;
+    sweep->tile.choices.tileable = 1u;
+    for (uint8_t r = 1u; r < 3u; r++) {
+        int hw = records[r][1] == TIGRIS_TILE_AXIS_HW;
+        sweep->tile.choices.axis = records[r][1];
+        for (uint8_t kind = 0u; kind <= 8u; kind++) {
+            sweep->tile.facts.band = kind == TIGRIS_BAND_KIND_LEADING ? (uint8_t)(kind | mode << 4) : kind;
+            int holds = !hw && ((kind == TIGRIS_BAND_KIND_RESHAPE && reshape) ||
+                (kind == TIGRIS_BAND_KIND_LEADING && leading) || (kind == TIGRIS_BAND_KIND_ROWS && row) ||
+                (kind == TIGRIS_BAND_KIND_TRANSPOSE && transpose) ||
+                (kind == TIGRIS_BAND_KIND_BY_INPUT && by_input) || kind == TIGRIS_BAND_KIND_STRIPE);
+            if (kind == TIGRIS_BAND_KIND_HW)
+                holds = hw;
+            tigris_stage_band_t band;
+            tigris_band_kind_t got = tigris_stage_band_kind(plan, stage, &band);
+            if (kind == TIGRIS_BAND_KIND_LEADING && !leading && !hw)
+                continue;
+            int32_t want_rows = !holds ? 0 : kind == TIGRIS_BAND_KIND_RESHAPE ? view.input_rows :
+                kind == TIGRIS_BAND_KIND_LEADING ? tigris_stage_leading_band(plan, stage) :
+                kind == TIGRIS_BAND_KIND_ROWS ? rows : 0;
+            if (got != (holds ? (tigris_band_kind_t)kind : TIGRIS_BAND_KIND_NONE) || band.rows != want_rows ||
+                band.mode != (holds && kind == TIGRIS_BAND_KIND_LEADING ? mode : 0))
+                counts->stated_failures++;
+        }
+    }
+    sweep->tile.facts.band = 0u;
+    sweep->header.version = TIGRIS_SCHEMA_VERSION_V10;
+    plan->tile_plans_v11 = NULL;
+    plan->tile_plans_v10 = &sweep->tile.choices;
 }
 
 /* The operator's own attributes: a permutation, one reduced axis, or pads on one axis. */
@@ -2601,9 +2852,9 @@ static void sweep_attributes(band_sweep_t *sweep, band_sweep_counts_t *counts)
 }
 
 /*
- * The executor and the tile facts take a stage's band kind in one order:
+ * Below schema 11 the executor takes a stage's band kind in one order:
  * reshape, leading, rows, transpose, by input, 2D, stripe; a tile record
- * checks leading before reshape. Over single-operator stages of every
+ * checks leading before reshape. From schema 11 the record states it. Over single-operator stages of every
  * operator, shapes of rank 2 to 4 with extents 1 and 3, either axis order
  * flag, unit and full second operands and a full-size constant, no Reshape is
  * a leading band, and a banded transpose or a global reduction by input is no
@@ -2618,7 +2869,7 @@ static void test_band_kind_order(void)
     memset(&sweep, 0, sizeof(sweep));
     memset(&counts, 0, sizeof(counts));
     tigris_plan_t *plan = &sweep.plan;
-    sweep.header.version = TIGRIS_SCHEMA_VERSION;
+    sweep.header.version = TIGRIS_SCHEMA_VERSION_V10;
     sweep.header.num_tensors = 3u;
     sweep.header.num_ops = 1u;
     sweep.header.num_stages = 1u;
@@ -2632,7 +2883,7 @@ static void test_band_kind_order(void)
     plan->shape_pool = sweep.shapes;
     plan->op_attributes = &sweep.attribute;
     plan->op_attribute_data = sweep.attribute_data;
-    plan->tile_plans_v11 = &sweep.tile;
+    plan->tile_plans_v10 = &sweep.tile.choices;
     plan->weight_entries = &sweep.weight;
     /* Operator inputs 0 and 1, its output, the stage operator, stage inputs, stage output. */
     const uint16_t pool[7] = {0u, 1u, 2u, 0u, 0u, 1u, 2u};
@@ -2708,8 +2959,18 @@ static void test_band_kind_order(void)
            counts.cases, counts.reshape_rows, counts.leading_rows);
     TEST_ASSERT_EQ(counts.exclusive_failures, 0, "reshape, leading, transpose and by-input bands exclude each other");
     TEST_ASSERT_EQ(counts.order_failures, 0, "the band kind follows the executor's order");
+    TEST_ASSERT_EQ(counts.stated_failures, 0, "a stated band kind holds exactly where its rule does");
     TEST_ASSERT(counts.reshape_rows > 0, "the sweep reaches a Reshape that is also a row band");
     TEST_ASSERT(counts.leading_rows > 0, "the sweep reaches a leading band that is also a row band");
+
+    /* Below schema 11 a stage without inputs keeps the executor's order too. */
+    sweep.stage.inputs_count = 0u;
+    sweep.stage.tile_plan_idx = 0u;
+    sweep.tile.choices.tileable = 1u;
+    sweep.tile.choices.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    int32_t replayed_rows = 0;
+    TEST_ASSERT_EQ(tigris_stage_band_kind(plan, &sweep.stage, NULL),
+                   replayed_band_kind(plan, &sweep.stage, &replayed_rows), "a stage without inputs");
 
     TEST_ASSERT_EQ(tigris_stage_band_kind(NULL, &sweep.stage, NULL), TIGRIS_BAND_KIND_NONE, "NULL plan");
     TEST_ASSERT_EQ(tigris_stage_band_kind(plan, NULL, NULL), TIGRIS_BAND_KIND_NONE, "NULL stage");
@@ -3348,7 +3609,7 @@ static void test_native_reduction_tiling_contract(void)
         plan_finish(buf);
         /* A band of one of the four rows. */
         tiled_record(buf)->choices.input_band_extent = 1u;
-        tiled_state_facts(buf, 1u, 4u, 4u, 0u, 1u);
+        tiled_state_facts(buf, 1u, 4u, 4u, 0u, 1u, TIGRIS_BAND_KIND_LEADING | TIGRIS_BAND_LEADING << 4);
         ((tigris_op_t *)(buf + TILED_OPS_OFF))->op_type = kinds[k];
         tigris_stage_t *stage = (tigris_stage_t *)(buf + TILED_STAGES_OFF);
         tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + TILED_TENSORS_OFF);
@@ -3368,7 +3629,7 @@ static void test_native_reduction_tiling_contract(void)
         TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                        "native reduction plan loads without tiling");
         stage->tile_plan_idx = 0;
-        /* The stage bands along its trailing axis, so a stated height band disagrees with the plan. */
+        /* The stage keeps only its trailing axis independent, so a leading band along the height is refused. */
         TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_TILE_FACTS,
                        "native reductions and scans refuse height tiling");
     }
@@ -3768,6 +4029,7 @@ static void test_prelu_tiling_contract(void)
         tile.facts.num_tiles = rows;
         tile.facts.original_extent = rows;
         tile.facts.band_axis = rank == 2u ? 0u : 1u;
+        tile.facts.band = rank == 2u ? TIGRIS_BAND_KIND_ROWS : TIGRIS_BAND_KIND_STRIPE;
         memcpy(buf + tile_off, &tile, sizeof(tile));
         TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                        "constant-alpha PRelu accepts row, sequence, and image height tiling");
@@ -3797,7 +4059,7 @@ static void test_activation_tiling_contract(void)
                 tiled_record(buf)->choices.input_band_extent = 1u;
             else
                 tiled_record(buf)->choices.output_band_extent = 1u;
-            tiled_state_facts(buf, 1u, rows, rows, 0u, rank == 2u ? 0u : 1u);
+            tiled_state_facts(buf, 1u, rows, rows, 0u, rank == 2u ? 0u : 1u, rank == 2u ? TIGRIS_BAND_KIND_ROWS : TIGRIS_BAND_KIND_STRIPE);
             if (kinds[k] == TIGRIS_OP_L2_NORMALIZATION) {
                 tigris_section_entry_t *dir = (tigris_section_entry_t *)(buf + sizeof(tigris_file_header_t));
                 dir[7] = (tigris_section_entry_t){TIGRIS_SEC_OP_ATTRIBUTES, TILED_ATTRS_OFF};
@@ -3830,7 +4092,7 @@ static void test_activation_tiling_contract(void)
     int32_t *dims = (int32_t *)(buf + TILED_SHAPES_OFF);
     memcpy(dims + 4, dims, 4u * sizeof(int32_t));
     tiled_record(buf)->choices.output_band_extent = 1u;
-    tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u);
+    tiled_state_facts(buf, 1u, 2u, 2u, 0u, 1u, TIGRIS_BAND_KIND_STRIPE);
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
                    "L2Pool supports image height tiling");
 }
@@ -3851,7 +4113,7 @@ static void test_resize_scale_guards(void)
     tensors[1].size_bytes = 7u * 4u * 4u * 4u;
     /* One output row at a time, each reading the two source rows around it. */
     tiled_record(buf)->choices.output_band_extent = 1u;
-    tiled_state_facts(buf, 1u, 7u, 7u, 1u, 1u);
+    tiled_state_facts(buf, 1u, 7u, 7u, 1u, 1u, TIGRIS_BAND_KIND_STRIPE);
     tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + TILED_ATTRS_OFF + 4u);
     attr->type = TIGRIS_OP_ATTR_RESIZE_SCALES;
     attr->data_len = 8;
@@ -5445,6 +5707,7 @@ static void check_state_batch_bands(const tigris_plan_t *original, const state_g
     tigris_tile_plan_v10_t tile = {0};
     if (header.num_ops > 8u) return;
     int found = 0;
+    int mode = 0;
     uint16_t at = 0u;
     for (uint16_t j = 0u; j < header.num_ops; j++) {
         ops[j] = original->ops[j];
@@ -5473,6 +5736,8 @@ static void check_state_batch_bands(const tigris_plan_t *original, const state_g
             if (batch <= 1) return;
             stages[j].tile_plan_idx = 0u;
             found = 1;
+            int own = time_major ? (int)TIGRIS_BAND_TIME_MAJOR_BATCH : (int)TIGRIS_BAND_BATCH;
+            mode = mode == 0 || mode == own ? own : -1;
         }
     }
     if (!found) return;
@@ -5501,6 +5766,25 @@ static void check_state_batch_bands(const tigris_plan_t *original, const state_g
         TEST_ASSERT(memcmp(output, (const uint8_t *)golden->output + run * golden->output_bytes,
                            golden->output_bytes) == 0, "batch state sequence matches TFLite Micro");
     }
+    /* From schema 11 the record states the batch band, in the operator's own mode only. */
+    tigris_tile_plan_v11_t stated = {.choices = tile};
+    stated.facts.band = (uint8_t)(TIGRIS_BAND_KIND_LEADING | (uint32_t)mode << 4);
+    header.version = TIGRIS_SCHEMA_VERSION_V11;
+    plan.tile_plans_v10 = NULL;
+    plan.tile_plans_v11 = &stated;
+    TEST_ASSERT_EQ(tigris_state_init(&plan, state, state_size), TIGRIS_EXEC_OK, "stated state init");
+    for (uint32_t run = 0u; mode > 0 && run < golden->runs; run++) {
+        TEST_ASSERT_EQ(run_with_state_once(&plan, state, state_size,
+                       (const uint8_t *)golden->input + run * golden->input_bytes, golden->input_bytes,
+                       output, golden->output_bytes, 256u), TIGRIS_EXEC_OK, "stated batch run");
+        TEST_ASSERT(memcmp(output, (const uint8_t *)golden->output + run * golden->output_bytes,
+                           golden->output_bytes) == 0, "stated batch bands match TFLite Micro");
+    }
+    stated.facts.band = (uint8_t)(TIGRIS_BAND_KIND_LEADING | TIGRIS_BAND_LEADING << 4);
+    for (uint16_t j = 0u; j < header.num_stages; j++)
+        if (stages[j].tile_plan_idx == 0u)
+            TEST_ASSERT_EQ(tigris_stage_band_kind(&plan, &stages[j], NULL), TIGRIS_BAND_KIND_NONE,
+                           "a recurrent operator bands only its batch");
     free(state);
 }
 
@@ -6001,6 +6285,8 @@ int main(void)
     test_reshape_band_contract();
     test_tile_facts_contract();
     test_stripe_runs_its_stated_band();
+    test_stated_band_kind();
+    test_untileable_matrix_stage();
     test_hw_record_contract();
     test_band_kind_order();
     test_float_section();

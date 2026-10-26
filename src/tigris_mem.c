@@ -5,6 +5,7 @@
 
 #include "tigris_mem.h"
 #include "tigris_executor.h"
+#include "tigris_mem_internal.h"
 
 #include <string.h>
 

@@ -8,6 +8,7 @@
 #include "tigris_binary_operands.h"
 #include "tigris_io_in_fast.h"
 #include "tigris_lz4.h"
+#include "tigris_mem_internal.h"
 #include "tigris_kernel_window.h"
 
 #include <string.h>

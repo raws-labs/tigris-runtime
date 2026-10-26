@@ -13,6 +13,7 @@
 #include "tigris.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
+#include "tigris_mem_internal.h"
 #include "tigris_kernels_s8.h"
 #include "elementwise_s8_golden.h"
 #include "test_harness.h"

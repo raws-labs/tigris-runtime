@@ -1,10 +1,11 @@
 """Record comparison, logical, selection, cast and sum reference outputs."""
 
-from importlib.metadata import version
 import math
 from pathlib import Path
 
-from generate_elementwise_goldens import REFERENCE_VERSION, flatbuffers, np, runtime, schema
+from generate_elementwise_goldens import (
+    c_array, check_reference, np, operator_model, preamble, runtime, schema, serialize,
+)
 
 KINDS = dict(zip(("EQUAL", "LESS", "LESS_EQUAL", "GREATER", "GREATER_EQUAL",
                   "LOGICAL_AND", "LOGICAL_OR", "LOGICAL_NOT", "SELECT_V2", "CAST", "ADD_N"), range(73, 84)))
@@ -14,16 +15,7 @@ TYPES = {np.dtype("float32"): (schema.TensorType.FLOAT32, 1),
 
 
 def model_bytes(kind, arrays, target, dtype, scales, zeros):
-    model = schema.ModelT()
-    model.version = 3
-    code = schema.OperatorCodeT()
-    code.builtinCode = getattr(schema.BuiltinOperator, kind)
-    code.deprecatedBuiltinCode = min(code.builtinCode, 127)
-    code.version = 1
-    model.operatorCodes = [code]
-    model.buffers = [schema.BufferT()]
-    graph = schema.SubGraphT()
-    graph.tensors = []
+    model, graph = operator_model(kind)
     for i, array in enumerate([*arrays, np.zeros(target, dtype)]):
         slot = i if i < len(arrays) else 3
         tensor = schema.TensorT()
@@ -45,10 +37,7 @@ def model_bytes(kind, arrays, target, dtype, scales, zeros):
         op.builtinOptions.inDataType = TYPES[arrays[0].dtype][0]
         op.builtinOptions.outDataType = TYPES[np.dtype(dtype)][0]
     graph.inputs, graph.outputs, graph.operators = op.inputs, op.outputs, [op]
-    model.subgraphs = [graph]
-    builder = flatbuffers.Builder(4096)
-    builder.Finish(model.Pack(builder), file_identifier=b"TFL3")
-    return bytes(builder.Output())
+    return serialize(model)
 
 
 def multiplier(scale):
@@ -108,10 +97,8 @@ def cases():
 
 
 def main():
-    if version("tflite-micro") != REFERENCE_VERSION:
-        raise RuntimeError(f"Requires tflite-micro=={REFERENCE_VERSION}")
-    lines = [f"/* TFLite Micro {REFERENCE_VERSION}; test/generate_bool_goldens.py. */",
-             "#ifndef TIGRIS_BOOL_GOLDEN_H", "#define TIGRIS_BOOL_GOLDEN_H",
+    check_reference()
+    lines = [*preamble("generate_bool_goldens.py", "TIGRIS_BOOL_GOLDEN_H"),
              "typedef struct {", "    uint8_t op, inputs, ranks[4], dtypes[4];",
              "    int32_t shapes[20], zeros[4], requant[5];", "    float scales[4];",
              "    uint32_t sizes[4];", "    const uint8_t *data[4];", "} bool_golden_t;"]
@@ -126,11 +113,7 @@ def main():
             shapes.extend([*array.shape, *([1] * (5 - array.ndim))] if array is not None else [1] * 5)
             sizes.append(array.nbytes if array is not None else 0)
             if array is not None:
-                lines.append(f"static const uint8_t {names[-1]}[] = {{")
-                data = array.tobytes()
-                for start in range(0, len(data), 24):
-                    lines.append("    " + ", ".join(str(v) for v in data[start:start + 24]) + ",")
-                lines.append("};")
+                lines += c_array("uint8_t", names[-1], array.tobytes(), 24)
         fmt = lambda values: "{" + ", ".join(map(str, values)) + "}"
         records.append("    {" + f"{KINDS[kind]}, {len(inputs)}, " + ", ".join(fmt(v) for v in (ranks, dtypes, shapes, zeros, requant,
                         [f"{float(np.float32(s)):.9e}f" for s in scales], sizes, names)) + "},")

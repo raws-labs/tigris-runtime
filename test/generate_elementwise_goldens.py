@@ -16,7 +16,20 @@ FLOAT_OPERATORS = (*OPERATORS, "NEG", "EXP", "LOG", "SQRT", "SQUARE",
                    "FLOOR", "CEIL", "ROUND", "SIN", "COS", "FLOOR_DIV", "FLOOR_MOD")
 
 
-def model_bytes(operation, count, scales, zeros, inputs, dtype=schema.TensorType.INT8):
+def check_reference():
+    """Refuse to record with any TFLite Micro but the pinned one."""
+    if version("tflite-micro") != REFERENCE_VERSION:
+        raise RuntimeError(f"Requires tflite-micro=={REFERENCE_VERSION}")
+
+
+def preamble(script, guard, *notes):
+    """A header's first lines: its source, any notes, and its include guard."""
+    return [f"/* TFLite Micro {REFERENCE_VERSION}; test/{script}. */", *notes,
+            f"#ifndef {guard}", f"#define {guard}"]
+
+
+def operator_model(operation):
+    """A model with one subgraph and one operator code, `operation`."""
     model = schema.ModelT()
     model.version = 3
     code = schema.OperatorCodeT()
@@ -26,8 +39,30 @@ def model_bytes(operation, count, scales, zeros, inputs, dtype=schema.TensorType
     model.operatorCodes = [code]
     model.buffers = [schema.BufferT()]
     graph = schema.SubGraphT()
-    graph.name = operation.encode()
     graph.tensors = []
+    model.subgraphs = [graph]
+    return model, graph
+
+
+def serialize(model):
+    builder = flatbuffers.Builder(4096)
+    builder.Finish(model.Pack(builder), file_identifier=b"TFL3")
+    return bytes(builder.Output())
+
+
+def c_array(ctype, name, values, per_row, integer=True):
+    """A C array definition, per_row values to a line."""
+    lines = [f"static const {ctype} {name}[] = {{"]
+    for start in range(0, len(values), per_row):
+        row = values[start:start + per_row]
+        lines.append("    " + ", ".join(str(int(v)) if integer else f"{float(v):.9e}f"
+                                        for v in row) + ",")
+    return lines + ["};"]
+
+
+def model_bytes(operation, count, scales, zeros, inputs, dtype=schema.TensorType.INT8):
+    model, graph = operator_model(operation)
+    graph.name = operation.encode()
     for index in range(inputs + 1):
         slot = index if index < inputs else 2
         tensor = schema.TensorT()
@@ -51,10 +86,7 @@ def model_bytes(operation, count, scales, zeros, inputs, dtype=schema.TensorType
     graph.inputs = op.inputs
     graph.outputs = op.outputs
     graph.operators = [op]
-    model.subgraphs = [graph]
-    builder = flatbuffers.Builder(4096)
-    builder.Finish(model.Pack(builder), file_identifier=b"TFL3")
-    return bytes(builder.Output())
+    return serialize(model)
 
 
 def high_mul(a, b):
@@ -158,21 +190,12 @@ def cases():
             yield operation, config, scales, zeros, arrays, expected, wide
 
 
-def c_array(name, values):
-    lines = [f"static const int8_t {name}[] = {{"]
-    for start in range(0, len(values), 16):
-        lines.append("    " + ", ".join(str(int(v)) for v in values[start:start + 16]) + ",")
-    return "\n".join(lines + ["};", ""])
-
-
 def main():
-    if version("tflite-micro") != REFERENCE_VERSION:
-        raise RuntimeError(f"Requires tflite-micro=={REFERENCE_VERSION}")
-    lines = [f"/* TFLite Micro {REFERENCE_VERSION}; test/generate_elementwise_goldens.py. */",
-             "/* Listed DIV entries use wide mask/remainder/threshold rounding because",
-             " * the reference's int32 rounding shift is >= 32; all other bytes are from the wheel. */",
-             "#ifndef TIGRIS_ELEMENTWISE_S8_GOLDEN_H",
-             "#define TIGRIS_ELEMENTWISE_S8_GOLDEN_H", "",
+    check_reference()
+    lines = [*preamble("generate_elementwise_goldens.py", "TIGRIS_ELEMENTWISE_S8_GOLDEN_H",
+                       "/* Listed DIV entries use wide mask/remainder/threshold rounding because",
+                       " * the reference's int32 rounding shift is >= 32; all other bytes are from the wheel. */"),
+             "",
              "typedef struct {", "    uint8_t operation;", "    float scales[3];",
              "    int32_t zeros[3];", "    uint32_t count;",
              "    const int8_t *input_a;", "    const int8_t *input_b;",
@@ -180,14 +203,14 @@ def main():
     records = []
     for operation, config, scales, zeros, arrays, expected, wide in cases():
         name = f"golden_{operation.lower()}_{config}"
-        lines.append(c_array(name + "_a", arrays[0]))
+        lines += c_array("int8_t", name + "_a", arrays[0], 16) + [""]
         if len(arrays) == 2:
-            lines.append(c_array(name + "_b", arrays[1]))
+            lines += c_array("int8_t", name + "_b", arrays[1], 16) + [""]
         if wide:
             lines.append("/* Wide DIV entries: index, raw numerator, raw denominator, exponent.")
             lines += [f" * {index}, {a}, {b}, {exponent}" for index, a, b, exponent in wide]
             lines.append(" */")
-        lines.append(c_array(name + "_y", expected))
+        lines += c_array("int8_t", name + "_y", expected, 16) + [""]
         c_scales = ", ".join(f"{float(np.float32(v)):.9e}f" for v in scales)
         c_zeros = ", ".join(str(v) for v in zeros)
         records.append(f"    {{TIGRIS_OP_{operation}, {{{c_scales}}}, {{{c_zeros}}}, "
@@ -202,9 +225,7 @@ def main():
 
 
 def write_float_cases():
-    lines = [f"/* TFLite Micro {REFERENCE_VERSION}; test/generate_elementwise_goldens.py. */",
-             "#ifndef TIGRIS_ELEMENTWISE_F32_GOLDEN_H",
-             "#define TIGRIS_ELEMENTWISE_F32_GOLDEN_H", "",
+    lines = [*preamble("generate_elementwise_goldens.py", "TIGRIS_ELEMENTWISE_F32_GOLDEN_H"), "",
              "typedef struct {", "    uint8_t operation;", "    uint8_t inputs;",
              "    float a[16];", "    float b[16];", "    float y[16];",
              "} elementwise_float_golden_t;", "",

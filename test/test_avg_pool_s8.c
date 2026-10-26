@@ -13,6 +13,7 @@
 #include "tigris_kernels_s8.h"
 #include "tigris_mem.h"
 #include "test_harness.h"
+#include "plan_fixture.h"
 
 #define TEST_H             16
 #define TEST_W              4
@@ -28,7 +29,7 @@ typedef struct {
     tigris_op_t op;
     tigris_stage_t stage;
     int32_t shapes[8];
-    uint16_t indices[7];
+    uint16_t indices[PLAN_FIXTURE_POOL(1)];
     tigris_quant_param_t quant_params[2];
     tigris_plan_t plan;
 } avg_fixture_t;
@@ -36,14 +37,10 @@ typedef struct {
 static void build_fixture(avg_fixture_t *fx)
 {
     memset(fx, 0, sizeof(*fx));
+    plan_fixture_chain(&fx->plan, &fx->header, fx->tensors, &fx->op, &fx->stage,
+                       fx->indices, fx->shapes, 1, 0);
 
-    fx->header.num_tensors = 2;
-    fx->header.num_ops = 1;
-    fx->header.num_stages = 1;
     fx->header.num_quant_params = 2;
-    fx->header.num_model_inputs = 1;
-    fx->header.num_model_outputs = 1;
-    fx->header.model_io_off = 5;
 
     for (uint16_t i = 0; i < 2; i++) {
         fx->tensors[i].size_bytes = TEST_ELEMENTS;
@@ -66,19 +63,7 @@ static void build_fixture(avg_fixture_t *fx)
     fx->quant_params[1].zero_point = 5;
     fx->quant_params[1].num_channels = 1;
 
-    fx->indices[0] = 0; /* op input */
-    fx->indices[1] = 1; /* op output */
-    fx->indices[2] = 0; /* stage op */
-    fx->indices[3] = 0; /* stage input */
-    fx->indices[4] = 1; /* stage output */
-    fx->indices[5] = 0; /* model input */
-    fx->indices[6] = 1; /* model output */
-
     fx->op.op_type = TIGRIS_OP_AVG_POOL;
-    fx->op.num_inputs = 1;
-    fx->op.num_outputs = 1;
-    fx->op.inputs_off = 0;
-    fx->op.outputs_off = 1;
     fx->op.weight_idx = TIGRIS_NO_WEIGHT;
     fx->op.bias_idx = TIGRIS_NO_WEIGHT;
     fx->op.act_min = -128;
@@ -92,25 +77,8 @@ static void build_fixture(avg_fixture_t *fx)
     fx->op.spatial.pad_left = 1;
     fx->op.spatial.pad_right = 1;
 
-    fx->stage.ops_off = 2;
-    fx->stage.ops_count = 1;
-    fx->stage.inputs_off = 3;
-    fx->stage.inputs_count = 1;
-    fx->stage.outputs_off = 4;
-    fx->stage.outputs_count = 1;
-    fx->stage.tile_plan_idx = TIGRIS_NO_TILE_PLAN;
-    fx->stage.chain_id = TIGRIS_NO_CHAIN;
-
-    fx->plan.header = &fx->header;
-    fx->plan.tensors = fx->tensors;
-    fx->plan.ops = &fx->op;
-    fx->plan.stages = &fx->stage;
-    fx->plan.index_pool = fx->indices;
-    fx->plan.shape_pool = fx->shapes;
     fx->plan.quant_params = fx->quant_params;
     fx->plan.num_quant_params = 2;
-    fx->plan.model_inputs = &fx->indices[5];
-    fx->plan.model_outputs = &fx->indices[6];
 }
 
 static int32_t round_divide_away_from_zero(int32_t value, int32_t divisor)

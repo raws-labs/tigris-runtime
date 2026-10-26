@@ -17,6 +17,8 @@
 #include "tigris_kernels.h"
 #include "tigris_mem.h"
 #include "test_harness.h"
+#include "trace_assert.h"
+#include "plan_fixture.h"
 
 #define TEST_N     1
 #define TEST_LONG 64
@@ -35,24 +37,19 @@ typedef struct {
     tigris_op_attribute_t attribute;
     uint8_t perm[4];
     int32_t shapes[8];
-    uint16_t indices[7];
+    uint16_t indices[PLAN_FIXTURE_POOL(1)];
     tigris_plan_t plan;
 } transpose_fixture_t;
 
 /** One Transpose stage permuting [N, rows, cols] to [N, cols, rows]. */
-#include "trace_assert.h"
-
 static void build_fixture(transpose_fixture_t *fx, int32_t rows, int32_t cols)
 {
     memset(fx, 0, sizeof(*fx));
+    plan_fixture_chain(&fx->plan, &fx->header, fx->tensors, &fx->op, &fx->stage,
+                       fx->indices, fx->shapes, 1, 0);
 
     fx->header.version = TIGRIS_SCHEMA_VERSION_V9;
-    fx->header.num_tensors = 2;
-    fx->header.num_ops = 1;
-    fx->header.num_stages = 1;
     fx->header.num_tile_plans = 1;
-    fx->header.num_model_inputs = 1;
-    fx->header.num_model_outputs = 1;
 
     fx->shapes[0] = TEST_N; fx->shapes[1] = rows; fx->shapes[2] = cols;
     fx->shapes[3] = TEST_N; fx->shapes[4] = cols;  fx->shapes[5] = rows;
@@ -68,10 +65,6 @@ static void build_fixture(transpose_fixture_t *fx, int32_t rows, int32_t cols)
     fx->tensors[1].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
 
     fx->op.op_type = TIGRIS_OP_TRANSPOSE;
-    fx->op.num_inputs = 1;
-    fx->op.num_outputs = 1;
-    fx->op.inputs_off = 0;
-    fx->op.outputs_off = 1;
 
     fx->perm[0] = 0; fx->perm[1] = 2; fx->perm[2] = 1;
     fx->attribute.op_index = 0;
@@ -79,22 +72,7 @@ static void build_fixture(transpose_fixture_t *fx, int32_t rows, int32_t cols)
     fx->attribute.data_offset = 0;
     fx->attribute.data_len = 3;
 
-    fx->indices[0] = 0;  /* op input */
-    fx->indices[1] = 1;  /* op output */
-    fx->indices[2] = 0;  /* stage op */
-    fx->indices[3] = 0;  /* stage input */
-    fx->indices[4] = 1;  /* stage output */
-    fx->indices[5] = 0;  /* model input */
-    fx->indices[6] = 1;  /* model output */
-
-    fx->stage.ops_off = 2;
-    fx->stage.ops_count = 1;
-    fx->stage.inputs_off = 3;
-    fx->stage.inputs_count = 1;
-    fx->stage.outputs_off = 4;
-    fx->stage.outputs_count = 1;
     fx->stage.tile_plan_idx = 0;
-    fx->stage.chain_id = TIGRIS_NO_CHAIN;
 
     fx->tile_plan.tileable = 1;
     fx->tile_plan.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
@@ -106,18 +84,10 @@ static void build_fixture(transpose_fixture_t *fx, int32_t rows, int32_t cols)
     fx->tile_plan.flags = (uint16_t)((cols >= rows)
                                      ? TIGRIS_TILE_FLAG_BAND_ON_COLUMNS : 0u);
 
-    fx->plan.header = &fx->header;
-    fx->plan.tensors = fx->tensors;
-    fx->plan.ops = &fx->op;
-    fx->plan.stages = &fx->stage;
     fx->plan.tile_plans = &fx->tile_plan;
     fx->plan.op_attributes = &fx->attribute;
     fx->plan.op_attribute_data = fx->perm;
     fx->plan.num_op_attributes = 1;
-    fx->plan.index_pool = fx->indices;
-    fx->plan.shape_pool = fx->shapes;
-    fx->plan.model_inputs = &fx->indices[5];
-    fx->plan.model_outputs = &fx->indices[6];
 }
 
 static tigris_exec_error_t run_case(
@@ -126,30 +96,9 @@ static tigris_exec_error_t run_case(
 {
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[SLOW_SIZE];
     uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(2, 1, 1, 0, 0, 0)];
-    tigris_exec_stats_t stats;
-    tigris_mem_t mem;
-    void *ptrs[2];
-
-    memset(&stats, 0, sizeof(stats));
-    memset(slow, 0, sizeof(slow));
-
-    if (tigris_mem_init(&mem, ptrs, 2, fast, fast_size,
-                        slow, sizeof(slow)) != TIGRIS_MEM_OK)
-        return TIGRIS_EXEC_ERR_MEM;
-    if (tigris_mem_alloc_slow(&mem, 0, fx->tensors[0].size_bytes)
-            != TIGRIS_MEM_OK)
-        return TIGRIS_EXEC_ERR_MEM;
-    memcpy(mem.tensor_ptrs[0], input, fx->tensors[0].size_bytes);
-
-    tigris_exec_error_t err = tigris_run_with_workspace_buffer(
-        &fx->plan, &mem, tigris_dispatch_kernel, NULL, &stats,
-        workspace, sizeof(workspace));
-    if (err != TIGRIS_EXEC_OK)
-        return err;
-
-    memcpy(output, mem.tensor_ptrs[1], fx->tensors[1].size_bytes);
-    *tiled = stats.stages_tiled;
-    return TIGRIS_EXEC_OK;
+    return run_fixture(&fx->plan, tigris_dispatch_kernel, NULL, fast, fast_size,
+                       slow, sizeof(slow), workspace, sizeof(workspace),
+                       input, output, tiled);
 }
 
 /** A rank-4 conversion: [N, H, W, C] -> [N, C, H, W] or the way back. */

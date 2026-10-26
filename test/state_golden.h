@@ -1,4 +1,35 @@
-/* test/generate_state_goldens.py; outputs recorded from TFLite Micro. */
+/* test/generate_state_goldens.py; outputs recorded from TFLite Micro.
+ * Frozen plans and their origin (compiler revision, flags):
+ *   float_svdf                  tigris develop 91b90aa, -m 256K
+ *   float_svdf_rank2_relu       tigris develop 91b90aa, -m 256K
+ *   svdf                        tigris develop 91b90aa, -m 256K
+ *   svdf_batch                  tigris develop 91b90aa, -m 256K
+ *   float_lstm                  tigris develop c4f824e, -m 256K
+ *   float_lstm_time_major_clip  tigris develop c4f824e, -m 256K
+ *   lstm                        tigris develop a895a48, -m 256K
+ *   lstm_time_major_clip        tigris develop a895a48, -m 256K
+ *   float_if                    tigris develop 6bb9378, -m 256K
+ *   float_while                 tigris develop 6bb9378, -m 256K
+ *   float_detection_fast        tigris develop b7b5aeb, -m 256K
+ *   float_detection_regular     tigris develop b7b5aeb, -m 256K
+ *   detection_fast              tigris develop b7b5aeb, -m 256K
+ *   detection_regular           tigris develop b7b5aeb, -m 256K
+ *   float_if_if                 tigris develop 6bb9378, -m 256K
+ *   float_while_counter         tigris v0.12.1, -m 256K --keep-names
+ *   float_while_countdown       tigris v0.12.1, -m 256K --keep-names
+ *   float_if_int32              tigris develop ae986a0, -m 256K
+ *   gather_index_arithmetic     tigris v0.12.1, -m 256K --keep-names
+ *   select_int32_condition      tigris develop ae986a0, -m 256K
+ *   if_conv                     tigris develop e86f70b, -m 256K
+ *   while_conv                  tigris develop e86f70b, -m 256K
+ *   float_if_through            tigris v0.12.1, -m 256K --keep-names
+ *   float_while_through         tigris v0.12.1, -m 256K --keep-names
+ *   float_while_if_through      tigris v0.12.1, -m 256K --keep-names
+ *   float_while_through_tiled   tigris v0.12.1, -m 256 --keep-names
+ *   float_svdf_lz4              tigris v0.13.0, -m 256K -c lz4
+ *   lstm_lz4                    tigris v0.13.0, -m 256K -c lz4
+ *   if_conv_chained             tigris v0.13.0, -m 256
+ */
 #ifndef TIGRIS_STATE_GOLDEN_H
 #define TIGRIS_STATE_GOLDEN_H
 

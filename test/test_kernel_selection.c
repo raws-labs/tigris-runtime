@@ -15,13 +15,7 @@
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "kernel_selection_plans.h"
-
-static int failures = 0;
-
-#define CHECK(cond, msg) do { \
-    if (!(cond)) { printf("  FAIL: %s\n", msg); failures++; } \
-    else { printf("  ok: %s\n", msg); } \
-} while (0)
+#include "test_harness.h"
 
 typedef struct {
     const char *name;
@@ -59,49 +53,49 @@ static void run_case(const selection_case_t *c)
 #ifdef TIGRIS_OP_CONFIG
     if (!c->selected) {
         snprintf(msg, sizeof(msg), "%s: refused at load without its kernel", c->name);
-        CHECK(lerr == TIGRIS_ERR_KERNEL_DISABLED, msg);
+        TEST_ASSERT(lerr == TIGRIS_ERR_KERNEL_DISABLED, msg);
         return;
     }
 #endif
     snprintf(msg, sizeof(msg), "%s: loads", c->name);
-    CHECK(lerr == TIGRIS_OK, msg);
+    TEST_ASSERT(lerr == TIGRIS_OK, msg);
     if (lerr != TIGRIS_OK) return;
 
     void *ptrs[8] = {NULL};
     tigris_mem_t mem;
     tigris_exec_stats_t stats;
     memset(&stats, 0, sizeof(stats));
-    CHECK(plan.header->num_tensors <= 8u, "tensor table fits");
-    CHECK(tigris_mem_init(&mem, ptrs, plan.header->num_tensors, fast, sizeof(fast),
-                          slow, sizeof(slow)) == TIGRIS_MEM_OK, "arena initializes");
+    TEST_ASSERT(plan.header->num_tensors <= 8u, "tensor table fits");
+    TEST_ASSERT(tigris_mem_init(&mem, ptrs, plan.header->num_tensors, fast, sizeof(fast),
+                                slow, sizeof(slow)) == TIGRIS_MEM_OK, "arena initializes");
     uint32_t offset = 0u;
     for (uint16_t i = 0; i < plan.header->num_model_inputs; i++) {
         uint16_t idx = plan.model_inputs[i];
         uint32_t n = tigris_iface_bytes(&plan, idx);
-        CHECK(tigris_mem_alloc_slow(&mem, idx, plan.tensors[idx].size_bytes) == TIGRIS_MEM_OK,
-              "input placed");
-        CHECK(tigris_input_write(&plan, &mem, idx, c->input + offset, n) == TIGRIS_OK,
-              "input written");
+        TEST_ASSERT(tigris_mem_alloc_slow(&mem, idx, plan.tensors[idx].size_bytes) == TIGRIS_MEM_OK,
+                    "input placed");
+        TEST_ASSERT(tigris_input_write(&plan, &mem, idx, c->input + offset, n) == TIGRIS_OK,
+                    "input written");
         offset += n;
     }
-    CHECK(offset == c->input_size, "inputs consumed");
+    TEST_ASSERT(offset == c->input_size, "inputs consumed");
     tigris_kernel_fn dispatch = tigris_plan_data_dtype(&plan) == 1u
         ? tigris_dispatch_kernel : tigris_dispatch_kernel_s8;
     tigris_exec_error_t err = tigris_run_with_workspace_buffer(
         &plan, &mem, dispatch, NULL, &stats, workspace, sizeof(workspace));
     snprintf(msg, sizeof(msg), "%s: runs", c->name);
-    CHECK(err == TIGRIS_EXEC_OK, msg);
+    TEST_ASSERT(err == TIGRIS_EXEC_OK, msg);
     offset = 0u;
     for (uint16_t i = 0; i < plan.header->num_model_outputs; i++) {
         uint16_t idx = plan.model_outputs[i];
         uint32_t n = tigris_iface_bytes(&plan, idx);
-        CHECK(offset + n <= sizeof(output) &&
-              tigris_output_read(&plan, &mem, idx, output + offset, n) == TIGRIS_OK,
-              "output read");
+        TEST_ASSERT(offset + n <= sizeof(output) &&
+                    tigris_output_read(&plan, &mem, idx, output + offset, n) == TIGRIS_OK,
+                    "output read");
         offset += n;
     }
     snprintf(msg, sizeof(msg), "%s: output matches the reference bit for bit", c->name);
-    CHECK(offset == c->golden_size && memcmp(output, c->golden, offset) == 0, msg);
+    TEST_ASSERT(offset == c->golden_size && memcmp(output, c->golden, offset) == 0, msg);
 }
 
 int main(void)
@@ -113,6 +107,5 @@ int main(void)
 #endif
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
         run_case(&cases[i]);
-    printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
-    return failures ? 1 : 0;
+    return test_report();
 }

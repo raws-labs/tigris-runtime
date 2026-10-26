@@ -7,17 +7,7 @@
 #include "arm_nnfunctions.h"
 #include "tigris_kernels_cmsis_nn.h"
 #include "tigris_kernels_s8.h"
-
-static int tests_run;
-static int tests_failed;
-
-#define CHECK(expr, msg) do { \
-    tests_run++; \
-    if (!(expr)) { \
-        fprintf(stderr, "FAIL line %d: %s\n", __LINE__, msg); \
-        tests_failed++; \
-    } \
-} while (0)
+#include "test_harness.h"
 
 /* Vendor stubs. Each one copies the arguments it receives into a record. */
 
@@ -595,44 +585,44 @@ static void test_queries_and_prepare(void)
     fixture_t fx;
     build_fixture(&fx);
 
-    CHECK(tigris_cmsis_nn_scratch_required(NULL) == UINT32_MAX,
-          "null plan fails closed");
-    CHECK(tigris_cmsis_nn_scratch_required(&fx.plan) == 80,
-          "workspace includes aligned vendor and quant-expansion scratch");
-    CHECK(tigris_cmsis_nn_fast_arena_required(&fx.plan) == 192,
-          "total preserves aligned core capacity plus all workspace");
+    TEST_ASSERT(tigris_cmsis_nn_scratch_required(NULL) == UINT32_MAX,
+                "null plan fails closed");
+    TEST_ASSERT(tigris_cmsis_nn_scratch_required(&fx.plan) == 80,
+                "workspace includes aligned vendor and quant-expansion scratch");
+    TEST_ASSERT(tigris_cmsis_nn_fast_arena_required(&fx.plan) == 192,
+                "total preserves aligned core capacity plus all workspace");
 
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[192];
     _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[64];
     void *ptrs[2];
     tigris_mem_t mem;
-    CHECK(tigris_mem_init(
-              &mem, ptrs, 2, fast, sizeof(fast), slow, sizeof(slow)) ==
-              TIGRIS_MEM_OK,
-          "memory manager initializes");
-    CHECK(tigris_cmsis_nn_prepare(&fx.plan, &mem) == 0,
-          "exact total capacity prepares");
-    CHECK(mem.fast_size == 112,
-          "scratch carve leaves at least the full core requirement");
-    CHECK(tigris_cmsis_nn_prepare(&fx.plan, &mem) == 0,
-          "repeated prepare is idempotent");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0 && mem.fast_size == sizeof(fast),
-          "deinit restores original capacity");
+    TEST_ASSERT(tigris_mem_init(
+                    &mem, ptrs, 2, fast, sizeof(fast), slow, sizeof(slow)) ==
+                    TIGRIS_MEM_OK,
+                "memory manager initializes");
+    TEST_ASSERT(tigris_cmsis_nn_prepare(&fx.plan, &mem) == 0,
+                "exact total capacity prepares");
+    TEST_ASSERT(mem.fast_size == 112,
+                "scratch carve leaves at least the full core requirement");
+    TEST_ASSERT(tigris_cmsis_nn_prepare(&fx.plan, &mem) == 0,
+                "repeated prepare is idempotent");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0 && mem.fast_size == sizeof(fast),
+                "deinit restores original capacity");
 
-    CHECK(tigris_mem_init(
-              &mem, ptrs, 2, fast, 191, slow, sizeof(slow)) == TIGRIS_MEM_OK,
-          "undersized arena still initializes");
-    CHECK(tigris_cmsis_nn_prepare(&fx.plan, &mem) == -1,
-          "one byte below total requirement fails before carving");
+    TEST_ASSERT(tigris_mem_init(
+                    &mem, ptrs, 2, fast, 191, slow, sizeof(slow)) == TIGRIS_MEM_OK,
+                "undersized arena still initializes");
+    TEST_ASSERT(tigris_cmsis_nn_prepare(&fx.plan, &mem) == -1,
+                "one byte below total requirement fails before carving");
 
     query_bytes = -1;
-    CHECK(tigris_cmsis_nn_scratch_required(&fx.plan) == UINT32_MAX,
-          "negative vendor result fails closed");
+    TEST_ASSERT(tigris_cmsis_nn_scratch_required(&fx.plan) == UINT32_MAX,
+                "negative vendor result fails closed");
     query_bytes = 33;
 
     fx.header.budget = UINT32_MAX;
-    CHECK(tigris_cmsis_nn_fast_arena_required(&fx.plan) == UINT32_MAX,
-          "unrepresentable total fails closed");
+    TEST_ASSERT(tigris_cmsis_nn_fast_arena_required(&fx.plan) == UINT32_MAX,
+                "unrepresentable total fails closed");
 }
 
 static void test_conv_arguments(void)
@@ -642,57 +632,57 @@ static void test_conv_arguments(void)
     tigris_mem_t mem;
 
     build_conv(&fx, 2, 8);
-    CHECK(prepare(&fx, &mem, ptrs) == 0, "conv prepares");
-    CHECK(query.fn == CALL_CONV &&
-          dims_are(query.input, 1, 7, 6, 3) && dims_are(query.filter, 8, 3, 2, 3) &&
-          dims_are(query.output, 1, 4, 6, 8) && tile_is(query.conv.stride, 1, 2) &&
-          tile_is(query.conv.padding, 1, 2) && tile_is(query.conv.dilation, 1, 2),
-          "conv sizing uses the tensor shapes and the operator geometry");
-    CHECK(dispatch(&fx, &mem) == 0, "conv adapter runs");
-    CHECK(call.fn == CALL_CONV && call.calls == 1, "conv makes one vendor call");
-    CHECK(call.conv.input_offset == 5 && call.conv.output_offset == 7,
-          "conv offsets are the negated input and the output zero points");
-    CHECK(tile_is(call.conv.stride, 1, 2) && tile_is(call.conv.padding, 1, 2) &&
-          tile_is(call.conv.dilation, 1, 2),
-          "conv stride, leading pads and dilation (0 means 1) per axis");
-    CHECK(call.conv.activation.min == -20 && call.conv.activation.max == 100,
-          "conv activation range is the operator's");
-    CHECK(dims_are(call.input, 1, 7, 6, 3) && dims_are(call.filter, 8, 3, 2, 3) &&
-          dims_are(call.bias, 1, 1, 1, 8) && dims_are(call.output, 1, 4, 6, 8),
-          "conv dims: filter [OC, KH, KW, IC], bias [OC]");
-    CHECK(call.input_data == input_buf && call.output_data == output_buf &&
-          call.filter_data == (const int8_t *)weight_blob &&
-          call.bias_data == (const int32_t *)(const void *)(weight_blob + BIAS_OFF),
-          "conv data pointers are the tensors and the operator's weights");
-    CHECK(channels_are_plan_arrays(8), "per-channel conv quantization points into the plan");
-    CHECK(scratch_in_workspace(&mem, call.ctx, 33), "conv scratch is the prepared workspace");
-    CHECK(query.calls == 1 && dims_are(query.input, 1, 7, 6, 3) &&
-          dims_are(query.filter, 8, 3, 2, 3) && dims_are(query.output, 1, 4, 6, 8) &&
-          tile_is(query.conv.padding, 1, 2) && tile_is(query.conv.dilation, 1, 2),
-          "conv dispatch sizes the call it makes");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "conv releases workspace");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0, "conv prepares");
+    TEST_ASSERT(query.fn == CALL_CONV &&
+                dims_are(query.input, 1, 7, 6, 3) && dims_are(query.filter, 8, 3, 2, 3) &&
+                dims_are(query.output, 1, 4, 6, 8) && tile_is(query.conv.stride, 1, 2) &&
+                tile_is(query.conv.padding, 1, 2) && tile_is(query.conv.dilation, 1, 2),
+                "conv sizing uses the tensor shapes and the operator geometry");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0, "conv adapter runs");
+    TEST_ASSERT(call.fn == CALL_CONV && call.calls == 1, "conv makes one vendor call");
+    TEST_ASSERT(call.conv.input_offset == 5 && call.conv.output_offset == 7,
+                "conv offsets are the negated input and the output zero points");
+    TEST_ASSERT(tile_is(call.conv.stride, 1, 2) && tile_is(call.conv.padding, 1, 2) &&
+                tile_is(call.conv.dilation, 1, 2),
+                "conv stride, leading pads and dilation (0 means 1) per axis");
+    TEST_ASSERT(call.conv.activation.min == -20 && call.conv.activation.max == 100,
+                "conv activation range is the operator's");
+    TEST_ASSERT(dims_are(call.input, 1, 7, 6, 3) && dims_are(call.filter, 8, 3, 2, 3) &&
+                dims_are(call.bias, 1, 1, 1, 8) && dims_are(call.output, 1, 4, 6, 8),
+                "conv dims: filter [OC, KH, KW, IC], bias [OC]");
+    TEST_ASSERT(call.input_data == input_buf && call.output_data == output_buf &&
+                call.filter_data == (const int8_t *)weight_blob &&
+                call.bias_data == (const int32_t *)(const void *)(weight_blob + BIAS_OFF),
+                "conv data pointers are the tensors and the operator's weights");
+    TEST_ASSERT(channels_are_plan_arrays(8), "per-channel conv quantization points into the plan");
+    TEST_ASSERT(scratch_in_workspace(&mem, call.ctx, 33), "conv scratch is the prepared workspace");
+    TEST_ASSERT(query.calls == 1 && dims_are(query.input, 1, 7, 6, 3) &&
+                dims_are(query.filter, 8, 3, 2, 3) && dims_are(query.output, 1, 4, 6, 8) &&
+                tile_is(query.conv.padding, 1, 2) && tile_is(query.conv.dilation, 1, 2),
+                "conv dispatch sizes the call it makes");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "conv releases workspace");
 
     build_conv(&fx, 0, 8);
-    CHECK(prepare(&fx, &mem, ptrs) == 0 && tile_is(query.conv.dilation, 1, 1),
-          "conv sizing maps dilation 0 to 1 on both axes");
-    CHECK(dispatch(&fx, &mem) == 0 && call.fn == CALL_CONV && dims_are(call.output, 1, 5, 6, 8) &&
-          tile_is(call.conv.dilation, 1, 1) && tile_is(query.conv.dilation, 1, 1),
-          "conv dilation 0 means 1 on both axes");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "undilated conv releases workspace");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0 && tile_is(query.conv.dilation, 1, 1),
+                "conv sizing maps dilation 0 to 1 on both axes");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0 && call.fn == CALL_CONV && dims_are(call.output, 1, 5, 6, 8) &&
+                tile_is(call.conv.dilation, 1, 1) && tile_is(query.conv.dilation, 1, 1),
+                "conv dilation 0 means 1 on both axes");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "undilated conv releases workspace");
 
     build_conv(&fx, 2, 1);
-    CHECK(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "per-tensor conv runs");
-    CHECK(call.multiplier != &quant_data[QUANT_BASE + OUT_QUANT_OFF] &&
-          channels_are(8, out_multiplier(0), out_shift(0)),
-          "per-tensor conv quantization is repeated for every output channel");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "per-tensor conv releases workspace");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "per-tensor conv runs");
+    TEST_ASSERT(call.multiplier != &quant_data[QUANT_BASE + OUT_QUANT_OFF] &&
+                channels_are(8, out_multiplier(0), out_shift(0)),
+                "per-tensor conv quantization is repeated for every output channel");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "per-tensor conv releases workspace");
 
     build_conv(&fx, 2, 0);
-    CHECK(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "unquantized conv runs");
-    CHECK(call.conv.input_offset == 0 && call.conv.output_offset == 0 &&
-          channels_are(8, 1, 0),
-          "unquantized conv uses zero offsets and identity requantization");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "unquantized conv releases workspace");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "unquantized conv runs");
+    TEST_ASSERT(call.conv.input_offset == 0 && call.conv.output_offset == 0 &&
+                channels_are(8, 1, 0),
+                "unquantized conv uses zero offsets and identity requantization");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "unquantized conv releases workspace");
 }
 
 static void test_conv_tiles(void)
@@ -703,10 +693,10 @@ static void test_conv_tiles(void)
 
     /* Height tile: output rows 2..3 read input rows 2..6. */
     build_conv(&fx, 1, 8);
-    CHECK(prepare(&fx, &mem, ptrs) == 0, "tiled conv prepares");
-    CHECK(dims_are(query.input, 1, 7, 6, 3) && dims_are(query.output, 1, 5, 6, 8) &&
-          tile_is(query.conv.padding, 1, 2),
-          "tiled conv sizing uses the whole tensors");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0, "tiled conv prepares");
+    TEST_ASSERT(dims_are(query.input, 1, 7, 6, 3) && dims_are(query.output, 1, 5, 6, 8) &&
+                tile_is(query.conv.padding, 1, 2),
+                "tiled conv sizing uses the whole tensors");
     mem.tile.active = 1;
     mem.tile.in_h = 5;
     mem.tile.out_h = 2;
@@ -714,15 +704,15 @@ static void test_conv_tiles(void)
     mem.tile.pad_bottom = 0;
     mem.tile.in_w = 6;
     mem.tile.out_w = 6;
-    CHECK(dispatch(&fx, &mem) == 0 && call.fn == CALL_CONV, "height tile runs on the adapter");
-    CHECK(dims_are(call.input, 1, 5, 6, 3) && dims_are(call.output, 1, 2, 6, 8) &&
-          tile_is(call.conv.padding, 1, 0) && tile_is(call.conv.dilation, 1, 1),
-          "height tile passes its rows and its top pad, keeps the width");
-    CHECK(call.input_data == input_buf && call.output_data == output_buf,
-          "height tile starts at the tile buffers");
-    CHECK(dims_are(query.input, 1, 5, 6, 3) && dims_are(query.output, 1, 2, 6, 8) &&
-          tile_is(query.conv.padding, 1, 0),
-          "height tile dispatch sizes the tile");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0 && call.fn == CALL_CONV, "height tile runs on the adapter");
+    TEST_ASSERT(dims_are(call.input, 1, 5, 6, 3) && dims_are(call.output, 1, 2, 6, 8) &&
+                tile_is(call.conv.padding, 1, 0) && tile_is(call.conv.dilation, 1, 1),
+                "height tile passes its rows and its top pad, keeps the width");
+    TEST_ASSERT(call.input_data == input_buf && call.output_data == output_buf,
+                "height tile starts at the tile buffers");
+    TEST_ASSERT(dims_are(query.input, 1, 5, 6, 3) && dims_are(query.output, 1, 2, 6, 8) &&
+                tile_is(query.conv.padding, 1, 0),
+                "height tile dispatch sizes the tile");
 
     /* 2D tile: columns 3..5 of the same rows read input columns 2..5. */
     mem.tile.width_tiled = 1;
@@ -730,10 +720,10 @@ static void test_conv_tiles(void)
     mem.tile.out_w = 3;
     mem.tile.pad_left = 0;
     mem.tile.pad_right = 0;
-    CHECK(dispatch(&fx, &mem) == 0 && call.fn == CALL_CONV, "2D tile runs on the adapter");
-    CHECK(dims_are(call.input, 1, 5, 4, 3) && dims_are(call.output, 1, 2, 3, 8) &&
-          tile_is(call.conv.padding, 0, 0),
-          "2D tile passes its columns and its left pad");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0 && call.fn == CALL_CONV, "2D tile runs on the adapter");
+    TEST_ASSERT(dims_are(call.input, 1, 5, 4, 3) && dims_are(call.output, 1, 2, 3, 8) &&
+                tile_is(call.conv.padding, 0, 0),
+                "2D tile passes its columns and its left pad");
 
     /* Line-buffer roll: 1 output row and 1 input row are already in place. */
     mem.tile.width_tiled = 0;
@@ -742,21 +732,21 @@ static void test_conv_tiles(void)
     mem.tile.pad_left = 0;
     mem.tile.out_row_start = 1;
     mem.tile.in_row_start = 1;
-    CHECK(dispatch(&fx, &mem) == 0 && call.fn == CALL_CONV, "rolled tile runs on the adapter");
-    CHECK(call.input_data == input_buf + 1 * 6 * 3 && call.output_data == output_buf + 1 * 6 * 8,
-          "rolled tile skips (out_row_start * stride - in_row_start) input rows and out_row_start output rows");
-    CHECK(dims_are(call.input, 1, 4, 6, 3) && dims_are(call.output, 1, 2, 6, 8),
-          "rolled tile drops the skipped input rows");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0 && call.fn == CALL_CONV, "rolled tile runs on the adapter");
+    TEST_ASSERT(call.input_data == input_buf + 1 * 6 * 3 && call.output_data == output_buf + 1 * 6 * 8,
+                "rolled tile skips (out_row_start * stride - in_row_start) input rows and out_row_start output rows");
+    TEST_ASSERT(dims_are(call.input, 1, 4, 6, 3) && dims_are(call.output, 1, 2, 6, 8),
+                "rolled tile drops the skipped input rows");
 
     mem.tile.width_tiled = 1;
     mem.tile.in_w = 4;
     mem.tile.out_w = 3;
-    CHECK(dispatch(&fx, &mem) == 0 && call.fn == CALL_CONV, "rolled 2D tile runs on the adapter");
-    CHECK(call.input_data == input_buf + 1 * 4 * 3 && call.output_data == output_buf + 1 * 3 * 8,
-          "rolled 2D tile steps rows of the tile width");
-    CHECK(dims_are(call.input, 1, 4, 4, 3) && dims_are(call.output, 1, 2, 3, 8),
-          "rolled 2D tile dims");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "tiled conv releases workspace");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0 && call.fn == CALL_CONV, "rolled 2D tile runs on the adapter");
+    TEST_ASSERT(call.input_data == input_buf + 1 * 4 * 3 && call.output_data == output_buf + 1 * 3 * 8,
+                "rolled 2D tile steps rows of the tile width");
+    TEST_ASSERT(dims_are(call.input, 1, 4, 4, 3) && dims_are(call.output, 1, 2, 3, 8),
+                "rolled 2D tile dims");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "tiled conv releases workspace");
 }
 
 static void test_depthwise_arguments(void)
@@ -766,44 +756,44 @@ static void test_depthwise_arguments(void)
     tigris_mem_t mem;
 
     build_depthwise(&fx, 3, 1);
-    CHECK(prepare(&fx, &mem, ptrs) == 0, "depthwise prepares");
-    CHECK(query.fn == CALL_DEPTHWISE && query.dw.ch_mult == 3 &&
-          dims_are(query.input, 1, 7, 6, 4) && dims_are(query.filter, 1, 3, 1, 12) &&
-          dims_are(query.output, 1, 4, 6, 12) && tile_is(query.dw.stride, 1, 2) &&
-          tile_is(query.dw.padding, 0, 1) && tile_is(query.dw.dilation, 3, 1),
-          "depthwise sizing uses the channel multiplier and the operator geometry");
-    CHECK(dispatch(&fx, &mem) == 0, "depthwise adapter runs");
-    CHECK(call.fn == CALL_DEPTHWISE && call.calls == 1, "depthwise makes one vendor call");
-    CHECK(call.dw.input_offset == -11 && call.dw.output_offset == -9 && call.dw.ch_mult == 3,
-          "depthwise offsets and channel multiplier");
-    CHECK(tile_is(call.dw.stride, 1, 2) && tile_is(call.dw.padding, 0, 1) &&
-          tile_is(call.dw.dilation, 3, 1),
-          "depthwise stride, leading pads and dilation (0 means 1) per axis");
-    CHECK(call.dw.activation.min == 3 && call.dw.activation.max == 60,
-          "depthwise activation range is the operator's");
-    CHECK(dims_are(call.input, 1, 7, 6, 4) && dims_are(call.filter, 1, 3, 1, 12) &&
-          dims_are(call.bias, 1, 1, 1, 12) && dims_are(call.output, 1, 4, 6, 12),
-          "vendor receives input and output channels independently");
-    CHECK(call.input_data == input_buf && call.output_data == output_buf &&
-          call.filter_data == (const int8_t *)weight_blob &&
-          call.bias_data == (const int32_t *)(const void *)(weight_blob + BIAS_OFF),
-          "depthwise data pointers are the tensors and the operator's weights");
-    CHECK(channels_are(12, out_multiplier(0), out_shift(0)),
-          "scalar quantization covers every output channel");
-    CHECK(scratch_in_workspace(&mem, call.ctx, 33), "depthwise scratch is the prepared workspace");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "depthwise releases workspace");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0, "depthwise prepares");
+    TEST_ASSERT(query.fn == CALL_DEPTHWISE && query.dw.ch_mult == 3 &&
+                dims_are(query.input, 1, 7, 6, 4) && dims_are(query.filter, 1, 3, 1, 12) &&
+                dims_are(query.output, 1, 4, 6, 12) && tile_is(query.dw.stride, 1, 2) &&
+                tile_is(query.dw.padding, 0, 1) && tile_is(query.dw.dilation, 3, 1),
+                "depthwise sizing uses the channel multiplier and the operator geometry");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0, "depthwise adapter runs");
+    TEST_ASSERT(call.fn == CALL_DEPTHWISE && call.calls == 1, "depthwise makes one vendor call");
+    TEST_ASSERT(call.dw.input_offset == -11 && call.dw.output_offset == -9 && call.dw.ch_mult == 3,
+                "depthwise offsets and channel multiplier");
+    TEST_ASSERT(tile_is(call.dw.stride, 1, 2) && tile_is(call.dw.padding, 0, 1) &&
+                tile_is(call.dw.dilation, 3, 1),
+                "depthwise stride, leading pads and dilation (0 means 1) per axis");
+    TEST_ASSERT(call.dw.activation.min == 3 && call.dw.activation.max == 60,
+                "depthwise activation range is the operator's");
+    TEST_ASSERT(dims_are(call.input, 1, 7, 6, 4) && dims_are(call.filter, 1, 3, 1, 12) &&
+                dims_are(call.bias, 1, 1, 1, 12) && dims_are(call.output, 1, 4, 6, 12),
+                "vendor receives input and output channels independently");
+    TEST_ASSERT(call.input_data == input_buf && call.output_data == output_buf &&
+                call.filter_data == (const int8_t *)weight_blob &&
+                call.bias_data == (const int32_t *)(const void *)(weight_blob + BIAS_OFF),
+                "depthwise data pointers are the tensors and the operator's weights");
+    TEST_ASSERT(channels_are(12, out_multiplier(0), out_shift(0)),
+                "scalar quantization covers every output channel");
+    TEST_ASSERT(scratch_in_workspace(&mem, call.ctx, 33), "depthwise scratch is the prepared workspace");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "depthwise releases workspace");
 
     build_depthwise(&fx, 0, 1);
-    CHECK(prepare(&fx, &mem, ptrs) == 0 && tile_is(query.dw.dilation, 1, 1),
-          "depthwise sizing maps dilation 0 to 1 on both axes");
-    CHECK(dispatch(&fx, &mem) == 0 && call.fn == CALL_DEPTHWISE &&
-          tile_is(call.dw.dilation, 1, 1) && tile_is(query.dw.dilation, 1, 1),
-          "depthwise dilation 0 means 1 on both axes");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "undilated depthwise releases workspace");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0 && tile_is(query.dw.dilation, 1, 1),
+                "depthwise sizing maps dilation 0 to 1 on both axes");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0 && call.fn == CALL_DEPTHWISE &&
+                tile_is(call.dw.dilation, 1, 1) && tile_is(query.dw.dilation, 1, 1),
+                "depthwise dilation 0 means 1 on both axes");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "undilated depthwise releases workspace");
 
     build_depthwise(&fx, 1, 12);
-    CHECK(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "per-channel depthwise runs");
-    CHECK(channels_are_plan_arrays(12), "per-channel depthwise quantization points into the plan");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "per-channel depthwise runs");
+    TEST_ASSERT(channels_are_plan_arrays(12), "per-channel depthwise quantization points into the plan");
 
     /* Rolled 2D tile at the left edge: 2 input rows skipped (1 output row at
      * stride 2), 4 input columns and a left pad of 1 give 5 output columns. */
@@ -817,13 +807,13 @@ static void test_depthwise_arguments(void)
     mem.tile.pad_left = 1;
     mem.tile.out_row_start = 1;
     mem.tile.in_row_start = 0;
-    CHECK(dispatch(&fx, &mem) == 0 && call.fn == CALL_DEPTHWISE, "rolled depthwise tile runs on the adapter");
-    CHECK(call.input_data == input_buf + 2 * 4 * 4 && call.output_data == output_buf + 1 * 5 * 12,
-          "rolled depthwise tile steps input rows of in_w and output rows of out_w");
-    CHECK(dims_are(call.input, 1, 3, 4, 4) && dims_are(call.output, 1, 2, 5, 12) &&
-          tile_is(call.dw.padding, 1, 0),
-          "rolled depthwise tile dims and pads");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "per-channel depthwise releases workspace");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0 && call.fn == CALL_DEPTHWISE, "rolled depthwise tile runs on the adapter");
+    TEST_ASSERT(call.input_data == input_buf + 2 * 4 * 4 && call.output_data == output_buf + 1 * 5 * 12,
+                "rolled depthwise tile steps input rows of in_w and output rows of out_w");
+    TEST_ASSERT(dims_are(call.input, 1, 3, 4, 4) && dims_are(call.output, 1, 2, 5, 12) &&
+                tile_is(call.dw.padding, 1, 0),
+                "rolled depthwise tile dims and pads");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "per-channel depthwise releases workspace");
 }
 
 static void test_fully_connected_arguments(void)
@@ -833,48 +823,48 @@ static void test_fully_connected_arguments(void)
     tigris_mem_t mem;
 
     build_fc(&fx, 0, 1);
-    CHECK(prepare(&fx, &mem, ptrs) == 0, "fully connected prepares");
-    CHECK(query.fn == CALL_FC && dims_are(query.filter, 12, 1, 1, 5),
-          "fully connected sizing uses [IC, OC]");
-    CHECK(dispatch(&fx, &mem) == 0, "fully connected adapter runs");
-    CHECK(call.fn == CALL_FC && call.calls == 1, "per-tensor fully connected uses the per-tensor kernel");
-    CHECK(call.fc.input_offset == 5 && call.fc.filter_offset == 0 && call.fc.output_offset == 7 &&
-          call.fc.activation.min == -128 && call.fc.activation.max == 90,
-          "fully connected offsets and activation range");
-    CHECK(call.tensor_quant.multiplier == out_multiplier(0) && call.tensor_quant.shift == out_shift(0),
-          "per-tensor fully connected quantization is the output's");
-    CHECK(dims_are(call.input, 2, 1, 1, 12) && dims_are(call.filter, 12, 1, 1, 5) &&
-          dims_are(call.bias, 1, 1, 1, 5) && dims_are(call.output, 2, 1, 1, 5),
-          "fully connected dims: rows from the output, depth from the input size");
-    CHECK(call.input_data == input_buf && call.output_data == output_buf &&
-          call.filter_data == (const int8_t *)weight_blob &&
-          call.bias_data == (const int32_t *)(const void *)(weight_blob + BIAS_OFF),
-          "fully connected data pointers");
-    CHECK(scratch_in_workspace(&mem, call.ctx, 33), "fully connected scratch is the prepared workspace");
-    CHECK(vsum.calls == 1 && vsum.buf == (int32_t *)call.ctx.buf && vsum.cols == 12 &&
-          vsum.rows == 5 && vsum.data == (const int8_t *)weight_blob &&
-          vsum.lhs_offset == 5 && vsum.rhs_offset == 0 && vsum.bias == NULL,
-          "kernel sums are computed into the scratch with the input offset");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "fully connected releases workspace");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0, "fully connected prepares");
+    TEST_ASSERT(query.fn == CALL_FC && dims_are(query.filter, 12, 1, 1, 5),
+                "fully connected sizing uses [IC, OC]");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0, "fully connected adapter runs");
+    TEST_ASSERT(call.fn == CALL_FC && call.calls == 1, "per-tensor fully connected uses the per-tensor kernel");
+    TEST_ASSERT(call.fc.input_offset == 5 && call.fc.filter_offset == 0 && call.fc.output_offset == 7 &&
+                call.fc.activation.min == -128 && call.fc.activation.max == 90,
+                "fully connected offsets and activation range");
+    TEST_ASSERT(call.tensor_quant.multiplier == out_multiplier(0) && call.tensor_quant.shift == out_shift(0),
+                "per-tensor fully connected quantization is the output's");
+    TEST_ASSERT(dims_are(call.input, 2, 1, 1, 12) && dims_are(call.filter, 12, 1, 1, 5) &&
+                dims_are(call.bias, 1, 1, 1, 5) && dims_are(call.output, 2, 1, 1, 5),
+                "fully connected dims: rows from the output, depth from the input size");
+    TEST_ASSERT(call.input_data == input_buf && call.output_data == output_buf &&
+                call.filter_data == (const int8_t *)weight_blob &&
+                call.bias_data == (const int32_t *)(const void *)(weight_blob + BIAS_OFF),
+                "fully connected data pointers");
+    TEST_ASSERT(scratch_in_workspace(&mem, call.ctx, 33), "fully connected scratch is the prepared workspace");
+    TEST_ASSERT(vsum.calls == 1 && vsum.buf == (int32_t *)call.ctx.buf && vsum.cols == 12 &&
+                vsum.rows == 5 && vsum.data == (const int8_t *)weight_blob &&
+                vsum.lhs_offset == 5 && vsum.rhs_offset == 0 && vsum.bias == NULL,
+                "kernel sums are computed into the scratch with the input offset");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "fully connected releases workspace");
 
     build_fc(&fx, 0, 5);
-    CHECK(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "per-channel fully connected runs");
-    CHECK(call.fn == CALL_FC_PER_CHANNEL && call.calls == 1,
-          "per-channel fully connected uses the per-channel kernel");
-    CHECK(call.fc.input_offset == 5 && call.fc.output_offset == 7 &&
-          dims_are(call.filter, 12, 1, 1, 5) && dims_are(call.output, 2, 1, 1, 5),
-          "per-channel fully connected parameters");
-    CHECK(channels_are_plan_arrays(5), "per-channel fully connected quantization points into the plan");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "per-channel fully connected releases workspace");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "per-channel fully connected runs");
+    TEST_ASSERT(call.fn == CALL_FC_PER_CHANNEL && call.calls == 1,
+                "per-channel fully connected uses the per-channel kernel");
+    TEST_ASSERT(call.fc.input_offset == 5 && call.fc.output_offset == 7 &&
+                dims_are(call.filter, 12, 1, 1, 5) && dims_are(call.output, 2, 1, 1, 5),
+                "per-channel fully connected parameters");
+    TEST_ASSERT(channels_are_plan_arrays(5), "per-channel fully connected quantization points into the plan");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "per-channel fully connected releases workspace");
 
     query_bytes = 0;
     build_fc(&fx, 1, 1);
-    CHECK(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "flat fully connected runs");
-    CHECK(dims_are(call.input, 1, 1, 1, 12) && dims_are(call.filter, 12, 1, 1, 5) &&
-          dims_are(call.output, 1, 1, 1, 5),
-          "a rank-1 output is one row");
-    CHECK(call.ctx.buf != NULL && call.ctx.size == 0 && vsum.calls == 0,
-          "no kernel sums without vendor scratch");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "flat fully connected runs");
+    TEST_ASSERT(dims_are(call.input, 1, 1, 1, 12) && dims_are(call.filter, 12, 1, 1, 5) &&
+                dims_are(call.output, 1, 1, 1, 5),
+                "a rank-1 output is one row");
+    TEST_ASSERT(call.ctx.buf != NULL && call.ctx.size == 0 && vsum.calls == 0,
+                "no kernel sums without vendor scratch");
     query_bytes = 33;
 }
 
@@ -885,36 +875,36 @@ static void test_pool_arguments(void)
     tigris_mem_t mem;
 
     build_pool(&fx, 0);
-    CHECK(prepare(&fx, &mem, ptrs) == 0, "average pool prepares");
-    CHECK(query.fn == CALL_AVGPOOL && query.dst_width == 5 && query.src_channels == 4,
-          "average pool sizing uses output width and channels");
-    CHECK(dispatch(&fx, &mem) == 0, "average pool adapter runs");
-    CHECK(call.fn == CALL_AVGPOOL && call.calls == 1, "average pool makes one vendor call");
-    CHECK(tile_is(call.pool.stride, 1, 2) && tile_is(call.pool.padding, 1, 0) &&
-          call.pool.activation.min == -128 && call.pool.activation.max == 127,
-          "average pool stride, leading pads and activation range");
-    CHECK(dims_are(call.input, 1, 6, 5, 4) && dims_are(call.filter, 1, 2, 3, 1) &&
-          dims_are(call.output, 1, 3, 5, 4),
-          "average pool dims: filter [1, KH, KW, 1]");
-    CHECK(call.input_data == input_buf && call.output_data == output_buf,
-          "average pool data pointers");
-    CHECK(scratch_in_workspace(&mem, call.ctx, 33), "average pool scratch is the prepared workspace");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "average pool releases workspace");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0, "average pool prepares");
+    TEST_ASSERT(query.fn == CALL_AVGPOOL && query.dst_width == 5 && query.src_channels == 4,
+                "average pool sizing uses output width and channels");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0, "average pool adapter runs");
+    TEST_ASSERT(call.fn == CALL_AVGPOOL && call.calls == 1, "average pool makes one vendor call");
+    TEST_ASSERT(tile_is(call.pool.stride, 1, 2) && tile_is(call.pool.padding, 1, 0) &&
+                call.pool.activation.min == -128 && call.pool.activation.max == 127,
+                "average pool stride, leading pads and activation range");
+    TEST_ASSERT(dims_are(call.input, 1, 6, 5, 4) && dims_are(call.filter, 1, 2, 3, 1) &&
+                dims_are(call.output, 1, 3, 5, 4),
+                "average pool dims: filter [1, KH, KW, 1]");
+    TEST_ASSERT(call.input_data == input_buf && call.output_data == output_buf,
+                "average pool data pointers");
+    TEST_ASSERT(scratch_in_workspace(&mem, call.ctx, 33), "average pool scratch is the prepared workspace");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "average pool releases workspace");
 
     build_pool(&fx, 1);
     add_pool_rounding(&fx);
-    CHECK(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "rounded global pool runs");
-    CHECK(call.fn == CALL_AVGPOOL && tile_is(call.pool.stride, 1, 1) && tile_is(call.pool.padding, 0, 0) &&
-          dims_are(call.filter, 1, 6, 5, 1) && dims_are(call.output, 1, 1, 1, 4),
-          "global pool is one window over the whole input");
-    CHECK(query.dst_width == 1 && query.src_channels == 4, "global pool dispatch sizes one column");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "rounded global pool releases workspace");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0, "rounded global pool runs");
+    TEST_ASSERT(call.fn == CALL_AVGPOOL && tile_is(call.pool.stride, 1, 1) && tile_is(call.pool.padding, 0, 0) &&
+                dims_are(call.filter, 1, 6, 5, 1) && dims_are(call.output, 1, 1, 1, 4),
+                "global pool is one window over the whole input");
+    TEST_ASSERT(query.dst_width == 1 && query.src_channels == 4, "global pool dispatch sizes one column");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "rounded global pool releases workspace");
 
     build_pool(&fx, 1);
     memset(input_buf, 0, sizeof(input_buf));
-    CHECK(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0 && call.calls == 0,
-          "a global mean without pool rounding runs on the reference kernel");
-    CHECK(tigris_cmsis_nn_deinit(&mem) == 0, "global mean releases workspace");
+    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0 && call.calls == 0,
+                "a global mean without pool rounding runs on the reference kernel");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "global mean releases workspace");
 
     /* arm_avgpool_s8 keeps the input quantization, so a rescaling pool runs on
      * the reference kernel and prepare reserves no workspace for it. */
@@ -924,11 +914,11 @@ static void test_pool_arguments(void)
             fx.quant[1].scale = 0.375f;
         else
             fx.quant[1].zero_point = -2;
-        CHECK(tigris_cmsis_nn_scratch_required(&fx.plan) == 0 && prepare(&fx, &mem, ptrs) == 0 &&
-              query.calls == 0 && mem.fast_size == sizeof(fast_arena),
-              "a rescaling average pool reserves no vendor workspace");
-        CHECK(dispatch(&fx, &mem) == 0 && call.calls == 0 && query.calls == 0,
-              "a rescaling average pool makes no vendor call");
+        TEST_ASSERT(tigris_cmsis_nn_scratch_required(&fx.plan) == 0 && prepare(&fx, &mem, ptrs) == 0 &&
+                    query.calls == 0 && mem.fast_size == sizeof(fast_arena),
+                    "a rescaling average pool reserves no vendor workspace");
+        TEST_ASSERT(dispatch(&fx, &mem) == 0 && call.calls == 0 && query.calls == 0,
+                    "a rescaling average pool makes no vendor call");
     }
 }
 
@@ -961,28 +951,28 @@ static void test_binary_dispatch(void)
             mem.tile.out_h = 1; mem.tile.out_w = 4;
             memset(output, 99, sizeof(output));
             ptrs[2] = reference;
-            CHECK(tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL) == 0, "binary reference runs");
+            TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL) == 0, "binary reference runs");
             ptrs[2] = output;
             reset_records();
-            CHECK(tigris_dispatch_kernel_cmsis_nn(&plan, &op, 0, &mem, NULL) == 0, "binary adapter runs");
+            TEST_ASSERT(tigris_dispatch_kernel_cmsis_nn(&plan, &op, 0, &mem, NULL) == 0, "binary adapter runs");
             int count = tiled ? 16 : 64;
-            CHECK(call.fn == fns[k] && call.calls == 1, "binary makes one vendor call");
-            CHECK(call.input_data == a && call.input2_data == b && call.output_data == output,
-                  "binary data pointers are the operands");
+            TEST_ASSERT(call.fn == fns[k] && call.calls == 1, "binary makes one vendor call");
+            TEST_ASSERT(call.input_data == a && call.input2_data == b && call.output_data == output,
+                        "binary data pointers are the operands");
             if (kinds[k] == TIGRIS_OP_MUL) {
-                CHECK(call.block_size == count, "vendor receives only the output band");
-                CHECK(call.input_1_offset == 17 && call.input_2_offset == 17 && call.out_offset == -17 &&
-                      call.out_mult == 1073741824 && call.out_shift == -2 &&
-                      call.out_activation_min == -128 && call.out_activation_max == 127,
-                      "multiply offsets, requantization (scale 0.125) and full int8 range");
+                TEST_ASSERT(call.block_size == count, "vendor receives only the output band");
+                TEST_ASSERT(call.input_1_offset == 17 && call.input_2_offset == 17 && call.out_offset == -17 &&
+                            call.out_mult == 1073741824 && call.out_shift == -2 &&
+                            call.out_activation_min == -128 && call.out_activation_max == 127,
+                            "multiply offsets, requantization (scale 0.125) and full int8 range");
             } else {
-                CHECK(dims_are(call.input, 1, 1, 1, count) && dims_are(call.input2, 1, 1, 1, count) &&
-                      dims_are(call.output, 1, 1, 1, count),
-                      "vendor receives only the output band");
-                CHECK(call.ctx.buf == NULL && call.ctx.size == 0, "extremum needs no scratch");
+                TEST_ASSERT(dims_are(call.input, 1, 1, 1, count) && dims_are(call.input2, 1, 1, 1, count) &&
+                            dims_are(call.output, 1, 1, 1, count),
+                            "vendor receives only the output band");
+                TEST_ASSERT(call.ctx.buf == NULL && call.ctx.size == 0, "extremum needs no scratch");
             }
-            CHECK(memcmp(reference, output, (size_t)count) == 0, "binary output matches reference");
-            if (tiled) CHECK(output[count] == 99, "binary band does not overwrite its neighbor");
+            TEST_ASSERT(memcmp(reference, output, (size_t)count) == 0, "binary output matches reference");
+            if (tiled) TEST_ASSERT(output[count] == 99, "binary band does not overwrite its neighbor");
         }
     }
 }
@@ -996,6 +986,5 @@ int main(void)
     test_fully_connected_arguments();
     test_pool_arguments();
     test_binary_dispatch();
-    printf("CMSIS arena tests: %d checks, %d failed\n", tests_run, tests_failed);
-    return tests_failed ? 1 : 0;
+    return test_report();
 }

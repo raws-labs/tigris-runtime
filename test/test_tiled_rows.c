@@ -17,6 +17,8 @@
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "test_harness.h"
+#include "trace_assert.h"
+#include "plan_fixture.h"
 
 #define TEST_ROWS  64
 #define TEST_IN    8
@@ -36,25 +38,20 @@ typedef struct {
     tigris_weight_entry_t weights[2];
     float blob[TEST_IN * TEST_OUT + TEST_OUT];
     int32_t shapes[9];   /* 6 used; the tail holds a rank-3 view */
-    uint16_t indices[8];
+    uint16_t indices[PLAN_FIXTURE_POOL_ONE_STAGE(2)];
     tigris_plan_t plan;
 } rows_fixture_t;
 
 /** One [rows, IN] x [OUT, IN] product followed by a Relu, all rank 2. */
-#include "trace_assert.h"
-
 static void build_fixture(rows_fixture_t *fx)
 {
     memset(fx, 0, sizeof(*fx));
+    plan_fixture_chain(&fx->plan, &fx->header, fx->tensors, fx->ops, &fx->stage,
+                       fx->indices, fx->shapes, 2, 1);
 
     fx->header.version = TIGRIS_SCHEMA_VERSION_V9;
-    fx->header.num_tensors = 3;
-    fx->header.num_ops = 2;
-    fx->header.num_stages = 1;
     fx->header.num_tile_plans = 1;
     fx->header.num_weights = 2;
-    fx->header.num_model_inputs = 1;
-    fx->header.num_model_outputs = 1;
 
     fx->shapes[0] = TEST_ROWS; fx->shapes[1] = TEST_IN;
     fx->shapes[2] = TEST_ROWS; fx->shapes[3] = TEST_OUT;
@@ -83,33 +80,13 @@ static void build_fixture(rows_fixture_t *fx)
     fx->weights[1].size_bytes = TEST_OUT * (uint32_t)sizeof(float);
 
     fx->ops[0].op_type = TIGRIS_OP_FULLY_CONN;
-    fx->ops[0].num_inputs = 1; fx->ops[0].num_outputs = 1;
-    fx->ops[0].inputs_off = 0; fx->ops[0].outputs_off = 1;
     fx->ops[0].weight_idx = 0; fx->ops[0].bias_idx = 1;
 
     fx->ops[1].op_type = TIGRIS_OP_RELU;
-    fx->ops[1].num_inputs = 1; fx->ops[1].num_outputs = 1;
-    fx->ops[1].inputs_off = 2; fx->ops[1].outputs_off = 3;
     fx->ops[1].weight_idx = TIGRIS_NO_WEIGHT;
     fx->ops[1].bias_idx = TIGRIS_NO_WEIGHT;
 
-    fx->indices[0] = 0;  /* op 0 input  */
-    fx->indices[1] = 1;  /* op 0 output */
-    fx->indices[2] = 1;  /* op 1 input  */
-    fx->indices[3] = 2;  /* op 1 output */
-    fx->indices[4] = 0;  /* stage ops   */
-    fx->indices[5] = 1;
-    fx->indices[6] = 0;  /* stage input, model input  */
-    fx->indices[7] = 2;  /* stage output, model output */
-
-    fx->stage.ops_off = 4;
-    fx->stage.ops_count = 2;
-    fx->stage.inputs_off = 6;
-    fx->stage.inputs_count = 1;
-    fx->stage.outputs_off = 7;
-    fx->stage.outputs_count = 1;
     fx->stage.tile_plan_idx = 0;
-    fx->stage.chain_id = TIGRIS_NO_CHAIN;
 
     fx->tile_plan.tileable = 1;
     fx->tile_plan.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
@@ -117,17 +94,9 @@ static void build_fixture(rows_fixture_t *fx)
     fx->tile_plan.num_tiles = TEST_ROWS;
     fx->tile_plan.original_height = TEST_ROWS;
 
-    fx->plan.header = &fx->header;
-    fx->plan.tensors = fx->tensors;
-    fx->plan.ops = fx->ops;
-    fx->plan.stages = &fx->stage;
     fx->plan.tile_plans = &fx->tile_plan;
     fx->plan.weight_entries = fx->weights;
     fx->plan.weight_blob = (const uint8_t *)fx->blob;
-    fx->plan.index_pool = fx->indices;
-    fx->plan.shape_pool = fx->shapes;
-    fx->plan.model_inputs = &fx->indices[6];
-    fx->plan.model_outputs = &fx->indices[7];
 }
 
 /* A kernel that fails once a given number of calls have succeeded, so a
@@ -154,30 +123,8 @@ static tigris_exec_error_t run_case_full(
 {
     _Alignas(TIGRIS_TENSOR_ALIGN) static uint8_t slow[SLOW_SIZE];
     uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0, 0)];
-    tigris_exec_stats_t stats;
-    tigris_mem_t mem;
-    void *ptrs[3];
-
-    memset(&stats, 0, sizeof(stats));
-    memset(slow, 0, sizeof(slow));
-
-    if (tigris_mem_init(&mem, ptrs, 3, fast, fast_size,
-                        slow, slow_size) != TIGRIS_MEM_OK)
-        return TIGRIS_EXEC_ERR_MEM;
-    if (tigris_mem_alloc_slow(&mem, 0, fx->tensors[0].size_bytes)
-            != TIGRIS_MEM_OK)
-        return TIGRIS_EXEC_ERR_MEM;
-    memcpy(mem.tensor_ptrs[0], input, fx->tensors[0].size_bytes);
-
-    tigris_exec_error_t err = tigris_run_with_workspace_buffer(
-        &fx->plan, &mem, kernel, user_ctx, &stats,
-        workspace, sizeof(workspace));
-    if (err != TIGRIS_EXEC_OK)
-        return err;
-
-    memcpy(output, mem.tensor_ptrs[2], fx->tensors[2].size_bytes);
-    *tiled = stats.stages_tiled;
-    return TIGRIS_EXEC_OK;
+    return run_fixture(&fx->plan, kernel, user_ctx, fast, fast_size, slow, slow_size,
+                       workspace, sizeof(workspace), input, output, tiled);
 }
 
 static tigris_exec_error_t run_case_slow(
@@ -403,22 +350,19 @@ typedef struct {
     tigris_weight_entry_t weights[2];
     float blob[ALIAS_IN * ALIAS_OUT + ALIAS_OUT];
     int32_t shapes[6];
-    uint16_t indices[10];
+    uint16_t indices[PLAN_FIXTURE_POOL(2)];
     tigris_plan_t plan;
 } alias_fixture_t;
 
 static void build_alias_fixture(alias_fixture_t *fx)
 {
     memset(fx, 0, sizeof(*fx));
+    plan_fixture_chain(&fx->plan, &fx->header, fx->tensors, fx->ops, fx->stages,
+                       fx->indices, fx->shapes, 2, 0);
 
     fx->header.version = TIGRIS_SCHEMA_VERSION_V9;
-    fx->header.num_tensors = 3;
-    fx->header.num_ops = 2;
-    fx->header.num_stages = 2;
     fx->header.num_tile_plans = 1;
     fx->header.num_weights = 2;
-    fx->header.num_model_inputs = 1;
-    fx->header.num_model_outputs = 1;
 
     fx->shapes[0] = TEST_ROWS; fx->shapes[1] = ALIAS_IN;
     fx->shapes[2] = TEST_ROWS; fx->shapes[3] = ALIAS_OUT;
@@ -447,44 +391,14 @@ static void build_alias_fixture(alias_fixture_t *fx)
     fx->weights[1].size_bytes = ALIAS_OUT * (uint32_t)sizeof(float);
 
     fx->ops[0].op_type = TIGRIS_OP_FULLY_CONN;
-    fx->ops[0].num_inputs = 1; fx->ops[0].num_outputs = 1;
-    fx->ops[0].inputs_off = 0; fx->ops[0].outputs_off = 1;
     fx->ops[0].weight_idx = 0; fx->ops[0].bias_idx = 1;
 
     fx->ops[1].op_type = TIGRIS_OP_RELU;
-    fx->ops[1].num_inputs = 1; fx->ops[1].num_outputs = 1;
-    fx->ops[1].inputs_off = 2; fx->ops[1].outputs_off = 3;
     fx->ops[1].weight_idx = TIGRIS_NO_WEIGHT;
     fx->ops[1].bias_idx = TIGRIS_NO_WEIGHT;
 
-    fx->indices[0] = 0;  /* op 0 input   */
-    fx->indices[1] = 1;  /* op 0 output  */
-    fx->indices[2] = 1;  /* op 1 input   */
-    fx->indices[3] = 2;  /* op 1 output  */
-    fx->indices[4] = 0;  /* stage 0 ops  */
-    fx->indices[5] = 1;  /* stage 1 ops  */
-    fx->indices[6] = 0;  /* stage 0 in, model input   */
-    fx->indices[7] = 1;  /* stage 0 out               */
-    fx->indices[8] = 1;  /* stage 1 in                */
-    fx->indices[9] = 2;  /* stage 1 out, model output */
-
-    fx->stages[0].ops_off = 4;
-    fx->stages[0].ops_count = 1;
-    fx->stages[0].inputs_off = 6;
-    fx->stages[0].inputs_count = 1;
-    fx->stages[0].outputs_off = 7;
-    fx->stages[0].outputs_count = 1;
     fx->stages[0].tile_plan_idx = 0;
-    fx->stages[0].chain_id = TIGRIS_NO_CHAIN;
-
-    fx->stages[1].ops_off = 5;
-    fx->stages[1].ops_count = 1;
-    fx->stages[1].inputs_off = 8;
-    fx->stages[1].inputs_count = 1;
-    fx->stages[1].outputs_off = 9;
-    fx->stages[1].outputs_count = 1;
     fx->stages[1].tile_plan_idx = 0;
-    fx->stages[1].chain_id = TIGRIS_NO_CHAIN;
 
     fx->tile_plan.tileable = 1;
     fx->tile_plan.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
@@ -492,17 +406,9 @@ static void build_alias_fixture(alias_fixture_t *fx)
     fx->tile_plan.num_tiles = TEST_ROWS;
     fx->tile_plan.original_height = TEST_ROWS;
 
-    fx->plan.header = &fx->header;
-    fx->plan.tensors = fx->tensors;
-    fx->plan.ops = fx->ops;
-    fx->plan.stages = fx->stages;
     fx->plan.tile_plans = &fx->tile_plan;
     fx->plan.weight_entries = fx->weights;
     fx->plan.weight_blob = (const uint8_t *)fx->blob;
-    fx->plan.index_pool = fx->indices;
-    fx->plan.shape_pool = fx->shapes;
-    fx->plan.model_inputs = &fx->indices[6];
-    fx->plan.model_outputs = &fx->indices[9];
 }
 
 static tigris_exec_error_t run_alias_case(

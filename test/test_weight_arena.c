@@ -13,6 +13,8 @@
 #include "tigris_mem.h"
 #include "tigris_mem_internal.h"
 #include "test_harness.h"
+#include "trace_assert.h"
+#include "plan_fixture.h"
 
 #define TEST_ALIGN_UP(x) \
     (((uint32_t)(x) + (TIGRIS_TENSOR_ALIGN - 1u)) & \
@@ -30,7 +32,7 @@ typedef struct {
     tigris_op_t ops[2];
     tigris_stage_t stages[2];
     int32_t shapes[12];
-    uint16_t indices[12];
+    uint16_t indices[PLAN_FIXTURE_POOL(2)];
     tigris_weight_block_t blocks[2];
     uint8_t weight_data[64];
     tigris_plan_t plan;
@@ -52,20 +54,14 @@ typedef struct {
     int fail_on_call;
 } kernel_ctx_t;
 
-#include "trace_assert.h"
-
 static void build_chain_plan(plan_fixture_t *fx)
 {
     memset(fx, 0, sizeof(*fx));
+    plan_fixture_chain(&fx->plan, &fx->header, fx->tensors, fx->ops, fx->stages,
+                       fx->indices, fx->shapes, 2, 0);
 
     /* A scheduled peak of 0 understates the stages, so a run reaches the in-run memory checks. */
     fx->header.version = TIGRIS_SCHEMA_VERSION;
-    fx->header.num_tensors = 3;
-    fx->header.num_ops = 2;
-    fx->header.num_stages = 2;
-    fx->header.num_model_inputs = 1;
-    fx->header.num_model_outputs = 1;
-    fx->header.model_io_off = 10;
 
     for (uint16_t i = 0; i < 3; i++) {
         fx->tensors[i].shape_off = (uint16_t)(i * 4);
@@ -80,49 +76,14 @@ static void build_chain_plan(plan_fixture_t *fx)
     fx->tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
     fx->tensors[2].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
 
-    fx->indices[0] = 0;  /* op 0 input */
-    fx->indices[1] = 1;  /* op 0 output */
-    fx->indices[2] = 1;  /* op 1 input */
-    fx->indices[3] = 2;  /* op 1 output */
-    fx->indices[4] = 0;  /* stage 0 op */
-    fx->indices[5] = 0;  /* stage 0 input */
-    fx->indices[6] = 1;  /* stage 0 output */
-    fx->indices[7] = 1;  /* stage 1 op */
-    fx->indices[8] = 1;  /* stage 1 input */
-    fx->indices[9] = 2;  /* stage 1 output */
-    fx->indices[10] = 0; /* model input */
-    fx->indices[11] = 2; /* model output */
-
     for (uint16_t i = 0; i < 2; i++) {
         fx->ops[i].op_type = TIGRIS_OP_RELU;
-        fx->ops[i].num_inputs = 1;
-        fx->ops[i].num_outputs = 1;
-        fx->ops[i].inputs_off = (uint16_t)(i * 2);
-        fx->ops[i].outputs_off = (uint16_t)(i * 2 + 1);
         fx->ops[i].weight_idx = TIGRIS_NO_WEIGHT;
         fx->ops[i].bias_idx = TIGRIS_NO_WEIGHT;
+        fx->stages[i].chain_id = 0;
+        fx->stages[i].chain_len = 2;
     }
-
-    fx->stages[0].ops_off = 4;
-    fx->stages[0].ops_count = 1;
-    fx->stages[0].inputs_off = 5;
-    fx->stages[0].inputs_count = 1;
-    fx->stages[0].outputs_off = 6;
-    fx->stages[0].outputs_count = 1;
-    fx->stages[0].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
-    fx->stages[0].chain_id = 0;
-    fx->stages[0].chain_len = 2;
     fx->stages[0].chain_tile_h = 1;
-
-    fx->stages[1].ops_off = 7;
-    fx->stages[1].ops_count = 1;
-    fx->stages[1].inputs_off = 8;
-    fx->stages[1].inputs_count = 1;
-    fx->stages[1].outputs_off = 9;
-    fx->stages[1].outputs_count = 1;
-    fx->stages[1].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
-    fx->stages[1].chain_id = 0;
-    fx->stages[1].chain_len = 2;
 
     fx->blocks[0].stage_idx = 0;
     fx->blocks[0].blob_offset = 0;
@@ -134,18 +95,10 @@ static void build_chain_plan(plan_fixture_t *fx)
     fx->blocks[1].uncompressed_size = CHAIN_BLOCK1_SIZE;
     memset(fx->weight_data, 0x5a, sizeof(fx->weight_data));
 
-    fx->plan.header = &fx->header;
-    fx->plan.tensors = fx->tensors;
-    fx->plan.ops = fx->ops;
-    fx->plan.stages = fx->stages;
-    fx->plan.index_pool = fx->indices;
-    fx->plan.shape_pool = fx->shapes;
     fx->plan.weight_blocks = fx->blocks;
     fx->plan.weight_blocks_data = fx->weight_data;
     fx->plan.num_weight_blocks = 2;
     fx->plan.weight_compression = TIGRIS_COMPRESS_NONE;
-    fx->plan.model_inputs = &fx->indices[10];
-    fx->plan.model_outputs = &fx->indices[11];
 }
 
 static void make_standalone(plan_fixture_t *fx)

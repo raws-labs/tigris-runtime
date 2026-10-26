@@ -27,7 +27,6 @@ typedef struct {
     uint8_t min_len;
     uint8_t max_len;
     uint8_t step;
-    uint8_t exact_len;
 } tigris_attribute_contract_t;
 
 #define TIGRIS_CONTRACT_BINARY 0x0001u
@@ -194,8 +193,6 @@ static tigris_error_t validate_contract_split(const tigris_plan_t *plan,
                                          const tigris_op_t *op, uint16_t op_index);
 static tigris_error_t validate_contract_svdf(const tigris_plan_t *plan,
                                          const tigris_op_t *op, uint16_t op_index);
-static tigris_error_t validate_contract_transpose(const tigris_plan_t *plan,
-                                         const tigris_op_t *op, uint16_t op_index);
 
 static const tigris_op_contract_t *tigris_op_contract(uint8_t opcode)
 {
@@ -228,7 +225,7 @@ static const tigris_op_contract_t *tigris_op_contract(uint8_t opcode)
         [TIGRIS_OP_REDUCE_MEAN] = {{{0u, 0u, 0u}, 0u}, 1u, 1u, 1u, 1u, 0x00000040u, 0x00000040u, 0u, 0u, TIGRIS_KERNEL_F32_REDUCE_MEAN, TIGRIS_KERNEL_S8_REDUCE_MEAN, TIGRIS_KERNEL_I32, validate_contract_arg_max},
         [TIGRIS_OP_SQUEEZE] = {{{0u, 0u, 0u}, 0u}, 1u, 1u, 1u, 1u, 0x00000000u, 0x00000000u, 0u, 0u, TIGRIS_KERNEL_F32_SQUEEZE, TIGRIS_KERNEL_S8_SQUEEZE, TIGRIS_KERNEL_I32, NULL},
         [TIGRIS_OP_UNSQUEEZE] = {{{0u, 0u, 0u}, 0u}, 1u, 1u, 1u, 1u, 0x00000000u, 0x00000000u, 0u, 0u, TIGRIS_KERNEL_F32_UNSQUEEZE, TIGRIS_KERNEL_S8_UNSQUEEZE, TIGRIS_KERNEL_I32, NULL},
-        [TIGRIS_OP_TRANSPOSE] = {{{255u, 255u, 255u}, 255u}, 1u, 1u, 1u, 1u, 0x00000002u, 0x00000002u, 0u, 0u, TIGRIS_KERNEL_F32_TRANSPOSE, TIGRIS_KERNEL_S8_TRANSPOSE, TIGRIS_KERNEL_I32, validate_contract_transpose},
+        [TIGRIS_OP_TRANSPOSE] = {{{255u, 255u, 255u}, 255u}, 1u, 1u, 1u, 1u, 0x00000002u, 0x00000002u, 0u, 0u, TIGRIS_KERNEL_F32_TRANSPOSE, TIGRIS_KERNEL_S8_TRANSPOSE, TIGRIS_KERNEL_I32, validate_contract_reshape},
         [TIGRIS_OP_RESIZE] = {{{0u, 0u, 0u}, 0u}, 1u, 1u, 1u, 1u, 0x00000400u, 0x00000000u, TIGRIS_CONTRACT_RESAMPLE, 0u, TIGRIS_KERNEL_F32_RESIZE, TIGRIS_KERNEL_S8_RESIZE, TIGRIS_KERNEL_I32, validate_contract_resize_linear},
         [TIGRIS_OP_GLOBAL_MAX] = {{{0u, 0u, 0u}, 0u}, 1u, 1u, 1u, 1u, 0x00000000u, 0x00000000u, 0u, 0u, TIGRIS_KERNEL_F32_GLOBAL_MAX, TIGRIS_KERNEL_S8_GLOBAL_MAX, TIGRIS_KERNEL_I32, validate_contract_global_max},
         [TIGRIS_OP_CONV1D] = {{{0u, 0u, 0u}, 0u}, 1u, 1u, 1u, 1u, 0x00000000u, 0x00000000u, TIGRIS_CONTRACT_FUSED, 0u, TIGRIS_KERNEL_F32_CONV1D, TIGRIS_KERNEL_S8_CONV1D, TIGRIS_KERNEL_I32, validate_contract_conv1d},
@@ -302,26 +299,26 @@ static const tigris_op_contract_t *tigris_op_contract(uint8_t opcode)
 static const tigris_attribute_contract_t *tigris_attribute_contract(uint8_t kind)
 {
     static const tigris_attribute_contract_t rows[21u] = {
-        [1] = {0u, 255u, 1u, 0u},
-        [2] = {4u, 4u, 1u, 4u},
-        [3] = {4u, 4u, 1u, 4u},
-        [4] = {8u, 8u, 1u, 8u},
-        [5] = {8u, 248u, 8u, 0u},
-        [6] = {1u, 255u, 1u, 0u},
-        [7] = {24u, 24u, 1u, 24u},
-        [8] = {1u, 1u, 1u, 1u},
-        [9] = {4u, 252u, 4u, 0u},
-        [10] = {8u, 8u, 1u, 8u},
-        [11] = {2u, 2u, 1u, 2u},
-        [12] = {0u, 255u, 1u, 0u},
-        [13] = {20u, 20u, 1u, 20u},
-        [14] = {2u, 254u, 2u, 0u},
-        [15] = {4u, 24u, 1u, 0u},
-        [16] = {8u, 112u, 1u, 0u},
-        [17] = {4u, 4u, 1u, 4u},
-        [18] = {32u, 32u, 1u, 32u},
-        [19] = {1u, 1u, 1u, 1u},
-        [20] = {4u, 252u, 4u, 0u},
+        [1] = {0u, 255u, 1u},
+        [2] = {4u, 4u, 1u},
+        [3] = {4u, 4u, 1u},
+        [4] = {8u, 8u, 1u},
+        [5] = {8u, 248u, 8u},
+        [6] = {1u, 255u, 1u},
+        [7] = {24u, 24u, 1u},
+        [8] = {1u, 1u, 1u},
+        [9] = {4u, 252u, 4u},
+        [10] = {8u, 8u, 1u},
+        [11] = {2u, 2u, 1u},
+        [12] = {4u, 76u, 4u},
+        [13] = {20u, 20u, 1u},
+        [14] = {2u, 254u, 2u},
+        [15] = {4u, 24u, 20u},
+        [16] = {8u, 112u, 104u},
+        [17] = {4u, 4u, 1u},
+        [18] = {32u, 32u, 1u},
+        [19] = {1u, 1u, 1u},
+        [20] = {4u, 24u, 4u},
     };
     const tigris_attribute_contract_t *result = NULL;
     if (kind < sizeof(rows) / sizeof(rows[0]))

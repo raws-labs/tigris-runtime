@@ -1388,14 +1388,26 @@ static void test_op_attribute_kinds(void)
                    TIGRIS_ERR_BAD_SECTION, "a kind beyond the set is refused");
 
     /* A schema-7 plan carries no kind but the permutation, whatever the
-     * operator, because the loader that reads it knows no other. */
+     * operator, because the loader that reads it knows no other. The
+     * variance floor below is valid for schema 8, so only the version
+     * refuses it. */
     build_transpose_plan(buf);
     plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V7);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "a schema-7 permutation loads");
+    ((tigris_op_t *)(buf + TRANSPOSE_OPS_OFF))->op_type = TIGRIS_OP_LAYER_NORM;
     attr = (tigris_op_attribute_t *)(buf + TRANSPOSE_ATTRS_OFF + 4u);
     attr->type = TIGRIS_OP_ATTR_EPSILON;
+    attr->data_len = (uint8_t)sizeof(float);
+    float floor_value = 1e-5f;
+    memcpy(buf + TRANSPOSE_ATTR_DATA_OFF, &floor_value, sizeof(floor_value));
     TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
                    TIGRIS_ERR_BAD_SECTION,
                    "a schema-7 plan carries no kind beyond the permutation");
+    plan_set_version(buf, TIGRIS_SCHEMA_VERSION_V8);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan),
+                   TIGRIS_ERR_BAD_OPERATOR,
+                   "the same variance floor passes the payload check at schema 8");
 }
 
 /**
@@ -5435,6 +5447,9 @@ static void test_constant_gather_contract(void)
         weight->size_bytes++;
         attr[1].data_len = 0u;
         TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "empty table shape refused");
+        attr[1].data_len = 28u;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                       "table shape length is checked before the movement payload reads it");
         attr[1].data_len = (uint8_t)(gold->rank * 4u);
         int32_t zero = 0;
         memcpy(buf + 1172 + attr[1].data_offset, &zero, 4u);
@@ -5453,6 +5468,13 @@ static void test_movement_contract(void)
         tigris_error_t error = tigris_plan_load(buf, sizeof(buf), &plan);
         if (error != TIGRIS_OK) fprintf(stderr, "movement loader case %zu: %d\n", g, error);
         TEST_ASSERT_EQ(error, TIGRIS_OK, "movement reference metadata loads");
+        tigris_op_t *op = (tigris_op_t *)(buf + 192);
+        if (((tigris_file_header_t *)buf)->num_weights != 0u) {
+            op->bias_idx = 0u;
+            TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_SECTION,
+                           "a movement operator without a constant table carries no bias");
+            op->bias_idx = TIGRIS_NO_WEIGHT;
+        }
         tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + 1156);
         attr->data_len--;
         TEST_ASSERT(tigris_plan_load(buf, sizeof(buf), &plan) != TIGRIS_OK, "truncated movement metadata refused");

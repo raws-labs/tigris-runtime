@@ -96,11 +96,12 @@ tigris_band_kind_t tigris_stage_band_kind(const tigris_plan_t *plan, const tigri
 /**
  * Derive what a stage's tile record states about its tiling (schema 11+),
  * by the rules the executor bands the stage with: the band axis, the extent
- * the bands divide, the band, the tile count and the halo. A layout
- * conversion sizes its band in the run, so its tile_extent is the record's,
- * bounded by the extent. An untileable record yields all zero. The run may
- * size its bands to the arena, so num_tiles counts the bands the plan states.
- * The loader refuses a record that disagrees with TIGRIS_ERR_TILE_FACTS.
+ * the bands divide, the band, the tile count and the halo. A height stripe
+ * divides its output rows into the stated output band, and num_tiles is the
+ * number of bands the executor runs. A layout conversion sizes its band in
+ * the run, so its tile_extent is the record's, bounded by the extent. An
+ * untileable record yields all zero.
+ * The loader returns TIGRIS_ERR_TILE_FACTS for a record that disagrees.
  *
  * @return 1 when derived, 0 when the stage's tiling has no such description.
  */

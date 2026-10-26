@@ -1090,11 +1090,13 @@ static int tile_v10_valid(const tigris_plan_t *plan, const tigris_stage_t *stage
         return tile->input_band_extent == 0u && tile->output_band_extent == 0u;
     if (tile->flags != 0u)
         return 0;
-    int resize = 0;
+    /* A Resize, and from schema 11 every height stripe, states its band in output rows. */
+    int output_rows = kind == TIGRIS_BAND_KIND_STRIPE &&
+                      plan->header->version >= TIGRIS_SCHEMA_VERSION_TILE_FACTS;
     for (uint16_t i = 0; i < stage->ops_count; i++)
         if (plan->ops[ops[i]].op_type == TIGRIS_OP_RESIZE || plan->ops[ops[i]].op_type == TIGRIS_OP_RESIZE_LINEAR)
-            resize = 1;
-    if (resize)
+            output_rows = 1;
+    if (output_rows)
         return out->ndim >= 3u && tile->input_band_extent == 0u &&
                tile->output_band_extent > 0u && tile->output_band_extent <= (uint32_t)b[1];
     if (tile->output_band_extent != 0u || tile->input_band_extent == 0u ||
@@ -4193,27 +4195,11 @@ int tigris_stage_tile_facts(const tigris_plan_t *plan, const tigris_stage_t *sta
         count = (uint64_t)bands_of(extent, tile.output_band_extent) *
                 bands_of((uint32_t)out_shape[2], tile.output_width_extent);
         halo = stage_halo(plan, stage);
-    } else if (tile.output_band_extent != 0u) {
-        /* A Resize bands its output rows. */
+    } else {
+        /* A height stripe, Resize included, bands its output rows. */
         out->band_axis = 1u;
         extent = (uint32_t)out_shape[1];
         out->tile_extent = tile.output_band_extent;
-        halo = stage_halo(plan, stage);
-    } else {
-        /* The height stripe runs over the first input more than one row high. */
-        const tigris_tensor_t *band = in;
-        for (uint16_t i = 0; i < stage->inputs_count; i++) {
-            const tigris_tensor_t *t = &plan->tensors[inputs[i]];
-            if (t->ndim != 4u || tigris_tensor_shape(plan, t)[1] != 1) {
-                band = t;
-                break;
-            }
-        }
-        if (band->ndim < 2u)
-            return 0;
-        out->band_axis = 1u;
-        extent = (uint32_t)tigris_tensor_shape(plan, band)[1];
-        out->tile_extent = tile.input_band_extent;
         halo = stage_halo(plan, stage);
     }
     if (count == 0u)

@@ -63,6 +63,8 @@ typedef struct {
 
 int tigris_reshape_band(const tigris_plan_t *plan, const tigris_stage_t *stage,
                         tigris_reshape_band_t *view);
+int tigris_pure_reinterpretation(const tigris_plan_t *plan, const tigris_tensor_t *in,
+                                 const tigris_tensor_t *out);
 int tigris_reshape_tile_valid(const tigris_tile_plan_t *tile,
                               const tigris_reshape_band_t *view);
 
@@ -115,9 +117,19 @@ int tigris_band_whole_input(const tigris_op_t *op, uint8_t position);
 int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
                                 uint16_t op_index, int row_tiled);
 
+/* How a height band treats an operator, read from its contract row. */
+typedef enum {
+    TIGRIS_HEIGHT_OP_REFUSED = 0,   /* no height band runs it */
+    TIGRIS_HEIGHT_OP_POINTWISE = 1, /* shape-preserving and halo-free */
+    TIGRIS_HEIGHT_OP_SPATIAL = 2,   /* a convolution or pool, with stride and halo */
+    TIGRIS_HEIGHT_OP_RESAMPLE = 3   /* a Resize, banded from the full extents on its own stage */
+} tigris_height_op_t;
+
 /* The rules the executor bands a stage by, which the loader's tile facts also derive from. */
+tigris_height_op_t tigris_height_op(uint8_t type);
 int tigris_height_spatial_op(uint8_t type);
 int tigris_height_upsample_op(uint8_t type);
+int tigris_axis1_binary_pointwise_op(uint8_t type);
 int tigris_stage_spatial_op(const tigris_plan_t *plan, const tigris_stage_t *stage);
 int tigris_stage_stripe_contract(const tigris_plan_t *plan, const tigris_stage_t *stage,
                                  uint8_t rank, uint8_t axis);

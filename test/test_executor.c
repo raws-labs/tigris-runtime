@@ -2667,17 +2667,13 @@ static void test_exec_chain_residual_rows(void)
     }
 }
 
-/* Fail-closed guard (final whole-branch review): is_height_tiling_op admits
- * ConvTranspose (the standalone 2D route needs it), so a forged/malformed plan
- * could place a ConvTranspose inside a tiled chain. exec_chain_tiled's composer
- * only models shrinking spatial ops (tigris_height_spatial_op), so it would run the
- * ConvTranspose with shape-preserving pointwise geometry - wrong output or an
- * OOB write, not an error. The guard in the chain's pre-execution op
- * enumeration must reject it with TIGRIS_EXEC_ERR_TILE. Here the ConvTranspose
- * sits in the SECOND chained stage, proving the guard covers every op the chain
- * would execute, not just the head stage's first op. Not reachable from the
- * compiler today (untileable ConvTranspose is kept out of chains); this is
- * defense-in-depth for the spec's first-class fail-closed invariant. */
+/* A forged or malformed plan can place a ConvTranspose inside a tiled chain.
+ * exec_chain_tiled's composer models only pointwise and shrinking spatial ops
+ * (tigris_height_op), so it would run the ConvTranspose with pointwise
+ * geometry and give wrong output or an out-of-bounds write. Its pre-execution
+ * pass over every op of every chained stage returns TIGRIS_EXEC_ERR_TILE
+ * instead. Here the ConvTranspose sits in the second chained stage, so the
+ * pass has to cover more than the head stage's first op. */
 static void test_exec_chained_convtranspose_fails_closed(void)
 {
     printf("  test_exec_chained_convtranspose_fails_closed...\n");

@@ -353,4 +353,17 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     set_tests_properties(posix_example_int8_output PROPERTIES
         PASS_REGULAR_EXPRESSION "Output: -1 1 -14 -5 -1\n"
         FAIL_REGULAR_EXPRESSION "Sanitizer;runtime error")
+
+    # An SVE target auto-detects a 64-byte TIGRIS_TENSOR_ALIGN, which stops the
+    # build; an explicit TIGRIS_TENSOR_ALIGN builds.
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        set(TIGRIS_SVE_ALIGN_COMMAND ${CMAKE_C_COMPILER} -std=c11 -fsyntax-only
+            -I${CMAKE_CURRENT_SOURCE_DIR}/include -D__ARM_FEATURE_SVE=1
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/tigris_mem.c)
+        add_test(NAME tensor_align_auto_sve COMMAND ${TIGRIS_SVE_ALIGN_COMMAND})
+        set_tests_properties(tensor_align_auto_sve PROPERTIES
+            PASS_REGULAR_EXPRESSION "the largest alignment compiled plans are sized for")
+        add_test(NAME tensor_align_explicit_sve
+            COMMAND ${TIGRIS_SVE_ALIGN_COMMAND} -DTIGRIS_TENSOR_ALIGN=64)
+    endif()
 endif()

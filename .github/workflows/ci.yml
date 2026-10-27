@@ -197,7 +197,7 @@ jobs:
       - run: >-
           clang -std=c11 -Wall -Wextra -Wpedantic -Werror
           -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
-          -Iinclude test/fuzz_loader.c src/tigris_loader.c
+          -Iinclude test/fuzz_loader.c src/tigris_loader.c src/tigris_band.c
           -o fuzz-loader
       - run: >-
           ./fuzz-loader fuzz-corpus -max_total_time=20 -timeout=2

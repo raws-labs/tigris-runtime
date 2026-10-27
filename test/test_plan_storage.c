@@ -22,7 +22,7 @@
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
 #include "tigris_loader.h"
-#include "tigris_binary_operands.h"
+#include "tigris_band.h"
 #include "test_harness.h"
 
 /* Under half the 262 KB that loader and executor frames sized by limits of 65535 would take. */

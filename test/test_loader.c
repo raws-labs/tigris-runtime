@@ -17,7 +17,7 @@
 #include "tigris_kernels.h"
 #include "tigris_kernels_s8.h"
 #include "tigris_iface.h"
-#include "tigris_binary_operands.h"
+#include "tigris_band.h"
 #include "test_harness.h"
 
 /* Error tests (no fixtures needed) */

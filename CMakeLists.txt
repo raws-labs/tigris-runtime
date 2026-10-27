@@ -13,6 +13,7 @@ endif()
 
 set(TIGRIS_RUNTIME_SRCS
     src/tigris_loader.c
+    src/tigris_band.c
     src/tigris_iface.c
     src/tigris_mem.c
     src/tigris_executor.c
@@ -247,7 +248,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     # fixed-workspace sizing contract live.
     add_library(stack_config_compile OBJECT
         src/tigris_executor.c src/tigris_executor_compat.c
-        src/tigris_loader.c)
+        src/tigris_loader.c src/tigris_band.c)
     target_include_directories(stack_config_compile PRIVATE include)
     target_compile_definitions(stack_config_compile PRIVATE
         TIGRIS_MAX_TENSORS=8

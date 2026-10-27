@@ -3,8 +3,8 @@
  * @brief The permutations a banded transpose can execute.
  *
  * Internal to src/. Not installed and not part of the public API. The loader
- * decides with it whether a transpose is bandable, for itself and for the
- * executor.
+ * and the band geometry decide with it whether a transpose is bandable, for
+ * themselves and for the executor.
  */
 #ifndef TIGRIS_TRANSPOSE_BAND_H
 #define TIGRIS_TRANSPOSE_BAND_H

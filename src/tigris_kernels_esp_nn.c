@@ -902,9 +902,6 @@ int tigris_dispatch_kernel_esp_nn(
 #if TIGRIS_KERNEL_S8_MUL
     case TIGRIS_OP_MUL: rc = adapt_mul(plan, op, mem); break;
 #endif
-    /* Global avg pool: s8_ref uses float rescale (in_scale/out_scale)
-     * that esp_nn_avg_pool_s8 doesn't support - fall back. */
-    case TIGRIS_OP_GLOBAL_AVG:  rc = -99; break;
     default:
         rc = -99; break;
     }

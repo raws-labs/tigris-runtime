@@ -381,15 +381,6 @@ static int adapt_avg_pool(
                                  &rounding_len) == NULL)
         return tigris_dispatch_kernel_s8(plan, op, op_index, mem, user_ctx);
 
-    /* arm_avgpool_s8 preserves the input scale/zero-point - it does not
-     * requantize. If the op rescales (in/out quant differ), fall back to the
-     * reference kernel which requantizes. */
-    const tigris_quant_param_t *pin_qp  = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
-    const tigris_quant_param_t *pout_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
-    if (pin_qp && pout_qp &&
-        (pin_qp->scale != pout_qp->scale || pin_qp->zero_point != pout_qp->zero_point))
-        return tigris_dispatch_kernel_s8(plan, op, op_index, mem, user_ctx);
-
     const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
 

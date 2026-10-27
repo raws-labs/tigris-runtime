@@ -253,6 +253,40 @@ static void test_same_quant_tie_rounding(void)
     }
 }
 
+static void test_window_outside_input_refused(void)
+{
+    printf("  test_window_outside_input_refused...\n");
+    avg_fixture_t fx;
+    int8_t input[1] = {7};
+    int8_t output[1];
+    void *ptrs[2] = {input, output};
+    tigris_mem_t mem;
+    build_fixture(&fx);
+
+    fx.shapes[1] = 1; fx.shapes[2] = 1; fx.shapes[3] = 1;
+    fx.shapes[5] = 1; fx.shapes[6] = 1; fx.shapes[7] = 1;
+    fx.tensors[0].size_bytes = 1;
+    fx.tensors[1].size_bytes = 1;
+    fx.op.spatial.kernel_h = 1;
+    fx.op.spatial.kernel_w = 1;
+    fx.op.spatial.pad_top = 2;
+    fx.op.spatial.pad_left = 2;
+    memset(&mem, 0, sizeof(mem));
+    mem.tensor_ptrs = ptrs;
+    mem.num_tensors = 2;
+
+    output[0] = 99;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&fx.plan, &fx.op, 0, &mem, NULL),
+                   -1, "window outside the input in both axes is refused");
+    TEST_ASSERT_EQ(output[0], 99, "refused window writes no output");
+
+    fx.op.spatial.pad_left = 0;
+    output[0] = 99;
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&fx.plan, &fx.op, 0, &mem, NULL),
+                   -1, "window outside the input in height is refused");
+    TEST_ASSERT_EQ(output[0], 99, "refused window writes no output");
+}
+
 static void test_asymmetric_quant_normal_and_tiled(void)
 {
     printf("  test_asymmetric_quant_normal_and_tiled...\n");
@@ -363,6 +397,7 @@ int main(void)
 {
     printf("TiGrIS Int8 AveragePool Tests\n\n");
     test_same_quant_tie_rounding();
+    test_window_outside_input_refused();
     test_asymmetric_quant_normal_and_tiled();
     test_accelerator_pool_routes();
 

@@ -5246,6 +5246,42 @@ static void test_schemas_before_4_are_refused(void)
                    "the MatMul is refused at the oldest supported schema");
 }
 
+/* Inputs that once crashed the loader, each with the result it gives now. */
+static void test_fuzz_regressions(void)
+{
+    static const struct {
+        const char *filename;
+        tigris_error_t expected;
+    } inputs[] = {
+        {"binary-op-without-output.tgrs", TIGRIS_ERR_BAD_OPERATOR},
+        {"misaligned-state-section.tgrs", TIGRIS_ERR_BAD_SECTION},
+        {"tiled-stage-without-operators.tgrs", TIGRIS_ERR_BAD_SECTION},
+    };
+    const size_t input_count = sizeof(inputs) / sizeof(inputs[0]);
+
+    printf("  test_fuzz_regressions...\n");
+    TEST_ASSERT_EQ(input_count, TIGRIS_FUZZ_REGRESSION_COUNT,
+                   "every fuzz regression input has a recorded result");
+    for (size_t i = 0; i < input_count; i++) {
+        char path[512];
+        int path_len = snprintf(path, sizeof(path), "%s/%s",
+                                TIGRIS_FUZZ_REGRESSION_DIR, inputs[i].filename);
+        TEST_ASSERT(path_len > 0 && (size_t)path_len < sizeof(path),
+                    "fuzz regression path fits");
+        if (path_len <= 0 || (size_t)path_len >= sizeof(path))
+            continue;
+        uint32_t len = 0;
+        uint8_t *buf = load_file(path, &len);
+        TEST_ASSERT(buf != NULL, "fuzz regression input is readable");
+        if (!buf)
+            continue;
+        tigris_plan_t plan;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, len, &plan), inputs[i].expected,
+                       "fuzz regression input gives its recorded result");
+        free(buf);
+    }
+}
+
 static void test_schema_compatibility_fixtures(void)
 {
     /*
@@ -6591,6 +6627,9 @@ int main(void)
     test_oldest_schema_validates_operators();
     test_schemas_before_4_are_refused();
     test_quant_param_counts_are_reconciled();
+
+    printf("\nFuzz regressions:\n");
+    test_fuzz_regressions();
 
     printf("\nStruct size tests:\n");
     test_struct_sizes();

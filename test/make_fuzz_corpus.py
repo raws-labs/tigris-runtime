@@ -3,7 +3,8 @@
 
 Deterministic seeds cover every cheap rejection path; the committed
 compiler-emitted plans cover the accepted schema versions and sections, and
-`fuzz_regressions/` keeps inputs that once crashed the loader.
+`fuzz_regressions/` keeps inputs that once crashed the loader. test_loader.c
+records the result each of them gives.
 """
 
 from __future__ import annotations

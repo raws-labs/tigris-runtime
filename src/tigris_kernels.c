@@ -2,7 +2,9 @@
  * @file tigris_kernels.c
  * @brief Reference float32 kernels + dispatch.
  *
- * All kernels are static. Data layout: NHWC, float32.
+ * Data layout: NHWC, float32. Also defines the operand resolution, geometry
+ * and dtype-generic kernels the int8 kernels share, declared in
+ * tigris_binary_operands.h and tigris_kernel_window.h.
  * Weight/bias accessed via tigris_op_weight() / tigris_op_bias().
  */
 
@@ -29,8 +31,9 @@ unsigned long g_tigris_kernel_rows = 0;
 
 /* Helpers */
 
-/** Total number of elements in a tensor. */
-static uint32_t tensor_numel(const tigris_plan_t *plan, uint16_t tidx)
+/* The element counts and row offsets below are declared in
+ * tigris_kernel_window.h, shared with the int8 kernels. */
+uint32_t tigris_tensor_numel(const tigris_plan_t *plan, uint16_t tidx)
 {
     const tigris_tensor_t *t = &plan->tensors[tidx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
@@ -40,18 +43,16 @@ static uint32_t tensor_numel(const tigris_plan_t *plan, uint16_t tidx)
     return n;
 }
 
-/** Tile-aware element count: uses tile dimensions when tiling active. */
-static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
-                                 const tigris_mem_t *mem)
+uint32_t tigris_tile_numel(const tigris_plan_t *plan, uint16_t tidx, const tigris_mem_t *mem)
 {
     if (!mem->tile.active)
-        return tensor_numel(plan, tidx);
+        return tigris_tensor_numel(plan, tidx);
     const tigris_tensor_t *t = &plan->tensors[tidx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
     /* Only the selected independent axis shrinks inside a packed band. */
     if (mem->tile.row_tiled) {
         uint8_t axis = tigris_band_axis(plan, t, mem->tile.row_tiled);
-        return tensor_numel(plan, tidx) / (uint32_t)shape[axis] *
+        return tigris_tensor_numel(plan, tidx) / (uint32_t)shape[axis] *
                (uint32_t)mem->tile.out_h;
     }
     /* Serialized activations are NHWC or NLC. */
@@ -60,15 +61,25 @@ static uint32_t tile_aware_numel(const tigris_plan_t *plan, uint16_t tidx,
            width * (uint32_t)shape[t->ndim - 1];
 }
 
-/** Per-row element count for pointwise row-offset pointer arithmetic:
- * the same width*channels term tile_aware_numel multiplies by out_h. */
-static uint32_t tile_row_elems(const tigris_plan_t *plan, uint16_t tidx,
+uint32_t tigris_tile_row_elems(const tigris_plan_t *plan, uint16_t tidx,
                                const tigris_mem_t *mem)
 {
     const tigris_tensor_t *t = &plan->tensors[tidx];
     const int32_t *shape = tigris_tensor_shape(plan, t);
     uint32_t width = t->ndim == 4 ? (uint32_t)mem->tile.out_w : 1u;
     return width * (uint32_t)shape[t->ndim - 1];
+}
+
+void tigris_pointwise_row_offsets(const tigris_plan_t *plan, uint16_t tidx,
+                                  const tigris_mem_t *mem, size_t *in_offset, size_t *out_offset)
+{
+    *in_offset = 0u;
+    *out_offset = 0u;
+    if (mem->tile.active) {
+        uint32_t row_elems = tigris_tile_row_elems(plan, tidx, mem);
+        *in_offset = (size_t)mem->tile.in_row_start * row_elems;
+        *out_offset = (size_t)mem->tile.out_row_start * row_elems;
+    }
 }
 
 /** True when two tensor descriptors have the same logical shape. */
@@ -137,11 +148,10 @@ static void apply_pointwise_row_offset_f32(
     const tigris_plan_t *plan, uint16_t tidx, const tigris_mem_t *mem,
     const float **x, float **y)
 {
-    if (!mem->tile.active)
-        return;
-    uint32_t row_elems = tile_row_elems(plan, tidx, mem);
-    *x += (size_t)mem->tile.in_row_start * row_elems;
-    *y += (size_t)mem->tile.out_row_start * row_elems;
+    size_t in_offset, out_offset;
+    tigris_pointwise_row_offsets(plan, tidx, mem, &in_offset, &out_offset);
+    *x += in_offset;
+    *y += out_offset;
 }
 
 /* Kernels */
@@ -415,7 +425,7 @@ static int kern_relu(
     const uint16_t *outs = tigris_op_outputs(plan, op);
     const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
     float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
     apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++)
         Y[i] = X[i] > 0.0f ? X[i] : 0.0f;
@@ -429,7 +439,7 @@ static int kern_relu6(
     const uint16_t *outs = tigris_op_outputs(plan, op);
     const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
     float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
     apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++) {
         float v = X[i] > 0.0f ? X[i] : 0.0f;
@@ -454,7 +464,7 @@ static int kern_sigmoid(
     const uint16_t *outs = tigris_op_outputs(plan, op);
     const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
     float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
     apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++)
         Y[i] = logistic_f32(X[i]);
@@ -477,7 +487,7 @@ static int kern_elementwise_unary_f32(
     const uint16_t *outs = tigris_op_outputs(plan, op);
     const float *input = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
     float *output = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
-    uint32_t count = tile_aware_numel(plan, ins[0], mem);
+    uint32_t count = tigris_tile_numel(plan, ins[0], mem);
     if (!input || !output) return -1;
     apply_pointwise_row_offset_f32(plan, ins[0], mem, &input, &output);
     for (uint32_t i = 0; i < count; i++) {
@@ -521,7 +531,7 @@ static int kern_activation_f32(
         }
         if (!isfinite(alpha)) return -1;
     }
-    uint32_t count = tile_aware_numel(plan, input_index, mem);
+    uint32_t count = tigris_tile_numel(plan, input_index, mem);
     apply_pointwise_row_offset_f32(plan, input_index, mem, &input, &output);
     for (uint32_t i = 0; i < count; i++) {
         float value = input[i];
@@ -544,7 +554,7 @@ static int kern_normalization_f32(
         !tensor_is_f32(plan, result) || !tensor_shapes_equal(plan, tensor, result)) return -1;
     const int32_t *shape = tigris_tensor_shape(plan, tensor);
     int32_t width = shape[tensor->ndim - 1u];
-    uint32_t count = tile_aware_numel(plan, input_index, mem);
+    uint32_t count = tigris_tile_numel(plan, input_index, mem);
     if (width <= 0 || count % (uint32_t)width != 0u) return -1;
     const float *input = (const float *)tigris_mem_tensor_ptr(mem, input_index);
     float *output = (float *)tigris_mem_tensor_ptr(mem, output_index);
@@ -591,7 +601,7 @@ static int kern_hardswish(
     const uint16_t *outs = tigris_op_outputs(plan, op);
     const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
     float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
     apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++) {
         float gate = X[i] + 3.0f;
@@ -614,7 +624,7 @@ static int kern_gelu(
     const uint8_t *mode = tigris_op_attribute_data(
         plan, op_index, TIGRIS_OP_ATTR_GELU_APPROXIMATE, &len);
     if (mode == NULL || len != 1u) return -1;
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
     apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++) {
         float x = X[i];
@@ -632,7 +642,7 @@ static int kern_erf(
     const uint16_t *outs = tigris_op_outputs(plan, op);
     const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
     float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
     apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++)
         Y[i] = erff(X[i]);
@@ -667,7 +677,7 @@ static int kern_layer_norm(
     if (width <= 0)
         return -1;
 
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
     apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
     if (n % (uint32_t)width != 0u)
         return -1;
@@ -714,7 +724,7 @@ static int kern_tanh(
     const uint16_t *outs = tigris_op_outputs(plan, op);
     const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
     float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
-    uint32_t n = tile_aware_numel(plan, ins[0], mem);
+    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
     apply_pointwise_row_offset_f32(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++)
         Y[i] = tanhf(X[i]);
@@ -741,8 +751,8 @@ static int kern_softmax(
     const uint32_t classes = (uint32_t)shape[x_tensor->ndim - 1];
     /* Normalization runs along the final stored dimension while a tile cuts
      * stored axis 1, so a tile always holds whole rows and needs nothing from
-     * its neighbours. tile_aware_numel counts in those same terms. */
-    const uint32_t count = tile_aware_numel(plan, ins[0], mem);
+     * its neighbors. tigris_tile_numel counts in those same terms. */
+    const uint32_t count = tigris_tile_numel(plan, ins[0], mem);
     if (classes == 0 || count % classes != 0)
         return -1;
 
@@ -845,8 +855,6 @@ static int kern_conv1d(
 #define BINARY_FLOOR_MOD 8
 #define BINARY_PRELU 9
 
-/* Declared in tigris_binary_operands.h, shared with the int8 kernels. */
-
 /* One operand's shape, left-padded with 1 to the output's rank. */
 static int binary_operand_shape(const int32_t *shape, uint8_t ndim, uint8_t rank,
                                 uint32_t *padded)
@@ -909,6 +917,7 @@ static int binary_operand_access(tigris_binary_operands_t *out, uint8_t k,
     return 1;
 }
 
+/* Declared in tigris_binary_operands.h, shared with the int8 kernels. */
 uint32_t tigris_binary_general_index(const tigris_binary_operands_t *operands,
                                      uint8_t k, uint32_t i)
 {
@@ -1123,7 +1132,7 @@ int tigris_int32_execute(const tigris_plan_t *plan, const tigris_op_t *op,
 #if TIGRIS_KERNEL_I32
     const uint16_t result = tigris_op_outputs(plan, op)[0];
     uint8_t *y = (uint8_t *)tigris_mem_tensor_ptr(mem, result);
-    const uint32_t count = tensor_numel(plan, result);
+    const uint32_t count = tigris_tensor_numel(plan, result);
     /* Counters and indices are never tiled. */
     if (y == NULL || mem->tile.active) return -1;
     if (op->op_type == TIGRIS_OP_CAST) {
@@ -1175,8 +1184,8 @@ int tigris_bool_execute(const tigris_plan_t *plan, const tigris_op_t *op,
     const tigris_tensor_t *output = &plan->tensors[result];
     uint8_t *y = (uint8_t *)tigris_mem_tensor_ptr(mem, result);
     const uint32_t element = tigris_dtype_size(output->dtype);
-    const uint32_t count = tile_aware_numel(plan, result, mem);
-    const uint32_t row = mem->tile.active ? tile_row_elems(plan, result, mem) : 0u;
+    const uint32_t count = tigris_tile_numel(plan, result, mem);
+    const uint32_t row = mem->tile.active ? tigris_tile_row_elems(plan, result, mem) : 0u;
     if (y == NULL) return -1;
     y += (size_t)mem->tile.out_row_start * row * element;
     if (op->op_type == TIGRIS_OP_CAST || op->op_type == TIGRIS_OP_LOGICAL_NOT) {
@@ -1253,8 +1262,8 @@ static int kern_add_n_f32(const tigris_plan_t *plan, const tigris_op_t *op, tigr
     const uint16_t *inputs = tigris_op_inputs(plan, op);
     const uint16_t result = tigris_op_outputs(plan, op)[0];
     float *y = (float *)tigris_mem_tensor_ptr(mem, result);
-    const uint32_t count = tile_aware_numel(plan, result, mem);
-    const uint32_t row = mem->tile.active ? tile_row_elems(plan, result, mem) : 0u;
+    const uint32_t count = tigris_tile_numel(plan, result, mem);
+    const uint32_t row = mem->tile.active ? tigris_tile_row_elems(plan, result, mem) : 0u;
     if (y == NULL) return -1;
     y += (size_t)mem->tile.out_row_start * row;
     for (uint32_t i = 0u; i < count; i++) {
@@ -1279,9 +1288,9 @@ static int kern_binary_f32(
     const uint16_t y_idx = operands.output;
     float *Y = (float *)tigris_mem_tensor_ptr(mem, y_idx);
 
-    uint32_t n = tile_aware_numel(plan, y_idx, mem);
+    uint32_t n = tigris_tile_numel(plan, y_idx, mem);
     if (mem->tile.active) {
-        uint32_t row_elems = tile_row_elems(plan, y_idx, mem);
+        uint32_t row_elems = tigris_tile_row_elems(plan, y_idx, mem);
         for (uint8_t k = 0; k < 2u; k++) {
             if (operands.period[k] == 0u)
                 operands.data[k] += (size_t)mem->tile.in_row_start * row_elems * sizeof(float);
@@ -1313,27 +1322,6 @@ static int kern_binary_f32(
         Y[i] = apply_fused_act_f32(v, op->fused_act);
     }
     return 0;
-}
-
-static int kern_mul(
-    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
-    tigris_mem_t *mem)
-{
-    return kern_binary_f32(plan, op, op_index, mem, BINARY_MUL);
-}
-
-static int kern_add(
-    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
-    tigris_mem_t *mem)
-{
-    return kern_binary_f32(plan, op, op_index, mem, BINARY_ADD);
-}
-
-static int kern_sub(
-    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
-    tigris_mem_t *mem)
-{
-    return kern_binary_f32(plan, op, op_index, mem, BINARY_SUB);
 }
 
 static int kern_global_avg_pool(
@@ -1389,7 +1377,7 @@ static int kern_global_avg_pool(
 static uint32_t independent_band_numel(const tigris_plan_t *plan, uint16_t index,
                                       const tigris_mem_t *mem)
 {
-    uint32_t count = tensor_numel(plan, index);
+    uint32_t count = tigris_tensor_numel(plan, index);
     if (!mem->tile.active) return count;
     const tigris_tensor_t *tensor = &plan->tensors[index];
     uint8_t axis = tigris_band_axis(plan, tensor, mem->tile.row_tiled);
@@ -1432,15 +1420,8 @@ static int axis_extents(
     return 0;
 }
 
-/**
- * Mean over one axis of a rank-3 tensor.
- *
- * The plan names a serialized axis, so the operator reads the same whichever
- * order a tensor states its own axes in: the token axis of a sequence and the
- * channel axis of a feature map are both just one axis of [outer, reduced,
- * inner]. Collapsing the token axis is what a mean-pooled sequence head does.
- */
-static int reduce_mean_extents(
+/* Declared in tigris_kernel_window.h, shared with the int8 kernels. */
+int tigris_rank3_axis_extents(
     const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index, const tigris_mem_t *mem,
     int32_t *outer, int32_t *reduced, int32_t *inner)
 {
@@ -1651,11 +1632,11 @@ int tigris_quantize_execute(const tigris_plan_t *plan, const tigris_op_t *op, ti
         tigris_tensor_quant(plan, &plan->tensors[quantize ? y_index : x_index]);
     const uint8_t *x = (const uint8_t *)tigris_mem_tensor_ptr(mem, x_index);
     uint8_t *y = (uint8_t *)tigris_mem_tensor_ptr(mem, y_index);
-    const uint32_t count = tile_aware_numel(plan, y_index, mem);
+    const uint32_t count = tigris_tile_numel(plan, y_index, mem);
     if (q == NULL || x == NULL || y == NULL) return -1;
     /* A tile covers the same rows of both; their elements differ in size. */
     if (mem->tile.active) {
-        const size_t row = tile_row_elems(plan, y_index, mem);
+        const size_t row = tigris_tile_row_elems(plan, y_index, mem);
         x += (size_t)mem->tile.in_row_start * row * (quantize ? sizeof(float) : 1u);
         y += (size_t)mem->tile.out_row_start * row * (quantize ? 1u : sizeof(float));
     }
@@ -1981,7 +1962,7 @@ int tigris_reduce_all_execute(const tigris_plan_t *plan, const tigris_op_t *op,
 {
     int32_t outer, reduced, inner;
     if (op->num_inputs != 1u || op->num_outputs != 1u ||
-        reduce_mean_extents(plan, op, op_index, mem, &outer, &reduced, &inner) != 0)
+        tigris_rank3_axis_extents(plan, op, op_index, mem, &outer, &reduced, &inner) != 0)
         return -1;
     const uint16_t src = tigris_op_inputs(plan, op)[0];
     const uint16_t dst = tigris_op_outputs(plan, op)[0];
@@ -2005,43 +1986,13 @@ int tigris_reduce_all_execute(const tigris_plan_t *plan, const tigris_op_t *op,
     return 0;
 }
 
-static int kern_reduce_mean(
-    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
-    tigris_mem_t *mem)
-{
-    int32_t outer;
-    int32_t reduced;
-    int32_t inner;
-    if (reduce_mean_extents(plan, op, op_index, mem, &outer, &reduced, &inner) != 0)
-        return -1;
-
-    const uint16_t *ins  = tigris_op_inputs(plan, op);
-    const uint16_t *outs = tigris_op_outputs(plan, op);
-    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
-    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
-    for (int32_t o = 0; o < outer; o++) {
-        const float *src = X + (size_t)o * (size_t)reduced * (size_t)inner;
-        float *dst = Y + (size_t)o * (size_t)inner;
-        for (int32_t i = 0; i < inner; i++)
-            dst[i] = 0.0f;
-        for (int32_t r = 0; r < reduced; r++) {
-            const float *row = src + (size_t)r * (size_t)inner;
-            for (int32_t i = 0; i < inner; i++)
-                dst[i] += row[i];
-        }
-        for (int32_t i = 0; i < inner; i++)
-            dst[i] /= (float)reduced;
-    }
-    return 0;
-}
-
 static int kern_reduce_f32(
     const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
     tigris_mem_t *mem)
 {
     int32_t outer, reduced, inner;
     if (op->num_inputs != 1u || op->num_outputs != 1u ||
-        reduce_mean_extents(plan, op, op_index, mem, &outer, &reduced, &inner) != 0) return -1;
+        tigris_rank3_axis_extents(plan, op, op_index, mem, &outer, &reduced, &inner) != 0) return -1;
     const float *input = (const float *)tigris_mem_tensor_ptr(mem, tigris_op_inputs(plan, op)[0]);
     float *output = (float *)tigris_mem_tensor_ptr(mem, tigris_op_outputs(plan, op)[0]);
     if (!input || !output) return -1;
@@ -2053,11 +2004,12 @@ static int kern_reduce_f32(
                         : op->op_type == TIGRIS_OP_REDUCE_MIN ? FLT_MAX : 0.0f;
             for (int32_t r = 0; r < reduced; r++) {
                 float sample = src[(size_t)r * (size_t)inner + (size_t)i];
-                if (op->op_type == TIGRIS_OP_REDUCE_SUM) value = sample + value;
+                if (op->op_type == TIGRIS_OP_REDUCE_SUM || op->op_type == TIGRIS_OP_REDUCE_MEAN)
+                    value = sample + value;
                 else if ((op->op_type == TIGRIS_OP_REDUCE_MAX && sample > value) ||
                          (op->op_type == TIGRIS_OP_REDUCE_MIN && sample < value)) value = sample;
             }
-            dst[i] = value;
+            dst[i] = op->op_type == TIGRIS_OP_REDUCE_MEAN ? value / (float)reduced : value;
         }
     }
     return 0;
@@ -2073,7 +2025,7 @@ static int kern_cumsum_f32(
         plan, op_index, TIGRIS_OP_ATTR_CUMSUM_OPTIONS, &length);
     if (!options || length != 2u || options[0] > 1u || options[1] > 1u ||
         op->num_inputs != 1u || op->num_outputs != 1u ||
-        reduce_mean_extents(plan, op, op_index, mem, &outer, &reduced, &inner) != 0) return -1;
+        tigris_rank3_axis_extents(plan, op, op_index, mem, &outer, &reduced, &inner) != 0) return -1;
     const uint16_t x = tigris_op_inputs(plan, op)[0];
     const uint16_t y = tigris_op_outputs(plan, op)[0];
     if (!tensor_shapes_equal(plan, &plan->tensors[x], &plan->tensors[y])) return -1;
@@ -2096,13 +2048,6 @@ static int kern_cumsum_f32(
     return 0;
 }
 
-/**
- * Split a tensor into contiguous parts along its outermost stored axis.
- *
- * The loader admits only the split whose parts are runs of the input, so each
- * output is that many bytes taken in order. Nothing is interleaved and no
- * shape arithmetic is needed; the parts differ only in how much they take.
- */
 /* Declared in tigris_binary_operands.h, shared with the int8 kernels. */
 int tigris_pad(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
                const tigris_mem_t *mem, uint32_t element, const uint8_t *fill)
@@ -2187,6 +2132,13 @@ static int kern_pad(const tigris_plan_t *plan, const tigris_op_t *op, uint16_t o
     return tigris_pad(plan, op, op_index, mem, sizeof(float), fill);
 }
 
+/**
+ * Split a tensor into contiguous parts along its outermost stored axis.
+ *
+ * The loader admits only the split whose parts are runs of the input, so each
+ * output is that many bytes taken in order. Nothing is interleaved and no
+ * shape arithmetic is needed; the parts differ only in how much they take.
+ */
 static int kern_split(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -2202,12 +2154,12 @@ static int kern_split(
     for (uint32_t axis = 0; axis < op->spatial.kernel_h; axis++)
         positions *= mem->tile.active && axis == tigris_band_axis(plan, input, mem->tile.row_tiled)
                    ? (uint32_t)mem->tile.in_h : (uint32_t)in_shape[axis];
-    uint32_t stride = tile_aware_numel(plan, ins[0], mem) * tigris_dtype_size(input->dtype) / positions;
+    uint32_t stride = tigris_tile_numel(plan, ins[0], mem) * tigris_dtype_size(input->dtype) / positions;
     uint32_t offset = 0;
     for (uint8_t i = 0; i < op->num_outputs; i++) {
         const tigris_tensor_t *part = &plan->tensors[outs[i]];
         uint8_t *destination = (uint8_t *)tigris_mem_tensor_ptr(mem, outs[i]);
-        uint32_t run = tile_aware_numel(plan, outs[i], mem) * tigris_dtype_size(part->dtype) / positions;
+        uint32_t run = tigris_tile_numel(plan, outs[i], mem) * tigris_dtype_size(part->dtype) / positions;
         if (destination == NULL)
             return -1;
         for (uint32_t q = 0; q < positions; q++)
@@ -2358,10 +2310,10 @@ static int kern_reshape(
      * always done this; the float one copied the whole tensor, which a row
      * band would write past the end of. */
     const tigris_tensor_t *in = &plan->tensors[ins[0]];
-    uint32_t elems = tensor_numel(plan, ins[0]);
+    uint32_t elems = tigris_tensor_numel(plan, ins[0]);
     uint32_t sz = in->size_bytes;
     if (elems != 0u)
-        sz = (in->size_bytes / elems) * tile_aware_numel(plan, ins[0], mem);
+        sz = (in->size_bytes / elems) * tigris_tile_numel(plan, ins[0], mem);
     if (X != Y)
         memcpy(Y, X, sz);
     return 0;
@@ -2519,6 +2471,40 @@ static int kern_avg_pool(
     return 0;
 }
 
+/* Declared in tigris_kernel_window.h, shared with the int8 kernels. */
+int tigris_concat_geometry(const tigris_plan_t *plan, const tigris_op_t *op,
+                           const tigris_mem_t *mem, tigris_concat_geometry_t *g)
+{
+    const tigris_tensor_t *y = &plan->tensors[tigris_op_outputs(plan, op)[0]];
+    const int32_t *y_shape = tigris_tensor_shape(plan, y);
+    uint8_t rank = y->ndim;
+    uint8_t axis = (rank == 4u && op->spatial.kernel_h == 0)
+                 ? 3u : (uint8_t)op->spatial.kernel_h;
+    int positions = 1;
+    int inner = 1;
+
+    if (axis == 0u || axis >= rank || (mem->tile.active && mem->tile.row_tiled < TIGRIS_BAND_LEADING && axis != rank - 1u))
+        return -1;
+    for (uint8_t j = 0; j < axis; j++)
+        positions *= mem->tile.active && mem->tile.row_tiled >= TIGRIS_BAND_LEADING &&
+                     j == tigris_band_axis(plan, y, mem->tile.row_tiled)
+                   ? mem->tile.out_h : y_shape[j];
+    for (uint8_t j = (uint8_t)(axis + 1u); j < rank; j++)
+        inner *= mem->tile.active && mem->tile.row_tiled >= TIGRIS_BAND_LEADING &&
+                 j == tigris_band_axis(plan, y, mem->tile.row_tiled)
+               ? mem->tile.out_h : y_shape[j];
+    if (mem->tile.active && mem->tile.row_tiled < TIGRIS_BAND_LEADING) {
+        positions = y_shape[0] * mem->tile.out_h;
+        if (rank == 4u)
+            positions *= mem->tile.out_w;
+    }
+    g->axis = axis;
+    g->positions = positions;
+    g->inner = inner;
+    g->total = y_shape[axis] * inner;
+    return 0;
+}
+
 static int kern_concat(
     const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
@@ -2527,37 +2513,10 @@ static int kern_concat(
 
     float *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
 
-    const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
-
-    /* Concat along one stored axis: each input contributes one contiguous
-     * run per position, a run being its extent along the axis times every
-     * axis after it, and the positions are the product of the axes ahead of
-     * it. Along the last axis, an image's channels or a sequence's features,
-     * the run is the input's own extent and a tile only shortens the axes
-     * ahead; any other axis is cut whole and never tiled. */
-    uint8_t rank = plan->tensors[outs[0]].ndim;
-    uint8_t axis = (rank == 4u && op->spatial.kernel_h == 0)
-                 ? 3u : (uint8_t)op->spatial.kernel_h;
-    int positions = 1;
-    int inner = 1;
+    tigris_concat_geometry_t g;
     int out_c_offset = 0;
-
-    if (axis == 0u || axis >= rank || (mem->tile.active && mem->tile.row_tiled < TIGRIS_BAND_LEADING && axis != rank - 1u))
+    if (tigris_concat_geometry(plan, op, mem, &g) != 0)
         return -1;
-    for (uint8_t j = 0; j < axis; j++)
-        positions *= mem->tile.active && mem->tile.row_tiled >= TIGRIS_BAND_LEADING &&
-                     j == tigris_band_axis(plan, &plan->tensors[outs[0]], mem->tile.row_tiled)
-                   ? mem->tile.out_h : y_shape[j];
-    for (uint8_t j = (uint8_t)(axis + 1u); j < rank; j++)
-        inner *= mem->tile.active && mem->tile.row_tiled >= TIGRIS_BAND_LEADING &&
-                 j == tigris_band_axis(plan, &plan->tensors[outs[0]], mem->tile.row_tiled)
-               ? mem->tile.out_h : y_shape[j];
-    if (mem->tile.active && mem->tile.row_tiled < TIGRIS_BAND_LEADING) {
-        positions = y_shape[0] * mem->tile.out_h;
-        if (rank == 4u)
-            positions *= mem->tile.out_w;
-    }
-    int total_OC = y_shape[axis] * inner;
 
     /* A constant leading part, which is how a learned token is prepended to a
      * sequence. The plan names it as the operator's weight and the loader has
@@ -2565,17 +2524,17 @@ static int kern_concat(
      * its extent is whatever they do not cover. */
     if (op->weight_idx != TIGRIS_NO_WEIGHT) {
         const float *K = (const float *)tigris_op_weight(plan, op);
-        int leading = total_OC;
+        int leading = g.total;
         if (K == NULL || mem->tile.active)
             return -1;
         for (int i = 0; i < op->num_inputs; i++) {
             const tigris_tensor_t *part = &plan->tensors[ins[i]];
-            leading -= tigris_tensor_shape(plan, part)[axis] * inner;
+            leading -= tigris_tensor_shape(plan, part)[g.axis] * g.inner;
         }
         if (leading <= 0)
             return -1;
-        for (int q = 0; q < positions; q++) {
-            memcpy(Y + (size_t)q * total_OC, K + (size_t)q * leading,
+        for (int q = 0; q < g.positions; q++) {
+            memcpy(Y + (size_t)q * g.total, K + (size_t)q * leading,
                    (size_t)leading * sizeof(float));
         }
         out_c_offset = leading;
@@ -2584,12 +2543,12 @@ static int kern_concat(
     for (int i = 0; i < op->num_inputs; i++) {
         const float *Xi = (const float *)tigris_mem_tensor_ptr(mem, ins[i]);
         const int32_t *xi_shape = tigris_tensor_shape(plan, &plan->tensors[ins[i]]);
-        int Ci = xi_shape[axis] * inner;
+        int Ci = xi_shape[g.axis] * g.inner;
 
         if (Xi == NULL)
             return -1;
-        for (int q = 0; q < positions; q++) {
-            memcpy(Y + (size_t)q * total_OC + out_c_offset,
+        for (int q = 0; q < g.positions; q++) {
+            memcpy(Y + (size_t)q * g.total + out_c_offset,
                    Xi + (size_t)q * Ci, (size_t)Ci * sizeof(float));
         }
         out_c_offset += Ci;
@@ -2802,14 +2761,17 @@ static int kern_resize_linear(
     return 0;
 }
 
-static int kern_resize_nearest(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+/* Declared in tigris_kernel_window.h, shared with the int8 kernels. */
+#if TIGRIS_KERNEL_F32_RESIZE || TIGRIS_KERNEL_S8_RESIZE
+int tigris_resize_nearest_execute(const tigris_plan_t *plan, const tigris_op_t *op,
+                                  tigris_mem_t *mem, uint32_t element,
+                                  tigris_pixel_copy_fn copy, const void *ctx)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
 
-    const float *X = (const float *)tigris_mem_tensor_ptr(mem, ins[0]);
-    float       *Y = (float *)tigris_mem_tensor_ptr(mem, outs[0]);
+    const uint8_t *X = (const uint8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
+    uint8_t       *Y = (uint8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
 
     const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
@@ -2846,14 +2808,18 @@ static int kern_resize_nearest(
             if (ih < 0 || ih >= IH) return -1;
             for (int ow = 0; ow < OW; ow++) {
                 int iw = tigris_resize_nearest(ow, x_shape[2], y_shape[2], op->spatial.kernel_h, scale_w);
-                const float *src = X + ((n * IH + ih) * IW + iw) * C;
-                float *dst = Y + ((n * OH + oh) * OW + ow) * C;
-                memcpy(dst, src, (size_t)C * sizeof(float));
+                const uint8_t *src = X + (size_t)(((n * IH + ih) * IW + iw) * C) * element;
+                uint8_t *dst = Y + (size_t)(((n * OH + oh) * OW + ow) * C) * element;
+                if (copy == NULL)
+                    memcpy(dst, src, (size_t)C * element);
+                else
+                    copy(dst, src, C, ctx);
             }
         }
     }
     return 0;
 }
+#endif
 
 /* The permutation walks below move one element at a time. Handing each of
  * those to memcpy costs a call plus the library's own size descent before a
@@ -3195,6 +3161,78 @@ static int kern_svdf_f32(const tigris_plan_t *plan, const tigris_op_t *op,
 
 /* Dispatch */
 
+/* Declared in tigris_kernel_window.h. A case is built when either dtype's
+ * kernel is selected; the loader refuses a plan whose dtype's kernel is not. */
+int tigris_dispatch_generic(const tigris_plan_t *plan, const tigris_op_t *op,
+                            uint16_t op_index, tigris_mem_t *mem)
+{
+    /* A build that selects none of these operators reads only op. */
+    (void)plan;
+    (void)op_index;
+    (void)mem;
+    switch ((tigris_op_type_t)op->op_type) {
+#if TIGRIS_KERNEL_F32_GATHER || TIGRIS_KERNEL_S8_GATHER
+    case TIGRIS_OP_GATHER: return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_GATHER_ND || TIGRIS_KERNEL_S8_GATHER_ND
+    case TIGRIS_OP_GATHER_ND: return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_STRIDED_SLICE || TIGRIS_KERNEL_S8_STRIDED_SLICE
+    case TIGRIS_OP_STRIDED_SLICE: return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_MIRROR_PAD || TIGRIS_KERNEL_S8_MIRROR_PAD
+    case TIGRIS_OP_MIRROR_PAD: return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_REVERSE_V2 || TIGRIS_KERNEL_S8_REVERSE_V2
+    case TIGRIS_OP_REVERSE_V2: return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_EMBEDDING_LOOKUP || TIGRIS_KERNEL_S8_EMBEDDING_LOOKUP
+    case TIGRIS_OP_EMBEDDING_LOOKUP: return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_DYNAMIC_UPDATE_SLICE || TIGRIS_KERNEL_S8_DYNAMIC_UPDATE_SLICE
+    case TIGRIS_OP_DYNAMIC_UPDATE_SLICE: return tigris_movement_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LOGICAL_AND || TIGRIS_KERNEL_S8_LOGICAL_AND
+    case TIGRIS_OP_LOGICAL_AND: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LOGICAL_OR || TIGRIS_KERNEL_S8_LOGICAL_OR
+    case TIGRIS_OP_LOGICAL_OR: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_LOGICAL_NOT || TIGRIS_KERNEL_S8_LOGICAL_NOT
+    case TIGRIS_OP_LOGICAL_NOT: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_SELECT_V2 || TIGRIS_KERNEL_S8_SELECT_V2
+    case TIGRIS_OP_SELECT_V2: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_CAST || TIGRIS_KERNEL_S8_CAST
+    case TIGRIS_OP_CAST: return tigris_bool_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_ARG_MAX || TIGRIS_KERNEL_S8_ARG_MAX
+    case TIGRIS_OP_ARG_MAX: return tigris_arg_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_ARG_MIN || TIGRIS_KERNEL_S8_ARG_MIN
+    case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_TRANSPOSE || TIGRIS_KERNEL_S8_TRANSPOSE
+    case TIGRIS_OP_TRANSPOSE: return tigris_transpose_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_REDUCE_ALL || TIGRIS_KERNEL_S8_REDUCE_ALL
+    case TIGRIS_OP_REDUCE_ALL: return tigris_reduce_all_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_DETECTION_POSTPROCESS || TIGRIS_KERNEL_S8_DETECTION_POSTPROCESS
+    case TIGRIS_OP_DETECTION_POSTPROCESS: return tigris_detection_execute(plan, op, op_index, mem);
+#endif
+#if TIGRIS_KERNEL_F32_DEQUANTIZE || TIGRIS_KERNEL_S8_DEQUANTIZE
+    case TIGRIS_OP_DEQUANTIZE: return tigris_quantize_execute(plan, op, mem);
+#endif
+#if TIGRIS_KERNEL_F32_SPLIT || TIGRIS_KERNEL_S8_SPLIT
+    case TIGRIS_OP_SPLIT: return kern_split(plan, op, mem);
+#endif
+    default:
+        return -1;  /* unsupported op type */
+    }
+}
+
 int tigris_dispatch_kernel(
     const tigris_plan_t *plan,
     const tigris_op_t   *op,
@@ -3255,10 +3293,10 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_L2_POOL: return kern_avg_pool(plan, op, mem);
 #endif
 #if TIGRIS_KERNEL_F32_ADD
-    case TIGRIS_OP_ADD: return kern_add(plan, op, op_index, mem);
+    case TIGRIS_OP_ADD: return kern_binary_f32(plan, op, op_index, mem, BINARY_ADD);
 #endif
 #if TIGRIS_KERNEL_F32_MUL
-    case TIGRIS_OP_MUL: return kern_mul(plan, op, op_index, mem);
+    case TIGRIS_OP_MUL: return kern_binary_f32(plan, op, op_index, mem, BINARY_MUL);
 #endif
 #if TIGRIS_KERNEL_F32_CONV1D
     case TIGRIS_OP_CONV1D: return kern_conv1d(plan, op, mem);
@@ -3285,23 +3323,21 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_CONCAT: return kern_concat(plan, op, mem);
 #endif
 #if TIGRIS_KERNEL_F32_RESIZE
-    case TIGRIS_OP_RESIZE: return kern_resize_nearest(plan, op, mem);
+    case TIGRIS_OP_RESIZE:
+        return tigris_resize_nearest_execute(plan, op, mem, sizeof(float), NULL, NULL);
 #endif
 #if TIGRIS_KERNEL_F32_RESIZE_LINEAR
     case TIGRIS_OP_RESIZE_LINEAR:
                                 return kern_resize_linear(plan, op, mem);
 #endif
 #if TIGRIS_KERNEL_F32_SUB
-    case TIGRIS_OP_SUB: return kern_sub(plan, op, op_index, mem);
+    case TIGRIS_OP_SUB: return kern_binary_f32(plan, op, op_index, mem, BINARY_SUB);
 #endif
 #if TIGRIS_KERNEL_F32_GLOBAL_MAX
     case TIGRIS_OP_GLOBAL_MAX: return kern_global_max_pool(plan, op, mem);
 #endif
 #if TIGRIS_KERNEL_F32_MATMUL
     case TIGRIS_OP_MATMUL: return kern_matmul(plan, op, mem);
-#endif
-#if TIGRIS_KERNEL_F32_TRANSPOSE
-    case TIGRIS_OP_TRANSPOSE: return tigris_transpose_execute(plan, op, op_index, mem);
 #endif
 #if TIGRIS_KERNEL_F32_GELU
     case TIGRIS_OP_GELU: return kern_gelu(plan, op, op_index, mem);
@@ -3370,7 +3406,7 @@ int tigris_dispatch_kernel(
     case TIGRIS_OP_LAYER_NORM: return kern_layer_norm(plan, op, op_index, mem);
 #endif
 #if TIGRIS_KERNEL_F32_REDUCE_MEAN
-    case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_mean(plan, op, op_index, mem);
+    case TIGRIS_OP_REDUCE_MEAN: return kern_reduce_f32(plan, op, op_index, mem);
 #endif
 #if TIGRIS_KERNEL_F32_REDUCE_MAX
     case TIGRIS_OP_REDUCE_MAX: return kern_reduce_f32(plan, op, op_index, mem);
@@ -3380,37 +3416,6 @@ int tigris_dispatch_kernel(
 #endif
 #if TIGRIS_KERNEL_F32_REDUCE_SUM
     case TIGRIS_OP_REDUCE_SUM: return kern_reduce_f32(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_REDUCE_ALL
-    case TIGRIS_OP_REDUCE_ALL: return tigris_reduce_all_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_GATHER
-    case TIGRIS_OP_GATHER:
-        return tigris_movement_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_GATHER_ND
-    case TIGRIS_OP_GATHER_ND:
-        return tigris_movement_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_STRIDED_SLICE
-    case TIGRIS_OP_STRIDED_SLICE:
-        return tigris_movement_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_MIRROR_PAD
-    case TIGRIS_OP_MIRROR_PAD:
-        return tigris_movement_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_REVERSE_V2
-    case TIGRIS_OP_REVERSE_V2:
-        return tigris_movement_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_EMBEDDING_LOOKUP
-    case TIGRIS_OP_EMBEDDING_LOOKUP:
-        return tigris_movement_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_DYNAMIC_UPDATE_SLICE
-    case TIGRIS_OP_DYNAMIC_UPDATE_SLICE:
-        return tigris_movement_execute(plan, op, op_index, mem);
 #endif
 #if TIGRIS_KERNEL_F32_EQUAL
     case TIGRIS_OP_EQUAL: return tigris_bool_execute(plan, op, op_index, mem);
@@ -3427,29 +3432,8 @@ int tigris_dispatch_kernel(
 #if TIGRIS_KERNEL_F32_GREATER_EQUAL
     case TIGRIS_OP_GREATER_EQUAL: return tigris_bool_execute(plan, op, op_index, mem);
 #endif
-#if TIGRIS_KERNEL_F32_LOGICAL_AND
-    case TIGRIS_OP_LOGICAL_AND: return tigris_bool_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_LOGICAL_OR
-    case TIGRIS_OP_LOGICAL_OR: return tigris_bool_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_LOGICAL_NOT
-    case TIGRIS_OP_LOGICAL_NOT: return tigris_bool_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_SELECT_V2
-    case TIGRIS_OP_SELECT_V2: return tigris_bool_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_CAST
-    case TIGRIS_OP_CAST: return tigris_bool_execute(plan, op, op_index, mem);
-#endif
 #if TIGRIS_KERNEL_F32_ADD_N
     case TIGRIS_OP_ADD_N: return kern_add_n_f32(plan, op, mem);
-#endif
-#if TIGRIS_KERNEL_F32_ARG_MAX
-    case TIGRIS_OP_ARG_MAX: return tigris_arg_execute(plan, op, op_index, mem);
-#endif
-#if TIGRIS_KERNEL_F32_ARG_MIN
-    case TIGRIS_OP_ARG_MIN: return tigris_arg_execute(plan, op, op_index, mem);
 #endif
 #if TIGRIS_KERNEL_F32_CUMSUM
     case TIGRIS_OP_CUMSUM: return kern_cumsum_f32(plan, op, op_index, mem);
@@ -3460,22 +3444,13 @@ int tigris_dispatch_kernel(
 #if TIGRIS_KERNEL_F32_LSTM
     case TIGRIS_OP_LSTM: return kern_lstm_f32(plan, op, op_index, mem);
 #endif
-#if TIGRIS_KERNEL_F32_DETECTION_POSTPROCESS
-    case TIGRIS_OP_DETECTION_POSTPROCESS: return tigris_detection_execute(plan, op, op_index, mem);
-#endif
 #if TIGRIS_KERNEL_F32_QUANTIZE
     case TIGRIS_OP_QUANTIZE: return tigris_quantize_execute(plan, op, mem);
-#endif
-#if TIGRIS_KERNEL_F32_DEQUANTIZE
-    case TIGRIS_OP_DEQUANTIZE: return tigris_quantize_execute(plan, op, mem);
-#endif
-#if TIGRIS_KERNEL_F32_SPLIT
-    case TIGRIS_OP_SPLIT: return kern_split(plan, op, mem);
 #endif
 #if TIGRIS_KERNEL_F32_PAD
     case TIGRIS_OP_PAD: return kern_pad(plan, op, op_index, mem);
 #endif
     default:
-        return -1;  /* unsupported op type */
+        return tigris_dispatch_generic(plan, op, op_index, mem);
     }
 }

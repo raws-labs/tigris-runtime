@@ -312,23 +312,13 @@ static int adapt_fully_connected(
 /* Average Pool / Global Average Pool */
 
 static int adapt_avg_pool(
-    const tigris_plan_t *plan, const tigris_op_t *op, uint16_t op_index,
-    tigris_mem_t *mem, void *user_ctx)
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
 
     const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
-
-    /* arm_avgpool_s8 rounds like TFLite AVERAGE_POOL_2D. A global pool without
-     * TIGRIS_OP_ATTR_POOL_ROUNDING is a mean, which rounds differently, so it
-     * runs on the reference kernel. */
-    uint8_t rounding_len = 0u;
-    if ((tigris_op_type_t)op->op_type == TIGRIS_OP_GLOBAL_AVG &&
-        tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_POOL_ROUNDING,
-                                 &rounding_len) == NULL)
-        return tigris_dispatch_kernel_s8(plan, op, op_index, mem, user_ctx);
 
     const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
@@ -390,7 +380,7 @@ static uint32_t cmsis_workspace_required(
     uint32_t max_broadcast_channels = 0;
     for (uint16_t i = 0; i < plan->header->num_ops; i++) {
         const tigris_op_t *op = &plan->ops[i];
-        if (tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, plan, op, 0) ==
+        if (tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, plan, op, i, 0) ==
             TIGRIS_ACCEL_ROUTE_S8_REF)
             continue;
         const uint16_t *ins  = tigris_op_inputs(plan, op);
@@ -571,21 +561,14 @@ int tigris_dispatch_kernel_cmsis_nn(
 {
     /* CMSIS-NN's vendored generic Conv/Depthwise kernels explicitly consume
      * dilation.h/.w, so non-tiled dilation remains native. The shared policy
-     * routes tiled spatial ops and pooling that requires requantization to
-     * s8_ref before any vendor call. */
+     * routes tiled spatial ops, pooling that requires requantization or
+     * rounds as a mean, and the single-rounding exceptions to s8_ref before
+     * any vendor call. */
     int handled = 0;
     int route_rc = tigris_accel_try_s8_ref(
         TIGRIS_ACCEL_CMSIS_NN, plan, op, op_index, mem, user_ctx, &handled);
     if (handled)
         return route_rc;
-
-#ifdef CMSIS_NN_USE_SINGLE_ROUNDING
-    if (op->op_type == TIGRIS_OP_MUL ||
-        (op->op_type == TIGRIS_OP_DEPTHWISE &&
-         tigris_tensor_shape(plan, &plan->tensors[tigris_op_inputs(plan, op)[0]])[3] !=
-         tigris_tensor_shape(plan, &plan->tensors[tigris_op_outputs(plan, op)[0]])[3]))
-        return tigris_dispatch_kernel_s8(plan, op, op_index, mem, user_ctx);
-#endif
 
     switch ((tigris_op_type_t)op->op_type) {
 #if TIGRIS_KERNEL_S8_CONV
@@ -598,10 +581,10 @@ int tigris_dispatch_kernel_cmsis_nn(
     case TIGRIS_OP_FULLY_CONN: return adapt_fully_connected(plan, op, mem);
 #endif
 #if TIGRIS_KERNEL_S8_AVG_POOL
-    case TIGRIS_OP_AVG_POOL: return adapt_avg_pool(plan, op, op_index, mem, user_ctx);
+    case TIGRIS_OP_AVG_POOL: return adapt_avg_pool(plan, op, mem);
 #endif
 #if TIGRIS_KERNEL_S8_GLOBAL_AVG
-    case TIGRIS_OP_GLOBAL_AVG: return adapt_avg_pool(plan, op, op_index, mem, user_ctx);
+    case TIGRIS_OP_GLOBAL_AVG: return adapt_avg_pool(plan, op, mem);
 #endif
 #if TIGRIS_KERNEL_S8_MUL
     case TIGRIS_OP_MUL: return adapt_binary(plan, op, mem);

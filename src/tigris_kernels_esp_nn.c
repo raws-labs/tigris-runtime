@@ -242,7 +242,7 @@ int tigris_esp_nn_prepare(
 
         /* ESP-NN encodes only unit dilation. Dilated Conv/Depthwise execute in
          * s8_ref, so do not size or allocate vendor scratch for them. */
-        if (tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, plan, op, 0) ==
+        if (tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, plan, op, i, 0) ==
             TIGRIS_ACCEL_ROUTE_S8_REF)
             continue;
 
@@ -322,11 +322,6 @@ int tigris_esp_nn_prepare(
             esp_conv_setup(op, &id, pad_h, pad_w, &cp, &fd);
 
             int s = esp_nn_get_conv_scratch_size(&id, &fd, &od, &cp);
-#ifdef __XTENSA__
-            if (s > 100000 || i < 5)
-                printf("  Op%u Conv %dx%dx%d->%dx%dx%d k%dx%d: scratch=%d\n",
-                       i, IH,IW,IC, OH,OW,OC, KH,KW, s);
-#endif
             max_scratch = MAX(max_scratch, s);
             max_quant_channels = MAX(max_quant_channels, OC);
 
@@ -446,9 +441,6 @@ int tigris_esp_nn_prepare(
     }
 
 #ifdef __XTENSA__
-    printf("  ESP-NN: psram=%d sram=%d max_needed=%d dw=%d pad=%d\n",
-           s_scratch_size, s_sram_scratch_size, max_scratch,
-           (int)dw_aligned, s_pad_size);
     s_conv_sram = s_conv_psram = s_conv_fallback = 0;
 #endif
 

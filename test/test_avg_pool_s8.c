@@ -337,7 +337,7 @@ static void test_accelerator_pool_routes(void)
     TEST_ASSERT_EQ(run_direct(&fx, input, direct, 0), 0,
                    "direct asymmetric AveragePool succeeds");
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_S8_REF,
                    "ESP-NN asymmetric AveragePool routes to s8_ref");
     TEST_ASSERT_EQ(run_route(&fx, TIGRIS_ACCEL_ESP_NN,
@@ -348,7 +348,7 @@ static void test_accelerator_pool_routes(void)
                     "ESP-NN asymmetric fallback matches s8_ref");
 
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_S8_REF,
                    "CMSIS-NN asymmetric AveragePool routes to s8_ref");
     TEST_ASSERT_EQ(run_route(&fx, TIGRIS_ACCEL_CMSIS_NN,
@@ -360,35 +360,35 @@ static void test_accelerator_pool_routes(void)
 
     fx.quant_params[1] = fx.quant_params[0];
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_ADAPTER,
                    "ESP-NN compatible normal AveragePool remains native");
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_ADAPTER,
                    "CMSIS-NN compatible normal AveragePool remains native");
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 1),
+                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 1),
                    TIGRIS_ACCEL_ROUTE_S8_REF,
                    "ESP-NN tiled AveragePool bypasses non-tile-aware adapter");
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 1),
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 1),
                    TIGRIS_ACCEL_ROUTE_S8_REF,
                    "CMSIS-NN tiled AveragePool remains on s8_ref route");
 
     fx.tensors[1].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_S8_REF,
                    "ESP-NN routes one-sided quant metadata to s8_ref");
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_S8_REF,
                    "CMSIS-NN routes one-sided quant metadata to s8_ref");
 
     fx.tensors[0].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_ADAPTER,
                    "unquantized input/output preserve native byte averaging");
 }

@@ -225,7 +225,7 @@ static void test_esp_dilated_ops_route_reference(void)
         build_fixture(&fx, cases[c].op_type, cases[c].horizontal);
 
         TEST_ASSERT_EQ(tigris_accel_pre_route(
-                           TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+                           TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 0),
                        TIGRIS_ACCEL_ROUTE_S8_REF,
                        "ESP-NN dilated op pre-routes to s8_ref");
         TEST_ASSERT_EQ(run_reference(&fx, direct, 0), 0,
@@ -252,7 +252,7 @@ static void test_cmsis_dilation_and_tile_routes(void)
 
     memset(untouched, 0x5a, sizeof(untouched));
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_ADAPTER,
                    "CMSIS-NN non-tiled dilation stays native");
     TEST_ASSERT_EQ(run_pre_route(&fx, TIGRIS_ACCEL_CMSIS_NN,
@@ -266,7 +266,7 @@ static void test_cmsis_dilation_and_tile_routes(void)
     }
 
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 1),
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 1),
                    TIGRIS_ACCEL_ROUTE_S8_REF,
                    "CMSIS-NN tiled dilated Conv routes to s8_ref");
     TEST_ASSERT_EQ(run_reference(&fx, direct, 1), 0,
@@ -280,11 +280,11 @@ static void test_cmsis_dilation_and_tile_routes(void)
 
     build_fixture(&fx, TIGRIS_OP_DEPTHWISE, 1);
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_ADAPTER,
                    "CMSIS-NN non-tiled dilated Depthwise stays native");
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 1),
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 1),
                    TIGRIS_ACCEL_ROUTE_S8_REF,
                    "CMSIS-NN tiled Depthwise routes to s8_ref");
 }
@@ -298,14 +298,14 @@ static void test_unit_dilation_keeps_esp_adapter(void)
     fx.op.spatial.dilation_h = 0;
     fx.op.spatial.dilation_w = 0;
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_ADAPTER,
                    "zero/default dilation is effective unit dilation");
 
     fx.op.spatial.dilation_h = 1;
     fx.op.spatial.dilation_w = 1;
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_ADAPTER,
                    "explicit unit dilation keeps ESP-NN adapter");
 }
@@ -316,17 +316,17 @@ static void test_depthwise_multiplier_routes_adapter(void)
     route_fixture_t fx;
     build_fixture(&fx, TIGRIS_OP_DEPTHWISE, 1);
     fx.op.spatial.dilation_w = 1;
-    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_ADAPTER, "ESP-NN keeps a unit multiplier");
-    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0),
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_ADAPTER, "CMSIS-NN keeps a unit multiplier");
     fx.shapes[7] = 2;
-    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_ADAPTER, "ESP-NN handles a channel multiplier");
-    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0),
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_ADAPTER, "CMSIS-NN handles a channel multiplier");
     fx.shapes[0] = 2;
-    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0),
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 0),
                    TIGRIS_ACCEL_ROUTE_S8_REF, "ESP-NN multiplier batch stays on reference");
 }
 
@@ -640,7 +640,7 @@ static void test_rolled_tile_routing(void)
     fx.op.spatial.pad_right = 0;
 
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 1),
+                       TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 1),
                    TIGRIS_ACCEL_ROUTE_ADAPTER,
                    "tiled non-dilated conv is an ESP adapter op by pre_route");
 
@@ -798,7 +798,7 @@ static void test_cmsis_plain_height_tile_routes_adapter(void)
     fx.op.spatial.dilation_h = 1;
     fx.op.spatial.dilation_w = 1;
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 1),
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 1),
                    TIGRIS_ACCEL_ROUTE_ADAPTER,
                    "CMSIS-NN plain-height tiled Conv routes to the adapter");
     memset(out, 0, sizeof(out));
@@ -812,7 +812,7 @@ static void test_cmsis_plain_height_tile_routes_adapter(void)
     fx.op.spatial.dilation_h = 1;
     fx.op.spatial.dilation_w = 1;
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 1),
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 1),
                    TIGRIS_ACCEL_ROUTE_ADAPTER,
                    "CMSIS-NN plain-height tiled Depthwise routes to the adapter");
 
@@ -820,7 +820,7 @@ static void test_cmsis_plain_height_tile_routes_adapter(void)
      * dilated-tile parity is out of scope for this step. */
     build_fixture(&fx, TIGRIS_OP_CONV, 0);  /* fixture dilation_h = 2 */
     TEST_ASSERT_EQ(tigris_accel_pre_route(
-                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 1),
+                       TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 1),
                    TIGRIS_ACCEL_ROUTE_S8_REF,
                    "CMSIS-NN dilated tiled Conv still routes to s8_ref");
 }
@@ -870,9 +870,9 @@ static void test_binary_routes(void)
     const uint8_t kinds[] = {TIGRIS_OP_MUL, TIGRIS_OP_MAXIMUM, TIGRIS_OP_MINIMUM};
     for (unsigned k = 0; k < sizeof(kinds); k++) {
         op.op_type = kinds[k];
-        TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &plan, &op, 1),
+        TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &plan, &op, 0, 1),
                        TIGRIS_ACCEL_ROUTE_ADAPTER, "CMSIS binary has an adapter");
-        TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &plan, &op, 1),
+        TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &plan, &op, 0, 1),
                        k == 0 ? TIGRIS_ACCEL_ROUTE_ADAPTER : TIGRIS_ACCEL_ROUTE_S8_REF,
                        "ESP only has a Mul adapter");
         if (k != 0) {
@@ -924,13 +924,36 @@ static void test_float_section_routes_reference(void)
     for (int backend = TIGRIS_ACCEL_ESP_NN; backend <= TIGRIS_ACCEL_CMSIS_NN; backend++) {
         int handled = 0;
         TEST_ASSERT_EQ(tigris_accel_pre_route((tigris_accel_backend_t)backend,
-                       &fx.plan, &fx.op, 0), TIGRIS_ACCEL_ROUTE_S8_REF,
+                       &fx.plan, &fx.op, 0, 0), TIGRIS_ACCEL_ROUTE_S8_REF,
                        "float section avoids the int8 adapter");
         TEST_ASSERT_EQ(tigris_accel_try_s8_ref((tigris_accel_backend_t)backend,
                        &fx.plan, &fx.op, 0, &mem, NULL, &handled), 0, "float section executes");
         TEST_ASSERT_EQ(handled, 1, "float section handled by reference");
         TEST_ASSERT(memcmp(output, expected, sizeof(expected)) == 0, "float section result");
     }
+}
+
+static void test_cmsis_global_pool_rounding_routes(void)
+{
+    printf("  test_cmsis_global_pool_rounding_routes...\n");
+    route_fixture_t fx;
+    const uint8_t rounding = TIGRIS_POOL_ROUNDING_AVERAGE;
+    tigris_op_attribute_t attr = { .op_index = 0, .type = TIGRIS_OP_ATTR_POOL_ROUNDING,
+                                   .data_len = 1, .data_offset = 0 };
+    build_fixture(&fx, TIGRIS_OP_GLOBAL_AVG, 0);
+    memset(&fx.op.spatial, 0, sizeof(fx.op.spatial));
+    fx.op.weight_idx = TIGRIS_NO_WEIGHT;
+    fx.tensors[0].quant_param_idx = 0;
+
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 0),
+                   TIGRIS_ACCEL_ROUTE_S8_REF, "CMSIS-NN global mean routes to s8_ref");
+    fx.plan.op_attributes = &attr;
+    fx.plan.op_attribute_data = &rounding;
+    fx.plan.num_op_attributes = 1;
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_CMSIS_NN, &fx.plan, &fx.op, 0, 0),
+                   TIGRIS_ACCEL_ROUTE_ADAPTER, "CMSIS-NN rounded global pool stays native");
+    TEST_ASSERT_EQ(tigris_accel_pre_route(TIGRIS_ACCEL_ESP_NN, &fx.plan, &fx.op, 0, 0),
+                   TIGRIS_ACCEL_ROUTE_S8_REF, "ESP-NN global pool routes to s8_ref");
 }
 
 int main(void)
@@ -942,6 +965,7 @@ int main(void)
     test_unit_dilation_keeps_esp_adapter();
     test_depthwise_multiplier_routes_adapter();
     test_float_section_routes_reference();
+    test_cmsis_global_pool_rounding_routes();
     test_binary_routes();
     test_rolled_tile_routing();
     test_width_tiled_routing();

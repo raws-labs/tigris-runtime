@@ -2159,6 +2159,63 @@ static void test_exec_height_tiling_contract(void)
         3, TIGRIS_OP_CONCAT, rank3_shape, 64, TIGRIS_EXEC_ERR_TILE);
 }
 
+/* A stripe stage whose output does not fit the slow arena fails with
+ * TIGRIS_EXEC_ERR_MEM before any band runs and leaves its input intact. */
+static void test_exec_stripe_output_needs_slow_room(void)
+{
+    printf("  test_exec_stripe_output_needs_slow_room...\n");
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[2];
+    tigris_op_t op;
+    tigris_stage_t stage;
+    tigris_tile_plan_t tile_plan;
+    uint16_t indices[PLAN_FIXTURE_POOL(1)];
+    const int32_t shapes[] = {1, 8, 8, 4, 1, 8, 8, 4};
+    tigris_plan_t plan;
+    void *ptrs[2];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[128];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[256];
+    tigris_mem_t mem;
+    uint8_t workspace[
+        TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(2, 1, 1, 0, 0, 0)];
+    tigris_exec_stats_t stats;
+    tile_probe_ctx_t ctx = {0};
+
+    plan_fixture_chain(&plan, &header, tensors, &op, &stage, indices, shapes, 1, 0);
+    memset(&tile_plan, 0, sizeof(tile_plan));
+    header.version = TIGRIS_SCHEMA_VERSION_V9;
+    header.num_tile_plans = 1;
+    for (int t = 0; t < 2; t++) {
+        tensors[t].size_bytes = sizeof(slow);
+        tensors[t].shape_off = (uint16_t)(4 * t);
+        tensors[t].ndim = 4;
+    }
+    op.op_type = TIGRIS_OP_RELU;
+    stage.tile_plan_idx = 0;
+    tile_plan.tileable = 1;
+    tile_plan.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    tile_plan.tile_height = 1;
+    tile_plan.num_tiles = 8;
+    tile_plan.original_height = 8;
+    plan.tile_plans = &tile_plan;
+
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 2, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "memory init");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, tensors[0].size_bytes),
+                   TIGRIS_MEM_OK, "the input fills the slow arena");
+    memset(mem.tensor_ptrs[0], 0x11, tensors[0].size_bytes);
+
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(
+                       &plan, &mem, tile_probe_kernel, &ctx, &stats,
+                       workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_ERR_MEM, "no slow room for the output is reported");
+    TEST_ASSERT_EQ(ctx.calls, 0, "no band runs");
+    int intact = 1;
+    for (size_t i = 0; i < sizeof(slow); i++)
+        intact &= slow[i] == 0x11;
+    TEST_ASSERT(intact, "the input is left as it was");
+}
+
 /* Build a single stride-2 ConvTranspose stage (8x8x4 in -> 16x16x4 out) with a
  * serialized tile plan and run it through the executor. `axis` selects a 2D
  * (HW) plan or a 1D (HEIGHT_OR_LENGTH) plan. total_io (256 + 1024) exceeds the
@@ -4008,6 +4065,7 @@ int main(void)
     test_exec_padding_range();
     test_exec_large_padding_and_dilation_modes();
     test_exec_height_tiling_contract();
+    test_exec_stripe_output_needs_slow_room();
     test_exec_half_pixel_bilinear_bands_match_one_band();
     test_exec_per_channel_gate_bands_over_the_map();
     test_exec_convtranspose_2d_routing();

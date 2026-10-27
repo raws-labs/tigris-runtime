@@ -912,19 +912,15 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled(
     tigris_mem_t             *mem,
     tigris_kernel_fn          kernel,
     void                     *user_ctx,
-    const uint16_t           *last_consumer,
-    uint16_t                  current_stage,
     executor_workspace_impl_t *workspace,
     tigris_exec_stats_t *stats)
 {
-    /* 1. Pre-allocate full output tensors in slow (or reuse input for in-place) */
+    /* 1. Pre-allocate full output tensors in slow */
     const uint16_t *sout = tigris_stage_outputs(plan, stage);
     const uint16_t *sin = tigris_stage_inputs(plan, stage);
     void **out_slow_bases = workspace->output_ptrs;
-    int in_place = 0;  /* set if output reuses input's slow memory */
 
-    /* Spatial op + image dims, computed up front: the in-place halo guard below
-     * and the tile geometry both need them. */
+    /* Spatial op + image dims, computed up front for the tile geometry. */
     int sp_op_idx = tigris_stage_spatial_op(plan, stage);
     const tigris_spatial_attrs_t *sp_attrs =
         (sp_op_idx >= 0) ? &plan->ops[sp_op_idx].spatial : NULL;
@@ -973,32 +969,9 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled(
 
     for (uint16_t i = 0; i < stage->outputs_count; i++) {
         uint16_t tidx = sout[i];
-        tigris_mem_error_t merr = tigris_mem_alloc_slow(
-            mem, tidx, plan->tensors[tidx].size_bytes);
-        if (merr != TIGRIS_MEM_OK) {
-            /* Allocation failed - try in-place if:
-             *   - Single input/output
-             *   - Input dies after this stage (last_consumer == current_stage)
-             *   - Input and output have same size
-             *   - No cross-tile halo: with eff_kh > stride a kernel reads input
-             *     rows beyond this tile, so writing the output into the shared
-             *     buffer would clobber rows the next tile still needs.
-             */
-            if (stage->inputs_count == 1 && stage->outputs_count == 1 &&
-                last_consumer && last_consumer[sin[0]] == current_stage &&
-                plan->tensors[sin[0]].size_bytes == plan->tensors[tidx].size_bytes &&
-                eff_kh <= stride)
-            {
-                /* Reuse input's slow memory for output */
-                out_slow_bases[i] = mem->tensor_ptrs[sin[0]];
-                mem->tensor_ptrs[tidx] = out_slow_bases[i];
-                in_place = 1;
-            } else {
-                return TIGRIS_EXEC_ERR_MEM;
-            }
-        } else {
-            out_slow_bases[i] = mem->tensor_ptrs[tidx];
-        }
+        if (tigris_mem_alloc_slow(mem, tidx, plan->tensors[tidx].size_bytes) != TIGRIS_MEM_OK)
+            return TIGRIS_EXEC_ERR_MEM;
+        out_slow_bases[i] = mem->tensor_ptrs[tidx];
     }
 
     /* 2. Save slow ptrs for stage inputs */
@@ -1189,18 +1162,12 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled(
             return TIGRIS_EXEC_ERR_TILE;
     }
 
-    /* 5. Clear tile context, restore input ptrs to slow (unless in-place),
+    /* 5. Clear tile context, restore input ptrs to slow,
      *    and NULL intermediate op outputs so compact_fast won't find stale
      *    fast-arena pointers with full-size metadata. */
     memset(&mem->tile, 0, sizeof(mem->tile));
-    if (!in_place) {
-        for (uint16_t i = 0; i < stage->inputs_count; i++)
-            mem->tensor_ptrs[sin[i]] = in_slow_bases[i];
-    } else {
-        /* In-place: input was overwritten, clear its pointer */
-        for (uint16_t i = 0; i < stage->inputs_count; i++)
-            mem->tensor_ptrs[sin[i]] = NULL;
-    }
+    for (uint16_t i = 0; i < stage->inputs_count; i++)
+        mem->tensor_ptrs[sin[i]] = in_slow_bases[i];
 
     /* Stage outputs already point to slow via spill_tile. */
     drop_band_intermediates(plan, stage, mem, sout, stage->outputs_count);
@@ -3889,8 +3856,7 @@ tigris_exec_error_t tigris_run_with_state(
                 result = exec_stage_tiled_2d(run_plan, stage, mem, kernel, user_ctx, workspace, stats);
                 break;
             case TIGRIS_BAND_KIND_STRIPE:
-                result = exec_stage_tiled(
-                    run_plan, stage, mem, kernel, user_ctx, last_consumer, s, workspace, stats);
+                result = exec_stage_tiled(run_plan, stage, mem, kernel, user_ctx, workspace, stats);
                 break;
             default:
                 result = exec_stage_normal(

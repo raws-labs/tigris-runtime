@@ -5,7 +5,7 @@
 
 #include "tigris_executor.h"
 #include "tigris_loader.h"
-#include "tigris_binary_operands.h"
+#include "tigris_band.h"
 #include "tigris_io_in_fast.h"
 #include "tigris_lz4.h"
 #include "tigris_mem_internal.h"

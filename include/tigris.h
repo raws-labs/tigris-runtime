@@ -408,7 +408,7 @@ typedef struct {
     uint8_t     num_model_outputs;  /* 39 */
     uint16_t    num_weights;        /* 40 */
     uint16_t    num_quant_params;   /* 42: quant param count (0 = no quantization) */
-    uint32_t    flags;              /* 44: header-level flags (currently 0) */
+    uint32_t    flags;              /* 44: TIGRIS_FLAG_* */
 } tigris_file_header_t;             /* 48 bytes total */
 
 /**

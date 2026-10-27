@@ -1,10 +1,11 @@
 /**
  * @file tigris_binary_operands.h
- * @brief Operand resolution for binary operators and padding, shared by the
- * float and int8 kernels.
+ * @brief Operand resolution, padding and the int32 and bool dispatch shared
+ * by the float and int8 kernels, and the operator dtype predicates the loader
+ * also reads.
  *
- * Internal to src/. Not installed and not part of the public API. Defined
- * in tigris_kernels.c.
+ * Internal to src/. Not installed and not part of the public API. The
+ * functions it declares are defined in tigris_kernels.c.
  */
 #ifndef TIGRIS_BINARY_OPERANDS_H
 #define TIGRIS_BINARY_OPERANDS_H
@@ -52,22 +53,6 @@ static inline int tigris_int32_operator(const tigris_plan_t *plan, const tigris_
     return int32;
 }
 
-typedef struct {
-    int32_t blocks;
-    int32_t input_rows;
-    int32_t input_width;
-    int32_t output_rows;
-    int32_t output_width;
-    uint8_t input_axis;     /* the input axis whose rows the band takes */
-} tigris_reshape_band_t;
-
-int tigris_reshape_band(const tigris_plan_t *plan, const tigris_stage_t *stage,
-                        tigris_reshape_band_t *view);
-int tigris_pure_reinterpretation(const tigris_plan_t *plan, const tigris_tensor_t *in,
-                                 const tigris_tensor_t *out);
-int tigris_reshape_tile_valid(const tigris_tile_plan_t *tile,
-                              const tigris_reshape_band_t *view);
-
 /** Operands of up to this rank are read by output coordinate when a
  * broadcast is not a repetition; the others need no coordinates. */
 #define TIGRIS_BROADCAST_MAX_RANK 5u
@@ -106,45 +91,6 @@ int tigris_binary_operands(
  * broadcast. */
 uint32_t tigris_binary_general_index(const tigris_binary_operands_t *operands,
                                      uint8_t k, uint32_t i);
-
-/* Band modes 0 and 1 are the height and row views; TIGRIS_BAND_LEADING and the
- * modes after it (tigris.h) are the leading bands. */
-uint8_t tigris_band_axis(const tigris_plan_t *plan, const tigris_tensor_t *tensor, int mode);
-int32_t tigris_stage_leading_band(const tigris_plan_t *plan, const tigris_stage_t *stage);
-int tigris_band_whole_input(const tigris_op_t *op, uint8_t position);
-
-/* Whether a reduction or movement preserves the existing row-band geometry. */
-int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
-                                uint16_t op_index, int row_tiled);
-
-/* How a height band treats an operator, read from its contract row. */
-typedef enum {
-    TIGRIS_HEIGHT_OP_REFUSED = 0,   /* no height band runs it */
-    TIGRIS_HEIGHT_OP_POINTWISE = 1, /* shape-preserving and halo-free */
-    TIGRIS_HEIGHT_OP_SPATIAL = 2,   /* a convolution or pool, with stride and halo */
-    TIGRIS_HEIGHT_OP_RESAMPLE = 3   /* a Resize, banded from the full extents on its own stage */
-} tigris_height_op_t;
-
-/* The rules the executor bands a stage by, which the loader's tile facts also derive from. */
-tigris_height_op_t tigris_height_op(uint8_t type);
-int tigris_height_spatial_op(uint8_t type);
-int tigris_height_upsample_op(uint8_t type);
-int tigris_axis1_binary_pointwise_op(uint8_t type);
-int tigris_stage_spatial_op(const tigris_plan_t *plan, const tigris_stage_t *stage);
-int tigris_stage_stripe_contract(const tigris_plan_t *plan, const tigris_stage_t *stage,
-                                 uint8_t rank, uint8_t axis);
-int tigris_tensor_row_view(const tigris_plan_t *plan, const tigris_tensor_t *t,
-                           int32_t *batch, int32_t *rows, int32_t *cols);
-int tigris_row_tiling_op(uint8_t type);
-int tigris_whole_operand_op(uint8_t type);
-int tigris_stage_row_tiled(const tigris_plan_t *plan, const tigris_stage_t *stage,
-                           int32_t *out_batch, int32_t *out_rows);
-int tigris_whole_band_operand(const tigris_plan_t *plan, const tigris_stage_t *stage,
-                              uint16_t tidx);
-int tigris_stage_input_driven_reduction(const tigris_plan_t *plan, const tigris_stage_t *stage);
-int tigris_transpose_extents(const tigris_plan_t *plan, uint16_t op_idx, uint16_t in_idx,
-                             int32_t *outer, int32_t *rows, int32_t *cols);
-int tigris_stage_tiled_transpose(const tigris_plan_t *plan, const tigris_stage_t *stage);
 
 /* Bool operations and byte-preserving selection share both dispatchers. */
 /** All of one axis of a rank-3 bool tensor, kept at one or dropped. */

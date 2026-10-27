@@ -14,6 +14,7 @@
 #include "tigris_kernels.h"
 #include "tigris_accel_policy.h"
 #include "tigris_kernel_window.h"
+#include "tigris_band.h"
 #include "tigris_binary_operands.h"
 #include "tigris_op_config.h"
 

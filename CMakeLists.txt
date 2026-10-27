@@ -155,8 +155,13 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
 
     add_executable(test_loader test/test_loader.c)
     target_include_directories(test_loader PRIVATE src)
+    file(GLOB TIGRIS_FUZZ_REGRESSIONS CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/test/fuzz_regressions/*.tgrs")
+    list(LENGTH TIGRIS_FUZZ_REGRESSIONS TIGRIS_FUZZ_REGRESSION_COUNT)
     target_compile_definitions(test_loader PRIVATE
-        TIGRIS_SCHEMA_COMPAT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/schema_compat")
+        TIGRIS_SCHEMA_COMPAT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/schema_compat"
+        TIGRIS_FUZZ_REGRESSION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fuzz_regressions"
+        TIGRIS_FUZZ_REGRESSION_COUNT=${TIGRIS_FUZZ_REGRESSION_COUNT})
     target_link_libraries(test_loader tigris_runtime)
 
     add_executable(test_executor test/test_executor.c)

@@ -16,42 +16,13 @@ CI enforces beyond `ctest`.
 
 ## Releasing
 
-Compiler and runtime release as a pair with the same version, starting with
-`v0.11.0`. The number identifies the tested combination. The plan schema,
-accepted schema range, host ABI, `compatibility.json`, and zoo runtime ranges
-retain their separate compatibility meanings.
+Compiler and runtime release as a pair with the same version. The release
+procedure for the pair is in the compiler's
+[CONTRIBUTING](https://github.com/raws-labs/tigris/blob/main/CONTRIBUTING.md#releasing).
+Below is what is specific to the runtime.
 
-A plan schema version changes only with the plan layout. A fix or addition that
-needs information the existing encoding lacks adds an operator attribute kind
-instead: the loader refuses kinds it does not know, so an older runtime rejects
-such a plan rather than running it with different semantics, and the change can
-ship in a patch release.
-
-1. Prepare and test both components with the same release number. Run
-   `scripts/check_version_sources.py --expect X.Y.Z` to verify the runtime's
-   CMake, ESP component, example, and consumer version sources.
-2. Promote the runtime's tested `develop` commit through "Promote to main"
-   (`.github/workflows/promote.yml`), with a dry run first. Then create the GitHub
-   release `vX.Y.Z` with its tag on that commit. Publish the runtime first and
-   wait for `host.yml` to attach all native archives and their SHA-256 files.
-   The first pair is `v0.11.0`; `v0.10.2` has no host archives.
-3. Pin the compiler's `runtime-host.json` to that tag and the per-platform
-   archive hashes, then run its wheel tests.
-4. Promote the compiler's tested `develop` commit through "Promote to main"
-   (`.github/workflows/promote.yml`), with a dry run first. Then create the GitHub
-   release `vX.Y.Z` with its tag on that commit. Its tag, setuptools-scm version,
-   and runtime pin must agree; the release-wheel build checks this equality.
-
-`scripts/release.sh X.Y.Z --notes NOTES.md` in each repository runs its steps up to
-a draft GitHub release: it lands the version change (runtime) or the runtime pin
-(compiler) through a pull request once CI passes, promotes the merged commit
-with a dry run first, and creates the draft on it. Publishing the draft tags
-the release and starts the release workflows. Run it in the runtime first, and
-in the compiler after the runtime release is published.
-
-A compiler-only change still releases the runtime and ESP component with the
-same new version. The runtime release note says: "No runtime implementation
-changes; released with the matching compiler version."
+`scripts/check_version_sources.py --expect X.Y.Z` verifies the runtime's CMake,
+ESP component, example, and consumer version sources.
 
 The capability contract uses the matching compiler branch or tag when available,
 otherwise `develop`. A runtime release can precede its compiler tag; the compiler
@@ -64,10 +35,8 @@ archives and their SHA-256 files without rebuilding or replacing existing assets
 the manylinux build images, and macOS builds set an explicit deployment target.
 Consumers pin the release and archive hashes separately.
 
-- `main` only fast-forwards to a tested `develop` commit, through the "Promote to
-  main" workflow; there are no release or back-merge pull requests.
-- Create the `vX.Y.Z` tag with the GitHub release on the promoted commit. The
-  `version` field in `idf_component.yml` must equal the tag without the `v`.
+- The `version` field in `idf_component.yml` must equal the release tag without
+  the `v`.
 - Pushing the tag runs `.github/workflows/publish-component.yml`, which uploads this
   repository as the `raws-labs/tigris-runtime` component to the ESP Component
   Registry. The `files` section of `idf_component.yml` decides what ships; the

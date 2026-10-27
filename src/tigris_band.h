@@ -82,6 +82,7 @@ int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
 int tigris_stage_spatial_op(const tigris_plan_t *plan, const tigris_stage_t *stage);
 int tigris_stage_stripe_contract(const tigris_plan_t *plan, const tigris_stage_t *stage,
                                  uint8_t rank, uint8_t axis);
+int tigris_chain_stage_reads_its_band(const tigris_plan_t *plan, const tigris_stage_t *stage);
 int tigris_tensor_row_view(const tigris_plan_t *plan, const tigris_tensor_t *t,
                            int32_t *batch, int32_t *rows, int32_t *cols);
 /* The row band rule; `loader` selects the loader's wider form. */

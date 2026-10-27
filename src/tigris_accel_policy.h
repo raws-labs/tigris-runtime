@@ -39,13 +39,20 @@ int tigris_accel_binary_params(const tigris_plan_t *plan, const tigris_op_t *op,
  * so either effective dilation axis above one routes to s8_ref. CMSIS-NN's
  * generic Conv/Depthwise implementations honor dilation. Both native
  * AveragePool adapters preserve input quantization and therefore route to
- * s8_ref when output quantization differs. Non-tile-aware pooling/spatial
- * adapter paths also route to the reference kernel here.
+ * s8_ref when output quantization differs. arm_avgpool_s8 rounds like TFLite
+ * AVERAGE_POOL_2D, so a CMSIS-NN GlobalAveragePool without
+ * TIGRIS_OP_ATTR_POOL_ROUNDING (a mean) routes to s8_ref. A build with
+ * CMSIS_NN_USE_SINGLE_ROUNDING routes CMSIS-NN Mul and a Depthwise whose
+ * output channels differ from its input channels to s8_ref. Non-tile-aware
+ * pooling/spatial adapter paths also route to the reference kernel here.
+ *
+ * @param op_index  Index of op in the plan, for its typed attributes.
  */
 tigris_accel_route_t tigris_accel_pre_route(
     tigris_accel_backend_t backend,
     const tigris_plan_t   *plan,
     const tigris_op_t     *op,
+    uint16_t               op_index,
     int                    tile_active);
 
 /**

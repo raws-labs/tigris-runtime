@@ -902,9 +902,12 @@ static void test_pool_arguments(void)
 
     build_pool(&fx, 1);
     memset(input_buf, 0, sizeof(input_buf));
-    TEST_ASSERT(prepare(&fx, &mem, ptrs) == 0 && dispatch(&fx, &mem) == 0 && call.calls == 0,
+    TEST_ASSERT(tigris_cmsis_nn_scratch_required(&fx.plan) == 0 && prepare(&fx, &mem, ptrs) == 0 &&
+                query.calls == 0 && mem.fast_size == sizeof(fast_arena),
+                "a global mean without pool rounding reserves no vendor workspace");
+    TEST_ASSERT(dispatch(&fx, &mem) == 0 && call.calls == 0,
                 "a global mean without pool rounding runs on the reference kernel");
-    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == 0, "global mean releases workspace");
+    TEST_ASSERT(tigris_cmsis_nn_deinit(&mem) == -1, "a global mean leaves no reservation to release");
 
     /* arm_avgpool_s8 keeps the input quantization, so a rescaling pool runs on
      * the reference kernel and prepare reserves no workspace for it. */

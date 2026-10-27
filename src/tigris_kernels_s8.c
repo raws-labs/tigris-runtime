@@ -3266,6 +3266,7 @@ tigris_accel_route_t tigris_accel_pre_route(
     tigris_accel_backend_t backend,
     const tigris_plan_t   *plan,
     const tigris_op_t     *op,
+    uint16_t               op_index,
     int                    tile_active)
 {
     if (plan && op && tigris_float_operator(plan, op))
@@ -3291,6 +3292,21 @@ tigris_accel_route_t tigris_accel_pre_route(
     if (backend == TIGRIS_ACCEL_ESP_NN && op &&
         op->op_type == TIGRIS_OP_GLOBAL_AVG)
         return TIGRIS_ACCEL_ROUTE_S8_REF;
+
+    /* arm_avgpool_s8 rounds like AVERAGE_POOL_2D; without this attribute the pool is a mean. */
+    if (backend == TIGRIS_ACCEL_CMSIS_NN && op &&
+        op->op_type == TIGRIS_OP_GLOBAL_AVG &&
+        tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_POOL_ROUNDING, NULL) == NULL)
+        return TIGRIS_ACCEL_ROUTE_S8_REF;
+
+#ifdef CMSIS_NN_USE_SINGLE_ROUNDING
+    if (backend == TIGRIS_ACCEL_CMSIS_NN && plan && op &&
+        (op->op_type == TIGRIS_OP_MUL ||
+         (op->op_type == TIGRIS_OP_DEPTHWISE &&
+          tigris_tensor_shape(plan, &plan->tensors[tigris_op_inputs(plan, op)[0]])[3] !=
+          tigris_tensor_shape(plan, &plan->tensors[tigris_op_outputs(plan, op)[0]])[3])))
+        return TIGRIS_ACCEL_ROUTE_S8_REF;
+#endif
 
     if (backend == TIGRIS_ACCEL_ESP_NN && is_conv_or_depthwise(op) &&
         (effective_dilation(op->spatial.dilation_h) != 1u ||
@@ -3373,7 +3389,7 @@ int tigris_accel_try_s8_ref(
     }
 
     *handled = tigris_accel_pre_route(
-                   backend, plan, op, mem->tile.active) ==
+                   backend, plan, op, op_index, mem->tile.active) ==
                TIGRIS_ACCEL_ROUTE_S8_REF;
     if (!*handled)
         return 0;

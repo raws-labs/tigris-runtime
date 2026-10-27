@@ -1,7 +1,8 @@
 /**
  * @file tigris_kernel_window.h
- * @brief Element counts, window and resampling geometry, and the dispatch of
- * dtype-generic operators, shared by the float and int8 kernels.
+ * @brief Element counts, window and resampling geometry, float attribute
+ * reads, GELU and the dispatch of dtype-generic operators, shared by the
+ * float and int8 kernels.
  *
  * Internal to src/. Not installed and not part of the public API.
  */
@@ -11,6 +12,7 @@
 #include "tigris.h"
 #include "tigris_mem.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -89,6 +91,94 @@ typedef struct {
  * it cannot concatenate along. */
 int tigris_concat_geometry(const tigris_plan_t *plan, const tigris_op_t *op,
                            const tigris_mem_t *mem, tigris_concat_geometry_t *g);
+
+/** Reads a float attribute of the op into `value`. Returns 1 when present, 0
+ * when absent (value untouched), or -1 for a payload that is not one float. */
+int tigris_float_attribute(const tigris_plan_t *plan, uint16_t op_index,
+                           uint8_t type, float *value);
+
+/** GELU of x: the tanh approximation when `approximate` is not 0, else the
+ * exact form through erfc. */
+static inline float tigris_gelu(float x, uint8_t approximate)
+{
+    float value;
+    if (approximate != 0u) {
+        value = 0.5f * x * (1.0f + tanhf(
+            0.7978845608028654f * (x + 0.044715f * x * x * x)));
+    } else {
+        value = 0.5f * x * erfcf(-0.7071067811865475f * x);
+    }
+    return value;
+}
+
+/** Geometry of a window operator on NHWC tensors (convolution, transposed
+ * convolution, depthwise convolution, pooling): the shapes, the op's kernel,
+ * stride, top and left pads and dilation (0 read as 1). While a tile is
+ * active its heights, widths, top pad and row starts replace them, and its
+ * left pad only on a 2D (HW) tile. The right and bottom edges stay implicit
+ * in the input bounds. */
+typedef struct {
+    int32_t n;
+    int32_t in_h;
+    int32_t in_w;
+    int32_t in_c;
+    int32_t out_h;
+    int32_t out_w;
+    int32_t out_c;
+    uint8_t kernel_h;
+    uint8_t kernel_w;
+    uint8_t stride_h;
+    uint8_t stride_w;
+    uint16_t pad_top;
+    uint16_t pad_left;
+    uint16_t dilation_h;
+    uint16_t dilation_w;
+    int32_t out_row_start;
+    int32_t in_row_start;
+} tigris_window_t;
+
+/** Fills `w` for `op` under the current tile. */
+static inline void tigris_window(const tigris_plan_t *plan, const tigris_op_t *op,
+                                 const tigris_mem_t *mem, tigris_window_t *w)
+{
+    const int32_t *x = tigris_tensor_shape(plan, &plan->tensors[tigris_op_inputs(plan, op)[0]]);
+    const int32_t *y = tigris_tensor_shape(plan, &plan->tensors[tigris_op_outputs(plan, op)[0]]);
+    w->n = x[0];
+    w->in_h = x[1];
+    w->in_w = x[2];
+    w->in_c = x[3];
+    w->out_h = y[1];
+    w->out_w = y[2];
+    w->out_c = y[3];
+    w->kernel_h = op->spatial.kernel_h;
+    w->kernel_w = op->spatial.kernel_w;
+    w->stride_h = op->spatial.stride_h;
+    w->stride_w = op->spatial.stride_w;
+    w->pad_top = op->spatial.pad_top;
+    w->pad_left = op->spatial.pad_left;
+    w->dilation_h = op->spatial.dilation_h;
+    w->dilation_w = op->spatial.dilation_w;
+    if (w->dilation_h == 0u) {
+        w->dilation_h = 1u;
+    }
+    if (w->dilation_w == 0u) {
+        w->dilation_w = 1u;
+    }
+    w->out_row_start = 0;
+    w->in_row_start = 0;
+    if (mem->tile.active != 0u) {
+        w->in_h = mem->tile.in_h;
+        w->out_h = mem->tile.out_h;
+        w->in_w = mem->tile.in_w;
+        w->out_w = mem->tile.out_w;
+        w->pad_top = mem->tile.pad_top;
+        if (mem->tile.width_tiled != 0u) {
+            w->pad_left = mem->tile.pad_left;
+        }
+        w->out_row_start = mem->tile.out_row_start;
+        w->in_row_start = mem->tile.in_row_start;
+    }
+}
 
 /** The half-open range of tap indices whose input coordinate is inside the
  * tensor.

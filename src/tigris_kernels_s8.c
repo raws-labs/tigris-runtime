@@ -412,9 +412,6 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv2d_s8(
     const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
     const uint8_t *B = (const uint8_t *)tigris_op_bias(plan, op);
 
-    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
-    const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
-
     /* Input quant param for zero point */
     const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
     int32_t input_zp = in_qp ? in_qp->zero_point : 0;
@@ -427,40 +424,13 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv2d_s8(
     /* Output qp holds the pre-computed per-channel multiplier/shift for
      * requantization (effective_scale = input_scale * weight_scale / output_scale). */
 
-    /* NHWC layout */
-    int N  = x_shape[0];
-    int IH = x_shape[1];
-    int IW = x_shape[2];
-    int IC = x_shape[3];
-    int OH = y_shape[1];
-    int OW = y_shape[2];
-    int OC = y_shape[3];
-    int KH = op->spatial.kernel_h;
-    int KW = op->spatial.kernel_w;
-    int SH = op->spatial.stride_h;
-    int SW = op->spatial.stride_w;
-    int PT = op->spatial.pad_top;
-    int PL = op->spatial.pad_left;
-    int DH = op->spatial.dilation_h ? op->spatial.dilation_h : 1;
-    int DW = op->spatial.dilation_w ? op->spatial.dilation_w : 1;
-    int32_t out_row_start = 0;
-    int32_t in_row_start = 0;
-
-    /* Tile override */
-    if (mem->tile.active) {
-        IH = mem->tile.in_h;
-        OH = mem->tile.out_h;
-        IW = mem->tile.in_w;
-        OW = mem->tile.out_w;
-        PT = mem->tile.pad_top;
-        /* Left pad only applies to a packed 2D (HW) tile; the right edge is
-         * already implicit in the IW bound check below, the same way the
-         * bottom edge is implicit in IH without a PB local. */
-        if (mem->tile.width_tiled)
-            PL = mem->tile.pad_left;
-        out_row_start = mem->tile.out_row_start;
-        in_row_start  = mem->tile.in_row_start;
-    }
+    tigris_window_t w;
+    tigris_window(plan, op, mem, &w);
+    int N = w.n, IH = w.in_h, IW = w.in_w, IC = w.in_c;
+    int OH = w.out_h, OW = w.out_w, OC = w.out_c;
+    int KH = w.kernel_h, KW = w.kernel_w, SH = w.stride_h, SW = w.stride_w;
+    int PT = w.pad_top, PL = w.pad_left, DH = w.dilation_h, DW = w.dilation_w;
+    int32_t out_row_start = w.out_row_start, in_row_start = w.in_row_start;
 
     /* Weight layout: [OC, KH, KW, IC] - OHWI */
     for (int n = 0; n < N; n++) {
@@ -518,9 +488,6 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv_transpose_s8(
     const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
     const uint8_t *B = (const uint8_t *)tigris_op_bias(plan, op);
 
-    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
-    const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
-
     /* Input quant param for zero point */
     const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
     int32_t input_zp = in_qp ? in_qp->zero_point : 0;
@@ -530,36 +497,13 @@ static TIGRIS_KERNEL_NOINLINE int kern_conv_transpose_s8(
     int32_t output_zp = out_qp ? out_qp->zero_point : 0;
     requant_params_t rq = requant_resolve(plan, out_qp);
 
-    /* NHWC layout */
-    int N  = x_shape[0];
-    int IH = x_shape[1];
-    int IW = x_shape[2];
-    int IC = x_shape[3];
-    int OH = y_shape[1];
-    int OW = y_shape[2];
-    int OC = y_shape[3];
-    int KH = op->spatial.kernel_h;
-    int KW = op->spatial.kernel_w;
-    int SH = op->spatial.stride_h;
-    int SW = op->spatial.stride_w;
-    int PT = op->spatial.pad_top;
-    int PL = op->spatial.pad_left;
-
-    /* Tile override. Structurally identical to kern_conv2d_s8: the tile's
-     * global offset is folded into the effective pads PT/PL by the
-     * executor, so the gather below runs unchanged in local packed
-     * coordinates. Left pad only applies to a packed 2D (HW) tile, same as
-     * kern_conv2d_s8. ConvTranspose never uses out_row_start / in_row_start
-     * (2D-only, no line-buffered chain). */
-    if (mem->tile.active) {
-        IH = mem->tile.in_h;
-        OH = mem->tile.out_h;
-        IW = mem->tile.in_w;
-        OW = mem->tile.out_w;
-        PT = mem->tile.pad_top;
-        if (mem->tile.width_tiled)
-            PL = mem->tile.pad_left;
-    }
+    /* Tile coordinates and no row starts, as in kern_conv_transpose. */
+    tigris_window_t w;
+    tigris_window(plan, op, mem, &w);
+    int N = w.n, IH = w.in_h, IW = w.in_w, IC = w.in_c;
+    int OH = w.out_h, OW = w.out_w, OC = w.out_c;
+    int KH = w.kernel_h, KW = w.kernel_w, SH = w.stride_h, SW = w.stride_w;
+    int PT = w.pad_top, PL = w.pad_left;
 
     /* Weight layout: [OC, KH, KW, IC] (OHWI) */
     for (int n = 0; n < N; n++) {
@@ -668,48 +612,20 @@ static TIGRIS_KERNEL_NOINLINE int kern_depthwise_conv2d_s8(
     const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
     const uint8_t *B = (const uint8_t *)tigris_op_bias(plan, op);
 
-    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
-    const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
-
     const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
     int32_t input_zp = in_qp ? in_qp->zero_point : 0;
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
     int32_t output_zp = out_qp ? out_qp->zero_point : 0;
     requant_params_t rq = requant_resolve(plan, out_qp);
 
-    int N  = x_shape[0];
-    int IH = x_shape[1];
-    int IW = x_shape[2];
-    int C  = x_shape[3];
-    int OC = y_shape[3];
-    int M  = OC / C;
-    int OH = y_shape[1];
-    int OW = y_shape[2];
-    int KH = op->spatial.kernel_h;
-    int KW = op->spatial.kernel_w;
-    int SH = op->spatial.stride_h;
-    int SW = op->spatial.stride_w;
-    int PT = op->spatial.pad_top;
-    int PL = op->spatial.pad_left;
-    int DH = op->spatial.dilation_h ? op->spatial.dilation_h : 1;
-    int DW = op->spatial.dilation_w ? op->spatial.dilation_w : 1;
-    int32_t out_row_start = 0;
-    int32_t in_row_start = 0;
-
-    if (mem->tile.active) {
-        IH = mem->tile.in_h;
-        OH = mem->tile.out_h;
-        IW = mem->tile.in_w;
-        OW = mem->tile.out_w;
-        PT = mem->tile.pad_top;
-        /* Left pad only applies to a packed 2D (HW) tile; the right edge is
-         * already implicit in the IW bound check below, the same way the
-         * bottom edge is implicit in IH without a PB local. */
-        if (mem->tile.width_tiled)
-            PL = mem->tile.pad_left;
-        out_row_start = mem->tile.out_row_start;
-        in_row_start  = mem->tile.in_row_start;
-    }
+    tigris_window_t w;
+    tigris_window(plan, op, mem, &w);
+    int N = w.n, IH = w.in_h, IW = w.in_w, C = w.in_c;
+    int OH = w.out_h, OW = w.out_w, OC = w.out_c;
+    int M = OC / C;
+    int KH = w.kernel_h, KW = w.kernel_w, SH = w.stride_h, SW = w.stride_w;
+    int PT = w.pad_top, PL = w.pad_left, DH = w.dilation_h, DW = w.dilation_w;
+    int32_t out_row_start = w.out_row_start, in_row_start = w.in_row_start;
 
     /* Output channel oc reads input channel oc / M, M the channel multiplier.
      * Weight layout: [KH, KW, OC] (HWC) */
@@ -1105,11 +1021,6 @@ static TIGRIS_KERNEL_NOINLINE int kern_avg_pool_s8(
     const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
 
-    const int32_t *x_shape =
-        tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
-    const int32_t *y_shape =
-        tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
-
     const tigris_quant_param_t *in_qp =
         tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
     const tigris_quant_param_t *out_qp =
@@ -1126,35 +1037,13 @@ static TIGRIS_KERNEL_NOINLINE int kern_avg_pool_s8(
     }
     int same_quant = in_scale == out_scale && input_zp == output_zp;
 
-    int N  = x_shape[0];
-    int IH = x_shape[1];
-    int IW = x_shape[2];
-    int C  = x_shape[3];
-    int OH = y_shape[1];
-    int OW = y_shape[2];
-    int KH = op->spatial.kernel_h;
-    int KW = op->spatial.kernel_w;
-    int SH = op->spatial.stride_h ? op->spatial.stride_h : 1;
-    int SW = op->spatial.stride_w ? op->spatial.stride_w : 1;
-    int PT = op->spatial.pad_top;
-    int PL = op->spatial.pad_left;
-    int32_t out_row_start = 0;
-    int32_t in_row_start = 0;
-
-    if (mem->tile.active) {
-        IH = mem->tile.in_h;
-        OH = mem->tile.out_h;
-        IW = mem->tile.in_w;
-        OW = mem->tile.out_w;
-        PT = mem->tile.pad_top;
-        /* Left pad only applies to a packed 2D (HW) tile; the right edge is
-         * already implicit in the IW bound check below, the same way the
-         * bottom edge is implicit in IH without a PB local. */
-        if (mem->tile.width_tiled)
-            PL = mem->tile.pad_left;
-        out_row_start = mem->tile.out_row_start;
-        in_row_start  = mem->tile.in_row_start;
-    }
+    tigris_window_t w;
+    tigris_window(plan, op, mem, &w);
+    int N = w.n, IH = w.in_h, IW = w.in_w, C = w.in_c, OH = w.out_h, OW = w.out_w;
+    int KH = w.kernel_h, KW = w.kernel_w, PT = w.pad_top, PL = w.pad_left;
+    int SH = w.stride_h ? w.stride_h : 1;
+    int SW = w.stride_w ? w.stride_w : 1;
+    int32_t out_row_start = w.out_row_start, in_row_start = w.in_row_start;
     if (KH <= 0 || KW <= 0)
         return -1;
 
@@ -1165,17 +1054,13 @@ static TIGRIS_KERNEL_NOINLINE int kern_avg_pool_s8(
         for (int oh = 0; oh < OH; oh++) {
             int oh_g = oh + out_row_start;
             int ih_base = oh_g * SH - PT - in_row_start;
-            int kh_start = ih_base < 0 ? -ih_base : 0;
-            int kh_end = KH;
-            if (ih_base + kh_end > IH)
-                kh_end = IH - ih_base;
+            int kh_start, kh_end;
+            tap_range(ih_base, IH, KH, 1, &kh_start, &kh_end);
 
             for (int ow = 0; ow < OW; ow++) {
                 int iw_base = ow * SW - PL;
-                int kw_start = iw_base < 0 ? -iw_base : 0;
-                int kw_end = KW;
-                if (iw_base + kw_end > IW)
-                    kw_end = IW - iw_base;
+                int kw_start, kw_end;
+                tap_range(iw_base, IW, KW, 1, &kw_start, &kw_end);
 
                 int32_t count = (kh_end - kh_start) * (kw_end - kw_start);
                 if (count <= 0)
@@ -1335,38 +1220,13 @@ static TIGRIS_KERNEL_NOINLINE int kern_max_pool_s8(
     const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
 
-    const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
-    const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
-
-    int N  = x_shape[0];
-    int IH = x_shape[1];
-    int IW = x_shape[2];
-    int C  = x_shape[3];
-    int OH = y_shape[1];
-    int OW = y_shape[2];
-    int KH = op->spatial.kernel_h;
-    int KW = op->spatial.kernel_w;
-    int SH = op->spatial.stride_h ? op->spatial.stride_h : 1;
-    int SW = op->spatial.stride_w ? op->spatial.stride_w : 1;
-    int PT = op->spatial.pad_top;
-    int PL = op->spatial.pad_left;
-    int32_t out_row_start = 0;
-    int32_t in_row_start = 0;
-
-    if (mem->tile.active) {
-        IH = mem->tile.in_h;
-        OH = mem->tile.out_h;
-        IW = mem->tile.in_w;
-        OW = mem->tile.out_w;
-        PT = mem->tile.pad_top;
-        /* Left pad only applies to a packed 2D (HW) tile; the right edge is
-         * already implicit in the IW bound check below, the same way the
-         * bottom edge is implicit in IH without a PB local. */
-        if (mem->tile.width_tiled)
-            PL = mem->tile.pad_left;
-        out_row_start = mem->tile.out_row_start;
-        in_row_start  = mem->tile.in_row_start;
-    }
+    tigris_window_t w;
+    tigris_window(plan, op, mem, &w);
+    int N = w.n, IH = w.in_h, IW = w.in_w, C = w.in_c, OH = w.out_h, OW = w.out_w;
+    int KH = w.kernel_h, KW = w.kernel_w, PT = w.pad_top, PL = w.pad_left;
+    int SH = w.stride_h ? w.stride_h : 1;
+    int SW = w.stride_w ? w.stride_w : 1;
+    int32_t out_row_start = w.out_row_start, in_row_start = w.in_row_start;
 
     /* Max preserves the value. The encoding is only preserved when the two
      * tensors declare the same quantization, which nothing enforces. */
@@ -1594,79 +1454,55 @@ static TIGRIS_KERNEL_NOINLINE int kern_resize_linear_s8(
     return 0;
 }
 
-static TIGRIS_KERNEL_NOINLINE int kern_sigmoid_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+/* Y[i] = table[X[i]] over the elements of a pointwise op's tile. */
+static void lut_apply_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem,
+    const int8_t table[256])
+{
+    const uint16_t input = tigris_op_inputs(plan, op)[0];
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, input);
+    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, tigris_op_outputs(plan, op)[0]);
+    uint32_t n = tigris_tile_numel(plan, input, mem);
+    apply_pointwise_row_offset_s8(plan, input, mem, &X, &Y);
+    for (uint32_t i = 0; i < n; i++)
+        Y[i] = table[(uint8_t)X[i]];
+}
+
+static float logistic_s8_table(float x)
+{
+    return 1.0f / (1.0f + expf(-x));
+}
+
+/* Sigmoid, Erf and Tanh through a 256-entry table indexed by the input code:
+ * round(f(real) / out_scale) + out_zp, clamped. A missing quantization reads
+ * as scale 1, zero point 0. With `checked`, a missing tensor or an output
+ * scale that is not positive is refused; Erf passes `checked`. */
+static TIGRIS_KERNEL_NOINLINE int kern_float_lut_s8(
+    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem,
+    float (*f)(float), int checked)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
-
-    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
+    if (checked && (!tigris_mem_tensor_ptr(mem, ins[0]) || !tigris_mem_tensor_ptr(mem, outs[0])))
+        return -1;
 
     const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
-
     float in_scale = in_qp ? in_qp->scale : 1.0f;
     int32_t in_zp = in_qp ? in_qp->zero_point : 0;
     float out_scale = out_qp ? out_qp->scale : 1.0f;
     int32_t out_zp = out_qp ? out_qp->zero_point : 0;
-
-    /* Build 256-entry LUT indexed by (uint8_t)int8_value.
-     * The cast (int8_t)i gives the two's complement mapping:
-     *   i=0->0, i=127->127, i=128->-128, i=255->-1 */
-    int8_t lut[256];
-    for (int i = 0; i < 256; i++) {
-        int8_t x_val = (int8_t)i;
-        float real = in_scale * (float)((int32_t)x_val - in_zp);
-        float sig = 1.0f / (1.0f + expf(-real));
-        int32_t q = (int32_t)roundf(sig / out_scale) + out_zp;
-        lut[i] = clamp_s8(q);
-    }
-
-    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
-    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
-    for (uint32_t i = 0; i < n; i++) {
-        Y[i] = lut[(uint8_t)X[i]];
-    }
-    return 0;
-}
-
-/* Erf via a 256-entry LUT, mirroring kern_sigmoid_s8. int8 in, int8 out with
- * its own output quant. */
-static TIGRIS_KERNEL_NOINLINE int kern_erf_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
-{
-    const uint16_t *ins  = tigris_op_inputs(plan, op);
-    const uint16_t *outs = tigris_op_outputs(plan, op);
-
-    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
-    if (!X || !Y)
+    if (checked && !(out_scale > 0.0f))
         return -1;
 
-    const tigris_quant_param_t *in_qp =
-        tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
-    const tigris_quant_param_t *out_qp =
-        tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
-    float in_scale = in_qp ? in_qp->scale : 1.0f;
-    int32_t in_zp = in_qp ? in_qp->zero_point : 0;
-    float out_scale = out_qp ? out_qp->scale : 1.0f;
-    int32_t out_zp = out_qp ? out_qp->zero_point : 0;
-    if (!(out_scale > 0.0f))
-        return -1;
-
+    /* Index (uint8_t)code: i=0->0, i=127->127, i=128->-128, i=255->-1. */
     int8_t lut[256];
     for (int i = 0; i < 256; i++) {
-        int8_t x_val = (int8_t)i;
-        float real = in_scale * (float)((int32_t)x_val - in_zp);
-        int32_t q = (int32_t)roundf(erff(real) / out_scale) + out_zp;
+        float real = in_scale * (float)((int32_t)(int8_t)i - in_zp);
+        int32_t q = (int32_t)roundf(f(real) / out_scale) + out_zp;
         lut[i] = clamp_s8(q);
     }
-
-    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
-    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
-    for (uint32_t i = 0; i < n; i++)
-        Y[i] = lut[(uint8_t)X[i]];
+    lut_apply_s8(plan, op, mem, lut);
     return 0;
 }
 
@@ -1718,13 +1554,9 @@ static TIGRIS_KERNEL_NOINLINE int kern_layer_norm_s8(
     if (!scale)
         return -1;
 
-    uint8_t attr_len = 0;
-    const uint8_t *raw = tigris_op_attribute_data(
-        plan, op_index, TIGRIS_OP_ATTR_EPSILON, &attr_len);
-    if (!raw || attr_len != sizeof(float))
-        return -1;
     float epsilon;
-    memcpy(&epsilon, raw, sizeof(epsilon));
+    if (tigris_float_attribute(plan, op_index, TIGRIS_OP_ATTR_EPSILON, &epsilon) != 1)
+        return -1;
 
     for (uint32_t r = 0; r < rows; r++) {
         const int8_t *row = X + (size_t)r * (size_t)width;
@@ -1906,13 +1738,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_leaky_relu_s8(
     activation_s8_t view;
     if (!activation_s8_begin(plan, op, mem, &view)) return -1;
     float alpha = 0.01f;
-    uint8_t length = 0;
-    const uint8_t *raw = tigris_op_attribute_data(plan, op_index, TIGRIS_OP_ATTR_ALPHA, &length);
-    if (raw) {
-        if (length != sizeof(alpha)) return -1;
-        memcpy(&alpha, raw, sizeof(alpha));
-    }
-    if (!isfinite(alpha)) return -1;
+    if (tigris_float_attribute(plan, op_index, TIGRIS_OP_ATTR_ALPHA, &alpha) < 0 ||
+        !isfinite(alpha)) return -1;
     int32_t multipliers[2];
     int shifts[2];
     float identity_scale = view.input_quant->scale / view.output_quant->scale;
@@ -2183,9 +2010,6 @@ static TIGRIS_KERNEL_NOINLINE int kern_hardswish_s8(
     const uint16_t *ins  = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
 
-    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
-
     const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
 
@@ -2221,12 +2045,7 @@ static TIGRIS_KERNEL_NOINLINE int kern_hardswish_s8(
         int32_t value = round_div_by_pot(sat_dbl_high_mul16(reluish, preshift), -out_exp);
         lut[i] = clamp_s8(value + out_zp);
     }
-
-    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
-    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
-    for (uint32_t i = 0; i < n; i++) {
-        Y[i] = lut[(uint8_t)X[i]];
-    }
+    lut_apply_s8(plan, op, mem, lut);
     return 0;
 }
 
@@ -2238,8 +2057,6 @@ static TIGRIS_KERNEL_NOINLINE int kern_gelu_s8(
 {
     const uint16_t *ins = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
-    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    int8_t *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
     const tigris_quant_param_t *iq = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
     const tigris_quant_param_t *oq = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
     uint8_t len = 0u;
@@ -2250,51 +2067,10 @@ static TIGRIS_KERNEL_NOINLINE int kern_gelu_s8(
     float inverse_scale = 1.0f / oq->scale;
     for (int32_t i = -128; i <= 127; i++) {
         float x = iq->scale * (float)(i - iq->zero_point);
-        float value = mode[0] ? 0.5f * x * (1.0f + tanhf(
-            0.7978845608028654f * (x + 0.044715f * x * x * x)))
-            : 0.5f * x * erfcf(-0.7071067811865475f * x);
-        float code = roundf(value * inverse_scale) + (float)oq->zero_point;
+        float code = roundf(tigris_gelu(x, mode[0]) * inverse_scale) + (float)oq->zero_point;
         lut[(uint8_t)(int8_t)i] = code > 127.0f ? 127 : code < -128.0f ? -128 : (int8_t)code;
     }
-    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
-    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
-    for (uint32_t i = 0; i < n; i++) Y[i] = lut[(uint8_t)X[i]];
-    return 0;
-}
-
-/* Tanh via a 256-entry LUT, mirroring kern_sigmoid_s8 (tanh in place of the
- * logistic). int8 input -> int8 output with its own output quant. */
-static TIGRIS_KERNEL_NOINLINE int kern_tanh_s8(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
-{
-    const uint16_t *ins  = tigris_op_inputs(plan, op);
-    const uint16_t *outs = tigris_op_outputs(plan, op);
-
-    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
-
-    const tigris_quant_param_t *in_qp = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
-    const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
-
-    float in_scale = in_qp ? in_qp->scale : 1.0f;
-    int32_t in_zp = in_qp ? in_qp->zero_point : 0;
-    float out_scale = out_qp ? out_qp->scale : 1.0f;
-    int32_t out_zp = out_qp ? out_qp->zero_point : 0;
-
-    int8_t lut[256];
-    for (int i = 0; i < 256; i++) {
-        int8_t x_val = (int8_t)i;
-        float real = in_scale * (float)((int32_t)x_val - in_zp);
-        float th = tanhf(real);
-        int32_t q = (int32_t)roundf(th / out_scale) + out_zp;
-        lut[i] = clamp_s8(q);
-    }
-
-    uint32_t n = tigris_tile_numel(plan, ins[0], mem);
-    apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
-    for (uint32_t i = 0; i < n; i++) {
-        Y[i] = lut[(uint8_t)X[i]];
-    }
+    lut_apply_s8(plan, op, mem, lut);
     return 0;
 }
 
@@ -3097,13 +2873,13 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_RESIZE: return kern_resize_nearest_s8(plan, op, mem);
 #endif
 #if TIGRIS_KERNEL_S8_SIGMOID
-    case TIGRIS_OP_SIGMOID: return kern_sigmoid_s8(plan, op, mem);
+    case TIGRIS_OP_SIGMOID: return kern_float_lut_s8(plan, op, mem, logistic_s8_table, 0);
 #endif
 #if TIGRIS_KERNEL_S8_GELU
     case TIGRIS_OP_GELU: return kern_gelu_s8(plan, op, op_index, mem);
 #endif
 #if TIGRIS_KERNEL_S8_TANH
-    case TIGRIS_OP_TANH: return kern_tanh_s8(plan, op, mem);
+    case TIGRIS_OP_TANH: return kern_float_lut_s8(plan, op, mem, tanhf, 0);
 #endif
 #if TIGRIS_KERNEL_S8_SOFTMAX
     case TIGRIS_OP_SOFTMAX: return kern_softmax_s8(plan, op, mem);
@@ -3142,7 +2918,7 @@ int tigris_dispatch_kernel_s8(
     case TIGRIS_OP_MATMUL: return kern_matmul_s8(plan, op, mem);
 #endif
 #if TIGRIS_KERNEL_S8_ERF
-    case TIGRIS_OP_ERF: return kern_erf_s8(plan, op, mem);
+    case TIGRIS_OP_ERF: return kern_float_lut_s8(plan, op, mem, erff, 1);
 #endif
 #if TIGRIS_KERNEL_S8_HARDSWISH
     case TIGRIS_OP_HARDSWISH: return kern_hardswish_s8(plan, op, mem);

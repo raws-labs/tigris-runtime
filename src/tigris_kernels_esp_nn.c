@@ -87,6 +87,37 @@ static int esp_per_channel_quant(
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+/* Filter dims, stride, pads and dilation (ESP-NN encodes none as {0, 0}) of a
+ * Conv call, for sizing and dispatch; dispatch adds offsets and activation. */
+static void esp_conv_setup(const tigris_op_t *op, const data_dims_t *input,
+                           int pad_top, int pad_left,
+                           conv_params_t *params, data_dims_t *filter)
+{
+    int groups = op->spatial.group > 1 ? (int)op->spatial.group : 1;
+    *params = (conv_params_t){
+        .stride   = { .width = op->spatial.stride_w, .height = op->spatial.stride_h },
+        .padding  = { .width = pad_left, .height = pad_top },
+        .dilation = { .width = 0, .height = 0 },
+    };
+    *filter = (data_dims_t){ .width = op->spatial.kernel_w, .height = op->spatial.kernel_h,
+                             .channels = input->channels / groups, .extra = 0 };
+}
+
+/* The same for a Depthwise call; depthwise weights are [KH, KW, OC]. */
+static void esp_dw_setup(const tigris_op_t *op, const data_dims_t *input,
+                         const data_dims_t *output, int pad_top, int pad_left,
+                         dw_conv_params_t *params, data_dims_t *filter)
+{
+    *params = (dw_conv_params_t){
+        .ch_mult  = output->channels / input->channels,
+        .stride   = { .width = op->spatial.stride_w, .height = op->spatial.stride_h },
+        .padding  = { .width = pad_left, .height = pad_top },
+        .dilation = { .width = 0, .height = 0 },
+    };
+    *filter = (data_dims_t){ .width = op->spatial.kernel_w, .height = op->spatial.kernel_h,
+                             .channels = output->channels, .extra = 0 };
+}
+
 static void esp_nn_workspace_free(void *ptr)
 {
 #ifdef __XTENSA__
@@ -284,17 +315,11 @@ int tigris_esp_nn_prepare(
 
             data_dims_t id = { .width = conv_IW, .height = conv_IH,
                                .channels = IC, .extra = 1 };
-            int groups = op->spatial.group > 1 ? (int)op->spatial.group : 1;
-            data_dims_t fd = { .width = KW, .height = KH,
-                               .channels = IC / groups, .extra = 0 };
             data_dims_t od = { .width = OW, .height = OH,
                                .channels = OC, .extra = 1 };
-            conv_params_t cp = {
-                .stride  = { .width = op->spatial.stride_w,
-                             .height = op->spatial.stride_h },
-                .padding = { .width = pad_w, .height = pad_h },
-                .dilation = { .width = 0, .height = 0 },
-            };
+            data_dims_t fd;
+            conv_params_t cp;
+            esp_conv_setup(op, &id, pad_h, pad_w, &cp, &fd);
 
             int s = esp_nn_get_conv_scratch_size(&id, &fd, &od, &cp);
 #ifdef __XTENSA__
@@ -313,7 +338,6 @@ int tigris_esp_nn_prepare(
 
             int IH = x_shape[1], IW = x_shape[2], C = x_shape[3];
             int OH = y_shape[1], OW = y_shape[2], OC = y_shape[3];
-            int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
 
             /* Band height the bounce buffer is sized for. adapt_depthwise
              * splits every call into row bands that fit the buffer and the
@@ -332,18 +356,12 @@ int tigris_esp_nn_prepare(
 
             data_dims_t id = { .width = IW, .height = IH,
                                .channels = C, .extra = 1 };
-            data_dims_t fd = { .width = KW, .height = KH,
-                               .channels = OC, .extra = 0 };
             data_dims_t od = { .width = OW, .height = tile_oh,
                                .channels = OC, .extra = 1 };
-            dw_conv_params_t dp = {
-                .ch_mult  = OC / C,
-                .stride   = { .width = op->spatial.stride_w,
-                              .height = op->spatial.stride_h },
-                .padding  = { .width = op->spatial.pad_left,
-                              .height = op->spatial.pad_top },
-                .dilation = { .width = 0, .height = 0 },
-            };
+            data_dims_t fd;
+            dw_conv_params_t dp;
+            esp_dw_setup(op, &id, &od, op->spatial.pad_top, op->spatial.pad_left,
+                         &dp, &fd);
 
             int s = esp_nn_get_depthwise_conv_scratch_size(&id, &fd, &od, &dp);
             max_scratch = MAX(max_scratch, s);
@@ -480,74 +498,37 @@ static const int8_t *asymmetric_pad_input(
     return (const int8_t *)dst;
 }
 
-/* Conv2D */
+/* Conv2D and Depthwise Conv2D run on the current tile (tigris_accel_tile_view). */
 
 static int adapt_conv2d(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+    const tigris_plan_t *plan, const tigris_op_t *op, const tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
-
-    const int8_t  *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    int8_t        *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
-    const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
-    const int32_t *B = (const int32_t *)tigris_op_bias(plan, op);
-
     const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
-
     const tigris_quant_param_t *in_qp  = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
 
-    int IH = x_shape[1], IW = x_shape[2], IC = x_shape[3];
-    int OH = y_shape[1], OW = y_shape[2], OC = y_shape[3];
-    int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
-
-    /* Use tile dimensions when tiling is active */
-    int pt = op->spatial.pad_top,    pb = op->spatial.pad_bottom;
-    if (mem->tile.active) {
-        IH = mem->tile.in_h;
-        OH = mem->tile.out_h;
-        pt = mem->tile.pad_top;
-        pb = mem->tile.pad_bottom;
-        if (mem->tile.width_tiled) {
-            IW = mem->tile.in_w;
-            OW = mem->tile.out_w;
-        }
-    }
-
-    /* Line-buffer roll: fold out_row_start into the output pointer and
-     * (out_row_start*stride - in_row_start) into the input pointer, matching
-     * kern_conv2d_s8 and the CMSIS-NN adapter. Rolled tiles are interior
-     * (pt==pb==0), so the asymmetric-pad path below is not taken. */
-    if (mem->tile.active &&
-        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0)) {
-        int delta = mem->tile.out_row_start * op->spatial.stride_h
-                  - mem->tile.in_row_start;
-        X  += delta * IW * IC;
-        Y  += mem->tile.out_row_start * OW * OC;
-        IH -= delta;
-    }
-
+    tigris_accel_tile_view_t v;
+    tigris_accel_tile_view(op, mem, x_shape, y_shape, &v);
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]) + v.in_offset;
+    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]) + v.out_offset;
+    const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
+    const int32_t *B = (const int32_t *)tigris_op_bias(plan, op);
+    int IC = x_shape[3], OC = y_shape[3];
     int32_t in_offset = in_qp ? -in_qp->zero_point : 0;
 
-    /* Handle asymmetric padding. A 2D (width_tiled) tile carries its own
-     * left/right pads; exec_stage_tiled_2d sets all four, so the bounce below
-     * pads the packed rectangle exactly as kern_conv2d_s8's IW/IH clipping. */
-    int pl = op->spatial.pad_left,   pr = op->spatial.pad_right;
-    if (mem->tile.active && mem->tile.width_tiled) {
-        pl = mem->tile.pad_left;
-        pr = mem->tile.pad_right;
-    }
-    int asymmetric = (pt != pb) || (pl != pr);
-
+    /* ESP-NN pads symmetrically, so a call with asymmetric pads (an edge tile
+     * of a symmetric op included) runs on a pre-padded copy with padding 0.
+     * A rolled tile is interior with no row pads. */
+    int pt = v.pad_top, pb = v.pad_bottom, pl = v.pad_left, pr = v.pad_right;
     const int8_t *conv_input = X;
-    int conv_IH = IH, conv_IW = IW;
+    int conv_IH = v.in_h, conv_IW = v.in_w;
     int pad_h = pt, pad_w = pl;
-
-    if (asymmetric) {
+    if ((pt != pb) || (pl != pr)) {
         const int8_t *padded = asymmetric_pad_input(
-            X, IH, IW, IC, pt, pb, pl, pr,
+            X, v.in_h, v.in_w, IC, pt, pb, pl, pr,
             (int8_t)(-in_offset), &conv_IH, &conv_IW);
         if (!padded) {
 #ifdef __XTENSA__
@@ -562,23 +543,20 @@ static int adapt_conv2d(
 
     data_dims_t input_dims  = { .width = conv_IW, .height = conv_IH,
                                 .channels = IC, .extra = 1 };
-    int groups = op->spatial.group > 1 ? (int)op->spatial.group : 1;
-    data_dims_t filter_dims = { .width = KW, .height = KH, .channels = IC / groups, .extra = 0 };
-    data_dims_t output_dims = { .width = OW, .height = OH, .channels = OC, .extra = 1 };
+    data_dims_t output_dims = { .width = v.out_w, .height = v.out_h,
+                                .channels = OC, .extra = 1 };
+    data_dims_t filter_dims;
+    conv_params_t params;
+    esp_conv_setup(op, &input_dims, pad_h, pad_w, &params, &filter_dims);
 
     quant_data_t quant;
     if (OC <= 0 || esp_per_channel_quant(
             plan, out_qp, (uint32_t)OC, &quant) != 0)
         return -99;
 
-    conv_params_t params = {
-        .in_offset  = in_offset,
-        .out_offset = out_qp ? out_qp->zero_point : 0,
-        .stride     = { .width = op->spatial.stride_w,  .height = op->spatial.stride_h },
-        .padding    = { .width = pad_w, .height = pad_h },
-        .dilation   = { .width = 0, .height = 0 },
-        .activation = { .min = op->act_min, .max = op->act_max },
-    };
+    params.in_offset = in_offset;
+    params.out_offset = out_qp ? out_qp->zero_point : 0;
+    params.activation = (act_params_t){ .min = op->act_min, .max = op->act_max };
 
     /* Two-tier scratch: prefer SRAM (fast), fall back to PSRAM, then s8_ref. */
     int needed = esp_nn_get_conv_scratch_size(&input_dims, &filter_dims,
@@ -600,8 +578,8 @@ static int adapt_conv2d(
         return -99;  /* fallback to s8_ref */
     }
 
-    esp_nn_conv_s8(&input_dims, conv_input, &filter_dims, W, B,
-                   &output_dims, Y, &params, &quant);
+    esp_nn_conv_s8(&input_dims, conv_input,
+                   &filter_dims, W, B, &output_dims, Y, &params, &quant);
     return 0;
 }
 
@@ -636,50 +614,25 @@ static int dw_bands_fit(int IH, int IW, int C, int OC, int OH, int OW, int band,
 }
 
 static int adapt_depthwise_conv2d(
-    const tigris_plan_t *plan, const tigris_op_t *op, tigris_mem_t *mem)
+    const tigris_plan_t *plan, const tigris_op_t *op, const tigris_mem_t *mem)
 {
     const uint16_t *ins  = tigris_op_inputs(plan, op);
     const uint16_t *outs = tigris_op_outputs(plan, op);
-
-    const int8_t  *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
-    int8_t        *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
-    const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
-    const int32_t *B = (const int32_t *)tigris_op_bias(plan, op);
-
     const int32_t *x_shape = tigris_tensor_shape(plan, &plan->tensors[ins[0]]);
     const int32_t *y_shape = tigris_tensor_shape(plan, &plan->tensors[outs[0]]);
-
     const tigris_quant_param_t *in_qp  = tigris_tensor_quant(plan, &plan->tensors[ins[0]]);
     const tigris_quant_param_t *out_qp = tigris_tensor_quant(plan, &plan->tensors[outs[0]]);
 
-    int IH = x_shape[1], IW = x_shape[2], C = x_shape[3];
-    int OH = y_shape[1], OW = y_shape[2], OC = y_shape[3];
-    int KH = op->spatial.kernel_h, KW = op->spatial.kernel_w;
+    tigris_accel_tile_view_t v;
+    tigris_accel_tile_view(op, mem, x_shape, y_shape, &v);
+    const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]) + v.in_offset;
+    int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]) + v.out_offset;
+    const int8_t  *W = (const int8_t *)tigris_op_weight(plan, op);
+    const int32_t *B = (const int32_t *)tigris_op_bias(plan, op);
 
-    /* Use tile dimensions when tiling is active */
-    if (mem->tile.active) {
-        IH = mem->tile.in_h;
-        OH = mem->tile.out_h;
-        if (mem->tile.width_tiled) {
-            IW = mem->tile.in_w;
-            OW = mem->tile.out_w;
-        }
-    }
-
-    /* Line-buffer roll: fold out_row_start into the output pointer and
-     * (out_row_start*stride - in_row_start) into the input pointer, matching
-     * kern_conv2d_s8 and the CMSIS-NN adapter. */
-    if (mem->tile.active &&
-        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0)) {
-        int delta = mem->tile.out_row_start * op->spatial.stride_h
-                  - mem->tile.in_row_start;
-        X  += delta * IW * C;
-        Y  += mem->tile.out_row_start * OW * OC;
-        IH -= delta;
-    }
-
+    int IH = v.in_h, IW = v.in_w, C = x_shape[3];
+    int OH = v.out_h, OW = v.out_w, OC = y_shape[3];
     data_dims_t input_dims  = { .width = IW, .height = IH, .channels = C, .extra = 1 };
-    data_dims_t filter_dims = { .width = KW, .height = KH, .channels = OC, .extra = 0 };
     data_dims_t output_dims = { .width = OW, .height = OH, .channels = OC, .extra = 1 };
 
     quant_data_t quant;
@@ -687,20 +640,13 @@ static int adapt_depthwise_conv2d(
             plan, out_qp, (uint32_t)OC, &quant) != 0)
         return -99;
 
-    /* Depthwise weights use [KH, KW, OC], with adjacent channels for each multiplier. */
-
-    int32_t in_offset = in_qp  ? -in_qp->zero_point  : 0;
-    int32_t out_offset = out_qp ? out_qp->zero_point : 0;
-
-    dw_conv_params_t params = {
-        .in_offset  = in_offset,
-        .out_offset = out_offset,
-        .ch_mult    = OC / C,
-        .stride     = { .width = op->spatial.stride_w,  .height = op->spatial.stride_h },
-        .padding    = { .width = (mem->tile.active && mem->tile.width_tiled) ? mem->tile.pad_left : op->spatial.pad_left,   .height = mem->tile.active ? mem->tile.pad_top : op->spatial.pad_top },
-        .dilation   = { .width = 0, .height = 0 },
-        .activation = { .min = op->act_min, .max = op->act_max },
-    };
+    data_dims_t filter_dims;
+    dw_conv_params_t params;
+    esp_dw_setup(op, &input_dims, &output_dims, v.pad_top, v.pad_left,
+                 &params, &filter_dims);
+    params.in_offset = in_qp ? -in_qp->zero_point : 0;
+    params.out_offset = out_qp ? out_qp->zero_point : 0;
+    params.activation = (act_params_t){ .min = op->act_min, .max = op->act_max };
 
     if (!s_dw_out_buf || OH <= 0 || OW <= 0)
         return -99;
@@ -728,7 +674,7 @@ static int adapt_depthwise_conv2d(
         uint16_t band_pad;
         (void)tigris_accel_row_band(IH, pad_top,
                                     (uint16_t)params.stride.height,
-                                    (uint16_t)KH, o0, rows,
+                                    (uint16_t)filter_dims.height, o0, rows,
                                     &in_start, &in_rows, &band_pad);
         input_dims.height = in_rows;
         output_dims.height = rows;

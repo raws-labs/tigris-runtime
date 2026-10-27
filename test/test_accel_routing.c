@@ -474,6 +474,76 @@ static void test_row_band_matches_unsplit_op(void)
                    "missing output is refused");
 }
 
+static int view_is(const tigris_accel_tile_view_t *v, int32_t in_h, int32_t in_w,
+                   int32_t out_h, int32_t out_w, uint16_t top, uint16_t bottom,
+                   uint16_t left, uint16_t right, int32_t in_offset, int32_t out_offset)
+{
+    return v->in_h == in_h && v->in_w == in_w && v->out_h == out_h && v->out_w == out_w &&
+           v->pad_top == top && v->pad_bottom == bottom && v->pad_left == left &&
+           v->pad_right == right && v->in_offset == in_offset && v->out_offset == out_offset;
+}
+
+static void test_tile_view(void)
+{
+    printf("  test_tile_view...\n");
+    static const int32_t x_shape[4] = {1, 9, 8, 3};
+    static const int32_t y_shape[4] = {1, 5, 7, 4};
+    tigris_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op_type = TIGRIS_OP_CONV;
+    op.spatial.stride_h = 2;
+    op.spatial.pad_top = 1;
+    op.spatial.pad_bottom = 2;
+    op.spatial.pad_left = 3;
+    op.spatial.pad_right = 4;
+
+    /* Tile fields that differ from the op in every value. */
+    tigris_mem_t mem;
+    memset(&mem, 0, sizeof(mem));
+    mem.tile.in_h = 6;
+    mem.tile.out_h = 3;
+    mem.tile.in_w = 5;
+    mem.tile.out_w = 2;
+    mem.tile.pad_top = 5;
+    mem.tile.pad_bottom = 6;
+    mem.tile.pad_left = 7;
+    mem.tile.pad_right = 8;
+    mem.tile.width_tiled = 1;
+    mem.tile.out_row_start = 2;
+    mem.tile.in_row_start = 1;
+
+    tigris_accel_tile_view_t v;
+    tigris_accel_tile_view(&op, &mem, x_shape, y_shape, &v);
+    TEST_ASSERT(view_is(&v, 9, 8, 5, 7, 1, 2, 3, 4, 0, 0),
+                "inactive tile: whole tensors and the op's pads");
+
+    mem.tile.active = 1;
+    mem.tile.width_tiled = 0;
+    mem.tile.out_row_start = 0;
+    mem.tile.in_row_start = 0;
+    tigris_accel_tile_view(&op, &mem, x_shape, y_shape, &v);
+    TEST_ASSERT(view_is(&v, 6, 8, 3, 7, 5, 6, 3, 4, 0, 0),
+                "height tile: tile rows and row pads, the op's widths and column pads");
+
+    mem.tile.width_tiled = 1;
+    tigris_accel_tile_view(&op, &mem, x_shape, y_shape, &v);
+    TEST_ASSERT(view_is(&v, 6, 5, 3, 2, 5, 6, 7, 8, 0, 0),
+                "2D tile: tile rows, columns and all four pads");
+
+    /* Roll: output from row 2, input from row 2 * 2 - 1 = 3 of the buffer. */
+    mem.tile.width_tiled = 0;
+    mem.tile.out_row_start = 2;
+    mem.tile.in_row_start = 1;
+    tigris_accel_tile_view(&op, &mem, x_shape, y_shape, &v);
+    TEST_ASSERT(view_is(&v, 3, 8, 3, 7, 5, 6, 3, 4, 3 * 8 * 3, 2 * 7 * 4),
+                "rolled height tile: offsets in full rows, input rows reduced");
+
+    mem.tile.width_tiled = 1;
+    tigris_accel_tile_view(&op, &mem, x_shape, y_shape, &v);
+    TEST_ASSERT(view_is(&v, 3, 5, 3, 2, 5, 6, 7, 8, 3 * 5 * 3, 2 * 2 * 4),
+                "rolled 2D tile: offsets in tile rows");
+}
+
 /* Quant data spanning two pages, so a param on page 1 reads past the first. */
 static int32_t channel_quant_data[TIGRIS_QUANT_PAGE_ELEMS + 8];
 
@@ -878,6 +948,7 @@ int main(void)
     test_row_banded_ops_route_to_reference();
     test_esp_asymmetric_pad_workspace_policy();
     test_row_band_matches_unsplit_op();
+    test_tile_view();
     test_channel_quant();
 
     return test_report();

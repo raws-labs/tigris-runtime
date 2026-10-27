@@ -93,6 +93,37 @@ int tigris_accel_row_band(
     int32_t  *in_rows,
     uint16_t *band_pad_top);
 
+/** Extents, pads and data offsets of one Conv or Depthwise adapter call. */
+typedef struct {
+    int32_t  in_h;
+    int32_t  in_w;
+    int32_t  out_h;
+    int32_t  out_w;
+    uint16_t pad_top;
+    uint16_t pad_bottom;
+    uint16_t pad_left;
+    uint16_t pad_right;
+    int32_t  in_offset;   /* elements from the input tensor pointer */
+    int32_t  out_offset;  /* elements from the output tensor pointer */
+} tigris_accel_tile_view_t;
+
+/**
+ * The part of an NHWC Conv or Depthwise op that the current call computes.
+ *
+ * Untiled, this is the whole tensors with the op's pads. An active tile sets
+ * the heights and the top and bottom pads from the tile, and a 2D tile also
+ * the widths and the left and right pads. A line-buffer roll writes from
+ * output row out_row_start and reads from input row
+ * out_row_start * stride_h - in_row_start, which the offsets hold and in_h
+ * excludes.
+ */
+void tigris_accel_tile_view(
+    const tigris_op_t        *op,
+    const tigris_mem_t       *mem,
+    const int32_t            *x_shape,
+    const int32_t            *y_shape,
+    tigris_accel_tile_view_t *view);
+
 /**
  * Per-channel requantization arrays for an op with `channels` output channels.
  *

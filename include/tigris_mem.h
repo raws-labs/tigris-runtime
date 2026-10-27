@@ -100,6 +100,8 @@ typedef struct {
 /**
  * Minimum alignment for tensor allocations (bytes, must be power of 2).
  * Auto-detected from target architecture, override with -DTIGRIS_TENSOR_ALIGN=N.
+ * Compiled plans size allocations for at most 32 bytes, so an auto-detected
+ * value above 32 (SVE) stops the build; an explicit value is not checked here.
  */
 #ifndef TIGRIS_TENSOR_ALIGN
   #if defined(__ARM_FEATURE_SVE)
@@ -118,6 +120,9 @@ typedef struct {
     #define TIGRIS_TENSOR_ALIGN 16   /* Cortex-M4/M7/M33: CMSIS-NN opt kernels need aligned buffers */
   #else
     #define TIGRIS_TENSOR_ALIGN 4    /* Cortex-M0, 8-bit MCUs, etc. */
+  #endif
+  #if TIGRIS_TENSOR_ALIGN > 32
+    #error "Auto-detected TIGRIS_TENSOR_ALIGN is above 32, the largest alignment compiled plans are sized for; define TIGRIS_TENSOR_ALIGN, for example -DTIGRIS_TENSOR_ALIGN=32"
   #endif
 #endif
 

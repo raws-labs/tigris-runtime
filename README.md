@@ -92,8 +92,10 @@ requirement. Generated standalone CMSIS harnesses reserve 4 KiB by default,
 validate it at startup, and report the exact required total when a larger model
 needs `TIGRIS_CMSIS_NN_SCRATCH_BYTES` overridden at build time.
 
-The compiler's cost model aligns each activation to 32 bytes, which covers
-every target except an SVE build (64). `mem.fast_peak` is the observed
+The compiler's cost model aligns each activation to 32 bytes. An SVE build
+auto-detects 64 and stops with `#error` unless `TIGRIS_TENSOR_ALIGN` is
+defined; a generated core header stops on any value above 32.
+`mem.fast_peak` is the observed
 allocator high-water mark, not the scheduled minimum: a roomy arena may defer
 compaction and therefore report a larger value. Contract tests run with the
 compiler's scheduled limit to prove that compaction, tiling, and weight

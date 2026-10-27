@@ -364,6 +364,7 @@ typedef enum {
     TIGRIS_ERR_MEM          = -14,  /* Arena cannot hold the tensor */
     TIGRIS_ERR_TENSOR_SLOTS = -15,  /* Memory manager has fewer tensor slots than the plan */
     TIGRIS_ERR_TILE_FACTS   = -16,  /* A tile record's stated tiling disagrees with the plan */
+    TIGRIS_ERR_CHAIN_BAND   = -17,  /* A chained stage reads a tensor off the band it runs */
 } tigris_error_t;
 
 /* Sentinel: tile_plan_idx == 0xFFFF means no tile plan for this stage */

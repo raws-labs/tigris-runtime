@@ -109,6 +109,10 @@ static void test_error_strings(void)
     TEST_ASSERT_EQ(TIGRIS_ERR_TILE_FACTS, -16, "tile-facts code follows the tensor-slot code");
     TEST_ASSERT(strcmp(tigris_error_str(TIGRIS_ERR_TILE_FACTS),
                        tigris_error_str((tigris_error_t)999)) != 0, "tile-facts string");
+    TEST_ASSERT_EQ(TIGRIS_ERR_CHAIN_BAND, -17, "chain-band code follows the tile-facts code");
+    TEST_ASSERT(strcmp(tigris_error_str(TIGRIS_ERR_CHAIN_BAND),
+                       "chained stage reads a tensor off its band; recompile the plan") == 0,
+                "chain-band string");
 }
 
 /* Minimal self-contained plans for malformed-input tests. */
@@ -760,6 +764,161 @@ static void test_chain_graph_guards(void)
     TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_ERR_BAD_SECTION,
                    "a chain past the end of a subgraph is refused");
     free(buf);
+}
+
+/* The MaxPool window of build_band_chain_plan: the height pad is half the
+ * kernel height, and the width pad is given. */
+typedef struct {
+    uint8_t kernel_h, kernel_w, stride_w, pad_w;
+} band_pool_t;
+
+/* A chain of two stages over [1, 4, 4, 1] tensors. Stage 0 runs a MaxPool
+ * 0 -> 1 with the given window (tensor 1 takes the width it yields), then
+ * `second` into tensor 2, reading tensors a and b (one of them for a unary
+ * op). Stage 1 runs a Relu 2 -> 3. */
+static uint8_t *build_band_chain_plan(band_pool_t window, uint8_t second, uint16_t a, uint16_t b,
+                                      uint32_t *out_size)
+{
+    const uint32_t tensors_off = 128u;
+    const uint32_t ops_off = tensors_off + 4u * (uint32_t)sizeof(tigris_tensor_t);
+    const uint32_t stages_off = align4(ops_off + 3u * (uint32_t)sizeof(tigris_op_t));
+    const uint32_t index_off = stages_off + 2u * (uint32_t)sizeof(tigris_stage_t);
+    const uint32_t shapes_off = align4(index_off + 14u * (uint32_t)sizeof(uint16_t));
+    const uint32_t strings_off = shapes_off + 8u * (uint32_t)sizeof(int32_t);
+    const uint32_t plan_size = align4(strings_off + 1u) + (uint32_t)sizeof(tigris_memory_t);
+    uint8_t *buf = calloc(1, plan_size);
+    if (!buf)
+        return NULL;
+
+    plan_builder_t builder = plan_builder_begin(buf, plan_size, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
+    hdr->num_tensors = 4;
+    hdr->num_ops = 3;
+    hdr->num_stages = 2;
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, tensors_off);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, ops_off);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, stages_off);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_INDEX_POOL, index_off);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_SHAPE_POOL, shapes_off);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_STRINGS, strings_off);
+    plan_finish(buf);
+
+    int32_t *shape = (int32_t *)(buf + shapes_off);
+    shape[0] = 1;
+    shape[1] = 4;
+    shape[2] = 4;
+    shape[3] = 1;
+    const int32_t pooled_w = (4 + 2 * (int32_t)window.pad_w - (int32_t)window.kernel_w) /
+                             (int32_t)window.stride_w + 1;
+    shape[4] = 1;
+    shape[5] = 4;
+    shape[6] = pooled_w;
+    shape[7] = 1;
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + tensors_off);
+    for (uint16_t i = 0; i < 4u; i++) {
+        tensors[i].size_bytes = 16u * (uint32_t)sizeof(float);
+        tensors[i].ndim = 4;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+    tensors[1].shape_off = 4;
+    tensors[1].size_bytes = 4u * (uint32_t)pooled_w * (uint32_t)sizeof(float);
+
+    /* Index pool: op inputs and outputs, then each stage's ops, inputs, outputs. */
+    static const uint16_t pool[14] = {0, 1, 0, 0, 2, 2, 3, 0, 1, 0, 2, 2, 2, 3};
+    uint16_t *indices = (uint16_t *)(buf + index_off);
+    memcpy(indices, pool, sizeof(pool));
+    indices[2] = a;
+    indices[3] = b;
+
+    tigris_op_t *ops = (tigris_op_t *)(buf + ops_off);
+    static const uint8_t types[3] = {TIGRIS_OP_MAX_POOL, 0u, TIGRIS_OP_RELU};
+    static const uint16_t inputs_off[3] = {0, 2, 5};
+    static const uint16_t outputs_off[3] = {1, 4, 6};
+    for (uint16_t i = 0; i < 3u; i++) {
+        ops[i].op_type = i == 1u ? second : types[i];
+        ops[i].num_inputs = (i == 1u && second == TIGRIS_OP_ADD) ? 2u : 1u;
+        ops[i].num_outputs = 1;
+        ops[i].stage = i < 2u ? 0u : 1u;
+        ops[i].inputs_off = inputs_off[i];
+        ops[i].outputs_off = outputs_off[i];
+        ops[i].weight_idx = TIGRIS_NO_WEIGHT;
+        ops[i].bias_idx = TIGRIS_NO_WEIGHT;
+    }
+    tigris_spatial_attrs_t *sp = &ops[0].spatial;
+    sp->kernel_h = window.kernel_h;
+    sp->kernel_w = window.kernel_w;
+    sp->stride_h = 1;
+    sp->stride_w = window.stride_w;
+    sp->pad_top = (uint16_t)(window.kernel_h / 2u);
+    sp->pad_bottom = (uint16_t)(window.kernel_h / 2u);
+    sp->pad_left = window.pad_w;
+    sp->pad_right = window.pad_w;
+    sp->dilation_h = 1;
+    sp->dilation_w = 1;
+    sp->group = 1;
+
+    tigris_stage_t *stages = (tigris_stage_t *)(buf + stages_off);
+    static const uint16_t stage_ops[2][2] = {{7, 2}, {11, 1}};
+    for (uint16_t s = 0; s < 2u; s++) {
+        stages[s].ops_off = stage_ops[s][0];
+        stages[s].ops_count = stage_ops[s][1];
+        stages[s].inputs_off = (uint16_t)(stage_ops[s][0] + stage_ops[s][1]);
+        stages[s].inputs_count = 1;
+        stages[s].outputs_off = (uint16_t)(stages[s].inputs_off + 1u);
+        stages[s].outputs_count = 1;
+        stages[s].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+        stages[s].chain_id = TIGRIS_NO_CHAIN;
+    }
+    *out_size = plan_size;
+    return buf;
+}
+
+/* The chain executor hands every op of a stage the band it is running, its
+ * rows and its width, so a chained op that reads a tensor from an earlier
+ * point of the band is refused. */
+static void test_chain_reads_its_band(void)
+{
+    printf("  test_chain_reads_its_band...\n");
+    static const struct {
+        band_pool_t window;
+        uint8_t second;
+        uint16_t a, b;
+        tigris_error_t chained;
+        const char *name;
+    } cases[] = {
+        {{3u, 3u, 1u, 1u}, TIGRIS_OP_RELU, 1, 1, TIGRIS_OK, "an op on the pool's output reads the band"},
+        {{3u, 3u, 1u, 1u}, TIGRIS_OP_RELU, 0, 0, TIGRIS_ERR_CHAIN_BAND,
+         "an op on the pool's input after the pool is refused"},
+        {{1u, 1u, 1u, 0u}, TIGRIS_OP_RELU, 0, 0, TIGRIS_OK, "a 1x1 pool leaves the band where it is"},
+        {{1u, 3u, 1u, 1u}, TIGRIS_OP_RELU, 0, 0, TIGRIS_OK,
+         "a 1x3 pool that keeps the width leaves the band where it is"},
+        {{1u, 1u, 2u, 0u}, TIGRIS_OP_RELU, 0, 0, TIGRIS_ERR_CHAIN_BAND,
+         "a 1x1 pool of width stride 2 moves the band"},
+        {{1u, 3u, 1u, 0u}, TIGRIS_OP_RELU, 0, 0, TIGRIS_ERR_CHAIN_BAND,
+         "a 1x3 pool without width pads moves the band"},
+        {{3u, 3u, 1u, 1u}, TIGRIS_OP_ADD, 1, 0, TIGRIS_OK,
+         "a binary op carries one operand from before the pool"},
+        {{3u, 3u, 1u, 1u}, TIGRIS_OP_ADD, 0, 1, TIGRIS_OK, "the carried operand may come first"},
+        {{3u, 3u, 1u, 1u}, TIGRIS_OP_ADD, 0, 0, TIGRIS_ERR_CHAIN_BAND,
+         "a binary op with no operand on the band"},
+        {{3u, 3u, 1u, 1u}, TIGRIS_OP_RELU, 3, 3, TIGRIS_ERR_CHAIN_BAND,
+         "a tensor the stage neither loads nor makes"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        tigris_plan_t plan;
+        uint32_t size = 0;
+        uint8_t *buf = build_band_chain_plan(cases[i].window, cases[i].second, cases[i].a,
+                                             cases[i].b, &size);
+        TEST_ASSERT(buf != NULL, "band plan allocation");
+        if (!buf)
+            return;
+        if (cases[i].a != 3u)
+            TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_OK, "the stages load unchained");
+        chain_plan_link(buf, 0, 2);
+        TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), cases[i].chained, cases[i].name);
+        free(buf);
+    }
 }
 
 /* The executor runs a chain from its head, so a hand-built plan that reaches a member first is refused. */
@@ -6374,6 +6533,7 @@ int main(void)
     test_chain_limit_guards();
     test_chain_shape_guards();
     test_chain_graph_guards();
+    test_chain_reads_its_band();
     test_chain_member_runs_from_its_head();
     test_stage_schedule_guards();
     test_schema_v5_many_stage_schedule();

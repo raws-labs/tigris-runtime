@@ -3350,6 +3350,8 @@ static tigris_error_t validate_stage(tigris_load_state_t *ctx, uint16_t i)
         /* The chain executor sizes every band it holds as [N, rows, W, C]. */
         if (!stage_tensors_rank4(&ctx->candidate, stage, 1))
             return TIGRIS_ERR_BAD_SECTION;
+        if (!tigris_chain_stage_reads_its_band(&ctx->candidate, stage))
+            return TIGRIS_ERR_CHAIN_BAND;
     }
     return TIGRIS_OK;
 }
@@ -3623,7 +3625,9 @@ const char *tigris_error_str(tigris_error_t err)
         case TIGRIS_ERR_TENSOR_SLOTS:
             return "memory manager has fewer tensor slots than the plan";
         case TIGRIS_ERR_TILE_FACTS:
-            return "tile record disagrees with the plan's tiling";
+            return "tile record disagrees with the tiling the runtime derives from the plan";
+        case TIGRIS_ERR_CHAIN_BAND:
+            return "chained stage reads a tensor off its band; recompile the plan";
         default:                    return "unknown error";
     }
 }

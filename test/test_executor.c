@@ -484,14 +484,14 @@ static uint32_t total_tensor_bytes(const tigris_plan_t *plan)
  *   python3 -c "
  *   import sys; sys.path.insert(0, 'scripts')
  *   from contract_cases.chains import _tiled_pool_chain_case
- *   from tigris.cli import _run_pipeline
+ *   from tigris.pipeline import plan_model
  *   from tigris.emitters.binary.writer import emit_binary
  *   import tempfile, onnx, os
  *   case = _tiled_pool_chain_case()
  *   with tempfile.TemporaryDirectory() as d:
  *       p = os.path.join(d, 'm.onnx')
  *       onnx.save(case.compile_model, p)
- *       ag, _ = _run_pipeline(p, (case.mem_budget,))
+ *       ag = plan_model(p, (case.mem_budget,))
  *       emit_binary(ag, 'pool_chain.tgrs')
  *   "
  */
@@ -631,13 +631,13 @@ extern int32_t g_tigris_interior_clamps;
  *   import sys, os, tempfile
  *   sys.path.insert(0, os.path.abspath('src')); sys.path.insert(0, os.path.abspath('scripts'))
  *   from contract_cases.chains import _tiled_chain_case
- *   from tigris.cli import _run_pipeline
+ *   from tigris.pipeline import plan_model
  *   from tigris.emitters.binary.writer import emit_binary
  *   import onnx
  *   case = _tiled_chain_case()
  *   with tempfile.TemporaryDirectory() as d:
  *       p = os.path.join(d, 'm.onnx'); onnx.save(case.compile_model, p)
- *       ag, _ = _run_pipeline(p, ('28K',))
+ *       ag = plan_model(p, ('28K',))
  *       emit_binary(ag, 'linebuf_conv_chain.tgrs')
  *   "
  *

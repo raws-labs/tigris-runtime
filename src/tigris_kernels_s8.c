@@ -3142,6 +3142,44 @@ int tigris_accel_row_band(
     return 1;
 }
 
+void tigris_accel_tile_view(
+    const tigris_op_t        *op,
+    const tigris_mem_t       *mem,
+    const int32_t            *x_shape,
+    const int32_t            *y_shape,
+    tigris_accel_tile_view_t *view)
+{
+    const tigris_tile_ctx_t *tile = &mem->tile;
+    view->in_h = x_shape[1];
+    view->in_w = x_shape[2];
+    view->out_h = y_shape[1];
+    view->out_w = y_shape[2];
+    view->pad_top = op->spatial.pad_top;
+    view->pad_bottom = op->spatial.pad_bottom;
+    view->pad_left = op->spatial.pad_left;
+    view->pad_right = op->spatial.pad_right;
+    view->in_offset = 0;
+    view->out_offset = 0;
+    if (tile->active == 0u)
+        return;
+
+    view->in_h = tile->in_h;
+    view->out_h = tile->out_h;
+    view->pad_top = tile->pad_top;
+    view->pad_bottom = tile->pad_bottom;
+    if (tile->width_tiled != 0u) {
+        view->in_w = tile->in_w;
+        view->out_w = tile->out_w;
+        view->pad_left = tile->pad_left;
+        view->pad_right = tile->pad_right;
+    }
+    int32_t delta = tile->out_row_start * (int32_t)op->spatial.stride_h
+                  - tile->in_row_start;
+    view->in_offset = delta * view->in_w * x_shape[3];
+    view->out_offset = tile->out_row_start * view->out_w * y_shape[3];
+    view->in_h -= delta;
+}
+
 int tigris_accel_channel_quant(
     const tigris_plan_t *plan,
     const tigris_quant_param_t *qp,

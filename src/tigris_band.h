@@ -82,7 +82,20 @@ int tigris_op_independent_band(const tigris_plan_t *plan, const tigris_op_t *op,
 int tigris_stage_spatial_op(const tigris_plan_t *plan, const tigris_stage_t *stage);
 int tigris_stage_stripe_contract(const tigris_plan_t *plan, const tigris_stage_t *stage,
                                  uint8_t rank, uint8_t axis);
-int tigris_chain_stage_reads_its_band(const tigris_plan_t *plan, const tigris_stage_t *stage);
+/* The executor that holds a stage's band, which settles what moves it. */
+typedef enum {
+    TIGRIS_BAND_HELD_BY_CHAIN = 0,
+    TIGRIS_BAND_HELD_BY_STRIPE = 1,
+    TIGRIS_BAND_HELD_BY_HW_TILE = 2
+} tigris_band_holder_t;
+
+int tigris_stage_reads_its_band(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                tigris_band_holder_t holder);
+tigris_error_t tigris_stage_stripe_banding(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                           tigris_band_holder_t holder);
+uint16_t tigris_stage_band_input(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                 tigris_band_holder_t holder);
+uint16_t tigris_stage_band_output(const tigris_plan_t *plan, const tigris_stage_t *stage);
 int tigris_tensor_row_view(const tigris_plan_t *plan, const tigris_tensor_t *t,
                            int32_t *batch, int32_t *rows, int32_t *cols);
 /* The row band rule; `loader` selects the loader's wider form. */

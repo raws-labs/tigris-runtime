@@ -936,20 +936,13 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled(
     /* The band runs over the first input that has rows to band. A rank-4
      * input one row high is a per-channel operand broadcast over every band
      * (see the LOAD step), so it does not set the extent while another does. */
-    uint16_t band_input = sin[0];
-    for (uint16_t i = 0; i < stage->inputs_count; i++) {
-        const tigris_tensor_t *candidate = &plan->tensors[sin[i]];
-        if (candidate->ndim != 4u ||
-            tigris_tensor_shape(plan, candidate)[1] != 1) {
-            band_input = sin[i];
-            break;
-        }
-    }
+    uint16_t band_input = tigris_stage_band_input(plan, stage, TIGRIS_BAND_HELD_BY_STRIPE);
     uint8_t rank = plan->tensors[band_input].ndim;
     const int32_t *in_shape = tigris_tensor_shape(plan, &plan->tensors[band_input]);
     int32_t full_in_h = in_shape[1];
     int32_t full_in_w = rank == 4 ? in_shape[2] : 1;
-    const int32_t *out_shape = tigris_tensor_shape(plan, &plan->tensors[sout[0]]);
+    const int32_t *out_shape = tigris_tensor_shape(
+        plan, &plan->tensors[tigris_stage_band_output(plan, stage)]);
     int32_t full_out_h = out_shape[1];
     int32_t full_out_w = rank == 4 ? out_shape[2] : 1;
     int32_t orig_pad_top = sp_attrs ? sp_attrs->pad_top : 0;
@@ -1298,7 +1291,9 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_2d(
         return TIGRIS_EXEC_ERR_TILE;
 
     /* 2D tiling is NHWC-only; the width axis has no meaning at rank 3. */
-    if (plan->tensors[sin[0]].ndim != 4 || plan->tensors[sout[0]].ndim != 4)
+    uint16_t band_output = tigris_stage_band_output(plan, stage);
+    if (plan->tensors[sin[0]].ndim != 4 || plan->tensors[sout[0]].ndim != 4 ||
+        plan->tensors[band_output].ndim != 4)
         return TIGRIS_EXEC_ERR_TILE;
 
     /* Spatial op + image geometry (height and width). */
@@ -1307,7 +1302,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_tiled_2d(
         (sp_op_idx >= 0) ? &plan->ops[sp_op_idx].spatial : NULL;
 
     const int32_t *in_shape = tigris_tensor_shape(plan, &plan->tensors[sin[0]]);
-    const int32_t *out_shape = tigris_tensor_shape(plan, &plan->tensors[sout[0]]);
+    const int32_t *out_shape = tigris_tensor_shape(plan, &plan->tensors[band_output]);
     int32_t IH = in_shape[1];
     int32_t IW = in_shape[2];
     int32_t OH = out_shape[1];
@@ -3542,14 +3537,17 @@ static TIGRIS_NOINLINE tigris_exec_error_t route_stage(
      * their own terms, outside the stripe contract. */
     int own_band = kind == TIGRIS_BAND_KIND_ROWS || kind == TIGRIS_BAND_KIND_TRANSPOSE ||
                    kind == TIGRIS_BAND_KIND_BY_INPUT;
-    /* The 2D contract is the stripe contract with a lone ConvTranspose
-     * admitted, which exec_stage_tiled refuses on its own. */
-    int axis1_tileable = own_band || (common_tile_rank &&
-        tigris_stage_stripe_contract(plan, stage, rank, TIGRIS_TILE_AXIS_HW));
     /* A stage that reads its inputs in place runs whole. */
     int needs_tiling = !io_in_fast &&
         (common_tile_rank || kind == TIGRIS_BAND_KIND_ROWS || kind == TIGRIS_BAND_KIND_TRANSPOSE) &&
         total_io > stage_dispatch_capacity(plan, stage, mem);
+    /* A stage the stripe or the HW tile cannot band runs whole without a
+     * tile record; the loader refuses one with a record by the same check.
+     * Every use below also requires needs_tiling, so a stage that fits skips
+     * the check. */
+    int axis1_tileable = own_band || (needs_tiling &&
+        tigris_stage_stripe_banding(plan, stage, kind == TIGRIS_BAND_KIND_HW
+            ? TIGRIS_BAND_HELD_BY_HW_TILE : TIGRIS_BAND_HELD_BY_STRIPE) == TIGRIS_OK);
 
     /* A serialized tile plan is a compiler promise: fail closed if an older
      * or malformed plan attaches it to a stage the runtime cannot tile

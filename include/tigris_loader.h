@@ -103,8 +103,9 @@ tigris_band_kind_t tigris_stage_band_kind(const tigris_plan_t *plan, const tigri
  * by the rules the executor bands the stage with: the band axis, the extent
  * the bands divide, the band, the tile count, the halo, and the band byte of
  * the kind the stage is banded by (tigris_stage_band_kind). A height stripe
- * divides its output rows into the stated output band, and num_tiles is the
- * number of bands the executor runs. A layout conversion sizes its band in
+ * divides the rows of its spatial op's output, or of its first output without
+ * one, into the stated output band, and num_tiles is the number of bands the
+ * executor runs. A layout conversion sizes its band in
  * the run, so its tile_extent is the record's, bounded by the extent. An
  * untileable record yields all zero.
  * The loader returns TIGRIS_ERR_TILE_FACTS for a record that disagrees.

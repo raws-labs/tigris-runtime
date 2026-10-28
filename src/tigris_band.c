@@ -979,26 +979,73 @@ int tigris_stage_stripe_contract(const tigris_plan_t *plan, const tigris_stage_t
     return spatial_count <= 1u;
 }
 
-/* Whether an op moves a chain's band: a convolution or pool whose output row r
- * reads more than input row r, or whose output width is not its input width.
- * The chain loader has checked that every tensor of the stage is rank 4. */
-static int moves_the_band(const tigris_plan_t *plan, const tigris_op_t *op)
+/* Whether an op moves the band its executor holds. A resample or a
+ * ConvTranspose always does. A convolution or pool does when its output row r
+ * reads more than input row r, and then by what the band holds: whole rows
+ * move when the output width is not the input width, and an HW tile, which
+ * holds a column halo, moves unless output column c reads input column c
+ * only. */
+static int moves_the_band(const tigris_plan_t *plan, const tigris_op_t *op, tigris_band_holder_t holder)
 {
     const tigris_spatial_attrs_t *sp = &op->spatial;
-    if (!tigris_height_spatial_op(op->op_type))
+    if (tigris_height_upsample_op(op->op_type) || op->op_type == TIGRIS_OP_CONV_TRANSPOSE)
+        return 1;
+    if (!tigris_height_spatial_op(op->op_type) && op->op_type != TIGRIS_OP_CONV1D)
         return 0;
     if (!(sp->kernel_h == 1u && sp->stride_h == 1u && sp->pad_top == 0u && sp->pad_bottom == 0u))
         return 1;
-    const int32_t *in = tigris_tensor_shape(plan, &plan->tensors[tigris_op_inputs(plan, op)[0]]);
-    const int32_t *out = tigris_tensor_shape(plan, &plan->tensors[tigris_op_outputs(plan, op)[0]]);
-    return in[2] != out[2];
+    if (holder == TIGRIS_BAND_HELD_BY_HW_TILE)
+        return !(sp->kernel_w == 1u && sp->stride_w == 1u && sp->pad_left == 0u && sp->pad_right == 0u);
+    const tigris_tensor_t *in = &plan->tensors[tigris_op_inputs(plan, op)[0]];
+    const tigris_tensor_t *out = &plan->tensors[tigris_op_outputs(plan, op)[0]];
+    if (in->ndim != 4u || out->ndim != 4u)
+        return 0;
+    return tigris_tensor_shape(plan, in)[2] != tigris_tensor_shape(plan, out)[2];
 }
 
-/* Whether the op at `position` of a chained stage finds `tensor` at the band's
+/* Whether a tensor is a rank-4 operand one row high, which the height stripe
+ * loads whole for every band (exec_stage_tiled). */
+static int one_row_operand(const tigris_plan_t *plan, uint16_t tensor)
+{
+    const tigris_tensor_t *t = &plan->tensors[tensor];
+    return t->ndim == 4u && tigris_tensor_shape(plan, t)[1] == 1;
+}
+
+/* Whether two tensors have the extents a banded executor hands an op: the
+ * same rank, rows and, at rank 4, width. */
+static int band_extents_equal(const tigris_plan_t *plan, uint16_t a, uint16_t b)
+{
+    const tigris_tensor_t *ta = &plan->tensors[a];
+    const tigris_tensor_t *tb = &plan->tensors[b];
+    if (ta->ndim != tb->ndim)
+        return 0;
+    const int32_t *sa = tigris_tensor_shape(plan, ta);
+    const int32_t *sb = tigris_tensor_shape(plan, tb);
+    return (ta->ndim < 2u || sa[1] == sb[1]) && (ta->ndim != 4u || sa[2] == sb[2]);
+}
+
+/* The stage input whose extents a banded executor starts with: the first
+ * input for the chain executor and the HW tile, and for the height stripe
+ * the first that is not one row high. The stage has an input. */
+uint16_t tigris_stage_band_input(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                 tigris_band_holder_t holder)
+{
+    const uint16_t *sin = tigris_stage_inputs(plan, stage);
+    if (holder == TIGRIS_BAND_HELD_BY_STRIPE) {
+        for (uint16_t i = 0; i < stage->inputs_count; i++) {
+            if (!one_row_operand(plan, sin[i]))
+                return sin[i];
+        }
+    }
+    return sin[0];
+}
+
+/* Whether the op at `position` of a stage finds `tensor` at the band's
  * current rows: produced by an earlier op of the stage with no band move after
- * it, or a stage input read before the first move. */
+ * it, or a stage input read before the first move. At ops_count it is whether
+ * the tensor is on the band the stage ends with. */
 static int reads_the_band(const tigris_plan_t *plan, const tigris_stage_t *stage,
-                          uint16_t position, uint16_t tensor)
+                          uint16_t position, uint16_t tensor, tigris_band_holder_t holder)
 {
     const uint16_t *sops = tigris_stage_ops(plan, stage);
     for (uint16_t j = position; j > 0u; j--) {
@@ -1008,7 +1055,7 @@ static int reads_the_band(const tigris_plan_t *plan, const tigris_stage_t *stage
             if (outs[k] == tensor)
                 return 1;
         }
-        if (moves_the_band(plan, op))
+        if (moves_the_band(plan, op, holder))
             return 0;
     }
     const uint16_t *sin = tigris_stage_inputs(plan, stage);
@@ -1020,36 +1067,120 @@ static int reads_the_band(const tigris_plan_t *plan, const tigris_stage_t *stage
 }
 
 /**
- * Whether every op of a chained stage reads the band the chain executor holds.
+ * Whether every op of a banded stage reads the band its executor holds.
  *
- * The chain executor runs a stage as one height band. It starts at the stage
- * input, each convolution or pool that does not map rows one to one or that
- * changes the width moves it to that op's output, and every op is handed the
- * current band's rows and width. A tensor from an earlier point of the band
- * has other rows or another width, so an op reading one computes from the
- * wrong elements. The one exception is a two-operand binary op, whose second
- * operand the executor offsets to the band (chain_kernel): it needs only one
- * operand on the band. Mirrors _ops_read_the_running_band in the compiler.
+ * The chain executor, the height stripe and the HW tile run a stage as one
+ * band. It starts at the stage input, each op that moves it (moves_the_band)
+ * moves it to that op's output, and every op is handed the current band's
+ * rows and width. A tensor from an earlier point of the band has other rows
+ * or another width, so an op reading one computes from the wrong elements
+ * and writes an output sized for other elements. The chain executor offsets
+ * the second operand of a two-operand binary op to the band (chain_kernel),
+ * so there that op needs only one operand on the band; the stripe and the
+ * tile offset none. The HW tile also writes every stage output at the output
+ * rectangle, so each has to be on the band the stage ends with.
+ *
+ * The executor sizes each op by the band's extents, which the band input sets
+ * and each move takes from the moving op's output. So a tensor is on the band
+ * only with those extents, and every op output has them. The one exception is
+ * an operand one row high of a binary op in the height stripe, which loads it
+ * whole and reads it as a broadcast. Mirrors _ops_read_the_running_band in
+ * the compiler.
+ *
+ * A lone op that keeps its rows independent (tigris_op_independent_band) is
+ * banded by its own kernel instead: the stripe hands it the band's rows of
+ * every operand at that operand's own extents, which the op keeps aligned,
+ * so it reads and writes on the stripe's band. Its kernel cuts no columns, so
+ * it is never on the band of an HW tile. The compiler bands such a stage
+ * before it asks _ops_read_the_running_band.
  */
-int tigris_chain_stage_reads_its_band(const tigris_plan_t *plan, const tigris_stage_t *stage)
+int tigris_stage_reads_its_band(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                tigris_band_holder_t holder)
 {
+    if (stage->inputs_count == 0u)
+        return 0;
     const uint16_t *sops = tigris_stage_ops(plan, stage);
+    if (stage->ops_count == 1u && stage->chain_len == 0u &&
+        tigris_op_independent_band(plan, &plan->ops[sops[0]], sops[0], 0))
+        return holder == TIGRIS_BAND_HELD_BY_STRIPE;
+    /* A tensor with the extents of the band at the current op. */
+    uint16_t extents = tigris_stage_band_input(plan, stage, holder);
     for (uint16_t j = 0; j < stage->ops_count; j++) {
         const tigris_op_t *op = &plan->ops[sops[j]];
         const uint16_t *ins = tigris_op_inputs(plan, op);
+        const uint16_t *outs = tigris_op_outputs(plan, op);
+        int binary = op->num_inputs >= 2u && tigris_axis1_binary_pointwise_op(op->op_type);
         uint8_t on_band = 0;
         for (uint8_t k = 0; k < op->num_inputs; k++) {
-            if (reads_the_band(plan, stage, j, ins[k]))
+            if (reads_the_band(plan, stage, j, ins[k], holder) &&
+                (band_extents_equal(plan, ins[k], extents) ||
+                 (holder == TIGRIS_BAND_HELD_BY_STRIPE && binary && one_row_operand(plan, ins[k]))))
                 on_band++;
         }
-        if (op->num_inputs == 2u && tigris_axis1_binary_pointwise_op(op->op_type)) {
+        if (holder == TIGRIS_BAND_HELD_BY_CHAIN && op->num_inputs == 2u && binary) {
             if (on_band == 0u)
                 return 0;
         } else if (on_band != op->num_inputs) {
             return 0;
         }
+        if (op->num_outputs > 0u && moves_the_band(plan, op, holder))
+            extents = outs[0];
+        for (uint8_t k = 0; k < op->num_outputs; k++) {
+            if (!band_extents_equal(plan, outs[k], extents))
+                return 0;
+        }
+    }
+    if (holder == TIGRIS_BAND_HELD_BY_HW_TILE) {
+        const uint16_t *sout = tigris_stage_outputs(plan, stage);
+        for (uint16_t i = 0; i < stage->outputs_count; i++) {
+            if (!reads_the_band(plan, stage, stage->ops_count, sout[i], holder))
+                return 0;
+        }
     }
     return 1;
+}
+
+/**
+ * Whether the height stripe or the HW tile can band a stage: every stage
+ * input and output has one rank, 3 or 4; its ops keep the stripe contract
+ * along HW, which also admits the lone ConvTranspose only the HW tile runs;
+ * and they read and write on the band (tigris_stage_reads_its_band). The
+ * executor bands a stripe or HW stage only when this holds, and the loader
+ * refuses a record of either kind when it does not.
+ *
+ * @return TIGRIS_OK; TIGRIS_ERR_BAD_OPERATOR when the ranks or the contract
+ *         fail; TIGRIS_ERR_TILE_BAND when an op reads or writes off the band.
+ */
+tigris_error_t tigris_stage_stripe_banding(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                           tigris_band_holder_t holder)
+{
+    const uint16_t *sin = tigris_stage_inputs(plan, stage);
+    const uint16_t *sout = tigris_stage_outputs(plan, stage);
+    uint8_t rank = 0u;
+    int common = 1;
+    for (uint32_t i = 0; i < (uint32_t)stage->inputs_count + stage->outputs_count; i++) {
+        uint8_t tensor_rank = plan->tensors[i < stage->inputs_count
+            ? sin[i] : sout[i - stage->inputs_count]].ndim;
+        if (rank == 0u)
+            rank = tensor_rank;
+        if (tensor_rank != rank)
+            common = 0;
+    }
+    if (!common || (rank != 3u && rank != 4u) ||
+        !tigris_stage_stripe_contract(plan, stage, rank, TIGRIS_TILE_AXIS_HW))
+        return TIGRIS_ERR_BAD_OPERATOR;
+    return tigris_stage_reads_its_band(plan, stage, holder) ? TIGRIS_OK : TIGRIS_ERR_TILE_BAND;
+}
+
+/* The tensor whose rows the output bands of a stripe or an HW tile cover: the
+ * output of the stage's spatial op, else the stage's first output. A stage
+ * output produced ahead of the spatial op has the input's rows. */
+uint16_t tigris_stage_band_output(const tigris_plan_t *plan, const tigris_stage_t *stage)
+{
+    int index = tigris_stage_spatial_op(plan, stage);
+    if (index >= 0 && plan->ops[index].num_outputs > 0u)
+        return tigris_op_outputs(plan, &plan->ops[index])[0];
+    return tigris_stage_outputs(plan, stage)[0];
 }
 
 /* Ceiling of a / b, or 0 when it does not fit 32 bits. */
@@ -1087,7 +1218,8 @@ int tigris_stage_tile_facts(const tigris_plan_t *plan, const tigris_stage_t *sta
         return 0;
     const uint16_t *inputs = tigris_stage_inputs(plan, stage);
     const tigris_tensor_t *in = &plan->tensors[inputs[0]];
-    const tigris_tensor_t *output = &plan->tensors[tigris_stage_outputs(plan, stage)[0]];
+    /* Only the stripe and the HW tile read the output; they band its rows. */
+    const tigris_tensor_t *output = &plan->tensors[tigris_stage_band_output(plan, stage)];
     const int32_t *in_shape = tigris_tensor_shape(plan, in);
     const int32_t *out_shape = tigris_tensor_shape(plan, output);
     uint64_t extent = 0u;

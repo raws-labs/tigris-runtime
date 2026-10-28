@@ -308,9 +308,11 @@ static int tile_v10_valid(const tigris_plan_t *plan, const tigris_stage_t *stage
     const uint16_t *ops = tigris_stage_ops(plan, stage);
     const tigris_tensor_t *in = &plan->tensors[inputs[0]];
     const tigris_tensor_t *out = &plan->tensors[outputs[0]];
-    const int32_t *b = tigris_tensor_shape(plan, out);
+    /* A stripe or an HW tile bands the rows of its spatial op's output. */
+    const tigris_tensor_t *band_out = &plan->tensors[tigris_stage_band_output(plan, stage)];
+    const int32_t *b = tigris_tensor_shape(plan, band_out);
     if (tile->axis == TIGRIS_TILE_AXIS_HW)
-        return in->ndim == 4u && out->ndim == 4u && tile->input_band_extent == 0u &&
+        return in->ndim == 4u && band_out->ndim == 4u && tile->input_band_extent == 0u &&
                tile->output_band_extent > 0u && tile->output_band_extent <= (uint32_t)b[1] &&
                tile->output_width_extent > 0u && tile->output_width_extent <= (uint32_t)b[2] &&
                tile->flags == 0u;
@@ -332,7 +334,7 @@ static int tile_v10_valid(const tigris_plan_t *plan, const tigris_stage_t *stage
         if (plan->ops[ops[i]].op_type == TIGRIS_OP_RESIZE || plan->ops[ops[i]].op_type == TIGRIS_OP_RESIZE_LINEAR)
             output_rows = 1;
     if (output_rows)
-        return out->ndim >= 3u && tile->input_band_extent == 0u &&
+        return band_out->ndim >= 3u && tile->input_band_extent == 0u &&
                tile->output_band_extent > 0u && tile->output_band_extent <= (uint32_t)b[1];
     if (tile->output_band_extent != 0u || tile->input_band_extent == 0u ||
         tile->input_band_extent > INT32_MAX)
@@ -3081,10 +3083,9 @@ static tigris_error_t validate_stage_tile_band(
             !stage_tensors_rank4(&ctx->candidate, stage, 0))
             return TIGRIS_ERR_BAD_SECTION;
         if (tigris_stage_band_kind(&ctx->candidate, stage, NULL) != TIGRIS_BAND_KIND_HW ||
-            !tigris_stage_stripe_contract(&ctx->candidate, stage, 4u, TIGRIS_TILE_AXIS_HW) ||
             !stage_binary_operands_equal(&ctx->candidate, stage))
             return TIGRIS_ERR_BAD_OPERATOR;
-        return TIGRIS_OK;
+        return tigris_stage_stripe_banding(&ctx->candidate, stage, TIGRIS_BAND_HELD_BY_HW_TILE);
     }
     if (!reshape && !leading_rows && tile->tileable &&
         tile->axis == TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH) {
@@ -3200,6 +3201,11 @@ static tigris_error_t validate_stage_tile_band(
                                                  TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH)) {
             return TIGRIS_ERR_BAD_OPERATOR;
         }
+        /* The executor bands a stage by its band kind, not by the branch
+         * above that admitted it, so a stage of the stripe's kind meets the
+         * stripe's check whichever branch that was. */
+        if (tigris_stage_band_kind(&ctx->candidate, stage, NULL) == TIGRIS_BAND_KIND_STRIPE)
+            return tigris_stage_stripe_banding(&ctx->candidate, stage, TIGRIS_BAND_HELD_BY_STRIPE);
     }
     return TIGRIS_OK;
 }
@@ -3350,7 +3356,7 @@ static tigris_error_t validate_stage(tigris_load_state_t *ctx, uint16_t i)
         /* The chain executor sizes every band it holds as [N, rows, W, C]. */
         if (!stage_tensors_rank4(&ctx->candidate, stage, 1))
             return TIGRIS_ERR_BAD_SECTION;
-        if (!tigris_chain_stage_reads_its_band(&ctx->candidate, stage))
+        if (!tigris_stage_reads_its_band(&ctx->candidate, stage, TIGRIS_BAND_HELD_BY_CHAIN))
             return TIGRIS_ERR_CHAIN_BAND;
     }
     return TIGRIS_OK;
@@ -3627,7 +3633,9 @@ const char *tigris_error_str(tigris_error_t err)
         case TIGRIS_ERR_TILE_FACTS:
             return "tile record disagrees with the tiling the runtime derives from the plan";
         case TIGRIS_ERR_CHAIN_BAND:
-            return "chained stage reads a tensor off its band; recompile the plan";
+            return "chained stage reads a tensor outside its band; recompile the model with this TiGrIS release";
+        case TIGRIS_ERR_TILE_BAND:
+            return "tiled stage reads or writes a tensor outside its band; recompile the model with this TiGrIS release";
         default:                    return "unknown error";
     }
 }

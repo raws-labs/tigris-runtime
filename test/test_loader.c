@@ -111,8 +111,14 @@ static void test_error_strings(void)
                        tigris_error_str((tigris_error_t)999)) != 0, "tile-facts string");
     TEST_ASSERT_EQ(TIGRIS_ERR_CHAIN_BAND, -17, "chain-band code follows the tile-facts code");
     TEST_ASSERT(strcmp(tigris_error_str(TIGRIS_ERR_CHAIN_BAND),
-                       "chained stage reads a tensor off its band; recompile the plan") == 0,
+                       "chained stage reads a tensor outside its band; "
+                       "recompile the model with this TiGrIS release") == 0,
                 "chain-band string");
+    TEST_ASSERT_EQ(TIGRIS_ERR_TILE_BAND, -18, "tile-band code follows the chain-band code");
+    TEST_ASSERT(strcmp(tigris_error_str(TIGRIS_ERR_TILE_BAND),
+                       "tiled stage reads or writes a tensor outside its band; "
+                       "recompile the model with this TiGrIS release") == 0,
+                "tile-band string");
 }
 
 /* Minimal self-contained plans for malformed-input tests. */
@@ -917,6 +923,713 @@ static void test_chain_reads_its_band(void)
             TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_OK, "the stages load unchained");
         chain_plan_link(buf, 0, 2);
         TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), cases[i].chained, cases[i].name);
+        free(buf);
+    }
+}
+
+/* One op of build_band_tile_plan: its type, the tensors it reads (b only for
+ * an Add) and, for a pool, its window. */
+typedef struct {
+    uint8_t type;
+    uint16_t a, b;
+    uint8_t kernel_h, kernel_w, stride_w, pad_h, pad_w;
+} band_op_t;
+
+/* Whether build_band_tile_plan bands an op's output: the executor's spatial op. */
+static int band_tile_spatial(uint8_t type)
+{
+    return type == TIGRIS_OP_MAX_POOL || type == TIGRIS_OP_RESIZE || type == TIGRIS_OP_CONV_TRANSPOSE;
+}
+
+/* A stage over x [1, h, w, 1], tensor 0: op 0 into tensor 1, op 1 into
+ * tensor 2, both stage and model outputs. A pool takes its window, a Resize
+ * doubles both axes, a ConvTranspose is 1x1 of weight 1. The record is a
+ * height stripe or, with `hw`, an HW tile, of `band` output rows by one
+ * column, and states the facts of the spatial op's output. With `version`
+ * below 11 the stage has no record. */
+static uint8_t *build_band_tile_plan(const band_op_t *ops_in, int hw, int32_t h, int32_t w,
+                                     uint32_t band, uint32_t version, uint32_t *out_size)
+{
+    const uint32_t tensors_off = 128u;
+    const uint32_t ops_off = tensors_off + 3u * (uint32_t)sizeof(tigris_tensor_t);
+    const uint32_t stages_off = align4(ops_off + 2u * (uint32_t)sizeof(tigris_op_t));
+    const uint32_t tiles_off = align4(stages_off + (uint32_t)sizeof(tigris_stage_t));
+    const uint32_t index_off = align4(tiles_off + (uint32_t)sizeof(tigris_tile_plan_v11_t));
+    const uint32_t shapes_off = align4(index_off + 13u * (uint32_t)sizeof(uint16_t));
+    const uint32_t strings_off = shapes_off + 12u * (uint32_t)sizeof(int32_t);
+    const uint32_t weights_off = align4(strings_off + 1u);
+    const uint32_t plan_size = weights_off + (uint32_t)sizeof(tigris_weight_entry_t) +
+                               (uint32_t)sizeof(float) + (uint32_t)sizeof(tigris_memory_t);
+    uint8_t *buf = calloc(1, plan_size);
+    if (!buf)
+        return NULL;
+
+    const int record = version >= TIGRIS_SCHEMA_VERSION_V11;
+    plan_builder_t builder = plan_builder_begin(buf, plan_size, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
+    hdr->num_tensors = 3;
+    hdr->num_ops = 2;
+    hdr->num_stages = 1;
+    hdr->num_tile_plans = record ? 1u : 0u;
+    hdr->num_weights = 1;
+    hdr->model_io_off = 5;
+    hdr->num_model_inputs = 1;
+    hdr->num_model_outputs = 2;
+    uint32_t section = 0u;
+    plan_builder_section(&builder, section++, TIGRIS_SEC_TENSORS, tensors_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_OPS, ops_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_STAGES, stages_off);
+    if (record)
+        plan_builder_section(&builder, section++, TIGRIS_SEC_TILE_PLANS, tiles_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_INDEX_POOL, index_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_SHAPE_POOL, shapes_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_STRINGS, strings_off);
+    plan_builder_section(&builder, section, TIGRIS_SEC_WEIGHTS, weights_off);
+    plan_finish(buf);
+    if (!record)
+        plan_set_version(buf, version);
+
+    int32_t *shapes = (int32_t *)(buf + shapes_off);
+    shapes[0] = 1; shapes[1] = h; shapes[2] = w; shapes[3] = 1;
+    tigris_op_t *ops = (tigris_op_t *)(buf + ops_off);
+    for (uint16_t j = 0; j < 2u; j++) {
+        const band_op_t *spec = &ops_in[j];
+        const int32_t *in = &shapes[4u * spec->a];
+        int32_t *out = &shapes[4u * (j + 1u)];
+        memcpy(out, in, 4u * sizeof(int32_t));
+        tigris_op_t *op = &ops[j];
+        op->op_type = spec->type;
+        op->num_inputs = spec->type == TIGRIS_OP_ADD ? 2u : 1u;
+        op->num_outputs = 1;
+        op->inputs_off = j == 0u ? 0u : 2u;
+        op->outputs_off = j == 0u ? 1u : 4u;
+        op->weight_idx = TIGRIS_NO_WEIGHT;
+        op->bias_idx = TIGRIS_NO_WEIGHT;
+        tigris_spatial_attrs_t *sp = &op->spatial;
+        sp->dilation_h = 1;
+        sp->dilation_w = 1;
+        sp->group = 1;
+        if (spec->type == TIGRIS_OP_MAX_POOL) {
+            sp->kernel_h = spec->kernel_h;
+            sp->kernel_w = spec->kernel_w;
+            sp->stride_h = 1;
+            sp->stride_w = spec->stride_w;
+            sp->pad_top = spec->pad_h;
+            sp->pad_bottom = spec->pad_h;
+            sp->pad_left = spec->pad_w;
+            sp->pad_right = spec->pad_w;
+            out[1] = in[1] + 2 * (int32_t)spec->pad_h - (int32_t)spec->kernel_h + 1;
+            out[2] = (in[2] + 2 * (int32_t)spec->pad_w - (int32_t)spec->kernel_w) /
+                     (int32_t)spec->stride_w + 1;
+        } else if (spec->type == TIGRIS_OP_RESIZE) {
+            sp->stride_h = 2;
+            sp->stride_w = 2;
+            out[1] = 2 * in[1];
+            out[2] = 2 * in[2];
+        } else if (spec->type == TIGRIS_OP_CONV_TRANSPOSE) {
+            sp->kernel_h = 1;
+            sp->kernel_w = 1;
+            sp->stride_h = 1;
+            sp->stride_w = 1;
+            op->weight_idx = 0;
+        }
+    }
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + tensors_off);
+    for (uint16_t i = 0; i < 3u; i++) {
+        tensors[i].shape_off = (uint16_t)(4u * i);
+        tensors[i].size_bytes = (uint32_t)(shapes[4u * i + 1u] * shapes[4u * i + 2u]) *
+                                (uint32_t)sizeof(float);
+        tensors[i].ndim = 4;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        tensors[i].flags = i == 0u ? TIGRIS_TENSOR_MODEL_INPUT : TIGRIS_TENSOR_MODEL_OUTPUT;
+    }
+
+    const uint16_t pool[13] = {0, 1, ops_in[1].a, ops_in[1].b, 2, 0, 1, 2, 0, 1, 0, 1, 2};
+    memcpy(buf + index_off, pool, sizeof(pool));
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + stages_off);
+    stage->ops_off = 8;
+    stage->ops_count = 2;
+    stage->inputs_off = 10;
+    stage->inputs_count = 1;
+    stage->outputs_off = 11;
+    stage->outputs_count = 2;
+    stage->tile_plan_idx = record ? 0u : TIGRIS_NO_TILE_PLAN;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    tigris_weight_entry_t *weight = (tigris_weight_entry_t *)(buf + weights_off);
+    weight->size_bytes = sizeof(float);
+    const float one = 1.0f;
+    memcpy(buf + weights_off + sizeof(*weight), &one, sizeof(one));
+
+    if (record) {
+        uint16_t banded = band_tile_spatial(ops_in[0].type) ? 1u :
+                          band_tile_spatial(ops_in[1].type) ? 2u : 1u;
+        const band_op_t *spatial = &ops_in[banded - 1u];
+        const int32_t *out = &shapes[4u * banded];
+        tigris_tile_plan_v11_t *tile = (tigris_tile_plan_v11_t *)(buf + tiles_off);
+        tile->choices.tileable = 1;
+        tile->choices.axis = hw ? TIGRIS_TILE_AXIS_HW : TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+        tile->choices.tiled_peak_bytes = 4096u;
+        tile->choices.output_band_extent = band;
+        tile->choices.output_width_extent = hw ? 1u : 0u;
+        tile->facts = (tigris_tile_facts_t){
+            .tile_extent = band,
+            .num_tiles = ((uint32_t)out[1] + band - 1u) / band * (uint32_t)(hw ? out[2] : 1),
+            .original_extent = (uint32_t)out[1],
+            .halo = spatial->type == TIGRIS_OP_MAX_POOL ? (uint16_t)(spatial->kernel_h - 1u) : 0u,
+            .band_axis = 1u, .band = hw ? TIGRIS_BAND_KIND_HW : TIGRIS_BAND_KIND_STRIPE};
+    }
+    *out_size = plan_size;
+    return buf;
+}
+
+#define BAND_POOL(kh, kw, sw, ph, pw) TIGRIS_OP_MAX_POOL, 0, 0, kh, kw, sw, ph, pw
+#define BAND_UNARY(type, a) type, a, a, 0, 0, 0, 0, 0
+
+/* A height stripe and an HW tile hand every op after the spatial op that
+ * op's output band, and offset no operand, so a tiled op that reads a tensor
+ * from before a band move is refused. An HW tile holds a column halo, so a
+ * 1 x k window moves its band, and it writes every output at the output
+ * tile, so an output from before the move is refused there too. */
+static void test_tile_reads_its_band(void)
+{
+    printf("  test_tile_reads_its_band...\n");
+    static const struct {
+        band_op_t ops[2];
+        int hw;
+        tigris_error_t expected;
+        const char *name;
+    } cases[] = {
+        {{{BAND_POOL(3, 3, 1, 1, 1)}, {BAND_UNARY(TIGRIS_OP_RELU, 1)}}, 0, TIGRIS_OK,
+         "a stripe op on the pool's output reads the band"},
+        {{{BAND_POOL(3, 3, 1, 1, 1)}, {BAND_UNARY(TIGRIS_OP_RELU, 0)}}, 0, TIGRIS_ERR_TILE_BAND,
+         "a stripe op on the pool's input after a 3x3 pool is refused"},
+        {{{BAND_POOL(1, 1, 1, 0, 0)}, {BAND_UNARY(TIGRIS_OP_RELU, 0)}}, 0, TIGRIS_OK,
+         "a 1x1 pool leaves the stripe's band where it is"},
+        {{{BAND_POOL(1, 3, 1, 0, 1)}, {BAND_UNARY(TIGRIS_OP_RELU, 0)}}, 0, TIGRIS_OK,
+         "a stripe holds whole rows, so a 1x3 pool that keeps the width leaves its band"},
+        {{{BAND_POOL(1, 3, 1, 0, 0)}, {BAND_UNARY(TIGRIS_OP_RELU, 0)}}, 0, TIGRIS_ERR_TILE_BAND,
+         "a 1x3 pool without width pads moves the stripe's band"},
+        {{{BAND_POOL(3, 3, 1, 1, 1)}, {TIGRIS_OP_ADD, 1, 0, 0, 0, 0, 0, 0}}, 0, TIGRIS_ERR_TILE_BAND,
+         "a stripe carries no binary operand from before the pool"},
+        {{{BAND_UNARY(TIGRIS_OP_RESIZE, 0)}, {BAND_UNARY(TIGRIS_OP_RELU, 0)}}, 0, TIGRIS_ERR_TILE_BAND,
+         "a stripe op on the Resize's input is refused"},
+        {{{BAND_UNARY(TIGRIS_OP_RESIZE, 0)}, {BAND_UNARY(TIGRIS_OP_RELU, 1)}}, 0, TIGRIS_OK,
+         "a stripe op on the Resize's output reads the band"},
+        {{{BAND_UNARY(TIGRIS_OP_RELU, 0)}, {BAND_POOL(3, 3, 1, 1, 1)}}, 0, TIGRIS_OK,
+         "a stripe writes an output from before the pool at its own rows"},
+        {{{BAND_POOL(3, 3, 1, 1, 1)}, {BAND_UNARY(TIGRIS_OP_RELU, 1)}}, 1, TIGRIS_OK,
+         "a tile op on the pool's output reads the band"},
+        {{{BAND_POOL(1, 1, 1, 0, 0)}, {BAND_UNARY(TIGRIS_OP_RELU, 0)}}, 1, TIGRIS_OK,
+         "a 1x1 pool leaves the tile's band where it is"},
+        {{{BAND_POOL(1, 3, 1, 0, 1)}, {BAND_UNARY(TIGRIS_OP_RELU, 0)}}, 1, TIGRIS_ERR_TILE_BAND,
+         "a tile holds a column halo, so a 1x3 pool moves its band"},
+        {{{BAND_UNARY(TIGRIS_OP_CONV_TRANSPOSE, 0)}, {BAND_UNARY(TIGRIS_OP_RELU, 0)}}, 1,
+         TIGRIS_ERR_TILE_BAND, "a tile op on the ConvTranspose's input is refused"},
+        {{{BAND_UNARY(TIGRIS_OP_CONV_TRANSPOSE, 0)}, {BAND_UNARY(TIGRIS_OP_RELU, 1)}}, 1, TIGRIS_OK,
+         "a tile op on the ConvTranspose's output reads the band"},
+        {{{BAND_UNARY(TIGRIS_OP_RELU, 0)}, {BAND_POOL(3, 3, 1, 1, 1)}}, 1, TIGRIS_ERR_TILE_BAND,
+         "a tile does not write an output from before the pool"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        tigris_plan_t plan;
+        uint32_t size = 0;
+        uint8_t *buf = build_band_tile_plan(cases[i].ops, cases[i].hw, 4, 4, 1u, TIGRIS_SCHEMA_VERSION,
+                                            &size);
+        TEST_ASSERT(buf != NULL, "band tile plan allocation");
+        if (!buf)
+            return;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), cases[i].expected, cases[i].name);
+        free(buf);
+    }
+}
+
+/* Runs a build_band_tile_plan stage over x [1, 16, 8, 1] in a fast arena
+ * that holds a band of four rows but not the stage, into y and z. */
+static tigris_exec_error_t run_band_tile(const tigris_plan_t *plan, const float *x, float *y,
+                                         float *z, tigris_exec_stats_t *stats)
+{
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[512], slow[4096];
+    void *pointers[3] = {NULL, NULL, NULL};
+    tigris_mem_t mem;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, pointers, 3, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "band tile arenas");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, 128u * sizeof(float)), TIGRIS_MEM_OK, "input allocation");
+    TEST_ASSERT_EQ(tigris_input_write(plan, &mem, 0, x, 128u * sizeof(float)), TIGRIS_OK, "input write");
+    memset(stats, 0, sizeof(*stats));
+    tigris_exec_error_t err = tigris_run(plan, &mem, tigris_dispatch_kernel, NULL, stats);
+    if (err == TIGRIS_EXEC_OK) {
+        TEST_ASSERT_EQ(tigris_output_read(plan, &mem, 1, y, plan->tensors[1].size_bytes), TIGRIS_OK,
+                       "first output read");
+        TEST_ASSERT_EQ(tigris_output_read(plan, &mem, 2, z, plan->tensors[2].size_bytes), TIGRIS_OK,
+                       "second output read");
+    }
+    return err;
+}
+
+/* x [1, 16, 8, 1], its Relu y and z, the max of a kernel_h x kernel_w window
+ * of y without pads, as the reference computes them. */
+static void band_tile_reference(const float *x, float *y, float *z, int32_t kernel_h, int32_t kernel_w)
+{
+    for (int32_t i = 0; i < 128; i++)
+        y[i] = x[i] > 0.0f ? x[i] : 0.0f;
+    const int32_t out_h = 16 - kernel_h + 1;
+    const int32_t out_w = 8 - kernel_w + 1;
+    for (int32_t r = 0; r < out_h; r++) {
+        for (int32_t c = 0; c < out_w; c++) {
+            float best = -1.0e30f;
+            for (int32_t i = 0; i < kernel_h; i++)
+                for (int32_t j = 0; j < kernel_w; j++)
+                    if (y[(r + i) * 8 + c + j] > best)
+                        best = y[(r + i) * 8 + c + j];
+            z[r * out_w + c] = best;
+        }
+    }
+}
+
+/* A stripe bands the rows of its spatial op's output. A stage output from
+ * before the op has the input's rows and width, so with it listed first the
+ * stripe still runs the pool at the pool's own output; a band taken from the
+ * first output would make a pool that narrows the width write past it. */
+static void test_stripe_bands_its_spatial_output(void)
+{
+    printf("  test_stripe_bands_its_spatial_output...\n");
+    static const int32_t windows[2][2] = {{1, 3}, {3, 3}};
+    float x[128], y[128], z[128], expected_y[128], expected_z[128];
+    for (uint32_t i = 0; i < 128u; i++)
+        x[i] = (float)((i * 7u) % 13u) - 6.0f;
+    for (size_t k = 0; k < 2u; k++) {
+        const band_op_t ops[2] = {
+            {BAND_UNARY(TIGRIS_OP_RELU, 0)},
+            {BAND_POOL((uint8_t)windows[k][0], (uint8_t)windows[k][1], 1, 0, 0)}};
+        tigris_plan_t plan;
+        tigris_exec_stats_t stats;
+        uint32_t size = 0;
+        uint8_t *buf = build_band_tile_plan(ops, 0, 16, 8, 4u, TIGRIS_SCHEMA_VERSION, &size);
+        TEST_ASSERT(buf != NULL, "stripe plan allocation");
+        if (!buf)
+            return;
+        tigris_error_t loaded = tigris_plan_load(buf, size, &plan);
+        TEST_ASSERT_EQ(loaded, TIGRIS_OK, "the record states the pool's output rows");
+        if (loaded != TIGRIS_OK) {
+            free(buf);
+            continue;
+        }
+        band_tile_reference(x, expected_y, expected_z, windows[k][0], windows[k][1]);
+        memset(y, 0, sizeof(y));
+        memset(z, 0, sizeof(z));
+        TEST_ASSERT_EQ(run_band_tile(&plan, x, y, z, &stats), TIGRIS_EXEC_OK, "the stripe runs");
+        TEST_ASSERT(stats.stages_tiled == 1u && stats.total_tiles > 1u, "the stage ran as a stripe");
+        TEST_ASSERT(memcmp(y, expected_y, plan.tensors[1].size_bytes) == 0, "the Relu matches the reference");
+        TEST_ASSERT(memcmp(z, expected_z, plan.tensors[2].size_bytes) == 0, "the pool matches the reference");
+        free(buf);
+    }
+}
+
+/* Below schema 11 a stage without a record also takes the height stripe when
+ * it does not fit. A stage whose op reads off the stripe's band runs whole. */
+static void test_untiled_stage_off_its_band_runs_whole(void)
+{
+    printf("  test_untiled_stage_off_its_band_runs_whole...\n");
+    const band_op_t ops[2] = {{BAND_POOL(3, 3, 1, 1, 1)}, {BAND_UNARY(TIGRIS_OP_RELU, 0)}};
+    float x[128], y[128], z[128], expected[128];
+    for (uint32_t i = 0; i < 128u; i++) {
+        x[i] = (float)((i * 7u) % 13u) - 6.0f;
+        expected[i] = x[i] > 0.0f ? x[i] : 0.0f;
+    }
+    tigris_plan_t plan;
+    tigris_exec_stats_t stats;
+    uint32_t size = 0;
+    uint8_t *buf = build_band_tile_plan(ops, 0, 16, 8, 4u, TIGRIS_SCHEMA_VERSION_V10, &size);
+    TEST_ASSERT(buf != NULL, "untiled plan allocation");
+    if (!buf)
+        return;
+    TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), TIGRIS_OK, "a stage without a record loads");
+    memset(z, 0, sizeof(z));
+    TEST_ASSERT_EQ(run_band_tile(&plan, x, y, z, &stats), TIGRIS_EXEC_OK, "the stage runs");
+    TEST_ASSERT_EQ(stats.stages_tiled, 0u, "the stage ran whole");
+    TEST_ASSERT(memcmp(z, expected, sizeof(expected)) == 0, "the Relu of the pool's input matches the reference");
+    free(buf);
+}
+
+/* The executor that holds the first stage of build_band_extent_plan. */
+enum { EXTENT_STRIPE, EXTENT_HW, EXTENT_CHAIN };
+
+/* A stage over x [1, 8, 4, 1] and y [1, y_h, y_w, 1], tensors 0 and 1: a
+ * Relu of x into a, then a Relu of y or, with `add`, a + y into b. As a
+ * stripe or an HW tile, a and b are the stage and model outputs and the
+ * record bands 4 rows, by one column for the tile. As a chain, a second
+ * stage adds a and b into c. With `y_first` the stage lists y ahead of x. */
+static uint8_t *build_band_extent_plan(int holder, int32_t y_h, int32_t y_w, int add, int y_first,
+                                       uint32_t *out_size)
+{
+    const int chain = holder == EXTENT_CHAIN;
+    const uint32_t tensors_off = 128u;
+    const uint32_t ops_off = tensors_off + 5u * (uint32_t)sizeof(tigris_tensor_t);
+    const uint32_t stages_off = align4(ops_off + 3u * (uint32_t)sizeof(tigris_op_t));
+    const uint32_t tiles_off = align4(stages_off + 2u * (uint32_t)sizeof(tigris_stage_t));
+    const uint32_t index_off = align4(tiles_off + (uint32_t)sizeof(tigris_tile_plan_v11_t));
+    const uint32_t shapes_off = align4(index_off + 22u * (uint32_t)sizeof(uint16_t));
+    const uint32_t strings_off = shapes_off + 20u * (uint32_t)sizeof(int32_t);
+    const uint32_t plan_size = align4(strings_off + 1u) + (uint32_t)sizeof(tigris_memory_t);
+    uint8_t *buf = calloc(1, plan_size);
+    if (!buf)
+        return NULL;
+
+    plan_builder_t builder = plan_builder_begin(buf, plan_size, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
+    hdr->num_tensors = chain ? 5u : 4u;
+    hdr->num_ops = chain ? 3u : 2u;
+    hdr->num_stages = chain ? 2u : 1u;
+    hdr->num_tile_plans = chain ? 0u : 1u;
+    hdr->model_io_off = 8;
+    hdr->num_model_inputs = 2;
+    hdr->num_model_outputs = chain ? 1u : 2u;
+    uint32_t section = 0u;
+    plan_builder_section(&builder, section++, TIGRIS_SEC_TENSORS, tensors_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_OPS, ops_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_STAGES, stages_off);
+    if (!chain)
+        plan_builder_section(&builder, section++, TIGRIS_SEC_TILE_PLANS, tiles_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_INDEX_POOL, index_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_SHAPE_POOL, shapes_off);
+    plan_builder_section(&builder, section, TIGRIS_SEC_STRINGS, strings_off);
+    plan_finish(buf);
+
+    const int32_t heights[5] = {8, y_h, 8, add ? 8 : y_h, 8};
+    const int32_t widths[5] = {4, y_w, 4, add ? 4 : y_w, 4};
+    int32_t *shapes = (int32_t *)(buf + shapes_off);
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + tensors_off);
+    for (uint16_t i = 0; i < hdr->num_tensors; i++) {
+        shapes[4u * i] = 1;
+        shapes[4u * i + 1u] = heights[i];
+        shapes[4u * i + 2u] = widths[i];
+        shapes[4u * i + 3u] = 1;
+        tensors[i].shape_off = (uint16_t)(4u * i);
+        tensors[i].size_bytes = (uint32_t)(heights[i] * widths[i]) * (uint32_t)sizeof(float);
+        tensors[i].ndim = 4;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        tensors[i].flags = i < 2u ? TIGRIS_TENSOR_MODEL_INPUT :
+                           (!chain || i == 4u) ? TIGRIS_TENSOR_MODEL_OUTPUT : 0u;
+    }
+
+    /* Index pool: each op's inputs and output, the model inputs and outputs,
+     * then stage 0's ops, inputs and outputs and stage 1's. */
+    const uint16_t pool[22] = {0, 2, add ? 2u : 1u, 1, 3, 2, 3, 4,
+                               0, 1, chain ? 4u : 2u, 3,
+                               0, 1, y_first ? 1u : 0u, y_first ? 0u : 1u, 2, 3,
+                               2, 2, 3, 4};
+    memcpy(buf + index_off, pool, sizeof(pool));
+    tigris_op_t *ops = (tigris_op_t *)(buf + ops_off);
+    static const uint16_t inputs_off[3] = {0, 2, 5};
+    static const uint16_t outputs_off[3] = {1, 4, 7};
+    for (uint16_t j = 0; j < hdr->num_ops; j++) {
+        ops[j].op_type = (j == 0u || (j == 1u && !add)) ? TIGRIS_OP_RELU : TIGRIS_OP_ADD;
+        ops[j].num_inputs = ops[j].op_type == TIGRIS_OP_ADD ? 2u : 1u;
+        ops[j].num_outputs = 1;
+        ops[j].stage = j < 2u ? 0u : 1u;
+        ops[j].inputs_off = inputs_off[j];
+        ops[j].outputs_off = outputs_off[j];
+        ops[j].weight_idx = TIGRIS_NO_WEIGHT;
+        ops[j].bias_idx = TIGRIS_NO_WEIGHT;
+    }
+
+    tigris_stage_t *stages = (tigris_stage_t *)(buf + stages_off);
+    static const uint16_t stage_lists[2][4] = {{12, 2, 2, 2}, {18, 1, 2, 1}};
+    for (uint16_t s = 0; s < hdr->num_stages; s++) {
+        stages[s].ops_off = stage_lists[s][0];
+        stages[s].ops_count = stage_lists[s][1];
+        stages[s].inputs_off = (uint16_t)(stage_lists[s][0] + stage_lists[s][1]);
+        stages[s].inputs_count = stage_lists[s][2];
+        stages[s].outputs_off = (uint16_t)(stages[s].inputs_off + stage_lists[s][2]);
+        stages[s].outputs_count = stage_lists[s][3];
+        stages[s].tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+        stages[s].chain_id = TIGRIS_NO_CHAIN;
+    }
+    if (chain) {
+        chain_plan_link(buf, 0, 2);
+    } else {
+        tigris_tile_plan_v11_t *tile = (tigris_tile_plan_v11_t *)(buf + tiles_off);
+        const int hw = holder == EXTENT_HW;
+        stages[0].tile_plan_idx = 0;
+        tile->choices.tileable = 1;
+        tile->choices.axis = hw ? TIGRIS_TILE_AXIS_HW : TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+        tile->choices.tiled_peak_bytes = 4096u;
+        tile->choices.output_band_extent = 4u;
+        tile->choices.output_width_extent = hw ? 1u : 0u;
+        tile->facts = (tigris_tile_facts_t){
+            .tile_extent = 4u, .num_tiles = hw ? 8u : 2u, .original_extent = 8u, .halo = 0u,
+            .band_axis = 1u, .band = hw ? TIGRIS_BAND_KIND_HW : TIGRIS_BAND_KIND_STRIPE};
+    }
+    *out_size = plan_size;
+    return buf;
+}
+
+/* A banded executor hands every op the extents of its band input: for the
+ * height stripe the first stage input that is not one row high, for the
+ * others the first. The loader refuses an op on a stage input of other rows
+ * or width, which would write past its band. The stripe reads a one-row
+ * operand of a binary op as a broadcast. */
+static void test_band_input_extents(void)
+{
+    printf("  test_band_input_extents...\n");
+    static const struct {
+        int holder;
+        int32_t y_h, y_w;
+        int add, y_first;
+        tigris_error_t expected;
+        const char *name;
+    } cases[] = {
+        {EXTENT_STRIPE, 8, 2, 0, 0, TIGRIS_ERR_TILE_BAND, "a stripe op on a narrower stage input is refused"},
+        {EXTENT_STRIPE, 6, 4, 0, 0, TIGRIS_ERR_TILE_BAND, "a stripe op on a shorter stage input is refused"},
+        {EXTENT_STRIPE, 8, 4, 0, 1, TIGRIS_OK, "a stripe op on a stage input of the band's extents reads the band"},
+        {EXTENT_STRIPE, 1, 4, 0, 0, TIGRIS_ERR_TILE_BAND, "a stripe Relu of a one-row stage input is refused"},
+        {EXTENT_STRIPE, 1, 4, 1, 1, TIGRIS_OK, "a stripe reads a one-row operand of a binary op as a broadcast"},
+        {EXTENT_HW, 8, 2, 0, 0, TIGRIS_ERR_TILE_BAND, "a tile op on a narrower stage input is refused"},
+        {EXTENT_HW, 8, 4, 0, 0, TIGRIS_OK, "a tile op on a stage input of the band's extents reads the band"},
+        {EXTENT_CHAIN, 8, 1, 0, 0, TIGRIS_ERR_CHAIN_BAND, "a chained op on a narrower stage input is refused"},
+        {EXTENT_CHAIN, 8, 4, 0, 0, TIGRIS_OK, "a chained op on a stage input of the band's extents reads the band"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        tigris_plan_t plan;
+        uint32_t size = 0;
+        uint8_t *buf = build_band_extent_plan(cases[i].holder, cases[i].y_h, cases[i].y_w, cases[i].add,
+                                              cases[i].y_first, &size);
+        TEST_ASSERT(buf != NULL, "band extent plan allocation");
+        if (!buf)
+            return;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, size, &plan), cases[i].expected, cases[i].name);
+        free(buf);
+    }
+}
+
+/* The two stripes of test_band_input_extents that load, run in a fast arena
+ * that holds a band but not the stage, against a C reference: a and b equal
+ * Relu(x) and Relu(y), or Relu(x) and Relu(x) + y with y one row high. */
+static void test_band_input_extents_run(void)
+{
+    printf("  test_band_input_extents_run...\n");
+    for (int add = 0; add < 2; add++) {
+        const int32_t y_h = add ? 1 : 8;
+        float x[32], y[32], a[32], b[32], expected_a[32], expected_b[32];
+        for (int32_t i = 0; i < 32; i++) {
+            x[i] = (float)((i * 7) % 13) - 6.0f;
+            y[i] = (float)((i * 5) % 11) - 5.0f;
+            expected_a[i] = x[i] > 0.0f ? x[i] : 0.0f;
+        }
+        for (int32_t i = 0; i < 32; i++)
+            expected_b[i] = add ? expected_a[i] + y[i % 4] : (y[i] > 0.0f ? y[i] : 0.0f);
+        tigris_plan_t plan;
+        uint32_t size = 0;
+        uint8_t *buf = build_band_extent_plan(EXTENT_STRIPE, y_h, 4, add, 1, &size);
+        TEST_ASSERT(buf != NULL, "band extent plan allocation");
+        if (!buf)
+            return;
+        tigris_error_t loaded = tigris_plan_load(buf, size, &plan);
+        TEST_ASSERT_EQ(loaded, TIGRIS_OK, "the stripe loads");
+        if (loaded != TIGRIS_OK) {
+            free(buf);
+            continue;
+        }
+        _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[256], slow[1024];
+        void *pointers[4] = {NULL, NULL, NULL, NULL};
+        tigris_mem_t mem;
+        tigris_exec_stats_t stats;
+        memset(&stats, 0, sizeof(stats));
+        TEST_ASSERT_EQ(tigris_mem_init(&mem, pointers, 4, fast, sizeof(fast), slow, sizeof(slow)),
+                       TIGRIS_MEM_OK, "band extent arenas");
+        TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, x, plan.tensors[0].size_bytes), TIGRIS_OK,
+                       "x write");
+        TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 1, y, plan.tensors[1].size_bytes), TIGRIS_OK,
+                       "y write");
+        TEST_ASSERT_EQ(tigris_run(&plan, &mem, tigris_dispatch_kernel, NULL, &stats), TIGRIS_EXEC_OK,
+                       "the stripe runs");
+        TEST_ASSERT(stats.stages_tiled == 1u && stats.total_tiles > 1u, "the stage ran as a stripe");
+        TEST_ASSERT_EQ(tigris_output_read(&plan, &mem, 2, a, sizeof(a)), TIGRIS_OK, "a read");
+        TEST_ASSERT_EQ(tigris_output_read(&plan, &mem, 3, b, sizeof(b)), TIGRIS_OK, "b read");
+        TEST_ASSERT(memcmp(a, expected_a, sizeof(a)) == 0, "a matches the reference");
+        TEST_ASSERT(memcmp(b, expected_b, sizeof(b)) == 0, "b matches the reference");
+        free(buf);
+    }
+}
+
+/* A stage of one op over x [1, 16, 8, 2], tensor 0, into y, tensor 1: an
+ * ArgMax over `axis` that keeps its dims, or a GlobalAveragePool when axis is
+ * 0. The record is a height stripe or, with `hw`, an HW tile, of four
+ * output rows by one column, and states the facts of y. */
+static uint8_t *build_lone_band_plan(uint8_t axis, int hw, uint32_t *out_size)
+{
+    const uint32_t tensors_off = 128u;
+    const uint32_t ops_off = tensors_off + 2u * (uint32_t)sizeof(tigris_tensor_t);
+    const uint32_t stages_off = align4(ops_off + (uint32_t)sizeof(tigris_op_t));
+    const uint32_t tiles_off = align4(stages_off + (uint32_t)sizeof(tigris_stage_t));
+    const uint32_t index_off = align4(tiles_off + (uint32_t)sizeof(tigris_tile_plan_v11_t));
+    const uint32_t shapes_off = align4(index_off + 7u * (uint32_t)sizeof(uint16_t));
+    const uint32_t strings_off = shapes_off + 8u * (uint32_t)sizeof(int32_t);
+    const uint32_t attrs_off = align4(strings_off + 1u);
+    const uint32_t plan_size = attrs_off + 16u + (uint32_t)sizeof(tigris_memory_t);
+    uint8_t *buf = calloc(1, plan_size);
+    if (!buf)
+        return NULL;
+
+    plan_builder_t builder = plan_builder_begin(buf, plan_size, TIGRIS_SCHEMA_VERSION);
+    tigris_file_header_t *hdr = builder.header;
+    hdr->num_tensors = 2;
+    hdr->num_ops = 1;
+    hdr->num_stages = 1;
+    hdr->num_tile_plans = 1;
+    hdr->model_io_off = 5;
+    hdr->num_model_inputs = 1;
+    hdr->num_model_outputs = 1;
+    uint32_t section = 0u;
+    plan_builder_section(&builder, section++, TIGRIS_SEC_TENSORS, tensors_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_OPS, ops_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_STAGES, stages_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_TILE_PLANS, tiles_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_INDEX_POOL, index_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_SHAPE_POOL, shapes_off);
+    plan_builder_section(&builder, section++, TIGRIS_SEC_STRINGS, strings_off);
+    if (axis != 0u)
+        plan_builder_section(&builder, section, TIGRIS_SEC_OP_ATTRIBUTES, attrs_off);
+    plan_finish(buf);
+
+    int32_t *shapes = (int32_t *)(buf + shapes_off);
+    const int32_t x_shape[4] = {1, 16, 8, 2};
+    memcpy(shapes, x_shape, sizeof(x_shape));
+    memcpy(shapes + 4, x_shape, sizeof(x_shape));
+    if (axis == 0u) {
+        shapes[5] = 1;
+        shapes[6] = 1;
+    } else {
+        shapes[4u + axis] = 1;
+    }
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + tensors_off);
+    for (uint16_t i = 0; i < 2u; i++) {
+        const int32_t *s = &shapes[4u * i];
+        tensors[i].shape_off = (uint16_t)(4u * i);
+        tensors[i].size_bytes = (uint32_t)(s[1] * s[2] * s[3]) * (uint32_t)sizeof(float);
+        tensors[i].ndim = 4;
+        tensors[i].dtype = i == 1u && axis != 0u ? 6u : 1u;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        tensors[i].flags = i == 0u ? TIGRIS_TENSOR_MODEL_INPUT : TIGRIS_TENSOR_MODEL_OUTPUT;
+    }
+    tigris_op_t *op = (tigris_op_t *)(buf + ops_off);
+    op->op_type = axis == 0u ? TIGRIS_OP_GLOBAL_AVG : TIGRIS_OP_ARG_MAX;
+    op->num_inputs = 1;
+    op->num_outputs = 1;
+    op->inputs_off = 0;
+    op->outputs_off = 1;
+    op->weight_idx = TIGRIS_NO_WEIGHT;
+    op->bias_idx = TIGRIS_NO_WEIGHT;
+    op->spatial = (tigris_spatial_attrs_t){.kernel_h = 1, .kernel_w = 1, .stride_h = 1, .stride_w = 1,
+                                           .dilation_h = 1, .dilation_w = 1, .group = 1};
+    const uint16_t pool[7] = {0, 1, 0, 0, 1, 0, 1};
+    memcpy(buf + index_off, pool, sizeof(pool));
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + stages_off);
+    stage->ops_off = 2;
+    stage->ops_count = 1;
+    stage->inputs_off = 3;
+    stage->inputs_count = 1;
+    stage->outputs_off = 4;
+    stage->outputs_count = 1;
+    stage->tile_plan_idx = 0;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+    if (axis != 0u) {
+        const uint16_t count = 1u;
+        memcpy(buf + attrs_off, &count, sizeof(count));
+        tigris_op_attribute_t *attr = (tigris_op_attribute_t *)(buf + attrs_off + 4u);
+        *attr = (tigris_op_attribute_t){0, TIGRIS_OP_ATTR_AXES, 1, 0};
+        buf[attrs_off + 4u + sizeof(*attr)] = axis;
+    }
+
+    const int32_t *out = &shapes[4];
+    const uint32_t band = out[1] < 4 ? (uint32_t)out[1] : 4u;
+    tigris_tile_plan_v11_t *tile = (tigris_tile_plan_v11_t *)(buf + tiles_off);
+    tile->choices.tileable = 1;
+    tile->choices.axis = hw ? TIGRIS_TILE_AXIS_HW : TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    tile->choices.tiled_peak_bytes = 4096u;
+    tile->choices.output_band_extent = band;
+    tile->choices.output_width_extent = hw ? 1u : 0u;
+    tile->facts = (tigris_tile_facts_t){
+        .tile_extent = band,
+        .num_tiles = ((uint32_t)out[1] + band - 1u) / band * (uint32_t)(hw ? out[2] : 1),
+        .original_extent = (uint32_t)out[1], .halo = 0u,
+        .band_axis = 1u, .band = hw ? TIGRIS_BAND_KIND_HW : TIGRIS_BAND_KIND_STRIPE};
+    *out_size = plan_size;
+    return buf;
+}
+
+/* A lone op that keeps its rows independent is handed the stripe's rows on
+ * every operand, each at its own width, so an ArgMax over the width loads as
+ * a stripe and runs as one. Its kernel cuts no columns, so an HW tile of
+ * it is refused even where the output keeps the input's extents. A record
+ * the loader accepts runs banded: the stated stripe of a GlobalAveragePool,
+ * which the stripe cannot band, is refused at load, not at run time. Only
+ * the cases expected to load run, against an ArgMax reference. */
+static void test_lone_band_op(void)
+{
+    printf("  test_lone_band_op...\n");
+    static const struct {
+        uint8_t axis;
+        int hw;
+        tigris_error_t expected;
+        const char *name;
+    } cases[] = {
+        {2u, 0, TIGRIS_OK, "a stripe of a lone ArgMax over the width loads"},
+        {3u, 0, TIGRIS_OK, "a stripe of a lone ArgMax over the channels loads"},
+        {2u, 1, TIGRIS_ERR_TILE_BAND, "an HW tile of a lone ArgMax over the width is refused"},
+        {3u, 1, TIGRIS_ERR_TILE_BAND, "an HW tile of a lone ArgMax over the channels is refused"},
+        {0u, 0, TIGRIS_ERR_BAD_OPERATOR, "a stated stripe of a GlobalAveragePool is refused"},
+    };
+    float x[256];
+    int32_t y[256], expected[256];
+    for (int32_t i = 0; i < 256; i++)
+        x[i] = (float)((i * 7) % 13) - 6.0f;
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        tigris_plan_t plan;
+        uint32_t size = 0;
+        uint8_t *buf = build_lone_band_plan(cases[k].axis, cases[k].hw, &size);
+        TEST_ASSERT(buf != NULL, "lone band plan allocation");
+        if (!buf)
+            return;
+        tigris_error_t loaded = tigris_plan_load(buf, size, &plan);
+        TEST_ASSERT_EQ(loaded, cases[k].expected, cases[k].name);
+        if (cases[k].expected != TIGRIS_OK || loaded != TIGRIS_OK) {
+            free(buf);
+            continue;
+        }
+        /* The first index of the largest element along the axis. */
+        const int32_t width = cases[k].axis == 2u ? 1 : 8;
+        const int32_t channels = cases[k].axis == 3u ? 1 : 2;
+        const int32_t extent = cases[k].axis == 2u ? 8 : 2;
+        const int32_t step = cases[k].axis == 2u ? 2 : 1;
+        for (int32_t r = 0; r < 16; r++)
+            for (int32_t c = 0; c < width; c++)
+                for (int32_t d = 0; d < channels; d++) {
+                    const float *first = &x[(r * 8 + c) * 2 + d];
+                    int32_t best = 0;
+                    for (int32_t j = 1; j < extent; j++)
+                        if (first[j * step] > first[best * step])
+                            best = j;
+                    expected[(r * width + c) * channels + d] = best;
+                }
+        _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[512], slow[2048];
+        void *pointers[2] = {NULL, NULL};
+        tigris_mem_t mem;
+        tigris_exec_stats_t stats;
+        memset(&stats, 0, sizeof(stats));
+        memset(y, 0, sizeof(y));
+        TEST_ASSERT_EQ(tigris_mem_init(&mem, pointers, 2, fast, sizeof(fast), slow, sizeof(slow)),
+                       TIGRIS_MEM_OK, "lone band arenas");
+        TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, 0, x, sizeof(x)), TIGRIS_OK, "x write");
+        TEST_ASSERT_EQ(tigris_run(&plan, &mem, tigris_dispatch_kernel, NULL, &stats), TIGRIS_EXEC_OK,
+                       "a loaded record runs");
+        TEST_ASSERT(stats.stages_tiled == 1u && stats.total_tiles > 1u, "the stage ran as a stripe");
+        TEST_ASSERT_EQ(tigris_output_read(&plan, &mem, 1, y, plan.tensors[1].size_bytes), TIGRIS_OK,
+                       "y read");
+        TEST_ASSERT(memcmp(y, expected, plan.tensors[1].size_bytes) == 0, "y matches the reference");
         free(buf);
     }
 }
@@ -2670,6 +3383,123 @@ static void test_untileable_matrix_stage(void)
                            "output read");
             TEST_ASSERT(memcmp(output, expected, sizeof(output)) == 0, "whole-stage outputs match the reference");
         }
+    }
+}
+
+/* A MatMul of a [1, 8, 4] by a [1, 4, 4] into y [1, 8, 4], all in model
+ * order, with a record of one-row bands that states the row band the stage
+ * holds or, with `stripe`, a stripe. */
+static uint8_t *build_row_band_matmul_plan(int stripe, uint32_t *out_size)
+{
+    const uint32_t tensors_off = 128u;
+    const uint32_t ops_off = tensors_off + 3u * (uint32_t)sizeof(tigris_tensor_t);
+    const uint32_t stages_off = align4(ops_off + (uint32_t)sizeof(tigris_op_t));
+    const uint32_t tiles_off = align4(stages_off + (uint32_t)sizeof(tigris_stage_t));
+    const uint32_t index_off = align4(tiles_off + (uint32_t)sizeof(tigris_tile_plan_v11_t));
+    const uint32_t shapes_off = align4(index_off + 10u * (uint32_t)sizeof(uint16_t));
+    const uint32_t strings_off = shapes_off + 9u * (uint32_t)sizeof(int32_t);
+    const uint32_t plan_size = align4(strings_off + 1u) + (uint32_t)sizeof(tigris_memory_t);
+    uint8_t *buf = calloc(1, plan_size);
+    if (!buf)
+        return NULL;
+
+    plan_builder_t builder = plan_builder_begin(buf, plan_size, TIGRIS_SCHEMA_VERSION_V11);
+    tigris_file_header_t *hdr = builder.header;
+    hdr->num_tensors = 3;
+    hdr->num_ops = 1;
+    hdr->num_stages = 1;
+    hdr->num_tile_plans = 1;
+    hdr->model_io_off = 3;
+    hdr->num_model_inputs = 2;
+    hdr->num_model_outputs = 1;
+    plan_builder_section(&builder, 0u, TIGRIS_SEC_TENSORS, tensors_off);
+    plan_builder_section(&builder, 1u, TIGRIS_SEC_OPS, ops_off);
+    plan_builder_section(&builder, 2u, TIGRIS_SEC_STAGES, stages_off);
+    plan_builder_section(&builder, 3u, TIGRIS_SEC_TILE_PLANS, tiles_off);
+    plan_builder_section(&builder, 4u, TIGRIS_SEC_INDEX_POOL, index_off);
+    plan_builder_section(&builder, 5u, TIGRIS_SEC_SHAPE_POOL, shapes_off);
+    plan_builder_section(&builder, 6u, TIGRIS_SEC_STRINGS, strings_off);
+    plan_finish(buf);
+
+    const int32_t shapes[9] = {1, 8, 4, 1, 4, 4, 1, 8, 4};
+    memcpy(buf + shapes_off, shapes, sizeof(shapes));
+    tigris_tensor_t *tensors = (tigris_tensor_t *)(buf + tensors_off);
+    for (uint16_t i = 0; i < 3u; i++) {
+        tensors[i].shape_off = (uint16_t)(3u * i);
+        tensors[i].size_bytes = (uint32_t)(shapes[3u * i + 1u] * shapes[3u * i + 2u]) * (uint32_t)sizeof(float);
+        tensors[i].ndim = 3;
+        tensors[i].dtype = 1;
+        tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+        tensors[i].flags = (i < 2u ? TIGRIS_TENSOR_MODEL_INPUT : TIGRIS_TENSOR_MODEL_OUTPUT) |
+                           TIGRIS_TENSOR_LINEAR;
+    }
+    tigris_op_t *op = (tigris_op_t *)(buf + ops_off);
+    op->op_type = TIGRIS_OP_MATMUL;
+    op->num_inputs = 2;
+    op->num_outputs = 1;
+    op->inputs_off = 0;
+    op->outputs_off = 2;
+    op->weight_idx = TIGRIS_NO_WEIGHT;
+    op->bias_idx = TIGRIS_NO_WEIGHT;
+    const uint16_t pool[10] = {0, 1, 2, 0, 1, 2, 0, 0, 1, 2};
+    memcpy(buf + index_off, pool, sizeof(pool));
+    tigris_stage_t *stage = (tigris_stage_t *)(buf + stages_off);
+    stage->ops_off = 6;
+    stage->ops_count = 1;
+    stage->inputs_off = 7;
+    stage->inputs_count = 2;
+    stage->outputs_off = 9;
+    stage->outputs_count = 1;
+    stage->tile_plan_idx = 0;
+    stage->chain_id = TIGRIS_NO_CHAIN;
+
+    /* A row band states its band in input rows, a stripe in output rows. */
+    tigris_tile_plan_v11_t *tile = (tigris_tile_plan_v11_t *)(buf + tiles_off);
+    tile->choices.tileable = 1;
+    tile->choices.axis = TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH;
+    tile->choices.tiled_peak_bytes = 128u;
+    if (stripe)
+        tile->choices.output_band_extent = 1u;
+    else
+        tile->choices.input_band_extent = 1u;
+    tile->facts = (tigris_tile_facts_t){.tile_extent = 1u, .num_tiles = 8u, .original_extent = 8u, .halo = 0u,
+                                        .band_axis = 1u,
+                                        .band = stripe ? TIGRIS_BAND_KIND_STRIPE : TIGRIS_BAND_KIND_ROWS};
+    *out_size = plan_size;
+    return buf;
+}
+
+/* The executor bands a stage by the kind its record states. A conversion and
+ * a matrix row band are admitted by their own loader branches, but a record
+ * of either that states the stripe's kind is checked as a stripe, which
+ * neither stage passes. */
+static void test_stated_stripe_meets_the_stripe_check(void)
+{
+    printf("  test_stated_stripe_meets_the_stripe_check...\n");
+    _Alignas(4) uint8_t buf[TILED_PLAN_SIZE];
+    tigris_plan_t plan;
+
+    /* [1, 2, 4, 8] to [1, 8, 2, 4]. A conversion's record states no band extent. */
+    build_tiled_stage_plan(buf, TIGRIS_OP_TRANSPOSE, 4u);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_OK,
+                   "a conversion that states its own kind loads");
+    tiled_state_facts(buf, 1u, 8u, 8u, 0u, 1u, TIGRIS_BAND_KIND_STRIPE);
+    TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), TIGRIS_ERR_BAD_OPERATOR,
+                   "a conversion that states a stripe is refused");
+
+    for (int stripe = 0; stripe < 2; stripe++) {
+        uint32_t size = 0;
+        uint8_t *matmul = build_row_band_matmul_plan(stripe, &size);
+        TEST_ASSERT(matmul != NULL, "row band plan allocation");
+        if (!matmul)
+            return;
+        if (stripe)
+            TEST_ASSERT_EQ(tigris_plan_load(matmul, size, &plan), TIGRIS_ERR_BAD_OPERATOR,
+                           "a row band that states a stripe is refused");
+        else
+            TEST_ASSERT_EQ(tigris_plan_load(matmul, size, &plan), TIGRIS_OK,
+                           "a row band that states its own kind loads");
+        free(matmul);
     }
 }
 
@@ -6570,6 +7400,12 @@ int main(void)
     test_chain_shape_guards();
     test_chain_graph_guards();
     test_chain_reads_its_band();
+    test_tile_reads_its_band();
+    test_stripe_bands_its_spatial_output();
+    test_untiled_stage_off_its_band_runs_whole();
+    test_band_input_extents();
+    test_band_input_extents_run();
+    test_lone_band_op();
     test_chain_member_runs_from_its_head();
     test_stage_schedule_guards();
     test_schema_v5_many_stage_schedule();
@@ -6592,6 +7428,7 @@ int main(void)
     test_stripe_runs_its_stated_band();
     test_stated_band_kind();
     test_untileable_matrix_stage();
+    test_stated_stripe_meets_the_stripe_check();
     test_hw_record_contract();
     test_band_kind_order();
     test_float_section();

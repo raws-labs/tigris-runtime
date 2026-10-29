@@ -183,7 +183,7 @@ typedef union {
  * workspace type uses tigris_run_with_workspace_buffer().
  *
  * @param plan      Loaded plan (read-only).
- * @param mem       Initialised memory manager.
+ * @param mem       Initialized memory manager.
  * @param kernel    Kernel dispatch callback (e.g. tigris_dispatch_kernel_s8).
  * @param user_ctx  Opaque context forwarded to every kernel call.
  * @param stats     Optional stats output (may be NULL).

@@ -182,10 +182,10 @@ void tigris_trace_emit(tigris_mem_t *mem, tigris_trace_kind_t kind, uint8_t pool
 /* API */
 
 /**
- * Initialise the memory manager. Zeroes all tensor pointers.
+ * Initialize the memory manager. Zeroes all tensor pointers.
  * Aligns the initial bump offset to TIGRIS_TENSOR_ALIGN.
  *
- * @param mem          Memory manager to initialise.
+ * @param mem          Memory manager to initialize.
  * @param tensor_ptrs  Caller-owned array of void* (one per tensor).
  * @param num_tensors  Number of tensors in the plan.
  * @param fast_buf     Fast arena buffer (SRAM on embedded targets).

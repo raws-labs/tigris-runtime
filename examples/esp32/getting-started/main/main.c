@@ -132,9 +132,11 @@ void app_main(void) {
     ESP_LOGE(TAG, "this example needs an ESP32-S3 with PSRAM (enable CONFIG_SPIRAM)");
     return;
 #endif
+    /* The required size assumes an aligned base, so the arena is allocated
+     * on TIGRIS_TENSOR_ALIGN rather than padded. */
     uint32_t fast_size = tigris_fast_arena_required(&plan);
-    void *fast_buf = heap_caps_malloc(fast_size,
-                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void *fast_buf = heap_caps_aligned_alloc(TIGRIS_TENSOR_ALIGN, fast_size,
+                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     /* The caller's copy of the input, in the model's declared dtype, is four
      * times the stored int8 tensor and has to come from the same PSRAM. Take it
      * off the slow arena here: sizing the arena to the whole free block first

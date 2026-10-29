@@ -38,14 +38,14 @@ idf.py flash monitor
 === TiGrIS getting-started: U-Net that does not fit ===
 
 Model:            unet_matched
-Ops / stages:     17 / 17
-Plan (flash):     146.4 KiB
+Ops / stages:     17 / 11
+Plan (flash):     139.9 KiB
 Fast arena:       232 KiB
 Largest tensor:   1.19 MiB  <- an arena runtime must hold this whole
 ...
-Fast (SRAM): 232 KiB   Slow (PSRAM): 5248 KiB   Workspace: 467 B
+Fast (SRAM): 232 KiB   Slow (PSRAM): 5248 KiB   Workspace: 439 B
 ...
-Stages tiled:       4 of 17   (total tiles 0, chains 10)
+Stages tiled:       4 of 11   (total tiles 42, chains 6)
 Peak fast arena:    232 KiB of a 2.38 MiB naive peak
 Output vs golden:   524288 int8 values, mean|diff|=0.517, max|diff|=3, 0.045% over 2 LSB
 

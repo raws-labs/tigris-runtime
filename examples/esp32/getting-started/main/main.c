@@ -12,7 +12,6 @@
  */
 
 #include <stdio.h>
-#include <string.h>
 #include <inttypes.h>
 
 #include "esp_heap_caps.h"
@@ -133,7 +132,7 @@ void app_main(void) {
     ESP_LOGE(TAG, "this example needs an ESP32-S3 with PSRAM (enable CONFIG_SPIRAM)");
     return;
 #endif
-    uint32_t fast_size = budget + tigris_weight_decompression_overhead(&plan);
+    uint32_t fast_size = tigris_fast_arena_required(&plan);
     void *fast_buf = heap_caps_malloc(fast_size,
                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     /* The caller's copy of the input, in the model's declared dtype, is four
@@ -183,15 +182,13 @@ void app_main(void) {
     printf("Fast (SRAM): %.0f KiB   Slow (PSRAM): %.0f KiB   Workspace: %u B\n\n",
            mem.fast_size / 1024.0f, slow_size / 1024.0f, (unsigned)ws_size);
 
-    /* 3. Reset the arena (esp_nn_prepare reduced mem.fast_size in place) and
-     *    hand the input over in the dtype the MODEL declares, not the dtype the
-     *    plan stores. This U-Net states float32 at its boundary and quantizes
-     *    inside itself, so the application never touches a scale or a zero
-     *    point: tigris_input_write() applies them. INPUT_VALUE is the float
-     *    that lands on the int8 code the golden reference was generated with.
+    /* 3. Hand the input over in the dtype the MODEL declares, not the dtype
+     *    the plan stores. This U-Net states float32 at its boundary and
+     *    quantizes inside itself, so the application never touches a scale or
+     *    a zero point: tigris_input_write() applies them. INPUT_VALUE is the
+     *    float that lands on the int8 code the golden reference was generated
+     *    with.
      *    The s8_ref decoder stages make the run take ~20 s. */
-    tigris_mem_init(&mem, mem.tensor_ptrs, mem.num_tensors,
-                    mem.fast_base, mem.fast_size, mem.slow_base, mem.slow_size);
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {
         uint16_t t = plan.model_inputs[i];
         tigris_error_t placed = tigris_input_alloc(&plan, &mem, t);
@@ -201,11 +198,6 @@ void app_main(void) {
         }
 
         uint32_t want = tigris_iface_bytes(&plan, t);
-        if (want == 0) {
-            /* No declared interface: the plan stores what the caller supplies. */
-            memset(mem.tensor_ptrs[t], 1, plan.tensors[t].size_bytes);
-            continue;
-        }
         float *feed = heap_caps_malloc(want, MALLOC_CAP_SPIRAM);
         if (!feed) {
             ESP_LOGE(TAG, "input buffer allocation failed (%u B)",

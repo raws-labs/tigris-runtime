@@ -46,7 +46,7 @@ Largest tensor:   1.19 MiB  <- an arena runtime must hold this whole
 Fast (SRAM): 232 KiB   Slow (PSRAM): 5248 KiB   Workspace: 439 B
 ...
 Stages tiled:       4 of 11   (total tiles 42, chains 6)
-Peak fast arena:    232 KiB of a 2.38 MiB naive peak
+Peak fast arena:    230 KiB of a 2.38 MiB naive peak
 Output vs golden:   524288 int8 values, mean|diff|=0.517, max|diff|=3, 0.045% over 2 LSB
 
 SELF_CHECK: PASS

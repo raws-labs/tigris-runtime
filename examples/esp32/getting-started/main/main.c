@@ -189,8 +189,7 @@ void app_main(void) {
      *    quantizes inside itself, so the application never touches a scale or
      *    a zero point: tigris_input_write() applies them. INPUT_VALUE is the
      *    float that lands on the int8 code the golden reference was generated
-     *    with.
-     *    The s8_ref decoder stages make the run take ~20 s. */
+     *    with. */
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {
         uint16_t t = plan.model_inputs[i];
         tigris_error_t placed = tigris_input_alloc(&plan, &mem, t);
@@ -258,7 +257,7 @@ void app_main(void) {
            (unsigned)stats.stages_tiled, plan.header->num_stages,
            (unsigned)stats.total_tiles, (unsigned)stats.stages_chain);
     printf("Peak fast arena:    %.0f KiB of a %.2f MiB naive peak\n",
-           mem.fast_size / 1024.0f,
+           mem.fast_peak / 1024.0f,
            /* naive peak is not stored in the plan; the headline figure comes
             * from `tigris analyze` and is documented in the README */ 2.38f);
     printf("Output vs golden:   %u int8 values, mean|diff|=%.3f, max|diff|=%d, "

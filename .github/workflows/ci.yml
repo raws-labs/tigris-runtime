@@ -195,7 +195,7 @@ jobs:
       - run: mkdir -p fuzz-artifacts
       - run: python3 test/make_fuzz_corpus.py fuzz-corpus
       - run: >-
-          clang -std=c11 -Wall -Wextra -Wpedantic -Werror
+          clang -std=c11 -Wall -Wextra -Wpedantic -Werror -ffp-contract=off
           -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
           -Iinclude test/fuzz_loader.c src/tigris_loader.c src/tigris_band.c
           -o fuzz-loader

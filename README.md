@@ -121,6 +121,9 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+With GCC and Clang the build compiles the runtime with `-ffp-contract=off`; a
+build that compiles `src/*.c` itself with those compilers needs the same flag.
+
 Every CTest case is self-contained. Whole-model numerical checks against ONNX
 Runtime run in the compiler repository's cross-repository contract gate.
 

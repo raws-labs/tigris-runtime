@@ -1999,6 +1999,33 @@ static TIGRIS_KERNEL_NOINLINE int kern_requantize_s8(
     return 0;
 }
 
+/* The multipliers and zero points of one HardSwish call. */
+typedef struct {
+    int32_t in_zp, out_zp;
+    int32_t out_mult, reluish_mult;
+    int     out_exp, reluish_exp;
+} hardswish_params_t;
+
+/* One LUT entry, as TFLite's int8 HARD_SWISH computes it. Kept out of line:
+ * inlined into the 256-entry loop, GCC 15 vectorizes the loop and spills its
+ * vector temporaries into a frame over the per-frame stack budget. */
+static TIGRIS_KERNEL_NOINLINE int8_t hardswish_entry(int code, const hardswish_params_t *p)
+{
+    int32_t hires = ((int32_t)(int8_t)code - p->in_zp) * (1 << 7);
+    int32_t preshift = sat_round_dbl_high_mul16(hires, p->out_mult);
+    int32_t reluish = hires;
+    if (p->reluish_exp > 0)
+        reluish = sat_left_shift16(reluish, p->reluish_exp - 1);
+    reluish = sat_round_dbl_high_mul16(reluish, p->reluish_mult);
+    if (p->reluish_exp > 0)
+        reluish = sat_left_shift16(reluish, 1);
+    if (p->reluish_exp < 0)
+        reluish = round_div_by_pot(reluish, -p->reluish_exp);
+    reluish = (reluish + (1 << 15)) >> 1;
+    int32_t value = round_div_by_pot(sat_dbl_high_mul16(reluish, preshift), -p->out_exp);
+    return clamp_s8(value + p->out_zp);
+}
+
 /* HardSwish via a 256-entry LUT, each entry as TFLite's int8 HARD_SWISH
  * computes it: 16-bit fixed point on an input scale 128 times finer, a
  * "relu-ish" factor x/3 saturated to [-1, 1] and mapped to [0, 1], and its
@@ -2029,22 +2056,10 @@ static TIGRIS_KERNEL_NOINLINE int kern_hardswish_s8(
     out_mult = int16_multiplier(out_mult);
     reluish_mult = int16_multiplier(reluish_mult);
 
+    hardswish_params_t hp = { in_zp, out_zp, out_mult, reluish_mult, out_exp, reluish_exp };
     int8_t lut[256];
-    for (int i = 0; i < 256; i++) {
-        int32_t hires = ((int32_t)(int8_t)i - in_zp) * (1 << 7);
-        int32_t preshift = sat_round_dbl_high_mul16(hires, out_mult);
-        int32_t reluish = hires;
-        if (reluish_exp > 0)
-            reluish = sat_left_shift16(reluish, reluish_exp - 1);
-        reluish = sat_round_dbl_high_mul16(reluish, reluish_mult);
-        if (reluish_exp > 0)
-            reluish = sat_left_shift16(reluish, 1);
-        if (reluish_exp < 0)
-            reluish = round_div_by_pot(reluish, -reluish_exp);
-        reluish = (reluish + (1 << 15)) >> 1;
-        int32_t value = round_div_by_pot(sat_dbl_high_mul16(reluish, preshift), -out_exp);
-        lut[i] = clamp_s8(value + out_zp);
-    }
+    for (int i = 0; i < 256; i++)
+        lut[i] = hardswish_entry(i, &hp);
     lut_apply_s8(plan, op, mem, lut);
     return 0;
 }

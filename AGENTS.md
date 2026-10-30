@@ -1,6 +1,6 @@
 # tigris-runtime
 
-C runtime that loads `.tgrs` plans and executes them in caller-owned fast and slow arenas with no allocation during inference. Library builds as C11 with `-Wall -Wextra -Wpedantic -Werror -Wvla`; the POSIX example is held to C99. Public, github.com/raws-labs/tigris-runtime; also published as ESP-IDF component `raws-labs/tigris-runtime`.
+C runtime that loads `.tgrs` plans and executes them in caller-owned fast and slow arenas with no allocation during inference. Library builds as C11 with `-Wall -Wextra -Wpedantic -Werror -Wvla -ffp-contract=off`; the POSIX example is held to C99. Public, github.com/raws-labs/tigris-runtime; also published as ESP-IDF component `raws-labs/tigris-runtime`.
 
 ## Build, test, run
 - `cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure`: every ctest case is self-contained (the `add_test` calls in `CMakeLists.txt`; `host_library` with `-DTIGRIS_BUILD_HOST=ON`). `posix_example` runs `tigris_posix_example` on a frozen plan from `test/schema_compat/` and pins its printed output.

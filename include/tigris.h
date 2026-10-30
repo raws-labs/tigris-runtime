@@ -25,8 +25,8 @@ extern "C" {
 
 /* Runtime release; scripts/check_version_sources.py holds it to the CMake project version. */
 #define TIGRIS_RUNTIME_VERSION_MAJOR 0
-#define TIGRIS_RUNTIME_VERSION_MINOR 12
-#define TIGRIS_RUNTIME_VERSION_PATCH 1
+#define TIGRIS_RUNTIME_VERSION_MINOR 13
+#define TIGRIS_RUNTIME_VERSION_PATCH 0
 
 /* Keep in sync with tigris/src/tigris/emitters/binary/defs.py */
 

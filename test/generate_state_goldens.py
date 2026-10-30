@@ -11,6 +11,13 @@ The plans are frozen compiler outputs at schemas 9, 10 and 11 and are not
 recompiled: the schema 9 and 10 plans are the tests of those released formats
 for LSTM, SVDF, detection, If and While. RECIPES names, per plan, the compiler
 revision and flags that emit it, and the header lists them.
+
+The recorded outputs are glibc 2.39's. With --cr, each argument is
+NAME=GOLDEN.npz:GOLDEN_cr.npz, the case's recording and its recording on a
+correctly rounded libm, and the header holds the outputs of the cases where
+the two differ (test/libm_rounding.h):
+
+    python test/generate_state_goldens.py --cr float_lstm=float_lstm.npz:float_lstm_cr.npz ...
 """
 
 import sys
@@ -37,6 +44,8 @@ RECIPES = {
     **dict.fromkeys(("float_svdf_lz4", "lstm_lz4"), "tigris v0.13.0, -m 256K -c lz4"),
     "if_conv_chained": "tigris v0.13.0, -m 256",
 }
+# The libm functions a float case calls, as named in libm_rounding.h.
+LIBM_CALLS = dict.fromkeys(("float_lstm", "float_lstm_time_major_clip", "float_if_through"), "LIBM_TANHF")
 
 
 def array(name, runs):
@@ -74,5 +83,31 @@ def main(arguments):
     print("#endif")
 
 
+def main_correctly_rounded(arguments):
+    body, entries = [], []
+    for argument in arguments:
+        name, paths = argument.split("=", 1)
+        legacy, correct = (np.load(path) for path in paths.split(":", 1))
+        if sorted(legacy.files) != sorted(correct.files) or any(
+                not np.array_equal(legacy[k], correct[k]) for k in legacy.files if k.startswith("input_")):
+            raise ValueError(f"{name}: the two recordings differ in their inputs")
+        order = sorted((k for k in legacy.files if k.startswith("output_")), key=lambda k: int(k[7:]))
+        if all(legacy[k].tobytes() == correct[k].tobytes() for k in order):
+            continue
+        if name not in LIBM_CALLS:
+            raise ValueError(f"{name}: outputs differ but the case calls none of the probed functions")
+        body.append(array(f"{name}_output_cr", [correct[k] for k in order]))
+        entries.append(f"    {{{name}_output, {LIBM_CALLS[name]}, {name}_output_cr}},\n")
+    print("/* test/generate_state_goldens.py --cr; outputs recorded from TFLite Micro on a\n"
+          " * correctly rounded libm, for the cases where they differ from state_golden.h. */")
+    print("#ifndef TIGRIS_STATE_GOLDEN_CR_H\n#define TIGRIS_STATE_GOLDEN_CR_H\n")
+    print("".join(body))
+    print("static const libm_golden_t state_goldens_cr[] = {\n" + "".join(entries) + "};\n")
+    print("#endif")
+
+
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    if sys.argv[1:2] == ["--cr"]:
+        main_correctly_rounded(sys.argv[2:])
+    else:
+        main(sys.argv[1:])

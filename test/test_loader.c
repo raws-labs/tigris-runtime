@@ -19,6 +19,8 @@
 #include "tigris_iface.h"
 #include "tigris_band.h"
 #include "test_harness.h"
+#include "libm_rounding.h"
+#include "state_golden_cr.h"
 
 /* Error tests (no fixtures needed) */
 
@@ -6752,7 +6754,8 @@ static tigris_exec_error_t run_state_fixture(const tigris_plan_t *plan, void *st
     return run_with_state_once(plan, state, state_size, x, sizeof(x), out, 4u * sizeof(float), 0u);
 }
 
-static void check_state_batch_bands(const tigris_plan_t *original, const state_golden_t *golden)
+static void check_state_batch_bands(const tigris_plan_t *original, const state_golden_t *golden,
+                                    const uint8_t *expected)
 {
     tigris_plan_t plan = *original;
     tigris_file_header_t header = *plan.header;
@@ -6818,7 +6821,7 @@ static void check_state_batch_bands(const tigris_plan_t *original, const state_g
         TEST_ASSERT_EQ(run_with_state_once(&plan, state, state_size,
                        (const uint8_t *)golden->input + run * golden->input_bytes, golden->input_bytes,
                        output, golden->output_bytes, 256u), TIGRIS_EXEC_OK, "256-byte batch run");
-        TEST_ASSERT(memcmp(output, (const uint8_t *)golden->output + run * golden->output_bytes,
+        TEST_ASSERT(memcmp(output, expected + run * golden->output_bytes,
                            golden->output_bytes) == 0, "batch state sequence matches TFLite Micro");
     }
     /* From schema 11 the record states the batch band, in the operator's own mode only. */
@@ -6832,7 +6835,7 @@ static void check_state_batch_bands(const tigris_plan_t *original, const state_g
         TEST_ASSERT_EQ(run_with_state_once(&plan, state, state_size,
                        (const uint8_t *)golden->input + run * golden->input_bytes, golden->input_bytes,
                        output, golden->output_bytes, 256u), TIGRIS_EXEC_OK, "stated batch run");
-        TEST_ASSERT(memcmp(output, (const uint8_t *)golden->output + run * golden->output_bytes,
+        TEST_ASSERT(memcmp(output, expected + run * golden->output_bytes,
                            golden->output_bytes) == 0, "stated batch bands match TFLite Micro");
     }
     stated.facts.band = (uint8_t)(TIGRIS_BAND_KIND_LEADING | TIGRIS_BAND_LEADING << 4);
@@ -6856,8 +6859,13 @@ static tigris_error_t load_altered(const state_golden_t *golden, uint8_t *copy, 
 static void test_state_goldens(void)
 {
     printf("  test_state_goldens...\n");
+    libm_report();
     for (size_t g = 0; g < sizeof(state_goldens) / sizeof(state_goldens[0]); g++) {
         const state_golden_t *golden = &state_goldens[g];
+        const uint8_t *expected = libm_golden(state_goldens_cr,
+                                              sizeof(state_goldens_cr) / sizeof(state_goldens_cr[0]),
+                                              golden->output);
+        TEST_ASSERT(expected != NULL, "state golden set fits this libm");
         uint8_t *buf = aligned_alloc(64u, ((size_t)golden->plan_size + 63u) / 64u * 64u);
         uint8_t *copy = aligned_alloc(64u, ((size_t)golden->plan_size + 63u) / 64u * 64u);
         TEST_ASSERT(buf != NULL && copy != NULL, "plan buffers");
@@ -6874,12 +6882,12 @@ static void test_state_goldens(void)
         void *state = malloc(state_size > 0u ? state_size : 1u);
         uint8_t out[256];
         TEST_ASSERT(state != NULL && golden->output_bytes <= sizeof(out), "state and output buffers");
-        if (state && golden->output_bytes <= sizeof(out)) {
+        if (expected && state && golden->output_bytes <= sizeof(out)) {
             /* The state carries from run to run as TFLite Micro keeps it. */
             TEST_ASSERT_EQ(tigris_state_init(&plan, state, state_size), TIGRIS_EXEC_OK, "state init");
             for (uint32_t run = 0; run < golden->runs; run++) {
                 const uint8_t *x = (const uint8_t *)golden->input + (size_t)run * golden->input_bytes;
-                const uint8_t *y = (const uint8_t *)golden->output + (size_t)run * golden->output_bytes;
+                const uint8_t *y = expected + (size_t)run * golden->output_bytes;
                 TEST_ASSERT_EQ(run_with_state_once(&plan, state, state_size, x, golden->input_bytes,
                                                    out, golden->output_bytes, 0u),
                                TIGRIS_EXEC_OK, "stateful run");
@@ -6887,7 +6895,7 @@ static void test_state_goldens(void)
             }
         }
         uint16_t lstm = plan.header->num_ops;
-        check_state_batch_bands(&plan, golden);
+        if (expected) check_state_batch_bands(&plan, golden, expected);
         for (uint16_t n = 0; n < plan.header->num_ops; n++)
             if (plan.ops[n].op_type == TIGRIS_OP_LSTM) lstm = n;
         if (lstm < plan.header->num_ops) {

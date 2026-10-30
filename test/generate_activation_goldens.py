@@ -1,5 +1,12 @@
-"""Record activation outputs from the pinned TFLite Micro reference kernels."""
+"""Record activation outputs from the pinned TFLite Micro reference kernels.
 
+On a libm whose expm1f rounds as glibc 2.39 does, writes activation_golden.h;
+on a correctly rounded one, writes activation_golden_cr.h with the cases whose
+outputs differ from activation_golden.h (test/libm_rounding.h).
+"""
+
+import ctypes
+import ctypes.util
 from pathlib import Path
 
 from generate_elementwise_goldens import (
@@ -9,6 +16,22 @@ from generate_elementwise_goldens import (
 
 KINDS = {"LEAKY_RELU": 21, "PRELU": 55, "ELU": 56, "LOG_SOFTMAX": 57,
          "L2_NORMALIZATION": 58, "L2_POOL_2D": 59}
+# The libm functions a float case calls, as named in libm_rounding.h.
+LIBM_CALLS = {"ELU": "LIBM_EXPM1F"}
+# The expm1f probes of libm_rounding.h: input, glibc 2.39 bits, correctly rounded bits.
+EXPM1F_PROBES = ((-4.453125, 0xBF7D0506, 0xBF7D0505), (-3.515625, 0xBF7863AA, 0xBF7863AB),
+                 (-2.765625, 0xBF6FE360, 0xBF6FE361))
+
+
+def correctly_rounded():
+    """Whether this process's expm1f, which TFLite Micro's ELU calls, rounds correctly."""
+    expm1f = ctypes.CDLL(ctypes.util.find_library("m")).expm1f
+    expm1f.restype, expm1f.argtypes = ctypes.c_float, [ctypes.c_float]
+    bits = [int(np.array(expm1f(x), np.float32).view(np.uint32)) for x, _, _ in EXPM1F_PROBES]
+    for column, correct in ((1, False), (2, True)):
+        if bits == [probe[column] for probe in EXPM1F_PROBES]:
+            return correct
+    raise RuntimeError(f"expm1f gives {[hex(b) for b in bits]} on the probes, neither golden set")
 
 
 def activation_model(kind, shape, target, quantized, scales, zeros, alpha, slope):
@@ -81,22 +104,26 @@ def cases():
 
 def main():
     check_reference()
+    correct = correctly_rounded()
     lines = [*preamble("generate_activation_goldens.py", "TIGRIS_ACTIVATION_GOLDEN_H"), "",
              "typedef struct {", "    uint8_t op, dtype;", "    int32_t shapes[8];",
              "    float scales[3];", "    int32_t zeros[3];", "    float slope;",
              "    uint32_t input_count, output_count, alpha_count;",
              "    int32_t alpha_shape[4];", "    const void *input, *output, *alpha;",
              "} activation_golden_t;", ""]
-    records = []
+    records, recorded = [], []
     counts = {False: 0, True: 0}
     for number, case in enumerate(cases()):
         kind, quantized, shape, target, scales, zeros, alpha, slope, data, expected = case
         counts[quantized] += len(expected)
+        blocks = {}
         for label, array in (("x", data), ("y", expected), ("alpha", alpha)):
             if array is None:
                 continue
-            lines += c_array("int8_t" if quantized else "float", f"activation_{number}_{label}",
-                             array.reshape(-1), 12, quantized)
+            blocks[label] = c_array("int8_t" if quantized else "float", f"activation_{number}_{label}",
+                                    array.reshape(-1), 12, quantized)
+            lines += blocks[label]
+        recorded.append((kind, quantized, blocks, expected))
         dims = ", ".join(map(str, (*shape, *target)))
         quant_scales = ", ".join(f"{value:.9e}f" for value in scales)
         quant_zeros = ", ".join(map(str, zeros))
@@ -106,9 +133,31 @@ def main():
                        f"{{{quant_scales}}}, {{{quant_zeros}}}, {slope:.9e}f, "
                        f"{len(data)}, {len(expected)}, {alpha.size if alpha is not None else 0}, "
                        f"{{{alpha_dims}}}, activation_{number}_x, activation_{number}_y, {alpha_name}}},")
+    if correct:
+        return record_correctly_rounded(recorded)
     lines += ["static const activation_golden_t activation_goldens[] = {", *records, "};", "#endif", ""]
     Path(__file__).with_name("activation_golden.h").write_text("\n".join(lines), encoding="ascii")
     print(f"Recorded {len(records)} cases: {counts[False]} float32 and {counts[True]} int8 outputs")
+
+
+def record_correctly_rounded(recorded):
+    """Writes the outputs that differ from activation_golden.h; only libm callers may."""
+    legacy = Path(__file__).with_name("activation_golden.h").read_text(encoding="ascii")
+    lines = [*preamble("generate_activation_goldens.py", "TIGRIS_ACTIVATION_GOLDEN_CR_H",
+                       "/* Outputs on a correctly rounded libm that differ from activation_golden.h. */"),
+             ""]
+    entries = []
+    for number, (kind, quantized, blocks, expected) in enumerate(recorded):
+        changed = [label for label, block in blocks.items() if "\n".join(block) not in legacy]
+        if not changed:
+            continue
+        if changed != ["y"] or quantized or kind not in LIBM_CALLS:
+            raise RuntimeError(f"activation case {number} ({kind}) differs in {changed}")
+        lines += c_array("float", f"activation_{number}_y_cr", expected, 12, False)
+        entries.append(f"    {{activation_{number}_y, {LIBM_CALLS[kind]}, activation_{number}_y_cr}},")
+    lines += ["static const libm_golden_t activation_goldens_cr[] = {", *entries, "};", "#endif", ""]
+    Path(__file__).with_name("activation_golden_cr.h").write_text("\n".join(lines), encoding="ascii")
+    print(f"Recorded {len(entries)} cases whose outputs differ on a correctly rounded libm")
 
 
 if __name__ == "__main__":

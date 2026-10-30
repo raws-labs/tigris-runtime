@@ -24,6 +24,8 @@
 #include "tigris_loader.h"
 #include "tigris_band.h"
 #include "test_harness.h"
+#include "libm_rounding.h"
+#include "state_golden_cr.h"
 
 /* Under half the 262 KB that loader and executor frames sized by limits of 65535 would take. */
 #define STORAGE_TEST_STACK (128u * 1024u)
@@ -132,6 +134,7 @@ static tigris_exec_error_t run_once(const tigris_plan_t *plan, void *state, size
 
 typedef struct {
     const state_golden_t *golden;
+    const uint8_t *expected;
     uint16_t depth;
     uint16_t chain;
 } golden_job_t;
@@ -164,7 +167,7 @@ static void *run_golden(void *arg)
     TEST_ASSERT_EQ(tigris_state_init(&plan, state, state_size), TIGRIS_EXEC_OK, "state init");
     for (uint32_t run = 0; run < golden->runs; run++) {
         const uint8_t *x = (const uint8_t *)golden->input + (size_t)run * golden->input_bytes;
-        const uint8_t *y = (const uint8_t *)golden->output + (size_t)run * golden->output_bytes;
+        const uint8_t *y = job->expected + (size_t)run * golden->output_bytes;
         TEST_ASSERT_EQ(run_once(&plan, state, state_size, x, golden->input_bytes,
                                 out, golden->output_bytes), TIGRIS_EXEC_OK, "golden run");
         TEST_ASSERT(memcmp(out, y, golden->output_bytes) == 0, "golden run matches TFLite Micro");
@@ -179,12 +182,17 @@ done:
 static void test_storage_follows_plan(void)
 {
     printf("  test_storage_follows_plan...\n");
+    libm_report();
     uint16_t deepest = 0u, longest = 0u;
     pthread_attr_t attr;
     TEST_ASSERT_EQ(pthread_attr_init(&attr), 0, "thread attributes");
     TEST_ASSERT_EQ(pthread_attr_setstacksize(&attr, STORAGE_TEST_STACK), 0, "small thread stack");
     for (size_t g = 0; g < sizeof(state_goldens) / sizeof(state_goldens[0]); g++) {
-        golden_job_t job = {&state_goldens[g], 0u, 0u};
+        golden_job_t job = {&state_goldens[g], NULL, 0u, 0u};
+        job.expected = libm_golden(state_goldens_cr, sizeof(state_goldens_cr) / sizeof(state_goldens_cr[0]),
+                                   state_goldens[g].output);
+        TEST_ASSERT(job.expected != NULL, "state golden set fits this libm");
+        if (job.expected == NULL) continue;
         pthread_t thread;
         int started = pthread_create(&thread, &attr, run_golden, &job);
         TEST_ASSERT_EQ(started, 0, "golden thread starts");

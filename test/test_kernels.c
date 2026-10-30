@@ -26,6 +26,8 @@
 #include "activation_golden.h"
 #include "reduction_golden.h"
 #include "test_harness.h"
+#include "libm_rounding.h"
+#include "activation_golden_cr.h"
 
 #define EPS 1e-5f
 
@@ -1765,8 +1767,14 @@ static void test_elementwise_reference_goldens(void)
 static void test_activation_reference_goldens(void)
 {
     printf("  test_activation_reference_goldens...\n");
+    libm_report();
     for (size_t g = 0; g < sizeof(activation_goldens) / sizeof(activation_goldens[0]); g++) {
         const activation_golden_t *gold = &activation_goldens[g];
+        const void *expected = libm_golden(activation_goldens_cr,
+                                           sizeof(activation_goldens_cr) / sizeof(activation_goldens_cr[0]),
+                                           gold->output);
+        TEST_ASSERT(expected != NULL, "activation golden set fits this libm");
+        if (!expected) continue;
         tigris_file_header_t header = {0};
         tigris_tensor_t tensors[2] = {0};
         tigris_op_t op = {0};
@@ -1849,13 +1857,13 @@ static void test_activation_reference_goldens(void)
         TEST_ASSERT(result == 0, "activation golden runs");
         for (uint32_t i = 0; i < gold->output_count; i++) {
             int equal = memcmp((uint8_t *)output + i * output_element,
-                               (const uint8_t *)gold->output + i * output_element, output_element) == 0;
+                               (const uint8_t *)expected + i * output_element, output_element) == 0;
             if (!equal) {
                 fprintf(stderr, "    activation case %zu op %u element %u\n", g, gold->op, i);
                 if (gold->dtype == 3)
-                    fprintf(stderr, "    actual %d expected %d\n", ((int8_t *)output)[i], ((const int8_t *)gold->output)[i]);
+                    fprintf(stderr, "    actual %d expected %d\n", ((int8_t *)output)[i], ((const int8_t *)expected)[i]);
                 else
-                    fprintf(stderr, "    actual %.9g expected %.9g\n", (double)((float *)output)[i], (double)((const float *)gold->output)[i]);
+                    fprintf(stderr, "    actual %.9g expected %.9g\n", (double)((float *)output)[i], (double)((const float *)expected)[i]);
             }
             TEST_ASSERT(equal, "activation output bits equal TFLM");
         }

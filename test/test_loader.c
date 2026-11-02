@@ -6049,6 +6049,41 @@ static void test_oldest_schema_validates_operators(void)
     free(buf);
 }
 
+/* From schema 12 the header flags name the quantization rule and the loader
+ * refuses a flag it does not know; earlier plans load whatever the field holds,
+ * as they always have, and round half away from zero. */
+static void test_header_flags(void)
+{
+    printf("  test_header_flags...\n");
+    _Alignas(4) uint8_t buf[MINIMAL_PLAN_SIZE];
+    tigris_plan_t plan;
+    static const struct {
+        uint32_t version, flags;
+        tigris_error_t expected;
+        const char *what;
+    } cases[] = {
+        {TIGRIS_SCHEMA_VERSION_V12, 0u, TIGRIS_OK, "schema 12 without flags loads"},
+        {TIGRIS_SCHEMA_VERSION_V12, TIGRIS_FLAG_XIP, TIGRIS_OK, "schema 12 with XIP loads"},
+        {TIGRIS_SCHEMA_VERSION_V12, TIGRIS_FLAG_QUANTIZE_TIES_EVEN, TIGRIS_OK,
+         "schema 12 with ties to even loads"},
+        {TIGRIS_SCHEMA_VERSION_V12, TIGRIS_FLAG_XIP | TIGRIS_FLAG_QUANTIZE_TIES_EVEN, TIGRIS_OK,
+         "schema 12 with both flags loads"},
+        {TIGRIS_SCHEMA_VERSION_V12, 0x00000004u, TIGRIS_ERR_BAD_VERSION,
+         "schema 12 refuses an unknown flag"},
+        {TIGRIS_SCHEMA_VERSION_V12, TIGRIS_FLAG_QUANTIZE_TIES_EVEN | 0x80000000u, TIGRIS_ERR_BAD_VERSION,
+         "schema 12 refuses an unknown flag beside a known one"},
+        {TIGRIS_SCHEMA_VERSION_V11, 0xFFFFFFFCu, TIGRIS_OK, "schema 11 does not read the flags"},
+        {TIGRIS_SCHEMA_VERSION_V11, TIGRIS_FLAG_QUANTIZE_TIES_EVEN, TIGRIS_OK,
+         "schema 11 loads the bit and ignores it"},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        build_minimal_plan(buf);
+        plan_set_version(buf, cases[c].version);
+        ((tigris_file_header_t *)buf)->flags = cases[c].flags;
+        TEST_ASSERT_EQ(tigris_plan_load(buf, sizeof(buf), &plan), cases[c].expected, cases[c].what);
+    }
+}
+
 /* Schemas 2 and 3 leave the meaning of opcodes outside their table open, so
  * operator validation cannot check them, and this MatMul with operands of 2x3
  * and 1x6 would read past its arena. The loader refuses both schemas, and the
@@ -6114,6 +6149,39 @@ static void test_fuzz_regressions(void)
     }
 }
 
+/* The v12 fixture is QuantizeLinear, DequantizeLinear, Relu, QuantizeLinear,
+ * DequantizeLinear at scale 2^-4 over 16 values. Inputs (k + 0.5) * 2^-4 are
+ * exact ties, so the output is max(0, k + 0.5 rounded to even) * 2^-4. */
+static void check_v12_fixture(const tigris_plan_t *plan)
+{
+    enum { N = 16 };
+    float x[N], y[N];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[256];
+    void *pointers[TIGRIS_MAX_TENSORS] = {NULL};
+    tigris_mem_t mem;
+    tigris_exec_stats_t stats;
+    const uint16_t in = plan->model_inputs[0], out = plan->model_outputs[0];
+    TEST_ASSERT_EQ(plan->header->flags, TIGRIS_FLAG_QUANTIZE_TIES_EVEN, "v12 states ties to even");
+    TEST_ASSERT_EQ(tigris_iface_bytes(plan, in), (uint32_t)sizeof(x), "v12 input is 16 float32");
+    TEST_ASSERT_EQ(tigris_iface_bytes(plan, out), (uint32_t)sizeof(y), "v12 output is 16 float32");
+    if (tigris_iface_bytes(plan, in) != sizeof(x) || tigris_iface_bytes(plan, out) != sizeof(y))
+        return;
+    for (int k = 0; k < N; k++)
+        x[k] = ((float)(k - N / 2) + 0.5f) * 0.0625f;
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, pointers, plan->header->num_tensors, fast, sizeof(fast), NULL, 0u),
+                   TIGRIS_MEM_OK, "v12 arena");
+    TEST_ASSERT_EQ(tigris_input_write(plan, &mem, in, x, sizeof(x)), TIGRIS_OK, "v12 input write");
+    memset(&stats, 0, sizeof(stats));
+    TEST_ASSERT_EQ(tigris_run(plan, &mem, tigris_dispatch_kernel_s8, NULL, &stats), TIGRIS_EXEC_OK,
+                   "v12 fixture runs");
+    TEST_ASSERT_EQ(tigris_output_read(plan, &mem, out, y, sizeof(y)), TIGRIS_OK, "v12 output read");
+    for (int k = 0; k < N; k++) {
+        const int below = k - N / 2;
+        const int level = (below % 2 == 0) ? below : below + 1;
+        TEST_ASSERT(y[k] == (float)(level > 0 ? level : 0) * 0.0625f, "v12 rounds ties to even");
+    }
+}
+
 static void test_schema_compatibility_fixtures(void)
 {
     /*
@@ -6129,6 +6197,8 @@ static void test_schema_compatibility_fixtures(void)
      *   v10 state:   a variable kept across invocations in the state buffer
      *   v11 QDQ Conv:the fast-arena figure, below the budget of a compressed
      *                tiled stage, and a tile record that states its tiling
+     *   v12 QDQ Relu:a float32 input quantized with ties to even, as the
+     *                header flag of an ONNX-sourced plan states
      */
     static const struct {
         const char *filename;
@@ -6148,6 +6218,7 @@ static void test_schema_compatibility_fixtures(void)
         {"schema-v10-state.tgrs", TIGRIS_SCHEMA_VERSION_V10, 0, 3, 0, 0},
         {"schema-v11-scheduled-peak.tgrs", TIGRIS_SCHEMA_VERSION_V11, 2, 0, 1,
          TIGRIS_TILE_AXIS_HEIGHT_OR_LENGTH},
+        {"schema-v12-quantize-ties-even.tgrs", TIGRIS_SCHEMA_VERSION_V12, 2, 0, 0, 0},
     };
     const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
 
@@ -6245,6 +6316,8 @@ static void test_schema_compatibility_fixtures(void)
                 TEST_ASSERT(memcmp(&derived, facts, sizeof(derived)) == 0,
                             "v11 stated tiling is the derived one");
             }
+            if (fixtures[i].version == TIGRIS_SCHEMA_VERSION_QUANTIZE_RULE)
+                check_v12_fixture(&plan);
             if (fixtures[i].version == TIGRIS_SCHEMA_VERSION_TILE_AXIS) {
                 TEST_ASSERT_EQ(plan.tile_plans[0].axis,
                                fixtures[i].tile_axis,
@@ -7471,6 +7544,7 @@ int main(void)
     test_weight_ranges_overlap_only_across_blocks();
     test_oldest_schema_validates_operators();
     test_schemas_before_4_are_refused();
+    test_header_flags();
     test_quant_param_counts_are_reconciled();
 
     printf("\nFuzz regressions:\n");

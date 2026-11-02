@@ -2214,6 +2214,11 @@ static tigris_error_t load_header_and_directory(tigris_load_state_t *ctx)
         ctx->hdr->version > TIGRIS_SCHEMA_VERSION)
         return TIGRIS_ERR_BAD_VERSION;
 
+    /* A flag this runtime does not know may change what the plan computes. */
+    if (ctx->hdr->version >= TIGRIS_SCHEMA_VERSION_QUANTIZE_RULE &&
+        (ctx->hdr->flags & ~(TIGRIS_FLAG_XIP | TIGRIS_FLAG_QUANTIZE_TIES_EVEN)) != 0u)
+        return TIGRIS_ERR_BAD_VERSION;
+
     if (ctx->hdr->file_size != ctx->buf_len)
         return TIGRIS_ERR_BAD_SIZE;
 
@@ -3615,7 +3620,7 @@ const char *tigris_error_str(tigris_error_t err)
         case TIGRIS_ERR_NULL:       return "null pointer argument";
         case TIGRIS_ERR_TOO_SMALL:  return "buffer too small for header";
         case TIGRIS_ERR_BAD_MAGIC:  return "bad magic (expected TGRS)";
-        case TIGRIS_ERR_BAD_VERSION:return "unsupported plan version";
+        case TIGRIS_ERR_BAD_VERSION:return "unsupported plan version or header flag";
         case TIGRIS_ERR_BAD_SIZE:   return "file_size field mismatch";
         case TIGRIS_ERR_BAD_SECTION:return "section offset out of bounds";
         case TIGRIS_ERR_MISSING_SEC:return "required section missing";

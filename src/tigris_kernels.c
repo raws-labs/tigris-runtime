@@ -1093,18 +1093,16 @@ int tigris_bool_execute(const tigris_plan_t *plan, const tigris_op_t *op,
         const uint8_t *x = (const uint8_t *)tigris_mem_tensor_ptr(mem, tigris_op_inputs(plan, op)[0]);
         if (x == NULL) return -1;
         x += (size_t)mem->tile.in_row_start * row;
-        /* An int8 result quantizes 0.0 and 1.0 as TFLite's QUANTIZE does:
-         * round(value / scale) + zero point, clamped. With scale 1 and zero
-         * point 0 that is TFLite's raw bool-to-int8 copy. */
+        /* An int8 result quantizes 0.0 and 1.0 by the plan's rule. With scale
+         * 1 and zero point 0 that is TFLite's raw bool-to-int8 copy. */
         int8_t levels[2] = {0, 1};
         if (output->dtype == 3u) {
             const tigris_quant_param_t *q = tigris_tensor_quant(plan, output);
             if (q == NULL || !(q->scale > 0.0f) || q->zero_point < -128 || q->zero_point > 127)
                 return -1;
-            const float one = 1.0f / q->scale;
-            const int32_t level = (one > 255.0f) ? 127 : ((int32_t)roundf(one) + q->zero_point);
             levels[0] = (int8_t)q->zero_point;
-            levels[1] = (int8_t)((level > 127) ? 127 : level);
+            levels[1] = tigris_plan_quantizes_ties_even(plan) ? tigris_quantize_value_even(1.0f, q)
+                                                             : tigris_quantize_value(1.0f, q);
         }
         for (uint32_t i = 0u; i < count; i++) {
             if (x[i] > 1u) return -1;
@@ -1541,11 +1539,13 @@ int tigris_quantize_execute(const tigris_plan_t *plan, const tigris_op_t *op, ti
         x += (size_t)mem->tile.in_row_start * row * (quantize ? sizeof(float) : 1u);
         y += (size_t)mem->tile.out_row_start * row * (quantize ? 1u : sizeof(float));
     }
+    const bool even = tigris_plan_quantizes_ties_even(plan);
     for (uint32_t i = 0u; i < count; i++) {
         if (quantize) {
             float value;
             memcpy(&value, x + (size_t)i * sizeof(value), sizeof(value));
-            ((int8_t *)y)[i] = tigris_quantize_value(value, q);
+            ((int8_t *)y)[i] = even ? tigris_quantize_value_even(value, q)
+                                    : tigris_quantize_value(value, q);
         } else {
             const int32_t level = (int32_t)((const int8_t *)x)[i];
             const float value = (float)((double)q->scale * (double)(level - q->zero_point));

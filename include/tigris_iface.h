@@ -64,6 +64,9 @@ tigris_error_t tigris_input_alloc(
 /**
  * Convert the caller's data into a model input tensor.
  * Int64 index inputs must fit int32; narrowing overflow returns BAD_INTERFACE.
+ * A float32 input stored as int8 is divided by its scale in float32, rounded
+ * as the plan's TIGRIS_FLAG_QUANTIZE_TIES_EVEN states, offset by its zero
+ * point and clamped.
  *
  * An input with no buffer yet is placed with tigris_input_alloc() first. A
  * buffer the caller allocated beforehand is used as it is.

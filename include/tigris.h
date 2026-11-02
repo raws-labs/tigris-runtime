@@ -34,6 +34,7 @@ extern "C" {
 
 #define TIGRIS_MAGIC           0x53524754  /* "TGRS" in little-endian */
 #define TIGRIS_MAGIC_BYTES     "TGRS"
+#define TIGRIS_SCHEMA_VERSION_V12 12
 #define TIGRIS_SCHEMA_VERSION_V11 11
 #define TIGRIS_SCHEMA_VERSION_V10 10
 #define TIGRIS_SCHEMA_VERSION_V9 9
@@ -41,7 +42,7 @@ extern "C" {
 #define TIGRIS_SCHEMA_VERSION_V7 7
 #define TIGRIS_SCHEMA_VERSION_V6 6
 #define TIGRIS_SCHEMA_VERSION_V5 5
-#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V11
+#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V12
 #define TIGRIS_SCHEMA_VERSION_V4 4
 #define TIGRIS_SCHEMA_VERSION_MIN TIGRIS_SCHEMA_VERSION_V4
 #define TIGRIS_SCHEMA_VERSION_OP_ATTRIBUTES TIGRIS_SCHEMA_VERSION_V4
@@ -74,6 +75,10 @@ extern "C" {
 
 /* A tile record states its tiling, which the loader derives from the plan and checks. */
 #define TIGRIS_SCHEMA_VERSION_TILE_FACTS TIGRIS_SCHEMA_VERSION_V11
+
+/* A plan states in its header flags how float32 values quantize to int8, and
+ * the loader refuses a header flag it does not know. */
+#define TIGRIS_SCHEMA_VERSION_QUANTIZE_RULE TIGRIS_SCHEMA_VERSION_V12
 #define TIGRIS_QUANT_PAGE_ELEMS 65536u
 
 /* Section type IDs */
@@ -199,6 +204,10 @@ static inline uint32_t tigris_dtype_size(uint8_t dtype)
 
 /* Header flags */
 #define TIGRIS_FLAG_XIP       0x00000001u  /* weights are execute-in-place from flash */
+/* Schema 12 and later: float32 quantizes to int8 with ties to even, as ONNX
+ * QuantizeLinear does. Clear, or in an earlier plan, ties go away from zero,
+ * as TFLite's QUANTIZE does. Both divide by the scale in float32. */
+#define TIGRIS_FLAG_QUANTIZE_TIES_EVEN 0x00000002u
 
 /* Fused activation types */
 #define TIGRIS_ACT_NONE   0
@@ -316,8 +325,9 @@ typedef enum {
      * float32 boxes [1, detections, 4], classes and scores [1, detections],
      * the count [1] and its working memory, as TFLite Micro does. */
     TIGRIS_OP_DETECTION_POSTPROCESS      = 89,
-    /* float32 to the int8 encoding of its output, as TFLite Micro's QUANTIZE:
-     * a float32 division by the scale, rounded half away from zero. */
+    /* float32 to the int8 encoding of its output: a float32 division by the
+     * scale, rounded as TIGRIS_FLAG_QUANTIZE_TIES_EVEN states, plus the zero
+     * point, clamped. */
     TIGRIS_OP_QUANTIZE                   = 90,
     /* int8 to float32, as TFLite Micro's DEQUANTIZE: the scale times the
      * offset value, in double. Both carry float32 across the boundary of a
@@ -351,7 +361,7 @@ typedef enum {
     TIGRIS_ERR_NULL         = -1,   /* Null pointer argument */
     TIGRIS_ERR_TOO_SMALL    = -2,   /* Buffer smaller than file header */
     TIGRIS_ERR_BAD_MAGIC    = -3,   /* Magic bytes are not "TGRS" */
-    TIGRIS_ERR_BAD_VERSION  = -4,   /* Unsupported plan schema version */
+    TIGRIS_ERR_BAD_VERSION  = -4,   /* Unsupported plan schema version or header flag */
     TIGRIS_ERR_BAD_SIZE     = -5,   /* file_size field does not match buf_len */
     TIGRIS_ERR_BAD_SECTION  = -6,   /* Section offset out of bounds */
     TIGRIS_ERR_MISSING_SEC  = -7,   /* Required section not present */

@@ -8,6 +8,7 @@
  * declare float32 while the plan stores int8, and over hand-built tensors for
  * the cases the fixture cannot reach.
  */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,6 +110,155 @@ static void test_quantization_rounds_as_tflite_does(void)
     TEST_ASSERT_EQ(tigris_quantize_value(1.25f, &shifted), 0, "the zero point follows rounding");
     TEST_ASSERT_EQ(tigris_quantize_value(3.0e9f, &unit), 127, "beyond int32 clamps high");
     TEST_ASSERT_EQ(tigris_quantize_value(-3.0e9f, &unit), -128, "beyond int32 clamps low");
+}
+
+/* Both rules on the same inputs: they differ only where value / scale is an
+ * exact tie with an even integer below it in magnitude. */
+static void test_quantization_rules_on_ties(void)
+{
+    static const struct {
+        float value, scale;
+        int32_t zero_point;
+        int8_t away, even;
+        const char *what;
+    } cases[] = {
+        {0.5f, 1.0f, 0, 1, 0, "one half"},
+        {-0.5f, 1.0f, 0, -1, 0, "minus one half"},
+        {1.5f, 1.0f, 0, 2, 2, "one and a half"},
+        {-1.5f, 1.0f, 0, -2, -2, "minus one and a half"},
+        {2.5f, 1.0f, 0, 3, 2, "two and a half"},
+        {-2.5f, 1.0f, 0, -3, -2, "minus two and a half"},
+        {0.49999997f, 1.0f, 0, 0, 0, "just below one half"},
+        {0.50000006f, 1.0f, 0, 1, 1, "just above one half"},
+        {-0.49999997f, 1.0f, 0, 0, 0, "just above minus one half"},
+        {-0.50000006f, 1.0f, 0, -1, -1, "just below minus one half"},
+        {2.4999998f, 1.0f, 0, 2, 2, "just below two and a half"},
+        {2.5000002f, 1.0f, 0, 3, 3, "just above two and a half"},
+        {-2.4999998f, 1.0f, 0, -2, -2, "just above minus two and a half"},
+        {-2.5000002f, 1.0f, 0, -3, -3, "just below minus two and a half"},
+        {0.15625f, 0.0625f, 0, 3, 2, "a tie at scale 2^-4"},
+        {-0.15625f, 0.0625f, 0, -3, -2, "a negative tie at scale 2^-4"},
+        {1.0f, 0.4f, 0, 3, 2, "1 / 0.4 is 2.5 in float32"},
+        {1.25f, 0.5f, -3, 0, -1, "a tie offset by a negative zero point"},
+        {-1.25f, 0.5f, 7, 4, 5, "a negative tie offset by a positive zero point"},
+        {126.5f, 1.0f, 0, 127, 126, "a tie below the upper clamp"},
+        {127.5f, 1.0f, 0, 127, 127, "a tie at the upper clamp"},
+        {-127.5f, 1.0f, 0, -128, -128, "a tie at the lower clamp"},
+        {-128.5f, 1.0f, 0, -128, -128, "a tie beyond the lower clamp"},
+        {-126.5f, 1.0f, -1, -128, -127, "a tie the zero point moves to the clamp"},
+        {300.0f, 1.0f, 0, 127, 127, "beyond the upper clamp"},
+        {-300.0f, 1.0f, 0, -128, -128, "beyond the lower clamp"},
+        {4194304.5f, 1.0f, -4194304, 1, 0, "a tie above 2^22"},
+        {4194305.5f, 1.0f, -4194304, 2, 2, "an odd tie above 2^22"},
+        {8388606.5f, 1.0f, -8388606, 1, 0, "the last ties below 2^23"},
+        {16777216.0f, 1.0f, -16777216, 0, 0, "an integer at 2^24"},
+        {3.0e9f, 1.0f, 0, 127, 127, "beyond int32"},
+        {-3.0e9f, 1.0f, 0, -128, -128, "beyond minus int32"},
+        {-0.0f, 1.0f, 3, 3, 3, "negative zero"},
+    };
+    printf("  test_quantization_rules_on_ties...\n");
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const tigris_quant_param_t q = {cases[c].scale, cases[c].zero_point, 1u, 0u, 0u, 0u};
+        TEST_ASSERT_EQ(tigris_quantize_value(cases[c].value, &q), cases[c].away, cases[c].what);
+        TEST_ASSERT_EQ(tigris_quantize_value_even(cases[c].value, &q), cases[c].even, cases[c].what);
+    }
+    const tigris_quant_param_t unit = {1.0f, 0, 1u, 0u, 0u, 0u};
+    TEST_ASSERT_EQ(tigris_quantize_value_even(INFINITY, &unit), 127, "infinity clamps high");
+    TEST_ASSERT_EQ(tigris_quantize_value_even(-INFINITY, &unit), -128, "minus infinity clamps low");
+    TEST_ASSERT_EQ(tigris_quantize_value_even(NAN, &unit), tigris_quantize_value(NAN, &unit),
+                   "NaN takes the same level under both rules");
+}
+
+/* Every 4099th float32 pattern below 2^31 in magnitude, with the zero point
+ * set to minus its floor so the level shows the rounding as 0 or 1 exactly. */
+static void test_quantization_rules_match_libm(void)
+{
+    uint32_t mismatches_away = 0u, mismatches_even = 0u, checked = 0u;
+    printf("  test_quantization_rules_match_libm...\n");
+    for (uint64_t bits = 0u; bits <= UINT32_MAX; bits += 4099u) {
+        const uint32_t pattern = (uint32_t)bits;
+        float value;
+        memcpy(&value, &pattern, sizeof(value));
+        if (!(fabsf(value) < 2147483520.0f))
+            continue;
+        const double floor_value = floor((double)value);
+        const tigris_quant_param_t q = {1.0f, (int32_t)-floor_value, 1u, 0u, 0u, 0u};
+        const int away = (int)(round((double)value) - floor_value);
+        const int even = (int)(nearbyint((double)value) - floor_value);
+        if (tigris_quantize_value(value, &q) != away) mismatches_away++;
+        if (tigris_quantize_value_even(value, &q) != even) mismatches_even++;
+        checked++;
+    }
+    TEST_ASSERT(checked > 500000u, "the sweep covers the float32 range");
+    TEST_ASSERT_EQ(mismatches_away, 0u, "half away from zero matches round()");
+    TEST_ASSERT_EQ(mismatches_even, 0u, "half to even matches nearbyint() in the default mode");
+}
+
+/* The input boundary takes the plan's rule: the flag counts from schema 12. */
+static void test_input_write_follows_the_plan_rule(void)
+{
+    static const struct {
+        uint32_t version, flags;
+        int even;
+        const char *what;
+    } plans[] = {
+        {TIGRIS_SCHEMA_VERSION_V12, TIGRIS_FLAG_QUANTIZE_TIES_EVEN, 1, "schema 12 with the flag"},
+        {TIGRIS_SCHEMA_VERSION_V12, TIGRIS_FLAG_QUANTIZE_TIES_EVEN | TIGRIS_FLAG_XIP, 1,
+         "schema 12 with the flag and XIP"},
+        {TIGRIS_SCHEMA_VERSION_V12, 0u, 0, "schema 12 without the flag"},
+        {TIGRIS_SCHEMA_VERSION_V11, TIGRIS_FLAG_QUANTIZE_TIES_EVEN, 0, "schema 11 ignores the bit"},
+    };
+    uint16_t in_idx = fixture_plan.model_inputs[0];
+    const tigris_tensor_t *t = &fixture_plan.tensors[in_idx];
+    uint32_t elements = t->size_bytes;
+    uint32_t bytes = tigris_iface_bytes(&fixture_plan, in_idx);
+    const tigris_quant_param_t *qp = tigris_tensor_quant(&fixture_plan, t);
+    void **ptrs = (void **)calloc(fixture_plan.header->num_tensors, sizeof(void *));
+    int8_t *storage = (int8_t *)calloc(elements, 1);
+    float *sent = (float *)malloc(bytes);
+    tigris_mem_t mem;
+
+    printf("  test_input_write_follows_the_plan_rule...\n");
+    if (!ptrs || !storage || !sent) {
+        free(ptrs); free(storage); free(sent);
+        return;
+    }
+    /* Odd multiples of half a step, both signs, kept inside the clamp. */
+    uint32_t inexact = 0u;
+    for (uint32_t i = 0; i < elements; i++) {
+        float half_step = (float)((int)(i % 16u) - 8) + 0.5f;
+        sent[i] = half_step * qp->scale;
+        if (sent[i] / qp->scale != half_step) inexact++;
+    }
+    TEST_ASSERT_EQ(inexact, 0u, "every input is an exact tie at the input scale");
+    for (size_t p = 0; p < sizeof(plans) / sizeof(plans[0]); p++) {
+        tigris_file_header_t header = *fixture_plan.header;
+        tigris_plan_t plan = fixture_plan;
+        header.version = plans[p].version;
+        header.flags = plans[p].flags;
+        plan.header = &header;
+        TEST_ASSERT_EQ(tigris_plan_quantizes_ties_even(&plan), plans[p].even != 0, plans[p].what);
+        memset(&mem, 0, sizeof(mem));
+        mem.tensor_ptrs = ptrs;
+        mem.num_tensors = fixture_plan.header->num_tensors;
+        ptrs[in_idx] = storage;
+        TEST_ASSERT_EQ(tigris_input_write(&plan, &mem, in_idx, sent, bytes), TIGRIS_OK,
+                       plans[p].what);
+        uint32_t wrong = 0u;
+        for (uint32_t i = 0; i < elements; i++) {
+            /* k + 0.5 goes to the even one of k and k + 1, or away from zero. */
+            int k = (int)(i % 16u) - 8;
+            int level = plans[p].even ? (k % 2 == 0 ? k : k + 1) : (k >= 0 ? k + 1 : k);
+            level += qp->zero_point;
+            if (level < -128) level = -128;
+            if (level > 127) level = 127;
+            if (storage[i] != (int8_t)level) wrong++;
+        }
+        TEST_ASSERT_EQ(wrong, 0u, plans[p].what);
+    }
+    free(sent);
+    free(storage);
+    free(ptrs);
 }
 
 static void test_output_is_read_back_in_the_declared_dtype(void)
@@ -450,6 +600,9 @@ int main(void)
     test_declared_interface_sizes_the_caller_buffer();
     test_float_roundtrips_through_the_quantized_boundary();
     test_quantization_rounds_as_tflite_does();
+    test_quantization_rules_on_ties();
+    test_quantization_rules_match_libm();
+    test_input_write_follows_the_plan_rule();
     test_output_is_read_back_in_the_declared_dtype();
     test_non_boundary_tensors_are_refused();
     test_plain_interface_copies();

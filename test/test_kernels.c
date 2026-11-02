@@ -2175,16 +2175,24 @@ static void test_movement_goldens(void)
     }
 }
 
-/* Bool to int8 quantizes 0.0 and 1.0 into the output's encoding, as TFLite's
- * QUANTIZE after a float CAST does; at scale 1 and zero point 0 that is the
- * raw copy of TFLite's own bool-to-int8 CAST. */
+/* Bool to int8 quantizes 0.0 and 1.0 into the output's encoding by the plan's
+ * rule; at scale 1 and zero point 0 that is the raw copy of TFLite's own
+ * bool-to-int8 CAST. 1 / 0.4 is 2.5 in float32, the one case the rules split. */
 static void test_cast_bool_to_int8(void)
 {
     printf("  test_cast_bool_to_int8...\n");
-    static const struct { float scale; int32_t zero_point; int8_t off, on; } cases[] = {
-        {1.0f, 0, 0, 1}, {1.0f / 256.0f, -128, -128, 127}, {0.3f, 5, 5, 8}, {1e-9f, 100, 100, 127},
+    static const struct { float scale; int32_t zero_point; int8_t off, on, on_even; } cases[] = {
+        {1.0f, 0, 0, 1, 1}, {1.0f / 256.0f, -128, -128, 127, 127}, {0.3f, 5, 5, 8, 8},
+        {1e-9f, 100, 100, 127, 127}, {0.4f, -1, -1, 2, 1},
     };
-    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    static const struct { uint32_t version, flags; int even; } rules[] = {
+        {TIGRIS_SCHEMA_VERSION_V11, TIGRIS_FLAG_QUANTIZE_TIES_EVEN, 0},
+        {TIGRIS_SCHEMA_VERSION_V12, 0u, 0},
+        {TIGRIS_SCHEMA_VERSION_V12, TIGRIS_FLAG_QUANTIZE_TIES_EVEN, 1},
+    };
+    for (size_t n = 0; n < (sizeof(rules) / sizeof(rules[0])) * (sizeof(cases) / sizeof(cases[0])); n++) {
+        const size_t r = n / (sizeof(cases) / sizeof(cases[0]));
+        const size_t c = n % (sizeof(cases) / sizeof(cases[0]));
         tigris_file_header_t header = {0};
         tigris_tensor_t tensors[2] = {{0}};
         tigris_op_t op = {0};
@@ -2196,9 +2204,12 @@ static void test_cast_bool_to_int8(void)
         int8_t output[4] = {0};
         void *pointers[] = {flags, output};
         uint16_t indices[] = {0, 1};
+        const int8_t on = rules[r].even ? cases[c].on_even : cases[c].on;
         quant.scale = cases[c].scale;
         quant.zero_point = cases[c].zero_point;
         quant.num_channels = 1;
+        header.version = rules[r].version;
+        header.flags = rules[r].flags;
         header.num_tensors = 2;
         header.num_ops = 1;
         header.num_quant_params = 1;
@@ -2219,7 +2230,72 @@ static void test_cast_bool_to_int8(void)
         mem.num_tensors = 2;
         TEST_ASSERT(tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL) == 0, "bool cast to int8 runs");
         for (int i = 0; i < 4; i++)
-            TEST_ASSERT(output[i] == (flags[i] ? cases[c].on : cases[c].off), "bool cast quantizes 0 and 1");
+            TEST_ASSERT(output[i] == (flags[i] ? on : cases[c].off), "bool cast quantizes 0 and 1");
+    }
+}
+
+/* QUANTIZE from float32 rounds by the plan's rule under both dispatchers:
+ * ties of both signs at scale 2^-4, their neighbors, and the clamp. */
+static void test_quantize_from_float_follows_the_plan_rule(void)
+{
+    printf("  test_quantize_from_float_follows_the_plan_rule...\n");
+    enum { N = 10 };
+    const float step = 0.0625f;
+    const float x[N] = {
+        2.5f * step, -2.5f * step, 0.5f * step, -0.5f * step, 3.5f * step,
+        nextafterf(2.5f * step, 0.0f), nextafterf(2.5f * step, 1.0f),
+        7.5f * step, -9.5f * step, 1000.0f,
+    };
+    /* Zero point 2: the levels are rounded value + 2, clamped. */
+    const int8_t away[N] = {5, -1, 3, 1, 6, 4, 5, 10, -8, 127};
+    const int8_t even[N] = {4, 0, 2, 2, 6, 4, 5, 10, -8, 127};
+    static const struct { uint32_t version, flags; int even; } rules[] = {
+        {TIGRIS_SCHEMA_VERSION_V11, TIGRIS_FLAG_QUANTIZE_TIES_EVEN, 0},
+        {TIGRIS_SCHEMA_VERSION_V12, TIGRIS_FLAG_XIP, 0},
+        {TIGRIS_SCHEMA_VERSION_V12, TIGRIS_FLAG_QUANTIZE_TIES_EVEN | TIGRIS_FLAG_XIP, 1},
+    };
+    for (size_t r = 0; r < sizeof(rules) / sizeof(rules[0]); r++) {
+        for (int s8 = 0; s8 < 2; s8++) {
+            tigris_file_header_t header = {0};
+            tigris_tensor_t tensors[2] = {{0}};
+            tigris_op_t op = {0};
+            tigris_plan_t plan = {0};
+            tigris_mem_t mem = {0};
+            tigris_quant_param_t quant = {0};
+            int32_t shapes[2] = {N, N};
+            int8_t output[N] = {0};
+            void *pointers[] = {(void *)x, output};
+            uint16_t indices[] = {0, 1};
+            quant.scale = step;
+            quant.zero_point = 2;
+            quant.num_channels = 1;
+            header.version = rules[r].version;
+            header.flags = rules[r].flags;
+            header.num_tensors = 2;
+            header.num_ops = 1;
+            header.num_quant_params = 1;
+            tensors[0] = (tigris_tensor_t){0, (uint32_t)sizeof(x), 0, 1, 1, 0, TIGRIS_NO_QUANT_PARAM, 0};
+            tensors[1] = (tigris_tensor_t){0, (uint32_t)N, 1, 1, 3, 0, 0, 0};
+            op.op_type = TIGRIS_OP_QUANTIZE;
+            op.num_inputs = op.num_outputs = 1;
+            op.outputs_off = 1;
+            op.weight_idx = op.bias_idx = TIGRIS_NO_WEIGHT;
+            plan.header = &header;
+            plan.tensors = tensors;
+            plan.ops = &op;
+            plan.shape_pool = shapes;
+            plan.index_pool = indices;
+            plan.quant_params = &quant;
+            plan.num_quant_params = 1;
+            mem.tensor_ptrs = pointers;
+            mem.num_tensors = 2;
+            const int status = s8 ? tigris_dispatch_kernel_s8(&plan, &op, 0, &mem, NULL)
+                                  : tigris_dispatch_kernel(&plan, &op, 0, &mem, NULL);
+            TEST_ASSERT(status == 0, "float32 quantize runs");
+            const int8_t *expected = rules[r].even ? even : away;
+            for (int i = 0; i < N; i++)
+                TEST_ASSERT(output[i] == expected[i], "float32 quantize level");
+        }
     }
 }
 
@@ -2410,6 +2486,7 @@ int main(void)
 {
     test_bool_goldens();
     test_cast_bool_to_int8();
+    test_quantize_from_float_follows_the_plan_rule();
     test_reduce_all();
     test_movement_goldens();
     printf("TiGrIS Kernel Tests\n\n");

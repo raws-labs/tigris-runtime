@@ -47,16 +47,40 @@ uint32_t tigris_iface_bytes(const tigris_plan_t *plan, uint16_t tensor_idx)
     return (iface_extent(tensor, &elements, &bytes) == TIGRIS_OK) ? bytes : 0u;
 }
 
-/* Half away from zero, matching the rounding the compiler quantizes with. */
-int8_t tigris_quantize_value(float value, const tigris_quant_param_t *quant)
+/* A rounded level plus the zero point, clamped as a float, which a value
+ * beyond int32 would overflow. NaN gives -128. */
+static int8_t quantize_level(float rounded, const tigris_quant_param_t *quant)
 {
-    /* roundf rounds half away from zero exactly, as std::round does; adding
-     * 0.5 first would round values just below one half up. The level is
-     * clamped as a float, which a value beyond int32 would overflow. */
-    float level = roundf(value / quant->scale) + (float)quant->zero_point;
+    float level = rounded + (float)quant->zero_point;
     if (!(level >= -128.0f)) level = -128.0f;
     if (level > 127.0f) level = 127.0f;
     return (int8_t)level;
+}
+
+int8_t tigris_quantize_value(float value, const tigris_quant_param_t *quant)
+{
+    /* roundf rounds half away from zero exactly, as std::round does; adding
+     * 0.5 first would round values just below one half up. */
+    return quantize_level(roundf(value / quant->scale), quant);
+}
+
+int8_t tigris_quantize_value_even(float value, const tigris_quant_param_t *quant)
+{
+    const float scaled = value / quant->scale;
+    const float whole = truncf(scaled);
+    const float half = whole * 0.5f;
+    float rounded = roundf(scaled);
+    /* scaled - whole is exact (Sterbenz), so it is 0.5 only at a tie; an even
+     * whole is the even neighbor, an odd one leaves roundf's. */
+    if (fabsf(scaled - whole) == 0.5f && truncf(half) == half)
+        rounded = whole;
+    return quantize_level(rounded, quant);
+}
+
+bool tigris_plan_quantizes_ties_even(const tigris_plan_t *plan)
+{
+    return plan->header->version >= TIGRIS_SCHEMA_VERSION_QUANTIZE_RULE &&
+           (plan->header->flags & TIGRIS_FLAG_QUANTIZE_TIES_EVEN) != 0u;
 }
 
 
@@ -216,8 +240,13 @@ tigris_error_t tigris_input_write(
 
     const float *in = (const float *)src;
     int8_t *out = (int8_t *)dst;
-    for (uint32_t i = 0u; i < elements; i++)
-        out[i] = tigris_quantize_value(in[i], quant);
+    if (tigris_plan_quantizes_ties_even(plan)) {
+        for (uint32_t i = 0u; i < elements; i++)
+            out[i] = tigris_quantize_value_even(in[i], quant);
+    } else {
+        for (uint32_t i = 0u; i < elements; i++)
+            out[i] = tigris_quantize_value(in[i], quant);
+    }
     return TIGRIS_OK;
 }
 

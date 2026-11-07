@@ -43,7 +43,7 @@ if(COMMAND idf_component_register)
     return()
 endif()
 
-project(tigris_runtime VERSION 0.14.0 LANGUAGES C)
+project(tigris_runtime VERSION 0.14.1 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 # Float results must not depend on whether the target fuses multiply-adds.

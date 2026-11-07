@@ -16,6 +16,7 @@
 #include "tigris_kernel_window.h"
 #include "tigris_band.h"
 #include "tigris_binary_operands.h"
+#include "tigris_iface_internal.h"
 #include "tigris_op_config.h"
 
 #include <math.h>
@@ -751,25 +752,27 @@ static TIGRIS_KERNEL_NOINLINE int kern_relu6_s8(
     const int8_t *X = (const int8_t *)tigris_mem_tensor_ptr(mem, ins[0]);
     int8_t       *Y = (int8_t *)tigris_mem_tensor_ptr(mem, outs[0]);
 
-    /* Quantized relu6: clamp to [zp_0, zp_6] in the input's domain, then
-     * re-encode if the output declares a different scale or zero point. */
+    /* Quantized relu6: re-encode at the output's scale and zero point, then
+     * clamp to the output encoding of 0 and of 6.0, which the plan's rounding
+     * rule quantizes. */
     passthrough_quant_t q = passthrough_quant(plan, ins[0], outs[0]);
-    float scale = q.in_scale;
-    int32_t zp = q.in_zp;
-    int8_t lo = clamp_s8(zp);  /* quantized 0 */
-    /* Round (not truncate) the quantized 6.0 ceiling to match TFLite's activation
-     * max and the compiler's fused-Relu6 bound; truncation is 1 LSB too low when
-     * 6/scale has a fractional part >= 0.5. */
-    int8_t hi = clamp_s8((int32_t)lroundf(6.0f / scale) + zp);  /* quantized 6 */
+    tigris_quant_param_t out_qp;
+    memset(&out_qp, 0, sizeof(out_qp));
+    out_qp.scale = q.out_scale;
+    out_qp.zero_point = q.out_zp;
+    int8_t lo = clamp_s8(q.out_zp);  /* quantized 0 */
+    int8_t hi = tigris_plan_quantizes_ties_even(plan)
+        ? tigris_quantize_value_even(6.0f, &out_qp)
+        : tigris_quantize_value(6.0f, &out_qp);  /* quantized 6 */
 
     uint32_t n = tigris_tile_numel(plan, ins[0], mem);
     apply_pointwise_row_offset_s8(plan, ins[0], mem, &X, &Y);
     for (uint32_t i = 0; i < n; i++) {
-        int8_t v = X[i];
+        int8_t v = q.same ? X[i] : (int8_t)requantize_passthrough(
+            X[i], q.in_zp, q.in_scale, q.out_zp, q.out_scale);
         if (v < lo) v = lo;
         if (v > hi) v = hi;
-        Y[i] = q.same ? v : (int8_t)requantize_passthrough(
-            v, q.in_zp, q.in_scale, q.out_zp, q.out_scale);
+        Y[i] = v;
     }
     return 0;
 }

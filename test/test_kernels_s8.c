@@ -856,6 +856,53 @@ static void test_relu6_s8_rounds_ceiling(void)
     TEST_ASSERT_EQ(out[3], 30, "relu6(30) passes through inside the range");
 }
 
+static void run_relu6_case(const char *what, uint32_t flags, float in_scale, int32_t in_zp,
+                           float out_scale, int32_t out_zp, const int8_t *x,
+                           const int8_t *expected, int n)
+{
+    plan_reset();
+    tigris_plan_t plan;
+    test_header.version = TIGRIS_SCHEMA_VERSION_QUANTIZE_RULE;
+    test_header.flags = flags;
+    uint16_t in_qp = add_quant_param(in_scale, in_zp, 1, NULL, NULL);
+    uint16_t out_qp = add_quant_param(out_scale, out_zp, 1, NULL, NULL);
+    int32_t shape[] = {1, n};
+    uint16_t t_x = add_tensor(&plan, "x", shape, 2, 3, (uint32_t)n, in_qp);
+    uint16_t t_y = add_tensor(&plan, "y", shape, 2, 3, (uint32_t)n, out_qp);
+    one_op_s8(&plan, TIGRIS_OP_RELU6, &t_x, 1, &t_y, 1, TIGRIS_NO_WEIGHT);
+
+    void *ptrs[MAX_TENSORS]; uint8_t fast[256], slow[16]; tigris_mem_t mem;
+    tigris_mem_init(&mem, ptrs, test_header.num_tensors, fast, sizeof(fast), slow, sizeof(slow));
+    tigris_mem_alloc_fast(&mem, t_x, (uint32_t)n); memcpy(ptrs[t_x], x, (size_t)n);
+    tigris_mem_alloc_fast(&mem, t_y, (uint32_t)n);
+    TEST_ASSERT_EQ(tigris_dispatch_kernel_s8(&plan, &test_ops[0], 0, &mem, NULL), 0, what);
+    for (int i = 0; i < n; i++)
+        TEST_ASSERT_EQ(((int8_t *)ptrs[t_y])[i], expected[i], what);
+}
+
+/* Relu6 clamps at the output encoding of 0 and 6.0, with 6.0 quantized by the
+ * plan's rule. At scale 0.48, 6.0 is the tie 12.5. Between encodings the input
+ * level nearest 6.0 is 6.3 at scale 0.7 and 5.6 at scale 1.4. */
+static void test_relu6_s8_output_ceiling(void)
+{
+    printf("  test_relu6_s8_output_ceiling...\n");
+    const int8_t x[] = {2, 11, 12, 13, 83};
+    const int8_t even[] = {2, 11, 12, 12, 12}, away[] = {2, 11, 12, 13, 13};
+    run_relu6_case("relu6 ceiling ties to even", TIGRIS_FLAG_QUANTIZE_TIES_EVEN,
+                   0.48f, 0, 0.48f, 0, x, even, 5);
+    run_relu6_case("relu6 ceiling ties away", 0u, 0.48f, 0, 0.48f, 0, x, away, 5);
+
+    const int8_t above[] = {-10, -5, 3, 4, 5, 20};
+    const int8_t above_expected[] = {-100, -100, -44, -40, -40, -40};
+    run_relu6_case("relu6 ceiling above 6.0 in the input encoding", 0u,
+                   0.7f, -5, 0.1f, -100, above, above_expected, 6);
+    const int8_t below[] = {-3, 0, 3, 4, 5, 50};
+    const int8_t below_expected[] = {-100, -100, -58, -44, -40, -40};
+    run_relu6_case("relu6 ceiling below 6.0 in the input encoding",
+                   TIGRIS_FLAG_QUANTIZE_TIES_EVEN, 1.4f, 0, 0.1f, -100, below,
+                   below_expected, 6);
+}
+
 /* Tanh via LUT (regression: s8 dispatch must handle TIGRIS_OP_TANH). */
 static void test_tanh_s8(void)
 {
@@ -2388,6 +2435,7 @@ int main(void)
 
     test_relu_s8();
     test_relu6_s8_rounds_ceiling();
+    test_relu6_s8_output_ceiling();
     test_binary_s8_contract();
     test_tiled_rank3_binary_s8();
     test_reshape_s8();

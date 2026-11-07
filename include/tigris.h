@@ -206,7 +206,9 @@ static inline uint32_t tigris_dtype_size(uint8_t dtype)
 #define TIGRIS_FLAG_XIP       0x00000001u  /* weights are execute-in-place from flash */
 /* Schema 12 and later: float32 quantizes to int8 with ties to even, as ONNX
  * QuantizeLinear does. Clear, or in an earlier plan, ties go away from zero,
- * as TFLite's QUANTIZE does. Both divide by the scale in float32. */
+ * as TFLite's QUANTIZE does. Both divide by the scale in float32. Rescaling
+ * int8 to int8, and rounding a float32 intermediate inside a kernel, do not
+ * follow it. */
 #define TIGRIS_FLAG_QUANTIZE_TIES_EVEN 0x00000002u
 
 /* Fused activation types */

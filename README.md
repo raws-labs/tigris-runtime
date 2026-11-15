@@ -21,9 +21,11 @@ strategy selected by the compiler. At runtime, TiGrIS:
   fast arena; and
 - reports allocation, tiling, and kernel failures to the caller.
 
-The schedule and activation bound are compiled, but addresses are assigned by
-bounded bump allocation, reset, and compaction during execution. A finite
-arena can still be exhausted.
+The schedule and activation bound are compiled, but addresses are assigned
+during execution. A normal stage places each tensor at a fixed offset inside
+its scheduled working set, from the lifetimes the plan gives; where no such
+placement is found it bump-allocates and compacts. Tiled stages and chains
+bump-allocate and reset. A finite arena can still be exhausted.
 
 ## Kernel backends
 

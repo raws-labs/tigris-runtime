@@ -2856,7 +2856,7 @@ static void test_exec_compaction_preserves_data(void)
                        &cp.plan, &mem, compaction_kernel, &ctx, &stats,
                        workspace, sizeof(workspace)),
                    TIGRIS_EXEC_OK, "compaction execution");
-    TEST_ASSERT_EQ(stats.compactions, 2, "fast retry and slow cleanup both compact");
+    TEST_ASSERT_EQ(stats.compactions, 1, "slow cleanup compacts; placed outputs need no fast retry");
     TEST_ASSERT(ctx.preserved, "live tensor data survives compaction");
     TEST_ASSERT(mem.tensor_ptrs[2] != NULL, "compacted output remains live");
     TEST_ASSERT(((uint8_t *)mem.tensor_ptrs[2])[47] == 0x6b,
@@ -2910,7 +2910,7 @@ static void test_exec_compact_slow_align(void)
                        &cp.plan, &mem, compaction_kernel, &ctx, &stats,
                        workspace, sizeof(workspace)),
                    TIGRIS_EXEC_OK, "run with an unaligned slow buffer");
-    TEST_ASSERT_EQ(stats.compactions, 2, "fast retry and slow cleanup both compact");
+    TEST_ASSERT_EQ(stats.compactions, 1, "slow cleanup compacts; placed outputs need no fast retry");
     TEST_ASSERT(ctx.preserved, "live tensor data survives compaction");
     for (size_t i = 0; i < 3; i++) {
         uint8_t *q = (uint8_t *)ptrs[i];
@@ -3932,7 +3932,7 @@ static void test_exec_io_in_fast_run(void)
     TEST_ASSERT_EQ(stats.loads_bytes, 0u, "input read in place");
     TEST_ASSERT_EQ(stats.spills_bytes, 0u, "output left in fast");
     TEST_ASSERT_EQ(stats.slow_peak, 0u, "no slow bytes");
-    TEST_ASSERT_EQ(stats.compactions, 1u, "the dead input's bytes are reclaimed");
+    TEST_ASSERT_EQ(stats.compactions, 0u, "the output takes the dead input's bytes in place");
     TEST_ASSERT(mem.fast_peak <= IO_PEAK, "in-place run within the stage peak");
     TEST_ASSERT(in_pool(ptrs[2], fast, sizeof(fast)), "output in fast");
     TEST_ASSERT(ptrs[0] == NULL, "input consumed");
@@ -4031,6 +4031,228 @@ static void test_exec_io_in_fast_run(void)
     TEST_ASSERT_EQ(roomy[128], 0xa5, "caller bytes untouched");
 }
 
+/* One stage: op j reads the tensors reads[j] lists (count first) and writes t[j + 1].
+ * t0 is the model input, the last tensor the model output. */
+#define PLACE_MAX_TENSORS 6u
+typedef struct {
+    tigris_file_header_t header;
+    tigris_tensor_t tensors[PLACE_MAX_TENSORS];
+    tigris_op_t ops[PLACE_MAX_TENSORS - 1u];
+    tigris_stage_t stage;
+    uint16_t indices[32];
+    tigris_plan_t plan;
+} place_plan_t;
+
+typedef struct {
+    void *written[PLACE_MAX_TENSORS];
+    int moved;
+} place_ctx_t;
+
+static void build_place_plan(place_plan_t *fx, const uint32_t *sizes, uint16_t num_ops,
+                             const uint8_t (*reads)[3], uint32_t peak)
+{
+    uint16_t n = 0u;
+    uint16_t num_t = (uint16_t)(num_ops + 1u);
+    memset(fx, 0, sizeof(*fx));
+    fx->header.version = TIGRIS_SCHEMA_VERSION;
+    fx->header.num_tensors = num_t;
+    fx->header.num_ops = num_ops;
+    fx->header.num_stages = 1;
+    fx->header.num_model_inputs = 1;
+    fx->header.num_model_outputs = 1;
+    fx->plan.scheduled_peak = peak;
+    for (uint16_t i = 0; i < num_t; i++) {
+        fx->tensors[i].dtype = 3;
+        fx->tensors[i].ndim = 1;
+        fx->tensors[i].size_bytes = sizes[i];
+        fx->tensors[i].quant_param_idx = TIGRIS_NO_QUANT_PARAM;
+    }
+    fx->tensors[0].flags = TIGRIS_TENSOR_MODEL_INPUT;
+    fx->tensors[num_ops].flags = TIGRIS_TENSOR_MODEL_OUTPUT;
+    for (uint16_t j = 0; j < num_ops; j++) {
+        fx->ops[j].num_inputs = reads[j][0];
+        fx->ops[j].inputs_off = n;
+        for (uint8_t k = 0; k < reads[j][0]; k++)
+            fx->indices[n++] = reads[j][1u + k];
+        fx->ops[j].num_outputs = 1;
+        fx->ops[j].outputs_off = n;
+        fx->indices[n++] = (uint16_t)(j + 1u);
+        fx->ops[j].weight_idx = TIGRIS_NO_WEIGHT;
+        fx->ops[j].bias_idx = TIGRIS_NO_WEIGHT;
+    }
+    fx->stage.ops_off = n;
+    fx->stage.ops_count = num_ops;
+    for (uint16_t j = 0; j < num_ops; j++)
+        fx->indices[n++] = j;
+    fx->stage.inputs_off = n;
+    fx->stage.inputs_count = 1;
+    fx->indices[n++] = 0;
+    fx->stage.outputs_off = n;
+    fx->stage.outputs_count = 1;
+    fx->indices[n++] = num_ops;
+    fx->stage.peak_bytes = peak;
+    fx->stage.tile_plan_idx = TIGRIS_NO_TILE_PLAN;
+    fx->stage.chain_id = TIGRIS_NO_CHAIN;
+    fx->plan.header = &fx->header;
+    fx->plan.tensors = fx->tensors;
+    fx->plan.ops = fx->ops;
+    fx->plan.stages = &fx->stage;
+    fx->plan.index_pool = fx->indices;
+    fx->plan.model_inputs = &fx->indices[fx->stage.inputs_off];
+    fx->plan.model_outputs = &fx->indices[fx->stage.outputs_off];
+}
+
+static uint8_t place_value(uint16_t op_index, uint32_t i, const uint8_t *const *in,
+                           const uint32_t *in_size, uint8_t count)
+{
+    uint32_t v = 7u * op_index + i;
+    for (uint8_t k = 0; k < count; k++)
+        v += (k + 1u) * in[k][i % in_size[k]];
+    return (uint8_t)v;
+}
+
+/* Counts every input found away from where its producer wrote it. */
+static int place_kernel(const tigris_plan_t *plan, const tigris_op_t *op,
+                        uint16_t op_index, tigris_mem_t *mem, void *user_ctx)
+{
+    place_ctx_t *ctx = (place_ctx_t *)user_ctx;
+    const uint16_t *ins = tigris_op_inputs(plan, op);
+    uint16_t o = tigris_op_outputs(plan, op)[0];
+    const uint8_t *in[2];
+    uint32_t in_size[2];
+    uint8_t *out = (uint8_t *)mem->tensor_ptrs[o];
+    if (!out || op->num_inputs > 2u)
+        return -1;
+    for (uint8_t k = 0; k < op->num_inputs; k++) {
+        in[k] = (const uint8_t *)mem->tensor_ptrs[ins[k]];
+        in_size[k] = plan->tensors[ins[k]].size_bytes;
+        if (!in[k])
+            return -1;
+        if (ctx->written[ins[k]] && ctx->written[ins[k]] != mem->tensor_ptrs[ins[k]])
+            ctx->moved++;
+    }
+    for (uint32_t i = 0; i < plan->tensors[o].size_bytes; i++)
+        out[i] = place_value(op_index, i, in, in_size, op->num_inputs);
+    ctx->written[o] = out;
+    return 0;
+}
+
+static void place_reference(const place_plan_t *fx, const uint8_t (*reads)[3],
+                            const uint8_t *input, uint8_t *output)
+{
+    static uint8_t values[PLACE_MAX_TENSORS][256];
+    uint16_t num_ops = fx->header.num_ops;
+    memcpy(values[0], input, fx->tensors[0].size_bytes);
+    for (uint16_t j = 0; j < num_ops; j++) {
+        const uint8_t *in[2];
+        uint32_t in_size[2];
+        for (uint8_t k = 0; k < reads[j][0]; k++) {
+            in[k] = values[reads[j][1u + k]];
+            in_size[k] = fx->tensors[reads[j][1u + k]].size_bytes;
+        }
+        for (uint32_t i = 0; i < fx->tensors[j + 1u].size_bytes; i++)
+            values[j + 1u][i] = place_value(j, i, in, in_size, reads[j][0]);
+    }
+    memcpy(output, values[num_ops], fx->tensors[num_ops].size_bytes);
+}
+
+/* Each op's input and output are live together and make the 256 B peak, as in
+ * a depthwise-separable chain; the arena has room for more, the stage gets 256 B. */
+static void test_exec_placement_tight_pair(void)
+{
+    printf("  test_exec_placement_tight_pair...\n");
+    static const uint32_t sizes[6] = {32u, 128u, 128u, 128u, 128u, 32u};
+    static const uint8_t reads[5][3] = {{1, 0, 0}, {1, 1, 0}, {1, 2, 0}, {1, 3, 0}, {1, 4, 0}};
+    place_plan_t fx;
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[1024];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[256];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(6, 1, 1, 0, 0, 0)];
+    uint8_t input[32], expected[32], output[32];
+    void *ptrs[6];
+    tigris_mem_t mem;
+    tigris_exec_stats_t stats;
+    place_ctx_t ctx;
+
+    for (uint32_t i = 0; i < sizeof(input); i++)
+        input[i] = (uint8_t)(11u * i + 3u);
+    build_place_plan(&fx, sizes, 5, reads, 256u);
+    place_reference(&fx, reads, input, expected);
+
+    /* Input loaded from slow, output spilled there. */
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 6, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "tight pair: memory");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, sizeof(input)), TIGRIS_MEM_OK,
+                   "tight pair: input in slow");
+    memcpy(ptrs[0], input, sizeof(input));
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, place_kernel, &ctx, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "tight pair: copy path runs");
+    TEST_ASSERT_EQ(ctx.moved, 0, "tight pair: no tensor moves within the stage");
+    TEST_ASSERT_EQ(stats.compactions, 1u, "tight pair: only the slow cleanup compacts");
+    TEST_ASSERT_EQ(stats.slow_overflow_count, 0u, "tight pair: nothing overflows to slow");
+    TEST_ASSERT(mem.fast_peak <= 256u, "tight pair: copy path within the stage peak");
+    TEST_ASSERT(memcmp(ptrs[5], expected, sizeof(expected)) == 0,
+                "tight pair: copy path output matches the reference");
+
+    /* Input read in place at the bottom of the stage window, output left in fast. */
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 6, fast, sizeof(fast), NULL, 0),
+                   TIGRIS_MEM_OK, "tight pair: in-place memory");
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, input, sizeof(input)), TIGRIS_OK,
+                   "tight pair: input written into fast");
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, place_kernel, &ctx, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "tight pair: in-place run");
+    TEST_ASSERT_EQ(ctx.moved, 0, "tight pair: in place, no tensor moves");
+    TEST_ASSERT_EQ(stats.compactions, 0u, "tight pair: in place, no compaction");
+    TEST_ASSERT(mem.fast_peak <= 256u, "tight pair: in place within the stage peak");
+    TEST_ASSERT_EQ(tigris_output_read(&fx.plan, &mem, 5, output, sizeof(output)), TIGRIS_OK,
+                   "tight pair: output read");
+    TEST_ASSERT(memcmp(output, expected, sizeof(expected)) == 0,
+                "tight pair: in-place output matches the reference");
+}
+
+/* With t0 read in place at the bottom of its 160 B window, no fixed offsets
+ * hold these lifetimes at the stated peak, though no step holds more than
+ * 160 B: the stage compacts instead, and its output is unchanged. */
+static void test_exec_placement_falls_back_to_compaction(void)
+{
+    printf("  test_exec_placement_falls_back_to_compaction...\n");
+    static const uint32_t sizes[6] = {64u, 32u, 64u, 32u, 96u, 64u};
+    static const uint8_t reads[5][3] = {{1, 0, 0}, {2, 0, 1}, {1, 2, 0}, {2, 1, 3}, {1, 4, 0}};
+    place_plan_t fx;
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[1024];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(6, 1, 1, 0, 0, 0)];
+    uint8_t input[64], expected[64], output[64];
+    void *ptrs[6];
+    tigris_mem_t mem;
+    tigris_exec_stats_t stats;
+    place_ctx_t ctx;
+
+    for (uint32_t i = 0; i < sizeof(input); i++)
+        input[i] = (uint8_t)(5u * i + 1u);
+    build_place_plan(&fx, sizes, 5, reads, 160u);
+    place_reference(&fx, reads, input, expected);
+
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 6, fast, sizeof(fast), NULL, 0),
+                   TIGRIS_MEM_OK, "fallback: memory without a slow buffer");
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, input, sizeof(input)), TIGRIS_OK,
+                   "fallback: input written into fast");
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, place_kernel, &ctx, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "fallback: the stage runs");
+    TEST_ASSERT_EQ(stats.compactions, 3u, "fallback: ops 2, 3 and 4 compact");
+    TEST_ASSERT(ctx.moved > 0, "fallback: compaction moved live tensors");
+    TEST_ASSERT_EQ(stats.slow_overflow_count, 0u, "fallback: nothing overflows to slow");
+    TEST_ASSERT(mem.fast_peak <= 160u, "fallback: within the stage peak");
+    TEST_ASSERT_EQ(tigris_output_read(&fx.plan, &mem, 5, output, sizeof(output)), TIGRIS_OK,
+                   "fallback: output read");
+    TEST_ASSERT(memcmp(output, expected, sizeof(expected)) == 0,
+                "fallback: output matches the reference");
+}
+
 int main(void)
 {
     printf("TiGrIS Memory + Executor Tests\n\n");
@@ -4080,6 +4302,8 @@ int main(void)
     test_exec_io_in_fast_rule();
     test_exec_input_write_out_of_memory();
     test_exec_io_in_fast_run();
+    test_exec_placement_tight_pair();
+    test_exec_placement_falls_back_to_compaction();
     test_exec_input_alloc();
     test_exec_fast_requirement_checked_up_front();
     test_exec_recordless_stage_runs_as_scheduled();

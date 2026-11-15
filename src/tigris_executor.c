@@ -93,6 +93,8 @@ typedef struct {
     int32_t *sp_tile_out_ge;   /* this tile: spatial-op output global row end */
     int32_t *out_gs;           /* per op-output tensor: global row start held */
     int32_t *out_ge;           /* per op-output tensor: global row end held */
+    int32_t *slot;             /* per tensor: a normal stage's planned fast offset (out_gs) */
+    int32_t *born;             /* per tensor: the normal-stage op it is first held for (out_ge) */
     int32_t *out_covered;      /* per stage output: rows a tiled stage or chain has written */
     void **roll_last_fast;     /* per chain last-stage output: its persistent fast buffer */
     uint16_t *last_use_op;
@@ -296,6 +298,10 @@ static int workspace_layout(
     TIGRIS_LAYOUT_TENSOR_I32_FIELD(out_gs);
     TIGRIS_LAYOUT_TENSOR_I32_FIELD(out_ge);
 #undef TIGRIS_LAYOUT_TENSOR_I32_FIELD
+    /* A normal stage runs outside every tiled stage and chain, so it plans
+     * its placement in their row arrays. */
+    workspace->slot = workspace->out_gs;
+    workspace->born = workspace->out_ge;
     workspace->out_covered = (int32_t *)cursor;
     cursor += (size_t)limits->outputs * sizeof(int32_t);
 
@@ -513,6 +519,309 @@ static void release_stage_tensor(const tigris_plan_t *plan,
     }
 }
 
+/* Normal-stage placement: before the first load, every tensor the stage
+ * loads or allocates gets a fixed offset in the stage's fast window, so the
+ * stage runs at its scheduled peak without moving data. A depth-first search
+ * in allocation order tries each tensor at the lowest, then the highest,
+ * offset where it overlaps no placed tensor alive at the same time; inputs
+ * already resident in the window keep their offsets. */
+
+#define SLOT_NONE (-1)
+#define BORN_NONE (-2)
+#define BORN_INPUT (-1)
+/* Search steps per planned tensor before the stage falls back to compaction. */
+#define PLACE_STEPS_PER_TENSOR 8u
+#define PLACE_FAILED UINT32_MAX
+
+#define PLACE_ALIGN_MASK ((uint32_t)TIGRIS_TENSOR_ALIGN - 1u)
+
+typedef struct {
+    const tigris_plan_t *plan;
+    const tigris_stage_t *stage;
+    const tigris_mem_t *mem;
+    const uint16_t *last_use_op;
+    int32_t *slot;
+    int32_t *born;
+    uint32_t window;
+} placement_t;
+
+/* Group j of the stage: its inputs for j = -1, else the outputs of op j. */
+static const uint16_t *placement_group(const placement_t *ps, int32_t j, uint16_t *count)
+{
+    const uint16_t *list;
+    if (j < 0) {
+        *count = ps->stage->inputs_count;
+        list = tigris_stage_inputs(ps->plan, ps->stage);
+    } else {
+        const tigris_op_t *op =
+            &ps->plan->ops[tigris_stage_ops(ps->plan, ps->stage)[j]];
+        *count = op->num_outputs;
+        list = tigris_op_outputs(ps->plan, op);
+    }
+    return list;
+}
+
+/* Bytes a tensor of size bytes takes; size is at most INT32_MAX. */
+static uint32_t placement_bytes(uint32_t size)
+{
+    return (size + PLACE_ALIGN_MASK) & ~PLACE_ALIGN_MASK;
+}
+
+static int32_t placement_death(const placement_t *ps, uint16_t t)
+{
+    uint16_t last = ps->last_use_op[t];
+    return (last == UINT16_MAX) ? (int32_t)ps->stage->ops_count : (int32_t)last;
+}
+
+/* Whether a stage input already sits in the window, where the stage reads it in place. */
+static int placement_resident(const tigris_mem_t *mem, uint16_t t)
+{
+    uintptr_t p = (uintptr_t)mem->tensor_ptrs[t];
+    uintptr_t low = (uintptr_t)mem->fast_base + mem->fast_reserved;
+    return (p >= low) && (p < (uintptr_t)mem->fast_base + mem->fast_used);
+}
+
+/* The tensor entry k of group j places, or UINT16_MAX when another entry or nothing does. */
+static uint16_t placement_entry(const placement_t *ps, int32_t j, uint16_t k)
+{
+    uint16_t count;
+    const uint16_t *list = placement_group(ps, j, &count);
+    uint16_t t = list[k];
+    uint16_t result = t;
+    if ((t >= ps->plan->header->num_tensors) || (ps->born[t] != j) ||
+        ((j < 0) && (placement_resident(ps->mem, t) != 0))) {
+        result = UINT16_MAX;
+    }
+    for (uint16_t q = 0u; (result != UINT16_MAX) && (q < k); q++) {
+        if (list[q] == t) {
+            result = UINT16_MAX;
+        }
+    }
+    return result;
+}
+
+/* Record who is placed and from when; returns the number of tensors to place,
+ * or PLACE_FAILED when one cannot fit the window at all. */
+static uint32_t placement_setup(const placement_t *ps)
+{
+    const uint16_t num_t = ps->plan->header->num_tensors;
+    const uintptr_t low = (uintptr_t)ps->mem->fast_base + ps->mem->fast_reserved;
+    uint32_t count = 0u;
+    for (int32_t j = -1; j < (int32_t)ps->stage->ops_count; j++) {
+        uint16_t n;
+        const uint16_t *list = placement_group(ps, j, &n);
+        for (uint16_t k = 0u; k < n; k++) {
+            if (list[k] < num_t) {
+                ps->slot[list[k]] = SLOT_NONE;
+                ps->born[list[k]] = BORN_NONE;
+            }
+        }
+    }
+    for (int32_t j = -1; (count != PLACE_FAILED) && (j < (int32_t)ps->stage->ops_count); j++) {
+        uint16_t n;
+        const uint16_t *list = placement_group(ps, j, &n);
+        const tigris_op_t *op = (j < 0) ? NULL
+            : &ps->plan->ops[tigris_stage_ops(ps->plan, ps->stage)[j]];
+        for (uint16_t k = 0u; (count != PLACE_FAILED) && (k < n); k++) {
+            uint16_t t = list[k];
+            uint32_t size;
+            if ((t >= num_t) || (ps->born[t] != BORN_NONE)) {
+                continue;
+            }
+            size = ps->plan->tensors[t].size_bytes;
+            if (j < 0) {
+                ps->born[t] = BORN_INPUT;
+                if (placement_resident(ps->mem, t) != 0) {
+                    uintptr_t at = (uintptr_t)ps->mem->tensor_ptrs[t] - low;
+                    if ((size > ps->window) || (placement_bytes(size) > ps->window) ||
+                        (at > (uintptr_t)(ps->window - placement_bytes(size)))) {
+                        count = PLACE_FAILED;
+                    } else {
+                        ps->slot[t] = (int32_t)at;
+                    }
+                    continue;
+                }
+            } else if ((ps->mem->tensor_ptrs[t] != NULL) || (size == 0u) ||
+                       (is_pure_reinterpretation(ps->plan, op) != 0)) {
+                /* Not allocated by the stage, or it shares its source's buffer. */
+                continue;
+            } else {
+                ps->born[t] = j;
+            }
+            count = ((size > ps->window) || (placement_bytes(size) > ps->window))
+                ? PLACE_FAILED : (count + 1u);
+        }
+    }
+    return count;
+}
+
+/* The lowest (down = 0) or highest offset at which t overlaps no placed
+ * tensor alive at the same time, or PLACE_FAILED. */
+static uint32_t placement_fit(const placement_t *ps, uint16_t t, int down)
+{
+    const uint16_t num_t = ps->plan->header->num_tensors;
+    const uint32_t size = placement_bytes(ps->plan->tensors[t].size_bytes);
+    const int32_t first = ps->born[t];
+    const int32_t last = placement_death(ps, t);
+    uint32_t bound = (down != 0) ? (ps->window & ~PLACE_ALIGN_MASK) : 0u;
+    uint32_t result = PLACE_FAILED;
+    int searching = 1;
+    while (searching != 0) {
+        uint32_t at;
+        uint32_t next = bound;
+        int clash = 0;
+        if ((down != 0) ? (bound < size) : (size > (ps->window - bound))) {
+            searching = 0;
+            continue;
+        }
+        at = (down != 0) ? (bound - size) : bound;
+        /* Group j holds what is first held at op j, so later groups start after t ends. */
+        for (int32_t j = -1; (j <= last) && (j < (int32_t)ps->stage->ops_count); j++) {
+            uint16_t n;
+            const uint16_t *list = placement_group(ps, j, &n);
+            for (uint16_t k = 0u; k < n; k++) {
+                uint16_t p = list[k];
+                uint32_t start;
+                uint32_t end;
+                if ((p >= num_t) || (p == t) || (ps->slot[p] < 0) ||
+                    (ps->born[p] > last) || (first > placement_death(ps, p))) {
+                    continue;
+                }
+                start = (uint32_t)ps->slot[p];
+                end = start + placement_bytes(ps->plan->tensors[p].size_bytes);
+                if ((start < (at + size)) && (end > at)) {
+                    if (clash == 0) {
+                        next = (down != 0) ? start : end;
+                    } else if (down != 0) {
+                        next = (start < next) ? start : next;
+                    } else {
+                        next = (end > next) ? end : next;
+                    }
+                    clash = 1;
+                }
+            }
+        }
+        if (clash == 0) {
+            result = at;
+            searching = 0;
+        }
+        bound = next;
+    }
+    return result;
+}
+
+static uint16_t placement_group_size(const placement_t *ps, int32_t j)
+{
+    uint16_t count;
+    (void)placement_group(ps, j, &count);
+    return count;
+}
+
+/* Step from entry (j, k) to the next (forward != 0) or previous entry that
+ * places a tensor; j leaves [-1, ops_count) when there is none. */
+static void placement_step(const placement_t *ps, int32_t *j, uint16_t *k, int forward)
+{
+    const int32_t ops = (int32_t)ps->stage->ops_count;
+    int moving = 1;
+    while (moving != 0) {
+        if (forward != 0) {
+            if (((uint32_t)*k + 1u) < placement_group_size(ps, *j)) {
+                *k = (uint16_t)(*k + 1u);
+            } else {
+                *j = *j + 1;
+                *k = 0u;
+                while ((*j < ops) && (placement_group_size(ps, *j) == 0u)) {
+                    *j = *j + 1;
+                }
+            }
+        } else if (*k > 0u) {
+            *k = (uint16_t)(*k - 1u);
+        } else {
+            *j = *j - 1;
+            while ((*j >= -1) && (placement_group_size(ps, *j) == 0u)) {
+                *j = *j - 1;
+            }
+            *k = (*j >= -1) ? (uint16_t)(placement_group_size(ps, *j) - 1u) : 0u;
+        }
+        if ((*j < -1) || (*j >= ops) || (placement_entry(ps, *j, *k) != UINT16_MAX)) {
+            moving = 0;
+        }
+    }
+}
+
+/* Plan the stage's offsets in workspace->slot; returns 1 when every tensor has one. */
+static TIGRIS_NOINLINE int place_stage(const tigris_plan_t *plan, const tigris_stage_t *stage,
+                                       const tigris_mem_t *mem,
+                                       const executor_workspace_impl_t *workspace)
+{
+    placement_t ps;
+    uint32_t count = PLACE_FAILED;
+    uint32_t steps = 0u;
+    uint32_t budget = 0u;
+    int32_t j = -1;
+    uint16_t k = 0u;
+
+    ps.plan = plan;
+    ps.stage = stage;
+    ps.mem = mem;
+    ps.last_use_op = workspace->last_use_op;
+    ps.slot = workspace->slot;
+    ps.born = workspace->born;
+    ps.window = mem->fast_size - mem->fast_reserved;
+    if ((mem->fast_used <= mem->fast_size) && (ps.window <= (uint32_t)INT32_MAX)) {
+        count = placement_setup(&ps);
+    }
+    if (count == PLACE_FAILED) {
+        j = -2;
+    } else {
+        budget = (count > (UINT32_MAX / PLACE_STEPS_PER_TENSOR))
+            ? UINT32_MAX : (count * PLACE_STEPS_PER_TENSOR);
+        if ((stage->inputs_count == 0u) || (placement_entry(&ps, j, k) == UINT16_MAX)) {
+            placement_step(&ps, &j, &k, 1);
+        }
+    }
+    while ((j >= -1) && (j < (int32_t)stage->ops_count) && (steps < budget)) {
+        uint16_t t = placement_entry(&ps, j, k);
+        int32_t held = ps.slot[t];
+        uint32_t up;
+        uint32_t next = PLACE_FAILED;
+        steps++;
+        ps.slot[t] = SLOT_NONE;
+        up = placement_fit(&ps, t, 0);
+        if (held < 0) {
+            next = (up != PLACE_FAILED) ? up : placement_fit(&ps, t, 1);
+        } else if ((uint32_t)held == up) {
+            next = placement_fit(&ps, t, 1);
+            next = (next == up) ? PLACE_FAILED : next;
+        } else {
+            /* The lowest and the highest offset were both tried. */
+        }
+        if (next != PLACE_FAILED) {
+            ps.slot[t] = (int32_t)next;
+            placement_step(&ps, &j, &k, 1);
+        } else {
+            placement_step(&ps, &j, &k, 0);
+        }
+    }
+    return (j >= (int32_t)stage->ops_count) ? 1 : 0;
+}
+
+/* Allocate (load = 0) or load a tensor at a planned window offset; fast_used
+ * stays the top of every allocation, where a fallback allocation starts. */
+static tigris_mem_error_t place_fast(tigris_mem_t *mem, uint16_t tidx, uint32_t size_bytes,
+                                     int32_t at, int load)
+{
+    const uint32_t top = mem->fast_used;
+    tigris_mem_error_t err;
+    mem->fast_used = mem->fast_reserved + (uint32_t)at;
+    err = (load != 0) ? tigris_mem_load(mem, tidx, size_bytes)
+                      : tigris_mem_alloc_fast(mem, tidx, size_bytes);
+    if (mem->fast_used < top) {
+        mem->fast_used = top;
+    }
+    return err;
+}
+
 static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
     const tigris_plan_t *plan,
     const tigris_stage_t *stage,
@@ -600,6 +909,12 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
             last_use_op[produced] = last_use_op[source];
     }
 
+    /* Place every tensor at an offset that holds it for its whole lifetime.
+     * Without such a placement, allocations bump and compact. */
+    int placed = place_stage(plan, stage, mem, workspace);
+    const int32_t *slot = workspace->slot;
+    const int32_t *born = workspace->born;
+
     /* Load stage inputs; one already in this stage's fast region is read in place. */
     for (uint16_t i = 0; i < stage->inputs_count; i++) {
         uint16_t tidx = sin[i];
@@ -611,8 +926,13 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
         }
         saved_slow[i] = mem->tensor_ptrs[tidx];
 
-        tigris_mem_error_t merr = tigris_mem_load(
-            mem, tidx, plan->tensors[tidx].size_bytes);
+        tigris_mem_error_t merr;
+        if ((placed != 0) && (born[tidx] == BORN_INPUT) && (slot[tidx] >= 0)) {
+            merr = place_fast(mem, tidx, plan->tensors[tidx].size_bytes, slot[tidx], 1);
+        } else {
+            placed = 0;
+            merr = tigris_mem_load(mem, tidx, plan->tensors[tidx].size_bytes);
+        }
         if (merr != TIGRIS_MEM_OK)
             return TIGRIS_EXEC_ERR_MEM;
     }
@@ -638,12 +958,23 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
             }
         }
 
-        /* Allocate outputs (with compaction retry on OOM, slow fallback) */
+        /* Allocate outputs at their offsets, or else bump with compaction
+         * retry on OOM and slow fallback. A bumped allocation that takes
+         * bytes ends the placement: it may sit where a later offset lies. */
         for (uint8_t k = 0; k < op->num_outputs; k++) {
             uint16_t tidx = outs[k];
             if (!mem->tensor_ptrs[tidx]) {
-                tigris_mem_error_t merr = tigris_mem_alloc_fast(
-                    mem, tidx, plan->tensors[tidx].size_bytes);
+                uint32_t bytes = plan->tensors[tidx].size_bytes;
+                tigris_mem_error_t merr = TIGRIS_MEM_ERR_OOM;
+                if ((placed != 0) && (born[tidx] == (int32_t)j) && (slot[tidx] >= 0)) {
+                    merr = place_fast(mem, tidx, bytes, slot[tidx], 0);
+                }
+                if (merr != TIGRIS_MEM_OK) {
+                    if (bytes != 0u) {
+                        placed = 0;
+                    }
+                    merr = tigris_mem_alloc_fast(mem, tidx, bytes);
+                }
                 if (merr != TIGRIS_MEM_OK) {
                     /* Try compacting fast memory and retry */
                     compact_fast(mem, plan);

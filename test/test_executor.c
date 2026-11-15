@@ -2819,6 +2819,8 @@ static void build_compaction_plan(compaction_plan_t *p)
     p->plan.model_outputs = &indices[7];
 }
 
+/* The fast arena holds the stage at fixed offsets; the compaction counted is
+ * the slow arena's cleanup after the stage, which moves the output down. */
 static void test_exec_compaction_preserves_data(void)
 {
     printf("  test_exec_compaction_preserves_data...\n");
@@ -2857,8 +2859,8 @@ static void test_exec_compaction_preserves_data(void)
                        workspace, sizeof(workspace)),
                    TIGRIS_EXEC_OK, "compaction execution");
     TEST_ASSERT_EQ(stats.compactions, 1, "slow cleanup compacts; placed outputs need no fast retry");
-    TEST_ASSERT(ctx.preserved, "live tensor data survives compaction");
-    TEST_ASSERT(mem.tensor_ptrs[2] != NULL, "compacted output remains live");
+    TEST_ASSERT(ctx.preserved, "op 1 reads t1 as op 0 wrote it");
+    TEST_ASSERT(mem.tensor_ptrs[2] != NULL, "output remains live after the slow cleanup");
     TEST_ASSERT(((uint8_t *)mem.tensor_ptrs[2])[47] == 0x6b,
                 "output survives slow-arena compaction");
     TEST_ASSERT_EQ(mem.fast_peak, 96u, "first run fast peak");
@@ -2883,8 +2885,8 @@ static void test_exec_compaction_preserves_data(void)
         TEST_ASSERT_EQ(slow[i], 0xa5, "slow arena canary");
 }
 
-/* tigris_mem_init starts an unaligned slow buffer at its first aligned address; compaction
- * keeps that start. */
+/* tigris_mem_init starts an unaligned slow buffer at its first aligned address; the slow
+ * cleanup's compaction keeps that start. */
 static void test_exec_compact_slow_align(void)
 {
     printf("  test_exec_compact_slow_align...\n");
@@ -2911,7 +2913,7 @@ static void test_exec_compact_slow_align(void)
                        workspace, sizeof(workspace)),
                    TIGRIS_EXEC_OK, "run with an unaligned slow buffer");
     TEST_ASSERT_EQ(stats.compactions, 1, "slow cleanup compacts; placed outputs need no fast retry");
-    TEST_ASSERT(ctx.preserved, "live tensor data survives compaction");
+    TEST_ASSERT(ctx.preserved, "op 1 reads t1 as op 0 wrote it");
     for (size_t i = 0; i < 3; i++) {
         uint8_t *q = (uint8_t *)ptrs[i];
         if (q >= slow && q < slow + slow_size)
@@ -4253,6 +4255,92 @@ static void test_exec_placement_falls_back_to_compaction(void)
                 "fallback: output matches the reference");
 }
 
+/* Stage input t0 is listed twice and op 1 lists t2 twice among its outputs:
+ * each tensor gets one offset, and the stage runs at its peak unmoved. */
+static void test_exec_placement_duplicate_entries(void)
+{
+    printf("  test_exec_placement_duplicate_entries...\n");
+    static const uint32_t sizes[4] = {32u, 128u, 128u, 32u};
+    static const uint8_t reads[3][3] = {{1, 0, 0}, {1, 1, 0}, {1, 2, 0}};
+    place_plan_t fx;
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[1024];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[256];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(4, 2, 1, 0, 0, 0)];
+    uint8_t input[32], expected[32];
+    void *ptrs[4];
+    tigris_mem_t mem;
+    tigris_exec_stats_t stats;
+    place_ctx_t ctx;
+    uint16_t n;
+
+    for (uint32_t i = 0; i < sizeof(input); i++)
+        input[i] = (uint8_t)(13u * i + 7u);
+    build_place_plan(&fx, sizes, 3, reads, 256u);
+    place_reference(&fx, reads, input, expected);
+    n = (uint16_t)(fx.stage.outputs_off + 1u);
+    fx.stage.inputs_off = n;
+    fx.stage.inputs_count = 2;
+    fx.indices[n++] = 0;
+    fx.indices[n++] = 0;
+    fx.ops[1].outputs_off = n;
+    fx.ops[1].num_outputs = 2;
+    fx.indices[n++] = 2;
+    fx.indices[n++] = 2;
+
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 4, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "duplicates: memory");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, sizeof(input)), TIGRIS_MEM_OK,
+                   "duplicates: input in slow");
+    memcpy(ptrs[0], input, sizeof(input));
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, place_kernel, &ctx, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "duplicates: the stage runs");
+    TEST_ASSERT_EQ(ctx.moved, 0, "duplicates: no tensor moves within the stage");
+    TEST_ASSERT(mem.fast_peak <= 256u, "duplicates: within the stage peak");
+    TEST_ASSERT(ptrs[3] != NULL && memcmp(ptrs[3], expected, sizeof(expected)) == 0,
+                "duplicates: output matches the reference");
+}
+
+/* t0 is read in place, but the stage states a 48 B peak and t0 alone takes
+ * 64 B, so it runs past the stage's window: no offsets are planned, the
+ * outputs fall back to compaction and the slow arena, and the result holds. */
+static void test_exec_placement_resident_input_past_window(void)
+{
+    printf("  test_exec_placement_resident_input_past_window...\n");
+    static const uint32_t sizes[3] = {64u, 32u, 32u};
+    static const uint8_t reads[2][3] = {{1, 0, 0}, {1, 1, 0}};
+    place_plan_t fx;
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[1024];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[256];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(3, 1, 1, 0, 0, 0)];
+    uint8_t input[64], expected[32], output[32];
+    void *ptrs[3];
+    tigris_mem_t mem;
+    tigris_exec_stats_t stats;
+    place_ctx_t ctx;
+
+    for (uint32_t i = 0; i < sizeof(input); i++)
+        input[i] = (uint8_t)(3u * i + 9u);
+    build_place_plan(&fx, sizes, 2, reads, 48u);
+    place_reference(&fx, reads, input, expected);
+
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 3, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "past window: memory");
+    TEST_ASSERT_EQ(tigris_input_write(&fx.plan, &mem, 0, input, sizeof(input)), TIGRIS_OK,
+                   "past window: input written into fast");
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, place_kernel, &ctx, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_OK, "past window: the stage runs");
+    TEST_ASSERT(stats.compactions > 0u, "past window: the stage compacts");
+    TEST_ASSERT(stats.slow_overflow_count > 0u, "past window: outputs overflow to slow");
+    TEST_ASSERT_EQ(tigris_output_read(&fx.plan, &mem, 2, output, sizeof(output)), TIGRIS_OK,
+                   "past window: output read");
+    TEST_ASSERT(memcmp(output, expected, sizeof(expected)) == 0,
+                "past window: output matches the reference");
+}
+
 int main(void)
 {
     printf("TiGrIS Memory + Executor Tests\n\n");
@@ -4304,6 +4392,8 @@ int main(void)
     test_exec_io_in_fast_run();
     test_exec_placement_tight_pair();
     test_exec_placement_falls_back_to_compaction();
+    test_exec_placement_duplicate_entries();
+    test_exec_placement_resident_input_past_window();
     test_exec_input_alloc();
     test_exec_fast_requirement_checked_up_front();
     test_exec_recordless_stage_runs_as_scheduled();

@@ -397,7 +397,11 @@ static uint32_t compact_pool(
         uint8_t *src = (uint8_t *)next;
         uint8_t *dst = base + wp;
         if (dst != src) {
-            memmove(dst, src, sz);
+            /* Tensors only move down, so dst lies below src. */
+            if ((uintptr_t)src - (uintptr_t)dst >= sz)
+                memcpy(dst, src, sz);
+            else
+                memmove(dst, src, sz);
             TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_MOVE,
                 base == mem->fast_base ? TIGRIS_TRACE_POOL_FAST : TIGRIS_TRACE_POOL_SLOW,
                 tidx, TIGRIS_TRACE_NONE_U16, wp, TIGRIS_TRACE_OFFSET(src, base),

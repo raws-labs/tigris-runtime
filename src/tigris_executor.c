@@ -400,10 +400,11 @@ static uint32_t compact_pool(
         uint8_t *dst = base + wp;
         if (dst != src) {
             /* Tensors only move down, so dst lies below src. */
-            if ((uintptr_t)src - (uintptr_t)dst >= sz)
+            if ((uintptr_t)src - (uintptr_t)dst >= sz) {
                 memcpy(dst, src, sz);
-            else
+            } else {
                 memmove(dst, src, sz);
+            }
             TIGRIS_TRACE_EMIT(mem, TIGRIS_TRACE_MOVE,
                 base == mem->fast_base ? TIGRIS_TRACE_POOL_FAST : TIGRIS_TRACE_POOL_SLOW,
                 tidx, TIGRIS_TRACE_NONE_U16, wp, TIGRIS_TRACE_OFFSET(src, base),
@@ -587,11 +588,15 @@ static uint32_t placement_bytes(uint32_t size)
     return (size + PLACE_ALIGN_MASK) & ~PLACE_ALIGN_MASK;
 }
 
-/* 1 + the last op that holds t, the same scale as born[]. */
+/* 1 + the last op that holds t, the same scale as born[], and never before
+ * born[t]: an op may read t before a later op writes it, but the lists need
+ * every listed tensor to live at least until now. */
 static uint32_t placement_death(const placement_t *ps, uint16_t t)
 {
     uint16_t last = ps->last_use_op[t];
-    return (last == UINT16_MAX) ? (uint32_t)ps->stage->ops_count + 1u : (uint32_t)last + 1u;
+    uint32_t death = (last == UINT16_MAX) ? ((uint32_t)ps->stage->ops_count + 1u)
+                                          : ((uint32_t)last + 1u);
+    return (death < (uint32_t)ps->born[t]) ? (uint32_t)ps->born[t] : death;
 }
 
 /* Whether a stage input already sits in the window, where the stage reads it in place. */

@@ -4341,6 +4341,35 @@ static void test_exec_placement_resident_input_past_window(void)
                 "past window: output matches the reference");
 }
 
+/* Op 0 reads t2, which op 1 writes, so t2's last read comes before its
+ * write, and the 224 B peak sends the search back over t2's offset. The
+ * search ends, and op 0 finds no t2 to read. */
+static void test_exec_placement_read_before_write(void)
+{
+    printf("  test_exec_placement_read_before_write...\n");
+    static const uint32_t sizes[6] = {32u, 32u, 32u, 128u, 32u, 128u};
+    static const uint8_t reads[5][3] = {{2, 0, 2}, {2, 1, 1}, {1, 1, 0}, {1, 3, 0}, {1, 3, 0}};
+    place_plan_t fx;
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t fast[1024];
+    _Alignas(TIGRIS_TENSOR_ALIGN) uint8_t slow[1024];
+    uint8_t workspace[TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS(6, 1, 1, 0, 0, 0)];
+    void *ptrs[6];
+    tigris_mem_t mem;
+    tigris_exec_stats_t stats;
+    place_ctx_t ctx;
+
+    build_place_plan(&fx, sizes, 5, reads, 224u);
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQ(tigris_mem_init(&mem, ptrs, 6, fast, sizeof(fast), slow, sizeof(slow)),
+                   TIGRIS_MEM_OK, "read before write: memory");
+    TEST_ASSERT_EQ(tigris_mem_alloc_slow(&mem, 0, sizes[0]), TIGRIS_MEM_OK,
+                   "read before write: input in slow");
+    memset(ptrs[0], 0x5a, sizes[0]);
+    TEST_ASSERT_EQ(tigris_run_with_workspace_buffer(&fx.plan, &mem, place_kernel, &ctx, &stats,
+                                                    workspace, sizeof(workspace)),
+                   TIGRIS_EXEC_ERR_KERNEL, "read before write: op 0 reports the missing input");
+}
+
 int main(void)
 {
     printf("TiGrIS Memory + Executor Tests\n\n");
@@ -4394,6 +4423,7 @@ int main(void)
     test_exec_placement_falls_back_to_compaction();
     test_exec_placement_duplicate_entries();
     test_exec_placement_resident_input_past_window();
+    test_exec_placement_read_before_write();
     test_exec_input_alloc();
     test_exec_fast_requirement_checked_up_front();
     test_exec_recordless_stage_runs_as_scheduled();

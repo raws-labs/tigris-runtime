@@ -627,6 +627,8 @@ static TIGRIS_KERNEL_NOINLINE int kern_depthwise_conv2d_s8(
     int KH = w.kernel_h, KW = w.kernel_w, SH = w.stride_h, SW = w.stride_w;
     int PT = w.pad_top, PL = w.pad_left, DH = w.dilation_h, DW = w.dilation_w;
     int32_t out_row_start = w.out_row_start, in_row_start = w.in_row_start;
+    /* Element distance between adjacent taps along the input and weight. */
+    int x_step_h = DH * IW * C, x_step_w = DW * C, w_step_h = KW * OC;
 
     /* Output channel oc reads input channel oc / M, M the channel multiplier.
      * Weight layout: [KH, KW, OC] (HWC) */
@@ -636,24 +638,33 @@ static TIGRIS_KERNEL_NOINLINE int kern_depthwise_conv2d_s8(
             int base_h = oh_g * SH - PT - in_row_start;
             int kh0, kh1;
             tap_range(base_h, IH, KH, DH, &kh0, &kh1);
+            int taps_h = kh1 - kh0;
             for (int ow = 0; ow < OW; ow++) {
                 int base_w = ow * SW - PL;
                 int kw0, kw1;
                 tap_range(base_w, IW, KW, DW, &kw0, &kw1);
+                int taps_w = kw1 - kw0;
+                /* Element indices of the first tap and of the output pixel. */
+                int x_first = ((n * IH + base_h + kh0 * DH) * IW + base_w + kw0 * DW) * C;
+                int w_first = (kh0 * KW + kw0) * OC;
+                int y_pixel = ((n * OH + oh_g) * OW + ow) * OC;
                 for (int oc = 0; oc < OC; oc++) {
-                    int c = oc / M;
                     int32_t acc = B ? load_bias_s32(B, (uint32_t)oc) : 0;
-                    for (int kh = kh0; kh < kh1; kh++) {
-                        int ih = base_h + kh * DH;
-                        for (int kw = kw0; kw < kw1; kw++) {
-                            int iw = base_w + kw * DW;
-                            int32_t x_val = (int32_t)X[((n*IH+ih)*IW+iw)*C+c] - input_zp;
-                            int32_t w_val = (int32_t)W[(kh*KW+kw)*OC+oc];
-                            acc += x_val * w_val;
+                    int x_row = x_first + oc / M;
+                    int w_row = w_first + oc;
+                    for (int th = 0; th < taps_h; th++) {
+                        int xi = x_row;
+                        int wi = w_row;
+                        for (int tw = 0; tw < taps_w; tw++) {
+                            acc += ((int32_t)X[xi] - input_zp) * (int32_t)W[wi];
+                            xi += x_step_w;
+                            wi += OC;
                         }
+                        x_row += x_step_h;
+                        w_row += w_step_h;
                     }
                     int32_t scaled = requant_apply(&rq, acc, oc);
-                    Y[((n*OH+oh_g)*OW+ow)*OC+oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
+                    Y[y_pixel + oc] = clamp_act(scaled + output_zp, op->act_min, op->act_max);
                 }
             }
         }

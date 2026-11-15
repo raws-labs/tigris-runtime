@@ -94,7 +94,8 @@ typedef struct {
     int32_t *out_gs;           /* per op-output tensor: global row start held */
     int32_t *out_ge;           /* per op-output tensor: global row end held */
     int32_t *slot;             /* per tensor: a normal stage's planned fast offset (out_gs) */
-    int32_t *born;             /* per tensor: the normal-stage op it is first held for (out_ge) */
+    uint16_t *born;            /* per tensor: 1 + the normal-stage op it is first held for (out_ge) */
+    uint16_t *next;            /* per tensor: the next planned tensor by offset (out_ge) */
     int32_t *out_covered;      /* per stage output: rows a tiled stage or chain has written */
     void **roll_last_fast;     /* per chain last-stage output: its persistent fast buffer */
     uint16_t *last_use_op;
@@ -296,12 +297,13 @@ static int workspace_layout(
         cursor += (size_t)limits->tensors * sizeof(int32_t);                   \
     } while (0)
     TIGRIS_LAYOUT_TENSOR_I32_FIELD(out_gs);
+    /* A normal stage runs outside every tiled stage and chain, so it plans
+     * its placement in their row arrays: two uint16 arrays fill out_ge. */
+    workspace->slot = workspace->out_gs;
+    workspace->born = (uint16_t *)cursor;
+    workspace->next = &workspace->born[limits->tensors];
     TIGRIS_LAYOUT_TENSOR_I32_FIELD(out_ge);
 #undef TIGRIS_LAYOUT_TENSOR_I32_FIELD
-    /* A normal stage runs outside every tiled stage and chain, so it plans
-     * its placement in their row arrays. */
-    workspace->slot = workspace->out_gs;
-    workspace->born = workspace->out_ge;
     workspace->out_covered = (int32_t *)cursor;
     cursor += (size_t)limits->outputs * sizeof(int32_t);
 
@@ -528,11 +530,16 @@ static void release_stage_tensor(const tigris_plan_t *plan,
  * stage runs at its scheduled peak without moving data. A depth-first search
  * in allocation order tries each tensor at the lowest, then the highest,
  * offset where it overlaps no placed tensor alive at the same time; inputs
- * already resident in the window keep their offsets. */
+ * already resident in the window keep their offsets. The placed tensors still
+ * alive when the current one is born form a list sorted by offset, so one
+ * pass over it finds both offsets; the others wait on a stack until the
+ * search steps back to their lifetime. */
 
+#define SLOT_UNSEEN (-2)
 #define SLOT_NONE (-1)
-#define BORN_NONE (-2)
-#define BORN_INPUT (-1)
+/* born[t] is 1 + the op that first holds t, 0 for a stage input. */
+#define BORN_INPUT 0u
+#define PLACE_END UINT16_MAX
 /* Search steps per planned tensor before the stage falls back to compaction. */
 #define PLACE_STEPS_PER_TENSOR 8u
 #define PLACE_FAILED UINT32_MAX
@@ -545,7 +552,11 @@ typedef struct {
     const tigris_mem_t *mem;
     const uint16_t *last_use_op;
     int32_t *slot;
-    int32_t *born;
+    uint16_t *born;
+    uint16_t *next;
+    uint16_t head;
+    uint16_t retired;
+    uint32_t now;
     uint32_t window;
 } placement_t;
 
@@ -565,16 +576,22 @@ static const uint16_t *placement_group(const placement_t *ps, int32_t j, uint16_
     return list;
 }
 
+static uint16_t placement_born(int32_t j)
+{
+    return (uint16_t)(j + 1);
+}
+
 /* Bytes a tensor of size bytes takes; size is at most INT32_MAX. */
 static uint32_t placement_bytes(uint32_t size)
 {
     return (size + PLACE_ALIGN_MASK) & ~PLACE_ALIGN_MASK;
 }
 
-static int32_t placement_death(const placement_t *ps, uint16_t t)
+/* 1 + the last op that holds t, the same scale as born[]. */
+static uint32_t placement_death(const placement_t *ps, uint16_t t)
 {
     uint16_t last = ps->last_use_op[t];
-    return (last == UINT16_MAX) ? (int32_t)ps->stage->ops_count : (int32_t)last;
+    return (last == UINT16_MAX) ? (uint32_t)ps->stage->ops_count + 1u : (uint32_t)last + 1u;
 }
 
 /* Whether a stage input already sits in the window, where the stage reads it in place. */
@@ -592,7 +609,8 @@ static uint16_t placement_entry(const placement_t *ps, int32_t j, uint16_t k)
     const uint16_t *list = placement_group(ps, j, &count);
     uint16_t t = list[k];
     uint16_t result = t;
-    if ((t >= ps->plan->header->num_tensors) || (ps->born[t] != j) ||
+    if ((t >= ps->plan->header->num_tensors) || (ps->slot[t] == SLOT_UNSEEN) ||
+        (ps->born[t] != placement_born(j)) ||
         ((j < 0) && (placement_resident(ps->mem, t) != 0))) {
         result = UINT16_MAX;
     }
@@ -604,9 +622,31 @@ static uint16_t placement_entry(const placement_t *ps, int32_t j, uint16_t k)
     return result;
 }
 
+/* Link t, whose slot is set, into the offset-sorted list. */
+static void placement_insert(placement_t *ps, uint16_t t)
+{
+    uint16_t *link = &ps->head;
+    while ((*link != PLACE_END) && (ps->slot[*link] <= ps->slot[t])) {
+        link = &ps->next[*link];
+    }
+    ps->next[t] = *link;
+    *link = t;
+}
+
+static void placement_remove(placement_t *ps, uint16_t t)
+{
+    uint16_t *link = &ps->head;
+    while ((*link != PLACE_END) && (*link != t)) {
+        link = &ps->next[*link];
+    }
+    if (*link == t) {
+        *link = ps->next[t];
+    }
+}
+
 /* Record who is placed and from when; returns the number of tensors to place,
  * or PLACE_FAILED when one cannot fit the window at all. */
-static uint32_t placement_setup(const placement_t *ps)
+static uint32_t placement_setup(placement_t *ps)
 {
     const uint16_t num_t = ps->plan->header->num_tensors;
     const uintptr_t low = (uintptr_t)ps->mem->fast_base + ps->mem->fast_reserved;
@@ -616,8 +656,7 @@ static uint32_t placement_setup(const placement_t *ps)
         const uint16_t *list = placement_group(ps, j, &n);
         for (uint16_t k = 0u; k < n; k++) {
             if (list[k] < num_t) {
-                ps->slot[list[k]] = SLOT_NONE;
-                ps->born[list[k]] = BORN_NONE;
+                ps->slot[list[k]] = SLOT_UNSEEN;
             }
         }
     }
@@ -629,12 +668,13 @@ static uint32_t placement_setup(const placement_t *ps)
         for (uint16_t k = 0u; (count != PLACE_FAILED) && (k < n); k++) {
             uint16_t t = list[k];
             uint32_t size;
-            if ((t >= num_t) || (ps->born[t] != BORN_NONE)) {
+            if ((t >= num_t) || (ps->slot[t] != SLOT_UNSEEN)) {
                 continue;
             }
             size = ps->plan->tensors[t].size_bytes;
             if (j < 0) {
                 ps->born[t] = BORN_INPUT;
+                ps->slot[t] = SLOT_NONE;
                 if (placement_resident(ps->mem, t) != 0) {
                     uintptr_t at = (uintptr_t)ps->mem->tensor_ptrs[t] - low;
                     if ((size > ps->window) || (placement_bytes(size) > ps->window) ||
@@ -642,6 +682,7 @@ static uint32_t placement_setup(const placement_t *ps)
                         count = PLACE_FAILED;
                     } else {
                         ps->slot[t] = (int32_t)at;
+                        placement_insert(ps, t);
                     }
                     continue;
                 }
@@ -650,7 +691,8 @@ static uint32_t placement_setup(const placement_t *ps)
                 /* Not allocated by the stage, or it shares its source's buffer. */
                 continue;
             } else {
-                ps->born[t] = j;
+                ps->born[t] = placement_born(j);
+                ps->slot[t] = SLOT_NONE;
             }
             count = ((size > ps->window) || (placement_bytes(size) > ps->window))
                 ? PLACE_FAILED : (count + 1u);
@@ -659,59 +701,73 @@ static uint32_t placement_setup(const placement_t *ps)
     return count;
 }
 
-/* The lowest (down = 0) or highest offset at which t overlaps no placed
- * tensor alive at the same time, or PLACE_FAILED. */
-static uint32_t placement_fit(const placement_t *ps, uint16_t t, int down)
+/* Bring the lists to a tensor born at b: forward, the listed tensors dead
+ * before b go on the stack; back, which returns to the entry the search came
+ * from, the stack gives back those it took on the way. */
+static void placement_advance(placement_t *ps, uint32_t b)
 {
-    const uint16_t num_t = ps->plan->header->num_tensors;
-    const uint32_t size = placement_bytes(ps->plan->tensors[t].size_bytes);
-    const int32_t first = ps->born[t];
-    const int32_t last = placement_death(ps, t);
-    uint32_t bound = (down != 0) ? (ps->window & ~PLACE_ALIGN_MASK) : 0u;
-    uint32_t result = PLACE_FAILED;
-    int searching = 1;
-    while (searching != 0) {
-        uint32_t at;
-        uint32_t next = bound;
-        int clash = 0;
-        if ((down != 0) ? (bound < size) : (size > (ps->window - bound))) {
-            searching = 0;
-            continue;
-        }
-        at = (down != 0) ? (bound - size) : bound;
-        /* Group j holds what is first held at op j, so later groups start after t ends. */
-        for (int32_t j = -1; (j <= last) && (j < (int32_t)ps->stage->ops_count); j++) {
-            uint16_t n;
-            const uint16_t *list = placement_group(ps, j, &n);
-            for (uint16_t k = 0u; k < n; k++) {
-                uint16_t p = list[k];
-                uint32_t start;
-                uint32_t end;
-                if ((p >= num_t) || (p == t) || (ps->slot[p] < 0) ||
-                    (ps->born[p] > last) || (first > placement_death(ps, p))) {
-                    continue;
-                }
-                start = (uint32_t)ps->slot[p];
-                end = start + placement_bytes(ps->plan->tensors[p].size_bytes);
-                if ((start < (at + size)) && (end > at)) {
-                    if (clash == 0) {
-                        next = (down != 0) ? start : end;
-                    } else if (down != 0) {
-                        next = (start < next) ? start : next;
-                    } else {
-                        next = (end > next) ? end : next;
-                    }
-                    clash = 1;
-                }
+    if (b > ps->now) {
+        uint16_t *link = &ps->head;
+        while (*link != PLACE_END) {
+            uint16_t p = *link;
+            if (placement_death(ps, p) < b) {
+                *link = ps->next[p];
+                ps->next[p] = ps->retired;
+                ps->retired = p;
+            } else {
+                link = &ps->next[p];
             }
         }
-        if (clash == 0) {
-            result = at;
-            searching = 0;
+    } else {
+        while ((ps->retired != PLACE_END) && (placement_death(ps, ps->retired) >= b)) {
+            uint16_t p = ps->retired;
+            ps->retired = ps->next[p];
+            placement_insert(ps, p);
         }
-        bound = next;
     }
-    return result;
+    ps->now = b;
+}
+
+/* The lowest (*low) and highest (*high) offsets at which t, born at now and
+ * not in the list, overlaps no listed tensor, or PLACE_FAILED. With
+ * high_wanted = 0, *high is found only when there is no lowest offset. */
+static void placement_fit(const placement_t *ps, uint16_t t, int high_wanted,
+                          uint32_t *low, uint32_t *high)
+{
+    const uint32_t size = placement_bytes(ps->plan->tensors[t].size_bytes);
+    const uint32_t top = ps->window & ~PLACE_ALIGN_MASK;
+    uint32_t free_at = 0u;
+    uint16_t p = ps->head;
+    int scanning = 1;
+    *low = PLACE_FAILED;
+    *high = PLACE_FAILED;
+    while (scanning != 0) {
+        uint32_t start = ps->window;
+        uint32_t bytes = 0u;
+        if (p == PLACE_END) {
+            scanning = 0;
+        } else {
+            start = (uint32_t)ps->slot[p];
+            bytes = placement_bytes(ps->plan->tensors[p].size_bytes);
+            p = ps->next[p];
+        }
+        /* No listed tensor lies in [free_at, start). */
+        if (start > free_at) {
+            uint32_t limit = (start < top) ? start : top;
+            if ((*low == PLACE_FAILED) && (size <= (start - free_at))) {
+                *low = free_at;
+            }
+            if ((limit >= size) && ((limit - size) >= free_at)) {
+                *high = limit - size;
+            }
+        }
+        if ((start + bytes) > free_at) {
+            free_at = start + bytes;
+        }
+        if ((high_wanted == 0) && (*low != PLACE_FAILED)) {
+            scanning = 0;
+        }
+    }
 }
 
 static uint16_t placement_group_size(const placement_t *ps, int32_t j)
@@ -771,6 +827,10 @@ static TIGRIS_NOINLINE int place_stage(const tigris_plan_t *plan, const tigris_s
     ps.last_use_op = workspace->last_use_op;
     ps.slot = workspace->slot;
     ps.born = workspace->born;
+    ps.next = workspace->next;
+    ps.head = PLACE_END;
+    ps.retired = PLACE_END;
+    ps.now = BORN_INPUT;
     ps.window = mem->fast_size - mem->fast_reserved;
     if ((mem->fast_used <= mem->fast_size) && (ps.window <= (uint32_t)INT32_MAX)) {
         count = placement_setup(&ps);
@@ -788,20 +848,25 @@ static TIGRIS_NOINLINE int place_stage(const tigris_plan_t *plan, const tigris_s
         uint16_t t = placement_entry(&ps, j, k);
         int32_t held = ps.slot[t];
         uint32_t up;
+        uint32_t down;
         uint32_t next = PLACE_FAILED;
         steps++;
+        placement_advance(&ps, ps.born[t]);
+        if (held >= 0) {
+            placement_remove(&ps, t);
+        }
         ps.slot[t] = SLOT_NONE;
-        up = placement_fit(&ps, t, 0);
+        placement_fit(&ps, t, (held >= 0) ? 1 : 0, &up, &down);
         if (held < 0) {
-            next = (up != PLACE_FAILED) ? up : placement_fit(&ps, t, 1);
+            next = (up != PLACE_FAILED) ? up : down;
         } else if ((uint32_t)held == up) {
-            next = placement_fit(&ps, t, 1);
-            next = (next == up) ? PLACE_FAILED : next;
+            next = (down == up) ? PLACE_FAILED : down;
         } else {
             /* The lowest and the highest offset were both tried. */
         }
         if (next != PLACE_FAILED) {
             ps.slot[t] = (int32_t)next;
+            placement_insert(&ps, t);
             placement_step(&ps, &j, &k, 1);
         } else {
             placement_step(&ps, &j, &k, 0);
@@ -917,7 +982,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
      * Without such a placement, allocations bump and compact. */
     int placed = place_stage(plan, stage, mem, workspace);
     const int32_t *slot = workspace->slot;
-    const int32_t *born = workspace->born;
+    const uint16_t *born = workspace->born;
 
     /* Load stage inputs; one already in this stage's fast region is read in place. */
     for (uint16_t i = 0; i < stage->inputs_count; i++) {
@@ -931,7 +996,7 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
         saved_slow[i] = mem->tensor_ptrs[tidx];
 
         tigris_mem_error_t merr;
-        if ((placed != 0) && (born[tidx] == BORN_INPUT) && (slot[tidx] >= 0)) {
+        if ((placed != 0) && (slot[tidx] >= 0) && (born[tidx] == BORN_INPUT)) {
             merr = place_fast(mem, tidx, plan->tensors[tidx].size_bytes, slot[tidx], 1);
         } else {
             placed = 0;
@@ -970,7 +1035,8 @@ static TIGRIS_NOINLINE tigris_exec_error_t exec_stage_normal_impl(
             if (!mem->tensor_ptrs[tidx]) {
                 uint32_t bytes = plan->tensors[tidx].size_bytes;
                 tigris_mem_error_t merr = TIGRIS_MEM_ERR_OOM;
-                if ((placed != 0) && (born[tidx] == (int32_t)j) && (slot[tidx] >= 0)) {
+                if ((placed != 0) && (slot[tidx] >= 0) &&
+                    (born[tidx] == placement_born((int32_t)j))) {
                     merr = place_fast(mem, tidx, bytes, slot[tidx], 0);
                 }
                 if (merr != TIGRIS_MEM_OK) {

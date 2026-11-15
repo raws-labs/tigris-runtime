@@ -325,6 +325,8 @@ static int kern_depthwise_conv2d(
     int KH = w.kernel_h, KW = w.kernel_w, SH = w.stride_h, SW = w.stride_w;
     int PT = w.pad_top, PL = w.pad_left, DH = w.dilation_h, DW = w.dilation_w;
     int32_t out_row_start = w.out_row_start, in_row_start = w.in_row_start;
+    /* Element distance between adjacent taps along the input and weight. */
+    int x_step_h = DH * IW * C, x_step_w = DW * C, w_step_h = KW * OC;
 
     /* Depthwise: group == C, each input channel convolved independently by
      * M filters; output channel oc reads input channel oc / M.
@@ -335,24 +337,33 @@ static int kern_depthwise_conv2d(
             int base_h = oh_g * SH - PT - in_row_start;
             int kh0, kh1;
             tap_range(base_h, IH, KH, DH, &kh0, &kh1);
+            int taps_h = kh1 - kh0;
             for (int ow = 0; ow < OW; ow++) {
                 int base_w = ow * SW - PL;
                 int kw0, kw1;
                 tap_range(base_w, IW, KW, DW, &kw0, &kw1);
+                int taps_w = kw1 - kw0;
+                /* Element indices of the first tap and of the output pixel. */
+                int x_first = ((n * IH + base_h + kh0 * DH) * IW + base_w + kw0 * DW) * C;
+                int w_first = (kh0 * KW + kw0) * OC;
+                int y_pixel = ((n * OH + oh_g) * OW + ow) * OC;
                 for (int oc = 0; oc < OC; oc++) {
-                    int c = oc / M;
                     /* The bias follows the sum, as in TFLite's reference kernels. */
                     float sum = 0.0f;
-                    for (int kh = kh0; kh < kh1; kh++) {
-                        int ih = base_h + kh * DH;
-                        for (int kw = kw0; kw < kw1; kw++) {
-                            int iw = base_w + kw * DW;
-                            float x_val = X[((n * IH + ih) * IW + iw) * C + c];
-                            float w_val = W[(kh * KW + kw) * OC + oc];
-                            sum += x_val * w_val;
+                    int x_row = x_first + oc / M;
+                    int w_row = w_first + oc;
+                    for (int th = 0; th < taps_h; th++) {
+                        int xi = x_row;
+                        int wi = w_row;
+                        for (int tw = 0; tw < taps_w; tw++) {
+                            sum += X[xi] * W[wi];
+                            xi += x_step_w;
+                            wi += OC;
                         }
+                        x_row += x_step_h;
+                        w_row += w_step_h;
                     }
-                    Y[((n * OH + oh_g) * OW + ow) * OC + oc] = apply_fused_act_f32(B ? sum + B[oc] : sum, op->fused_act);
+                    Y[y_pixel + oc] = apply_fused_act_f32(B ? sum + B[oc] : sum, op->fused_act);
                 }
             }
         }

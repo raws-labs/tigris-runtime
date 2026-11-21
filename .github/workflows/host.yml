@@ -30,13 +30,14 @@ jobs:
           - runner: windows-2022
             platform: win_amd64
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
     container: ${{ matrix.container }}
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
         if: runner.os == 'Windows'
       - name: Install native build tools in the Linux build image
         if: runner.os == 'Linux'
@@ -65,12 +66,13 @@ jobs:
   msvc:
     name: MSVC runtime and host library
     runs-on: windows-2022
+    timeout-minutes: 10
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
       - run: >-
           cmake -S . -B build-msvc -G Ninja -DCMAKE_C_COMPILER=cl
           -DCMAKE_BUILD_TYPE=Release -DTIGRIS_BUILD_HOST=ON
@@ -80,7 +82,8 @@ jobs:
   publish:
     if: github.event_name == 'release'
     needs: [build, msvc]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:

@@ -19,7 +19,8 @@ on:
 jobs:
   upload:
     if: github.repository == 'raws-labs/tigris-runtime'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Check the version sources state the tag

@@ -13,7 +13,8 @@ permissions:
 jobs:
   capability-contract:
     name: Compiler capability contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -71,12 +72,13 @@ jobs:
     name: Native ${{ matrix.compiler }}
     if: github.ref_type != 'tag'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         include:
-          - {compiler: gcc, os: ubuntu-latest}
-          - {compiler: clang, os: ubuntu-latest}
+          - {compiler: gcc, os: ubuntu-26.04}
+          - {compiler: clang, os: ubuntu-26.04}
           # GCC 11 reports maybe-uninitialized cases at -O3 that newer GCC does not.
           - {compiler: gcc-11, os: ubuntu-22.04}
     steps:
@@ -107,7 +109,8 @@ jobs:
   sanitizers:
     name: ASan and UBSan
     if: github.ref_type != 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: >-
@@ -128,6 +131,7 @@ jobs:
     name: Static analysis and MISRA regression
     if: github.ref_type != 'tag'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     env:
       CPPCHECK_COMMIT: 904cfdcf774c44b17db789c8a212e2f1c69fc833
     steps:
@@ -169,6 +173,7 @@ jobs:
     name: Deterministic runtime coverage
     if: github.ref_type != 'tag'
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Mutation-test the coverage checker
@@ -191,7 +196,8 @@ jobs:
   loader-fuzz-smoke:
     name: Loader fuzz smoke
     if: github.ref_type != 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: mkdir -p fuzz-artifacts
@@ -217,13 +223,30 @@ jobs:
   cortex-m:
     name: Cortex-M cross-build
     if: github.ref_type != 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    env:
+      ARM_GNU_VERSION: 14.2.rel1
+      ARM_GNU_SHA256: 62a63b981fe391a9cbad7ef51b17e49aeaa3e7b0d029b36ca1e9c3b2a9b78823
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update
-      - run: >-
-          sudo apt-get install --yes --no-install-recommends
-          gcc-arm-none-eabi libnewlib-arm-none-eabi
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/arm-gnu
+          key: arm-gnu-toolchain-${{ env.ARM_GNU_VERSION }}-x86_64-arm-none-eabi
+      - name: Install the Arm GNU Toolchain with newlib
+        run: |
+          name="arm-gnu-toolchain-$ARM_GNU_VERSION-x86_64-arm-none-eabi.tar.xz"
+          archive="$RUNNER_TEMP/arm-gnu/$name"
+          if [ ! -f "$archive" ]; then
+            mkdir -p "$RUNNER_TEMP/arm-gnu"
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://developer.arm.com/-/media/Files/downloads/gnu/$ARM_GNU_VERSION/binrel/$name"
+          fi
+          echo "$ARM_GNU_SHA256  $archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/arm-gnu-toolchain"
+          tar -xJf "$archive" -C "$RUNNER_TEMP/arm-gnu-toolchain" --strip-components=1
+          echo "$RUNNER_TEMP/arm-gnu-toolchain/bin" >> "$GITHUB_PATH"
       - run: >-
           cmake -S . -B build-arm
           -DCMAKE_BUILD_TYPE=Release
@@ -236,7 +259,8 @@ jobs:
   stack-usage:
     name: Stack usage budget
     if: github.ref_type != 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: >-

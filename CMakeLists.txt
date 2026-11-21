@@ -322,6 +322,205 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
         TIGRIS_COUNT_KERNEL_ROWS)
     target_link_libraries(tigris_contract_runner_rows m)
 
+    # Contract runner on the accelerated dispatchers, linked against the
+    # vendors' portable C kernels so the host compares them with s8_ref.
+    option(TIGRIS_CONTRACT_ACCEL
+        "Build tigris_contract_runner_accel on host CMSIS-NN and ESP-NN kernels" OFF)
+    if(TIGRIS_CONTRACT_ACCEL)
+        if(CMAKE_VERSION VERSION_LESS 3.25)
+            message(FATAL_ERROR "TIGRIS_CONTRACT_ACCEL requires CMake 3.25 or newer")
+        endif()
+        include(FetchContent)
+        find_package(Git REQUIRED)
+        # Declares a vendor's sources at a pinned commit. A local checkout in
+        # FETCHCONTENT_SOURCE_DIR_<NAME> builds offline and must be an
+        # unmodified git checkout of exactly that commit.
+        function(tigris_pinned_sources name repository commit)
+            string(TOUPPER "${name}" upper)
+            set(dir "${FETCHCONTENT_SOURCE_DIR_${upper}}")
+            if(dir)
+                execute_process(
+                    COMMAND "${GIT_EXECUTABLE}" -C "${dir}" rev-parse --show-toplevel HEAD
+                    RESULT_VARIABLE status OUTPUT_VARIABLE found ERROR_QUIET
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+                string(REPLACE "\n" ";" found "${found}")
+                list(LENGTH found count)
+                set(top "")
+                set(head "")
+                if(status EQUAL 0 AND count EQUAL 2)
+                    list(GET found 0 top)
+                    list(GET found 1 head)
+                    file(REAL_PATH "${top}" top)
+                endif()
+                file(REAL_PATH "${dir}" real_dir)
+                if(NOT top STREQUAL real_dir OR NOT head STREQUAL commit)
+                    message(FATAL_ERROR
+                        "FETCHCONTENT_SOURCE_DIR_${upper} (${dir}) must be the top of a "
+                        "git checkout at commit ${commit}; found '${head}'")
+                endif()
+                execute_process(
+                    COMMAND "${GIT_EXECUTABLE}" -C "${dir}" status --porcelain
+                        --untracked-files=all --ignored=matching
+                    RESULT_VARIABLE status OUTPUT_VARIABLE changes ERROR_QUIET)
+                # The vendor builds glob their sources, so an untracked or
+                # ignored file would be compiled too.
+                if(NOT status EQUAL 0 OR NOT changes STREQUAL "")
+                    message(FATAL_ERROR
+                        "FETCHCONTENT_SOURCE_DIR_${upper} (${dir}) has local changes, "
+                        "untracked or ignored files; it must match commit ${commit}")
+                endif()
+            endif()
+            # Sources only: SOURCE_SUBDIR names no directory, so nothing is added.
+            FetchContent_Declare(${name}
+                GIT_REPOSITORY ${repository}
+                GIT_TAG ${commit}
+                SOURCE_SUBDIR __tigris_no_add_subdir__)
+        endfunction()
+        tigris_pinned_sources(cmsis_nn https://github.com/ARM-software/CMSIS-NN.git
+            13c97dbb6f781d4aab38ed34e6e441f42b79aff4)  # v8.0.0
+        tigris_pinned_sources(esp_nn https://github.com/espressif/esp-nn.git
+            ace42ac7721119cd543fc40ffe719e601fa8f20f)  # v1.5.0
+        FetchContent_MakeAvailable(cmsis_nn esp_nn)
+
+        # AddressSanitizer and UndefinedBehaviorSanitizer on everything the
+        # runner links, so a vendor access outside a heap buffer, such as
+        # ESP-NN's workspace, or undefined behavior fails the run. Both report
+        # on stderr and exit nonzero.
+        set(TIGRIS_ACCEL_SANITIZE -fsanitize=address,undefined
+            -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
+
+        # Without __ARM_FEATURE_DSP or __ARM_FEATURE_MVE CMSIS-NN compiles its
+        # pure C paths.
+        set(CMSIS_OPTIMIZATION_LEVEL "-O2" CACHE STRING "" FORCE)
+        add_subdirectory(${cmsis_nn_SOURCE_DIR} ${cmsis_nn_BINARY_DIR}
+            EXCLUDE_FROM_ALL SYSTEM)
+        target_compile_options(cmsis-nn PRIVATE -w ${TIGRIS_ACCEL_SANITIZE})
+
+        # ESP-NN's two portable C variants, which esp32 and esp32c3 run. With
+        # CONFIG_NN_OPTIMIZED and no S3 or P4 target, esp_nn.h selects
+        # esp_nn_generic_opt.h, which maps conv, depthwise conv and softmax to
+        # the _opt sources and every other kernel to the ANSI sources; without
+        # it, every kernel is ANSI C. The multicore sources need FreeRTOS and
+        # stay out. The definition is PUBLIC so every translation unit that
+        # includes esp_nn.h sees the same variant.
+        set(esp_nn_ansi_sources
+            ${esp_nn_SOURCE_DIR}/src/activation_functions/esp_nn_relu_ansi.c
+            ${esp_nn_SOURCE_DIR}/src/activation_functions/esp_nn_hard_swish_ansi.c
+            ${esp_nn_SOURCE_DIR}/src/common/esp_nn_mean_ansi.c
+            ${esp_nn_SOURCE_DIR}/src/basic_math/esp_nn_add_ansi.c
+            ${esp_nn_SOURCE_DIR}/src/basic_math/esp_nn_mul_ansi.c
+            ${esp_nn_SOURCE_DIR}/src/convolution/esp_nn_conv_ansi.c
+            ${esp_nn_SOURCE_DIR}/src/convolution/esp_nn_depthwise_conv_ansi.c
+            ${esp_nn_SOURCE_DIR}/src/fully_connected/esp_nn_fully_connected_ansi.c
+            ${esp_nn_SOURCE_DIR}/src/softmax/esp_nn_softmax_ansi.c
+            ${esp_nn_SOURCE_DIR}/src/logistic/esp_nn_logistic_ansi.c
+            ${esp_nn_SOURCE_DIR}/src/pooling/esp_nn_avg_pool_ansi.c
+            ${esp_nn_SOURCE_DIR}/src/pooling/esp_nn_max_pool_ansi.c)
+        add_library(tigris_esp_nn_host STATIC ${esp_nn_ansi_sources}
+            ${esp_nn_SOURCE_DIR}/src/convolution/esp_nn_conv_opt.c
+            ${esp_nn_SOURCE_DIR}/src/convolution/esp_nn_depthwise_conv_opt.c
+            ${esp_nn_SOURCE_DIR}/src/softmax/esp_nn_softmax_opt.c)
+        target_compile_definitions(tigris_esp_nn_host PUBLIC CONFIG_NN_OPTIMIZED=1)
+        add_library(tigris_esp_nn_host_ansi STATIC ${esp_nn_ansi_sources})
+        foreach(library tigris_esp_nn_host tigris_esp_nn_host_ansi)
+            target_include_directories(${library} SYSTEM PUBLIC
+                ${esp_nn_SOURCE_DIR}/include ${esp_nn_SOURCE_DIR}/src/common)
+            target_compile_options(${library} PRIVATE -O2 -w ${TIGRIS_ACCEL_SANITIZE})
+        endforeach()
+
+        # Every vendor function the adapters call, wrapped at link time by
+        # test/contract_vendor_calls.c so the runner reports how often each
+        # ran. ESP-NN's public names are macros; these are the real symbols,
+        # the variant's suffix appended to the last group. The adapters' calls
+        # into the routing policy and the s8 dispatcher are wrapped as well.
+        set(TIGRIS_CONTRACT_WRAPPED
+            arm_avgpool_s8
+            arm_avgpool_s8_get_buffer_size
+            arm_convolve_wrapper_s8
+            arm_convolve_wrapper_s8_get_buffer_size
+            arm_depthwise_conv_wrapper_s8
+            arm_depthwise_conv_wrapper_s8_get_buffer_size
+            arm_elementwise_mul_s8
+            arm_fully_connected_per_channel_s8
+            arm_fully_connected_s8
+            arm_fully_connected_s8_get_buffer_size
+            arm_maximum_s8
+            arm_minimum_s8
+            arm_vector_sum_s8
+            esp_nn_avg_pool_s8_ansi
+            esp_nn_fully_connected_per_ch_s8_ansi
+            esp_nn_fully_connected_s8_ansi
+            esp_nn_mul_elementwise_s8_ansi
+            tigris_accel_try_s8_ref
+            tigris_dispatch_kernel_s8)
+        set(TIGRIS_ESP_NN_VARIANT_WRAPPED
+            esp_nn_conv_s8
+            esp_nn_depthwise_conv_s8
+            esp_nn_get_conv_scratch_size
+            esp_nn_get_depthwise_conv_scratch_size
+            esp_nn_set_conv_scratch_buf
+            esp_nn_set_depthwise_conv_scratch_buf)
+
+        # Builds one accelerated contract runner on CMSIS-NN and the given
+        # ESP-NN variant library, whose kernels carry `suffix`. A build-time
+        # check fails the runner when the adapters reference an arm_* or
+        # esp_nn_* symbol that is not wrapped, or the wrapper file and the
+        # list disagree.
+        function(tigris_contract_runner_accel target esp_nn_library suffix)
+            list(TRANSFORM TIGRIS_ESP_NN_VARIANT_WRAPPED APPEND ${suffix}
+                OUTPUT_VARIABLE variant_wrapped)
+            set(wrapped ${TIGRIS_CONTRACT_WRAPPED} ${variant_wrapped})
+
+            add_library(${target}_objects OBJECT ${TIGRIS_RUNTIME_SRCS})
+            target_include_directories(${target}_objects PRIVATE include)
+            target_compile_definitions(${target}_objects PRIVATE
+                TIGRIS_HAS_CMSIS_NN TIGRIS_HAS_ESP_NN)
+            target_compile_options(${target}_objects PRIVATE ${TIGRIS_ACCEL_SANITIZE})
+            target_link_libraries(${target}_objects PRIVATE cmsis-nn ${esp_nn_library})
+
+            add_library(${target}_calls OBJECT test/contract_vendor_calls.c)
+            target_include_directories(${target}_calls PRIVATE include src)
+            target_compile_options(${target}_calls PRIVATE ${TIGRIS_ACCEL_SANITIZE})
+            target_link_libraries(${target}_calls PRIVATE cmsis-nn ${esp_nn_library})
+
+            set(prefix ${CMAKE_CURRENT_BINARY_DIR}/${target}_wrap)
+            file(GENERATE OUTPUT ${prefix}_objects-$<CONFIG>.txt
+                CONTENT "$<JOIN:$<TARGET_OBJECTS:${target}_objects>,\n>\n")
+            file(GENERATE OUTPUT ${prefix}_wrappers-$<CONFIG>.txt
+                CONTENT "$<JOIN:$<TARGET_OBJECTS:${target}_calls>,\n>\n")
+            string(REPLACE ";" "," wrapped_arg "${wrapped}")
+            add_custom_command(
+                OUTPUT ${prefix}-$<CONFIG>.stamp
+                COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DWRAPPED=${wrapped_arg}
+                    -DOBJECTS=${prefix}_objects-$<CONFIG>.txt
+                    -DWRAPPERS=${prefix}_wrappers-$<CONFIG>.txt
+                    -DSTAMP=${prefix}-$<CONFIG>.stamp
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_vendor_wraps.cmake
+                DEPENDS ${target}_objects ${target}_calls
+                    $<TARGET_OBJECTS:${target}_objects>
+                    $<TARGET_OBJECTS:${target}_calls>
+                    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_vendor_wraps.cmake
+                COMMENT "Checking the call wrappers of ${target}"
+                VERBATIM)
+            add_custom_target(${target}_wrap_check DEPENDS ${prefix}-$<CONFIG>.stamp)
+
+            add_executable(${target}
+                test/contract_runner.c $<TARGET_OBJECTS:${target}_objects>
+                $<TARGET_OBJECTS:${target}_calls>)
+            add_dependencies(${target} ${target}_wrap_check)
+            target_include_directories(${target} PRIVATE include)
+            target_compile_definitions(${target} PRIVATE
+                TIGRIS_HAS_CMSIS_NN TIGRIS_HAS_ESP_NN TIGRIS_CONTRACT_VENDOR_CALLS)
+            target_compile_options(${target} PRIVATE ${TIGRIS_ACCEL_SANITIZE})
+            list(TRANSFORM wrapped PREPEND "LINKER:--wrap=" OUTPUT_VARIABLE wrap_flags)
+            target_link_options(${target} PRIVATE ${TIGRIS_ACCEL_SANITIZE} ${wrap_flags})
+            target_link_libraries(${target} cmsis-nn ${esp_nn_library} m)
+        endfunction()
+        tigris_contract_runner_accel(tigris_contract_runner_accel tigris_esp_nn_host _opt)
+        tigris_contract_runner_accel(tigris_contract_runner_accel_ansi
+            tigris_esp_nn_host_ansi _ansi)
+    endif()
+
     # Self-contained unit tests.
     add_test(NAME loader COMMAND test_loader)
     add_test(NAME executor COMMAND test_executor)

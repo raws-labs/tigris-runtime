@@ -1,7 +1,7 @@
 # TiGrIS Runtime
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/getting-started/quickstart/)
+[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/getting-started/what-is-tigris/)
 
 Portable C runtime for [TiGrIS](https://github.com/raws-labs/tigris). It
 loads compatible `.tgrs` plans and executes them against caller-owned memory

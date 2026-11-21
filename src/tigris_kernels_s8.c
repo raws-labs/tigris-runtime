@@ -3060,11 +3060,10 @@ static int cmsis_tiled_spatial_uses_reference(const tigris_op_t *op)
     switch ((tigris_op_type_t)op->op_type) {
     case TIGRIS_OP_CONV:
     case TIGRIS_OP_DEPTHWISE:
-        /* Plain-height tiles run on the CMSIS-NN adapter, which honors the tile
-         * context (in_h/out_h/pad_top/pad_bottom) like the ESP-NN adapter does.
-         * Dilated tiles still fall back to the reference kernel until native
-         * dilated-tile parity is covered; rolled and 2D-width tiles are already
-         * routed to reference by tigris_accel_try_s8_ref before this policy. */
+        /* Height, rolled and 2D tiles run on the CMSIS-NN adapter, which
+         * honors the tile context (tigris_accel_tile_view) like the ESP-NN
+         * adapter does. Dilated tiles still fall back to the reference kernel
+         * until native dilated-tile parity is covered. */
         return (effective_dilation(op->spatial.dilation_h) != 1u ||
                 effective_dilation(op->spatial.dilation_w) != 1u);
     case TIGRIS_OP_AVG_POOL:
@@ -3361,6 +3360,37 @@ tigris_accel_route_t tigris_accel_pre_route(
     return TIGRIS_ACCEL_ROUTE_ADAPTER;
 }
 
+tigris_accel_tile_kind_t tigris_accel_tile_kind(const tigris_tile_ctx_t *tile)
+{
+    /* The executor sets one geometry per call; the order below only decides
+     * synthetic combinations, and matches the routing they had before. */
+    tigris_accel_tile_kind_t kind = TIGRIS_ACCEL_TILE_HEIGHT;
+    if (tile->active == 0u)
+        kind = TIGRIS_ACCEL_TILE_NONE;
+    else if (tile->row_tiled != 0u)
+        kind = TIGRIS_ACCEL_TILE_ROW_BAND;
+    else if (tile->width_tiled != 0u)
+        kind = TIGRIS_ACCEL_TILE_2D;
+    else if (tile->out_row_start != 0 || tile->in_row_start != 0)
+        kind = TIGRIS_ACCEL_TILE_ROLLED;
+    else if (tile->transposed_tile != 0u)
+        kind = TIGRIS_ACCEL_TILE_TRANSPOSED;
+    else if (tile->reduce_acc != NULL)
+        kind = tile->reduce_channels != 0 ? TIGRIS_ACCEL_TILE_REDUCE_GROUPED
+                                          : TIGRIS_ACCEL_TILE_REDUCE_INPUT;
+    return kind;
+}
+
+/* A tile kind without a case is a build error: -Wswitch-enum (MSVC C4061)
+ * names a missing enumerator even beside the default that MISRA 16.4 asks for. */
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch-enum"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(default : 4061)
+#pragma warning(error : 4061)
+#endif
 int tigris_accel_try_s8_ref(
     tigris_accel_backend_t backend,
     const tigris_plan_t   *plan,
@@ -3379,50 +3409,52 @@ int tigris_accel_try_s8_ref(
         return tigris_int32_execute(plan, op, op_index, mem);
     }
 
-    /* 2D tiles carry mem->tile.width_tiled and partition width via
-     * pad_left/tile-in_w as well as height (see exec_stage_tiled_2d). The
-     * ESP-NN/CMSIS-NN Conv/Depthwise adapters honor the packed-width tile
-     * natively (in_w/out_w/pad_left, right pad implicit via IW clipping); every
-     * other op still routes to s8_ref. */
-    if (mem->tile.active && mem->tile.width_tiled &&
-        !is_conv_or_depthwise(op)) {
-        *handled = 1;
-        return tigris_dispatch_kernel_s8(
-            plan, op, op_index, mem, user_ctx);
+    /* Every tile kind is routed here by name. */
+    int reference = 0;
+    switch (tigris_accel_tile_kind(&mem->tile)) {
+    case TIGRIS_ACCEL_TILE_ROW_BAND:
+        /* A row band hands the kernel a buffer holding only the band's rows,
+         * and says so in mem->tile.out_h rather than in the tensor shape. The
+         * vendor FullyConnected kernels take their row count from the output
+         * tensor, so they would read and write the whole matrix into a
+         * band-sized allocation. The s8 reference kernel honors the band. */
+        reference = 1;
+        break;
+    case TIGRIS_ACCEL_TILE_2D:
+    case TIGRIS_ACCEL_TILE_ROLLED:
+        /* The Conv/Depthwise adapters take the packed-width tile (in_w, out_w,
+         * pad_left; the right pad is implicit) and fold the line-buffer roll
+         * (out_row_start, in_row_start) into their data pointers, see
+         * tigris_accel_tile_view. Every other adapter ignores both. */
+        reference = !is_conv_or_depthwise(op);
+        break;
+    case TIGRIS_ACCEL_TILE_NONE:
+    case TIGRIS_ACCEL_TILE_HEIGHT:
+    case TIGRIS_ACCEL_TILE_REDUCE_INPUT:
+    case TIGRIS_ACCEL_TILE_REDUCE_GROUPED:
+    case TIGRIS_ACCEL_TILE_TRANSPOSED:
+        /* The operator policy decides, told whether a tile is active. */
+        reference = 0;
+        break;
+    default:
+        /* Unreachable: tigris_accel_tile_kind returns a named kind. */
+        reference = 1;
+        break;
     }
 
-    /* A row band hands the kernel a buffer holding only the band's rows, and
-     * says so in mem->tile.out_h rather than in the tensor shape. The vendor
-     * FullyConnected kernels take their row count from the output tensor, so
-     * they would read and write the whole matrix into a band-sized allocation.
-     * The s8 reference kernel honors the band, so route there. */
-    if (mem->tile.active && mem->tile.row_tiled) {
-        *handled = 1;
-        return tigris_dispatch_kernel_s8(
-            plan, op, op_index, mem, user_ctx);
-    }
-
-    /* Line-buffered chains roll overlap rows across tiles by setting
-     * mem->tile.out_row_start / in_row_start (see exec_chain_tiled). The
-     * ESP-NN/CMSIS-NN Conv/Depthwise adapters honor the roll natively - they
-     * fold out_row_start into the output pointer and (out_row_start*stride -
-     * in_row_start) into the input pointer, matching the s8 kernel's index math.
-     * Every other op ignores the offsets and would write rows at the wrong
-     * position, so a rolled non-conv/depthwise op still routes to s8_ref. */
-    if (mem->tile.active &&
-        (mem->tile.out_row_start != 0 || mem->tile.in_row_start != 0) &&
-        !is_conv_or_depthwise(op)) {
-        *handled = 1;
-        return tigris_dispatch_kernel_s8(
-            plan, op, op_index, mem, user_ctx);
-    }
-
-    *handled = tigris_accel_pre_route(
-                   backend, plan, op, op_index, mem->tile.active) ==
-               TIGRIS_ACCEL_ROUTE_S8_REF;
-    if (!*handled)
+    if (!reference)
+        reference = tigris_accel_pre_route(
+                        backend, plan, op, op_index, mem->tile.active) ==
+                    TIGRIS_ACCEL_ROUTE_S8_REF;
+    *handled = reference;
+    if (!reference)
         return 0;
 
     return tigris_dispatch_kernel_s8(
         plan, op, op_index, mem, user_ctx);
 }
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif

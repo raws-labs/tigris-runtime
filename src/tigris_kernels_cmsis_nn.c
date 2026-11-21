@@ -408,7 +408,9 @@ static uint32_t cmsis_workspace_required(
                                op->spatial.pad_left, &dp, &fd);
                 s = arm_depthwise_conv_wrapper_s8_get_buffer_size(&dp, &id, &fd, &od);
             }
-            if ((!out_qp || out_qp->num_channels == 1u) && ys[3] > 0 &&
+            /* tigris_accel_channel_quant expands a per-tensor multiplier
+             * unless it already covers every output channel. */
+            if ((!out_qp || (out_qp->num_channels == 1u && ys[3] > 1)) && ys[3] > 0 &&
                 (uint32_t)ys[3] > max_broadcast_channels)
                 max_broadcast_channels = (uint32_t)ys[3];
             break;

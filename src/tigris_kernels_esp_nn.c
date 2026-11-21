@@ -15,8 +15,10 @@
  *   - dilation = {0, 0} encodes "no dilation" (NOT {1, 1})
  *   - Depthwise weights: [KH, KW, C] layout (HWC)
  *
- * CRITICAL: must #include "sdkconfig.h" before <esp_nn.h> so that
- * CONFIG_NN_OPTIMIZED routes to the S3 SIMD path (not ANSI C fallback).
+ * CRITICAL: on ESP-IDF, must #include "sdkconfig.h" before <esp_nn.h> so that
+ * CONFIG_NN_OPTIMIZED routes to the S3 SIMD path (not ANSI C fallback). A
+ * build without ESP_PLATFORM gets CONFIG_NN_OPTIMIZED, or its absence, from
+ * the compiler command line.
  *
  * Memory: tigris_esp_nn_prepare() obtains platform-managed aligned workspace.
  * No workspace allocation occurs during inference.
@@ -29,9 +31,13 @@
 #include "tigris_kernels_s8.h"
 #include "tigris_op_config.h"
 
+#ifdef ESP_PLATFORM
 #include "sdkconfig.h"   /* CONFIG_NN_OPTIMIZED, CONFIG_IDF_TARGET_ESP32S3 */
+#endif
 #include <esp_nn.h>
+#ifdef ESP_PLATFORM
 #include "esp_nn_multicore.h"   /* not pulled in by esp_nn.h */
+#endif
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -157,8 +163,13 @@ void tigris_esp_nn_deinit(void)
 
 int tigris_esp_nn_enable_dual_core(void)
 {
+#ifdef ESP_PLATFORM
     esp_nn_dual_core_enable();
     return esp_nn_dual_core_active() ? 1 : 0;
+#else
+    /* A host build links ESP-NN without its FreeRTOS worker. */
+    return 0;
+#endif
 }
 
 /* Max conv input rect (IH, IW) an op sees at inference. For an op in a tiled
@@ -166,8 +177,10 @@ int tigris_esp_nn_enable_dual_core(void)
  * full tensor. Tiling produces asymmetric EDGE tiles (a top tile pads only the
  * top, a left width tile only the left) even when the full op is symmetric, so
  * the ESP-NN asymmetric-pad bounce buffer must be sized for THIS rect - not the
- * full op, which would reserve a full-tensor pad buffer for a small tile. */
-static void esp_conv_tile_input_dims(
+ * full op, which would reserve a full-tensor pad buffer for a small tile.
+ * Returns 1 for an op in a tiled stage or chain, also when its rect clamps to
+ * the full tensor, and 0 otherwise. */
+static int esp_conv_tile_input_dims(
     const tigris_plan_t *plan, uint16_t op_idx,
     int IH, int IW, int SH, int SW, int eff_kh, int eff_kw,
     int *tile_IH, int *tile_IW)
@@ -198,7 +211,7 @@ static void esp_conv_tile_input_dims(
         } else {
             tigris_tile_plan_v10_t tp = tigris_stage_tiles(plan, st);
             if (!tp.tileable)
-                return;             /* untiled stage: keep full dims */
+                return 0;           /* untiled stage: keep full dims */
             th = (int32_t)(tp.output_band_extent ? tp.output_band_extent : tp.input_band_extent);
             if (tp.axis == TIGRIS_TILE_AXIS_HW)   /* 2D: width also tiled */
                 tw = (int32_t)tp.output_width_extent;
@@ -216,8 +229,9 @@ static void esp_conv_tile_input_dims(
         if (ciw > (int32_t)IW) ciw = (int32_t)IW;
         *tile_IH = (int)cih;
         *tile_IW = (int)ciw;
-        return;
+        return 1;
     }
+    return 0;
 }
 
 /* tigris_esp_nn_prepare */
@@ -294,15 +308,15 @@ int tigris_esp_nn_prepare(
 
             /* Tile-aware pad-bounce sizing: an edge tile is asymmetric even when
              * the full op is symmetric, so size the bounce for the tile's input
-             * rect. Dilated convs are already routed to s8_ref above, so the
-             * effective kernel equals the kernel here. */
+             * rect, including a rect that spans the whole input. Dilated convs
+             * are already routed to s8_ref above, so the effective kernel
+             * equals the kernel here. */
             {
                 int SH = op->spatial.stride_h ? op->spatial.stride_h : 1;
                 int SW = op->spatial.stride_w ? op->spatial.stride_w : 1;
                 int tIH, tIW;
-                esp_conv_tile_input_dims(plan, i, IH, IW, SH, SW, KH, KW,
-                                         &tIH, &tIW);
-                if (tIH != IH || tIW != IW) {
+                if (esp_conv_tile_input_dims(plan, i, IH, IW, SH, SW, KH, KW,
+                                             &tIH, &tIW)) {
                     uint32_t req;
                     if (!tigris_accel_esp_pad_workspace_fits(
                             tIH, tIW, IC, (uint16_t)pt, (uint16_t)pb,
@@ -553,7 +567,11 @@ static int adapt_conv2d(
     /* Two-tier scratch: prefer SRAM (fast), fall back to PSRAM, then s8_ref. */
     int needed = esp_nn_get_conv_scratch_size(&input_dims, &filter_dims,
                                               &output_dims, &params);
-    if (needed <= s_sram_scratch_size && s_sram_scratch) {
+    if (needed == 0) {
+        /* A kernel that takes no scratch, such as the portable C variants'
+         * conv, runs without one. */
+        esp_nn_set_conv_scratch_buf(NULL);
+    } else if (needed <= s_sram_scratch_size && s_sram_scratch) {
         esp_nn_set_conv_scratch_buf(s_sram_scratch);
 #ifdef __XTENSA__
         s_conv_sram++;

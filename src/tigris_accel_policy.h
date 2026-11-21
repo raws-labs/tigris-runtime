@@ -150,6 +150,25 @@ int tigris_accel_channel_quant(
     const int32_t **multipliers,
     const int32_t **shifts);
 
+/** Geometry of one kernel call, derived from the executor's tile context. */
+typedef enum {
+    TIGRIS_ACCEL_TILE_NONE,            /* untiled: whole tensors */
+    TIGRIS_ACCEL_TILE_HEIGHT,          /* output-row tile, standalone or chain */
+    TIGRIS_ACCEL_TILE_2D,              /* tile over height and width */
+    TIGRIS_ACCEL_TILE_ROLLED,          /* chain tile with line-buffer roll offsets */
+    TIGRIS_ACCEL_TILE_ROW_BAND,        /* row band of a non-spatial op */
+    TIGRIS_ACCEL_TILE_REDUCE_INPUT,    /* global reduction walked along its input */
+    TIGRIS_ACCEL_TILE_REDUCE_GROUPED,  /* reduction over packed channel groups */
+    TIGRIS_ACCEL_TILE_TRANSPOSED,      /* layout conversion tiled along output rows */
+} tigris_accel_tile_kind_t;
+
+/**
+ * Classify the current call. A context names one geometry per executor path;
+ * for a context with several flags set, row band precedes 2D, which precedes
+ * a roll, a transposed tile, and the reductions.
+ */
+tigris_accel_tile_kind_t tigris_accel_tile_kind(const tigris_tile_ctx_t *tile);
+
 /**
  * Execute the reference route selected by tigris_accel_pre_route().
  *

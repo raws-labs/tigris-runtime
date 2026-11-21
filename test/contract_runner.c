@@ -4,9 +4,23 @@
  * Usage:
  *   tigris_contract_runner plan.tgrs inputs.bin outputs.bin [activation-limit]
  *       [--no-linebuffer] [--workspace-limits=T,I,O,C,S,D] [--slow-arena=BYTES]
- *       [--inputs-in-slow]
+ *       [--inputs-in-slow] [--dispatch=reference|cmsis-nn|esp-nn]
  *
  * inputs.bin and outputs.bin concatenate model tensors in model-I/O order.
+ * --dispatch=reference, the default, picks the float32 or s8 reference kernels
+ * by plan dtype. cmsis-nn and esp-nn exist only in a runner built with
+ * TIGRIS_HAS_CMSIS_NN and TIGRIS_HAS_ESP_NN, and run int8 plans. Guard bytes
+ * follow each arena, and on cmsis-nn also the activation region below the
+ * vendor scratch; a changed guard byte fails the run with a line starting
+ * TIGRIS_CONTRACT_GUARD, and under AddressSanitizer any access to a guard
+ * fails it. A runner built with TIGRIS_CONTRACT_VENDOR_CALLS prints, after a
+ * run on an accelerated dispatch, the calls each wrapped vendor function
+ * received during preparation (TIGRIS_CONTRACT_VENDOR_PREPARE) and during the
+ * run (TIGRIS_CONTRACT_VENDOR), 0 included; per operator type the adapter
+ * takes, its calls into the s8 dispatcher (TIGRIS_CONTRACT_FALLBACK); and the
+ * largest scratch a CMSIS-NN call was given with the most output channels a
+ * call read expanded quantization for from the workspace
+ * (TIGRIS_CONTRACT_SCRATCH).
  * The companion compiler gate owns ONNX Runtime comparison and malformed-plan
  * expectations; this executable deliberately proves only the public runtime
  * load/allocate/run/output path.
@@ -26,6 +40,30 @@
 #include "tigris_iface.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
+#ifdef TIGRIS_HAS_CMSIS_NN
+#include "tigris_kernels_cmsis_nn.h"
+#endif
+#ifdef TIGRIS_HAS_ESP_NN
+#include "tigris_kernels_esp_nn.h"
+#endif
+
+#ifdef TIGRIS_CONTRACT_VENDOR_CALLS
+/* Vendor call counters, defined in test/contract_vendor_calls.c. */
+void tigris_contract_vendor_begin_run(const char *dispatch, const void *workspace,
+                                      uint32_t workspace_size);
+void tigris_contract_vendor_print(void);
+#endif
+
+#if defined(__SANITIZE_ADDRESS__)
+#define CONTRACT_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define CONTRACT_ASAN 1
+#endif
+#endif
+#ifdef CONTRACT_ASAN
+#include <sanitizer/asan_interface.h>
+#endif
 
 #ifdef TIGRIS_COUNT_KERNEL_ROWS
 /* Test-only kernel row counters, defined in the runtime sources when they are
@@ -39,6 +77,53 @@ extern int32_t g_tigris_chain_tile_h;
 extern int32_t g_tigris_chain_num_tiles;
 extern int32_t g_tigris_interior_clamps;
 #endif
+
+typedef enum {
+    DISPATCH_REFERENCE,
+    DISPATCH_CMSIS_NN,
+    DISPATCH_ESP_NN,
+} dispatch_kind_t;
+
+/* Bytes after each arena that no allocation may reach. */
+#define GUARD_BYTES 64u
+
+static uint8_t guard_byte(uint32_t index)
+{
+    return (uint8_t)(0xA5u ^ (index * 37u));
+}
+
+/* Fills a guard. Under AddressSanitizer the guard is also poisoned, so a read
+ * of it fails the run as well as a write. */
+static void guard_fill(uint8_t *guard, uint32_t length)
+{
+    for (uint32_t i = 0; i < length; ++i)
+        guard[i] = guard_byte(i);
+#ifdef CONTRACT_ASAN
+    ASAN_POISON_MEMORY_REGION(guard, length);
+#endif
+}
+
+/* Prints the guard line and returns 1 when a guard byte changed. */
+static int guard_changed(uint8_t *guard, uint32_t length, const char *arena)
+{
+    uint32_t changed = 0;
+#ifdef CONTRACT_ASAN
+    ASAN_UNPOISON_MEMORY_REGION(guard, length);
+#endif
+    uint32_t first = 0;
+    for (uint32_t i = 0; i < length; ++i) {
+        if (guard[i] != guard_byte(i)) {
+            if (changed == 0u)
+                first = i;
+            ++changed;
+        }
+    }
+    if (changed == 0u)
+        return 0;
+    printf("TIGRIS_CONTRACT_GUARD arena=%s first=%" PRIu32 " changed=%" PRIu32 "\n",
+           arena, first, changed);
+    return 1;
+}
 
 static int load_file_aligned(
     const char *path, uint8_t **out_data, uint32_t *out_size)
@@ -62,6 +147,11 @@ static int load_file_aligned(
         goto fail;
     if (alignment < sizeof(void *))
         alignment = sizeof(void *);
+#ifdef TIGRIS_HAS_ESP_NN
+    /* ESP-NN reads filters in place from a 16-byte aligned plan. */
+    if (alignment < 16u)
+        alignment = 16u;
+#endif
     if (posix_memalign((void **)&data, alignment, (size_t)end) != 0)
         goto fail;
     if (fread(data, 1, (size_t)end, file) != (size_t)end)
@@ -91,8 +181,43 @@ static int allocate_aligned(size_t alignment, uint32_t size, void **out)
     return posix_memalign(out, alignment, size) == 0 ? 0 : -1;
 }
 
+static int parse_dispatch(const char *name, dispatch_kind_t *out_kind)
+{
+    if (strcmp(name, "reference") == 0) {
+        *out_kind = DISPATCH_REFERENCE;
+        return 0;
+    }
+#ifdef TIGRIS_HAS_CMSIS_NN
+    if (strcmp(name, "cmsis-nn") == 0) {
+        *out_kind = DISPATCH_CMSIS_NN;
+        return 0;
+    }
+#endif
+#ifdef TIGRIS_HAS_ESP_NN
+    if (strcmp(name, "esp-nn") == 0) {
+        *out_kind = DISPATCH_ESP_NN;
+        return 0;
+    }
+#endif
+    return -1;
+}
+
+static const char *dispatch_name(dispatch_kind_t kind)
+{
+    switch (kind) {
+    case DISPATCH_REFERENCE:
+        return "reference";
+    case DISPATCH_CMSIS_NN:
+        return "cmsis-nn";
+    case DISPATCH_ESP_NN:
+        return "esp-nn";
+    }
+    return "unknown";
+}
+
 static int choose_dispatch(
-    const tigris_plan_t *plan, tigris_kernel_fn *out_dispatch)
+    const tigris_plan_t *plan, dispatch_kind_t kind,
+    tigris_kernel_fn *out_dispatch)
 {
     uint8_t dtype;
 
@@ -102,6 +227,24 @@ static int choose_dispatch(
         return -1;
 
     dtype = tigris_plan_data_dtype(plan);
+    if (kind != DISPATCH_REFERENCE) {
+        /* The accelerated dispatchers run int8 plans. */
+        if (dtype != 3)
+            return -1;
+#ifdef TIGRIS_HAS_CMSIS_NN
+        if (kind == DISPATCH_CMSIS_NN) {
+            *out_dispatch = tigris_dispatch_kernel_cmsis_nn;
+            return 0;
+        }
+#endif
+#ifdef TIGRIS_HAS_ESP_NN
+        if (kind == DISPATCH_ESP_NN) {
+            *out_dispatch = tigris_dispatch_kernel_esp_nn;
+            return 0;
+        }
+#endif
+        return -1;
+    }
     if (dtype == 1) {
         *out_dispatch = tigris_dispatch_kernel;
         return 0;
@@ -246,10 +389,17 @@ int main(int argc, char **argv)
     uint8_t *plan_data = NULL;
     uint32_t plan_size = 0;
     void **tensor_ptrs = NULL;
-    void *fast_buf = NULL;
+    uint8_t *fast_buf = NULL;
     tigris_exec_stats_t stats;
-    void *slow_buf = NULL;
+    uint8_t *slow_buf = NULL;
     uint32_t fast_size;
+    uint32_t core_size;
+    uint32_t activation_size;
+    uint32_t activation_guard = 0;
+    uint32_t backend_scratch = 0;
+    dispatch_kind_t dispatch_kind = DISPATCH_REFERENCE;
+    int prepared = 0;
+    int guards_ok;
     uint32_t required_size;
     uint32_t activation_limit;
     uint32_t slow_size;
@@ -299,6 +449,12 @@ int main(int argc, char **argv)
             have_slow_arena = 1;
         } else if (strcmp(argv[arg_index], "--inputs-in-slow") == 0) {
             inputs_in_slow = 1;
+        } else if (strncmp(argv[arg_index], "--dispatch=", 11) == 0) {
+            if (parse_dispatch(argv[arg_index] + 11, &dispatch_kind) != 0) {
+                fprintf(stderr, "dispatch not available in this runner: %s\n",
+                        argv[arg_index] + 11);
+                return 2;
+            }
         } else if (pos_argc < (int)(sizeof(pos_argv) / sizeof(pos_argv[0]))) {
             pos_argv[pos_argc++] = argv[arg_index];
         } else {
@@ -311,7 +467,7 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: %s plan.tgrs inputs.bin outputs.bin [activation-limit] "
                 "[--no-linebuffer] [--workspace-limits=T,I,O,C,S,D] [--slow-arena=BYTES] "
-                "[--inputs-in-slow]\n",
+                "[--inputs-in-slow] [--dispatch=reference|cmsis-nn|esp-nn]\n",
                 pos_argv[0]);
         return 2;
     }
@@ -326,8 +482,9 @@ int main(int argc, char **argv)
             goto cleanup;
         }
     }
-    if (choose_dispatch(&plan, &dispatch) != 0) {
-        fprintf(stderr, "plan has unsupported or mixed contract dtype\n");
+    if (choose_dispatch(&plan, dispatch_kind, &dispatch) != 0) {
+        fprintf(stderr, "plan has unsupported or mixed contract dtype for the "
+                "%s dispatch\n", dispatch_name(dispatch_kind));
         goto cleanup;
     }
     overhead = tigris_weight_decompression_overhead(&plan);
@@ -354,22 +511,96 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     fast_size = activation_limit + overhead;
+    core_size = fast_size;
+    activation_size = fast_size;
+#ifdef TIGRIS_HAS_CMSIS_NN
+    if (dispatch_kind == DISPATCH_CMSIS_NN) {
+        /* The scratch goes on top of the 16-aligned core arena, as
+         * tigris_cmsis_nn_fast_arena_required() sizes it. */
+        backend_scratch = tigris_cmsis_nn_scratch_required(&plan);
+        if (backend_scratch == UINT32_MAX || fast_size > UINT32_MAX - 15u ||
+            (backend_scratch > 0u &&
+             backend_scratch > UINT32_MAX - ((fast_size + 15u) & ~15u))) {
+            fprintf(stderr, "plan has unrepresentable CMSIS-NN scratch\n");
+            goto cleanup;
+        }
+        if (backend_scratch > 0u) {
+            activation_size = (fast_size + 15u) & ~15u;
+            fast_size = activation_size + backend_scratch;
+            activation_guard = GUARD_BYTES;
+        }
+    }
+#endif
     if (have_slow_arena)
         slow_size = (uint32_t)slow_arena;
+    /* Fast buffer layout, offsets from its base:
+     *   [0, core_size)  activation region the executor allocates in, exactly
+     *       the activation limit plus the reserve, as on the reference dispatch
+     *   [core_size, activation_size + activation_guard)  guard
+     *       "fast_activation": the padding to the 16-aligned core arena plus
+     *       the inner guard
+     *   then backend_scratch bytes of CMSIS-NN workspace, then guard "fast".
+     * activation_guard is 0 without a CMSIS-NN workspace, so the "fast" guard
+     * directly follows the activation region. tigris_cmsis_nn_prepare() carves
+     * the workspace from the top of the arena it is given, so the runner
+     * passes the 16-aligned region plus the inner guard and, once the
+     * workspace is placed above that guard, lowers mem.fast_size to
+     * core_size. The executor sees the region a reference run sees, and the
+     * vendor the scratch it would have without the guard;
+     * tigris_cmsis_nn_deinit() restores the size the arena was prepared with. */
     tensor_ptrs = calloc(plan.header->num_tensors, sizeof(*tensor_ptrs));
-    if (!tensor_ptrs ||
-        allocate_aligned(TIGRIS_TENSOR_ALIGN, fast_size, &fast_buf) != 0 ||
+    if (!tensor_ptrs || fast_size > UINT32_MAX - 2u * GUARD_BYTES ||
+        slow_size > UINT32_MAX - GUARD_BYTES ||
+        allocate_aligned(TIGRIS_TENSOR_ALIGN,
+                         fast_size + activation_guard + GUARD_BYTES,
+                         (void **)&fast_buf) != 0 ||
         (slow_size > 0u &&
-         allocate_aligned(TIGRIS_TENSOR_ALIGN, slow_size, &slow_buf) != 0)) {
+         allocate_aligned(TIGRIS_TENSOR_ALIGN, slow_size + GUARD_BYTES,
+                          (void **)&slow_buf) != 0)) {
         fprintf(stderr, "could not allocate contract arenas\n");
         goto cleanup;
     }
+    if (activation_guard)
+        guard_fill(fast_buf + core_size, activation_size - core_size + activation_guard);
+    guard_fill(fast_buf + activation_guard + fast_size, GUARD_BYTES);
+    if (slow_buf)
+        guard_fill(slow_buf + slow_size, GUARD_BYTES);
     if (tigris_mem_init(
             &mem, tensor_ptrs, plan.header->num_tensors,
-            fast_buf, fast_size, slow_buf, slow_size) != TIGRIS_MEM_OK) {
+            fast_buf, fast_size + activation_guard, slow_buf, slow_size) != TIGRIS_MEM_OK) {
         fprintf(stderr, "memory initialization failed\n");
         goto cleanup;
     }
+#ifdef TIGRIS_HAS_CMSIS_NN
+    if (dispatch_kind == DISPATCH_CMSIS_NN) {
+        /* Preparation would accept an arena short of its requirement by at
+         * most the inner guard, so the runner refuses that arena itself. */
+        uint32_t cmsis_required = tigris_cmsis_nn_fast_arena_required(&plan);
+        if ((activation_guard &&
+             (cmsis_required == UINT32_MAX || cmsis_required > fast_size)) ||
+            tigris_cmsis_nn_prepare(&plan, &mem) != 0) {
+            fprintf(stderr, "CMSIS-NN preparation failed\n");
+            goto cleanup;
+        }
+        prepared = 1;
+        if (mem.fast_size != activation_size + activation_guard) {
+            fprintf(stderr, "CMSIS-NN workspace is not where the guard layout "
+                    "expects it\n");
+            goto cleanup;
+        }
+        mem.fast_size = core_size;
+    }
+#endif
+#ifdef TIGRIS_HAS_ESP_NN
+    if (dispatch_kind == DISPATCH_ESP_NN) {
+        /* ESP-NN takes its workspace from the heap, not the fast arena. */
+        if (tigris_esp_nn_prepare(&plan, &mem) != 0) {
+            fprintf(stderr, "ESP-NN preparation failed\n");
+            goto cleanup;
+        }
+        prepared = 1;
+    }
+#endif
     if (load_inputs(pos_argv[2], &plan, &mem, inputs_in_slow) != 0)
         goto cleanup;
     if (no_linebuffer) {
@@ -389,6 +620,14 @@ int main(int argc, char **argv)
     }
 #ifdef TIGRIS_COUNT_KERNEL_ROWS
     g_tigris_kernel_rows = 0;
+#endif
+#ifdef TIGRIS_CONTRACT_VENDOR_CALLS
+    if (activation_guard)
+        tigris_contract_vendor_begin_run(dispatch_name(dispatch_kind),
+                                         fast_buf + activation_size + activation_guard,
+                                         backend_scratch);
+    else
+        tigris_contract_vendor_begin_run(dispatch_name(dispatch_kind), NULL, 0);
 #endif
     memset(&stats, 0, sizeof(stats));
     {
@@ -420,6 +659,16 @@ int main(int argc, char **argv)
         } else {
             error = tigris_run(&plan, &mem, dispatch, NULL, &stats);
         }
+        guards_ok = !(activation_guard &&
+                      guard_changed(fast_buf + core_size,
+                                    activation_size - core_size + activation_guard,
+                                    "fast_activation"));
+        if (guard_changed(fast_buf + activation_guard + fast_size, GUARD_BYTES, "fast"))
+            guards_ok = 0;
+        if (slow_buf && guard_changed(slow_buf + slow_size, GUARD_BYTES, "slow"))
+            guards_ok = 0;
+        if (!guards_ok)
+            goto cleanup;
         if (error != TIGRIS_EXEC_OK) {
             fprintf(stderr, "inference failed: %s after %u stages "
                     "(fast peak %u of %u)\n",
@@ -440,6 +689,12 @@ int main(int argc, char **argv)
         " peak=%" PRIu32 " slow_peak=%" PRIu32 "\n",
         plan.header->budget, activation_limit, overhead, required_size,
         fast_size, mem.fast_peak, stats.slow_peak);
+    printf("TIGRIS_CONTRACT_DISPATCH name=%s scratch=%" PRIu32 "\n",
+           dispatch_name(dispatch_kind), backend_scratch);
+#ifdef TIGRIS_CONTRACT_VENDOR_CALLS
+    if (dispatch_kind != DISPATCH_REFERENCE)
+        tigris_contract_vendor_print();
+#endif
 #ifdef TIGRIS_COUNT_KERNEL_ROWS
     printf(
         "TIGRIS_CONTRACT_ROWS kernel_rows=%lu chain_tiles=%" PRId32
@@ -450,6 +705,15 @@ int main(int argc, char **argv)
     result = 0;
 
 cleanup:
+#ifdef TIGRIS_HAS_CMSIS_NN
+    if (prepared && dispatch_kind == DISPATCH_CMSIS_NN)
+        (void)tigris_cmsis_nn_deinit(&mem);
+#endif
+#ifdef TIGRIS_HAS_ESP_NN
+    if (prepared && dispatch_kind == DISPATCH_ESP_NN)
+        tigris_esp_nn_deinit();
+#endif
+    (void)prepared;
     free(state);
     free(workspace);
     free(slow_buf);

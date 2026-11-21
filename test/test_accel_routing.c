@@ -825,6 +825,134 @@ static void test_cmsis_plain_height_tile_routes_adapter(void)
                    "CMSIS-NN dilated tiled Conv still routes to s8_ref");
 }
 
+/* Whether a tile kind sends a unit-dilation Conv (conv != 0) or a 1x1
+ * MaxPool to s8_ref. No default: a new kind fails to compile here too. */
+static int kind_routes_reference(tigris_accel_tile_kind_t kind, int conv,
+                                 tigris_accel_backend_t backend)
+{
+    switch (kind) {
+    case TIGRIS_ACCEL_TILE_NONE:
+        return 0;
+    case TIGRIS_ACCEL_TILE_ROW_BAND:
+        return 1;
+    case TIGRIS_ACCEL_TILE_2D:
+    case TIGRIS_ACCEL_TILE_ROLLED:
+        return !conv;
+    case TIGRIS_ACCEL_TILE_HEIGHT:
+    case TIGRIS_ACCEL_TILE_REDUCE_INPUT:
+    case TIGRIS_ACCEL_TILE_REDUCE_GROUPED:
+    case TIGRIS_ACCEL_TILE_TRANSPOSED:
+        /* An active tile sends CMSIS-NN pooling to s8_ref. */
+        return !conv && backend == TIGRIS_ACCEL_CMSIS_NN;
+    }
+    return -1;
+}
+
+/* Sets the tile context the executor builds for one kind. */
+static void set_tile_kind(tigris_mem_t *mem, tigris_accel_tile_kind_t kind,
+                          int32_t *acc)
+{
+    switch (kind) {
+    case TIGRIS_ACCEL_TILE_NONE:
+        mem->tile.active = 0;
+        break;
+    case TIGRIS_ACCEL_TILE_HEIGHT:
+        break;
+    case TIGRIS_ACCEL_TILE_2D:
+        mem->tile.width_tiled = 1;
+        break;
+    case TIGRIS_ACCEL_TILE_ROLLED:
+        mem->tile.out_row_start = 2;
+        mem->tile.out_h = 3;
+        break;
+    case TIGRIS_ACCEL_TILE_ROW_BAND:
+        mem->tile.row_tiled = 1;
+        mem->tile.in_h = 1;
+        mem->tile.out_h = 1;
+        break;
+    case TIGRIS_ACCEL_TILE_REDUCE_INPUT:
+        mem->tile.reduce_acc = acc;
+        mem->tile.reduce_first = 1;
+        mem->tile.reduce_last = 1;
+        break;
+    case TIGRIS_ACCEL_TILE_REDUCE_GROUPED:
+        mem->tile.reduce_acc = acc;
+        mem->tile.reduce_channels = 1;
+        mem->tile.reduce_positions = 1;
+        break;
+    case TIGRIS_ACCEL_TILE_TRANSPOSED:
+        mem->tile.transposed_tile = 1;
+        break;
+    }
+}
+
+/* Every tile kind the executor produces is classified and routed. */
+static void test_every_tile_kind_routes(void)
+{
+    printf("  test_every_tile_kind_routes...\n");
+    route_fixture_t fx;
+    int32_t acc[8];
+
+    for (int conv = 0; conv < 2; conv++) {
+        build_fixture(&fx, conv ? TIGRIS_OP_CONV : TIGRIS_OP_MAX_POOL, 0);
+        fx.op.spatial.dilation_h = 1;
+        fx.op.spatial.dilation_w = 1;
+        if (!conv) {
+            fx.op.spatial.kernel_h = 1;
+            fx.op.spatial.kernel_w = 1;
+            fx.op.spatial.pad_top = 0;
+            fx.op.spatial.pad_bottom = 0;
+            fx.op.spatial.pad_left = 0;
+            fx.op.spatial.pad_right = 0;
+        }
+        for (int k = TIGRIS_ACCEL_TILE_NONE; k <= TIGRIS_ACCEL_TILE_TRANSPOSED; k++) {
+            tigris_accel_tile_kind_t kind = (tigris_accel_tile_kind_t)k;
+            for (int b = TIGRIS_ACCEL_ESP_NN; b <= TIGRIS_ACCEL_CMSIS_NN; b++) {
+                tigris_accel_backend_t backend = (tigris_accel_backend_t)b;
+                tigris_mem_t mem;
+                void *ptrs[2];
+                int8_t out[8];
+                int handled = -1;
+                memset(out, 0, sizeof(out));
+                memset(acc, 0, sizeof(acc));
+                init_mem(&mem, ptrs, out, &fx, 1);
+                set_tile_kind(&mem, kind, acc);
+                TEST_ASSERT_EQ(tigris_accel_tile_kind(&mem.tile), kind,
+                               "the tile context classifies as its kind");
+                TEST_ASSERT_EQ(tigris_accel_try_s8_ref(
+                                   backend, &fx.plan, &fx.op, 0, &mem, NULL, &handled),
+                               0, "the routed call succeeds");
+                TEST_ASSERT_EQ(handled, kind_routes_reference(kind, conv, backend),
+                               "the tile kind routes as specified");
+            }
+        }
+    }
+
+    /* Several flags at once: row band, then 2D, then a roll; inactive wins. */
+    tigris_tile_ctx_t tile;
+    memset(&tile, 0, sizeof(tile));
+    tile.active = 1;
+    tile.row_tiled = 1;
+    tile.width_tiled = 1;
+    tile.out_row_start = 1;
+    TEST_ASSERT_EQ(tigris_accel_tile_kind(&tile), TIGRIS_ACCEL_TILE_ROW_BAND,
+                   "a row band precedes a 2D tile and a roll");
+    tile.row_tiled = 0;
+    TEST_ASSERT_EQ(tigris_accel_tile_kind(&tile), TIGRIS_ACCEL_TILE_2D,
+                   "a 2D tile precedes a roll");
+    tile.width_tiled = 0;
+    tile.transposed_tile = 1;
+    tile.reduce_acc = acc;
+    TEST_ASSERT_EQ(tigris_accel_tile_kind(&tile), TIGRIS_ACCEL_TILE_ROLLED,
+                   "a roll precedes a transposed tile and a reduction");
+    tile.out_row_start = 0;
+    TEST_ASSERT_EQ(tigris_accel_tile_kind(&tile), TIGRIS_ACCEL_TILE_TRANSPOSED,
+                   "a transposed tile precedes a reduction");
+    tile.active = 0;
+    TEST_ASSERT_EQ(tigris_accel_tile_kind(&tile), TIGRIS_ACCEL_TILE_NONE,
+                   "an inactive context is untiled whatever else it holds");
+}
+
 static void test_binary_routes(void)
 {
     tigris_file_header_t header = { .num_tensors = 3, .num_ops = 1 };
@@ -970,6 +1098,7 @@ int main(void)
     test_rolled_tile_routing();
     test_width_tiled_routing();
     test_row_banded_ops_route_to_reference();
+    test_every_tile_kind_routes();
     test_esp_asymmetric_pad_workspace_policy();
     test_row_band_matches_unsplit_op();
     test_tile_view();
